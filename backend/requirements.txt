@@ -1,0 +1,22 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+pydantic==2.11.7
+pydantic-settings==2.10.1
+SQLAlchemy==2.0.43
+aiosqlite==0.20.0
+rapidfuzz==3.14.1
+python-multipart==0.0.20
+httpx==0.28.1
+
+# attachment rendering (mock provider) + file conversion (vision engine)
+fpdf2==2.8.4
+python-docx==1.2.0
+Pillow==11.3.0
+PyMuPDF==1.26.4
+openpyxl==3.1.5
+
+# --- Postgres (your production DB): uncomment + set DATABASE_URL ---
+# asyncpg==0.30.0
+
+# --- Microsoft Graph (EMAIL_PROVIDER=graph) ---
+# msal==1.31.0
