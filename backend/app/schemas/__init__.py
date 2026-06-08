@@ -109,6 +109,10 @@ class EmployeeIn(BaseModel):
     dco_number: str | None = None
     account_manager: str | None = None
     employee_email_id: str | None = None
+    project: str | None = None
+    contact_no: str | None = None
+    location: str | None = None
+    all_emails: str | None = None
 
 
 class EmployeeOut(EmployeeIn):
@@ -124,3 +128,18 @@ class UploadResult(BaseModel):
     validation_status: str
     llm_summary: str | None
     match_note: str | None
+
+
+class SkipDetail(BaseModel):
+    sheet: str
+    row: int
+    id: str
+    name: str
+    reason: str
+
+
+class ImportSummary(BaseModel):
+    inserted: int
+    updated: int
+    skipped: int
+    skipped_details: list[SkipDetail] = []

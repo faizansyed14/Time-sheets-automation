@@ -4,7 +4,8 @@ Ingestion pipeline — shared by BOTH the email "Accept" action and the Upload p
 Core unit: ingest_timesheet_bytes(...) takes one timesheet's bytes and:
   1. extracts leave data (LLM)            -> buckets + validation summary
   2. matches identity vs all_employee_data
-  3. files sheet + (optional) approval + extraction_result.json under <emp>/<Month-Year>/
+  3. files sheet + (optional) approval + extraction_result.json under
+     <Manager>/<Employee>/<Month-Year>/   (falls back to "Unassigned" if no manager)
   4. upserts a TimesheetRecord (dedupe on employee + month + year)
 
 ingest_email(...) reads the approval screenshot once, then calls the core unit per
@@ -65,6 +66,7 @@ async def ingest_timesheet_bytes(
 
     matched, note = await matching.match_employee(db, ext.employee_id, ext.employee_name)
     employee_name = matched.name if matched else (ext.employee_name or "Unknown")
+    account_manager = matched.account_manager if matched else None
 
     cal_days = None
     if 1 <= ext.month <= 12 and ext.year:
@@ -73,15 +75,15 @@ async def ingest_timesheet_bytes(
     # ---- file on disk (best-effort; never blocks record creation) ----
     folder_rel = None
     try:
-        sp.save_file(employee_name, ext.month, ext.year, filename, data)
+        sp.save_file(account_manager, employee_name, ext.month, ext.year, filename, data)
         if approval_bytes is not None:
-            sp.save_file(employee_name, ext.month, ext.year, approval_name, approval_bytes)
-        sp.save_text(employee_name, ext.month, ext.year, "extraction_result.json", _json.dumps({
+            sp.save_file(account_manager, employee_name, ext.month, ext.year, approval_name, approval_bytes)
+        sp.save_text(account_manager, employee_name, ext.month, ext.year, "extraction_result.json", _json.dumps({
             "employee": {"extracted_id": ext.employee_id, "extracted_name": ext.employee_name,
                          "matched_id": matched.employee_id if matched else None,
                          "matched_name": matched.name if matched else None,
                          "dco_number": matched.dco_number if matched else None,
-                         "account_manager": matched.account_manager if matched else None,
+                         "account_manager": account_manager,
                          "match_note": note},
             "period": {"month": ext.month, "year": ext.year},
             "leaves": {"annual": ext.annual_leave_dates, "remote": ext.remote_work_dates,
@@ -91,7 +93,7 @@ async def ingest_timesheet_bytes(
             "approval": {"detected": approval_detected, "detail": approval_detail},
             "source": source_id, "ingested_at": datetime.now(timezone.utc).isoformat(),
         }, indent=2, default=str))
-        folder_rel = sp.folder_rel(employee_name, ext.month, ext.year)
+        folder_rel = sp.folder_rel(account_manager, employee_name, ext.month, ext.year)
     except Exception:
         folder_rel = None
 
@@ -104,7 +106,7 @@ async def ingest_timesheet_bytes(
     rec.matched_employee_pk = matched.id if matched else None
     rec.employee_id = matched.employee_id if matched else ext.employee_id
     rec.employee_name = employee_name
-    rec.account_manager = matched.account_manager if matched else None
+    rec.account_manager = account_manager
     rec.dco_number = matched.dco_number if matched else None
     rec.match_note = note
     rec.month = ext.month
@@ -122,7 +124,10 @@ async def ingest_timesheet_bytes(
     rec.approval_detected = approval_detected
     rec.approval_detail = approval_detail
     if not existing:
-        rec.approval_status = ApprovalStatus.PENDING
+        # If ingested from a source ID that starts with "upload:", it's pending.
+        # Otherwise (email flow), it's auto-approved as per requirement.
+        is_upload = source_id and source_id.startswith("upload:")
+        rec.approval_status = ApprovalStatus.PENDING if is_upload else ApprovalStatus.APPROVED
     rec.source_email_id = source_id
     rec.storage_folder = folder_rel
     if not existing:

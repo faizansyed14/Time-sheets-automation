@@ -31,4 +31,10 @@ class Employee(Base):
     account_manager: Mapped[str | None] = mapped_column(String, nullable=True)
     employee_email_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # Extended fields from the real Excel import
+    project: Mapped[str | None] = mapped_column(String, nullable=True)
+    contact_no: Mapped[str | None] = mapped_column(String, nullable=True)
+    location: Mapped[str | None] = mapped_column(String, nullable=True)   # "DXB" | "AUH"
+    all_emails: Mapped[str | None] = mapped_column(String, nullable=True)  # semicolon-separated
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
