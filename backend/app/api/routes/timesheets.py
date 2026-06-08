@@ -182,8 +182,14 @@ async def record_sources(record_id: str, db: AsyncSession = Depends(get_db)):
     if not r.storage_folder:
         return []
     try:
-        emp, month = r.storage_folder.split("/", 1)
-        items = sp.get_storage_provider().list_items(emp, month)
+        parts = r.storage_folder.split("/")
+        if len(parts) == 3:
+            manager, emp, month = parts
+        elif len(parts) == 2:
+            manager, emp, month = "Unassigned", parts[0], parts[1]
+        else:
+            return []
+        items = sp.get_storage_provider().list_items(manager, emp, month)
         return [{"name": i.name, "rel_path": i.rel_path, "content_type": i.content_type, "size": i.size}
                 for i in items]
     except Exception:

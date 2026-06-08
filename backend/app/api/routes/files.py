@@ -1,5 +1,5 @@
 """
-Files routes — browse and manage the <Employee>/<Month-Year>/<files> tree.
+Files routes — browse and manage the <Manager>/<Employee>/<Month-Year>/<files> tree.
 
 Backed by the active storage provider (local now, OneDrive later), so the same
 CRUD the UI performs here will create/rename/delete folders in OneDrive once
@@ -11,8 +11,13 @@ from fastapi import APIRouter, Body, HTTPException, Query, Response
 from pydantic import BaseModel
 
 from app.services import storage_provider as sp
+from app.services.archive_export import build_zip
 
 router = APIRouter(prefix="/files", tags=["files"])
+
+
+class CreateManager(BaseModel):
+    name: str
 
 
 class CreateEmployee(BaseModel):
@@ -28,20 +33,29 @@ class RenameFolder(BaseModel):
     new_name: str
 
 
-@router.get("/employees")
-def list_employees():
-    return [e.__dict__ for e in sp.get_storage_provider().list_employees()]
+# ---- 3-level listing ----
+
+@router.get("/managers")
+def list_managers():
+    return [m.__dict__ for m in sp.get_storage_provider().list_managers()]
 
 
-@router.get("/employees/{employee}/months")
-def list_months(employee: str):
-    return [m.__dict__ for m in sp.get_storage_provider().list_months(employee)]
+@router.get("/managers/{manager}/employees")
+def list_employees(manager: str):
+    return [e.__dict__ for e in sp.get_storage_provider().list_employees(manager)]
 
 
-@router.get("/employees/{employee}/months/{month}/items")
-def list_items(employee: str, month: str):
-    return [i.__dict__ for i in sp.get_storage_provider().list_items(employee, month)]
+@router.get("/managers/{manager}/employees/{employee}/months")
+def list_months(manager: str, employee: str):
+    return [m.__dict__ for m in sp.get_storage_provider().list_months(manager, employee)]
 
+
+@router.get("/managers/{manager}/employees/{employee}/months/{month}/items")
+def list_items(manager: str, employee: str, month: str):
+    return [i.__dict__ for i in sp.get_storage_provider().list_items(manager, employee, month)]
+
+
+# ---- reading ----
 
 @router.get("/content")
 def file_content(rel_path: str = Query(...)):
@@ -54,18 +68,45 @@ def file_content(rel_path: str = Query(...)):
                     headers={"Content-Disposition": f'{disp}; filename="{name}"'})
 
 
-@router.post("/employees", status_code=201)
-def create_employee(body: CreateEmployee):
+# ---- ZIP download ----
+
+@router.get("/download-zip")
+def download_zip(manager: str | None = Query(default=None)):
+    """
+    Download the storage tree as a ZIP.
+    ?manager=X  → just that manager's subtree.
+    (no query)  → entire archive.
+    """
+    data = build_zip(manager)
+    filename = f"{manager}_timesheets.zip" if manager else "timesheets_archive.zip"
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---- folder CRUD ----
+
+@router.post("/managers", status_code=201)
+def create_manager(body: CreateManager):
     if not body.name.strip():
         raise HTTPException(400, "Name required")
-    return sp.get_storage_provider().create_employee(body.name).__dict__
+    return sp.get_storage_provider().create_manager(body.name).__dict__
 
 
-@router.post("/employees/{employee}/months", status_code=201)
-def create_month(employee: str, body: CreateMonth):
+@router.post("/managers/{manager}/employees", status_code=201)
+def create_employee(manager: str, body: CreateEmployee):
+    if not body.name.strip():
+        raise HTTPException(400, "Name required")
+    return sp.get_storage_provider().create_employee(manager, body.name).__dict__
+
+
+@router.post("/managers/{manager}/employees/{employee}/months", status_code=201)
+def create_month(manager: str, employee: str, body: CreateMonth):
     if not body.month_label.strip():
         raise HTTPException(400, "Month label required")
-    return sp.get_storage_provider().create_month(employee, body.month_label).__dict__
+    return sp.get_storage_provider().create_month(manager, employee, body.month_label).__dict__
 
 
 @router.patch("/folder")

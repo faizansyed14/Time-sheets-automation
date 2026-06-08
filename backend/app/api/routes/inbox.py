@@ -1,4 +1,4 @@
-"""Inbox routes — read emails, preview attachments, Accept/Reject."""
+"""Inbox routes — read emails, preview attachments, Accept/Reject/Restore."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models.email_message import EmailMessage, EmailStatus
+from app.models.timesheet_record import TimesheetRecord
 from app.schemas import (
     AttachmentOut,
     DecisionIn,
@@ -135,7 +136,6 @@ async def get_attachment(provider_message_id: str, attachment_id: str):
 
 @router.post("/{provider_message_id}/decision")
 async def decide(provider_message_id: str, body: DecisionIn, db: AsyncSession = Depends(get_db)):
-    # ensure synced
     provider = get_email_provider()
     msg = await provider.get_message(provider_message_id)
     if not msg:
@@ -143,6 +143,11 @@ async def decide(provider_message_id: str, body: DecisionIn, db: AsyncSession = 
     row = await _sync_message(db, msg)
     await db.commit()
     await db.refresh(row)
+
+    if row.status == EmailStatus.INGESTED:
+        raise HTTPException(409, "Email already ingested — cannot re-decide.")
+    if row.status == EmailStatus.ARCHIVED and not body.accepted:
+        raise HTTPException(409, "Email already archived. Use /restore to reopen.")
 
     if not body.accepted:
         row.status = EmailStatus.ARCHIVED
@@ -153,3 +158,58 @@ async def decide(provider_message_id: str, body: DecisionIn, db: AsyncSession = 
     records = await ingest_email(db, row)
     return {"status": "ingested", "records_created": len(records),
             "record_ids": [r.id for r in records]}
+
+
+@router.post("/{provider_message_id}/restore")
+async def restore_email(provider_message_id: str, db: AsyncSession = Depends(get_db)):
+    """Restore an archived email back to 'new' so it can be accepted."""
+    row = (
+        await db.execute(
+            select(EmailMessage).where(EmailMessage.provider_message_id == provider_message_id)
+        )
+    ).scalar_one_or_none()
+
+    if not row:
+        # Try by internal id as well
+        row = (
+            await db.execute(
+                select(EmailMessage).where(EmailMessage.id == provider_message_id)
+            )
+        ).scalar_one_or_none()
+
+    if not row:
+        raise HTTPException(404, "Email not found")
+    if row.status != EmailStatus.ARCHIVED:
+        raise HTTPException(409, f"Email status is '{row.status}', only archived emails can be restored.")
+
+    row.status = EmailStatus.NEW
+    row.decided_at = None
+    await db.commit()
+    await db.refresh(row)
+    return {"status": "new", "id": row.id, "provider_message_id": row.provider_message_id}
+
+
+@router.post("/{provider_message_id}/rerun")
+async def rerun_extraction(provider_message_id: str, db: AsyncSession = Depends(get_db)):
+    """Wipe existing month folders for related records and run ingestion again."""
+    row = (await db.execute(select(EmailMessage).where(EmailMessage.provider_message_id == provider_message_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "Email session not found")
+    if row.status != EmailStatus.INGESTED:
+        raise HTTPException(400, "Only accepted emails can be re-run")
+
+    # Find affected records to find storage paths
+    recs = (await db.execute(select(TimesheetRecord).where(TimesheetRecord.source_email_id == provider_message_id))).scalars().all()
+    
+    from app.services import storage_provider as sp
+    for r in recs:
+        if r.storage_folder:
+            # Delete the specific month folder
+            try:
+                sp.get_storage_provider().delete_folder(r.storage_folder)
+            except Exception:
+                pass # Already gone or permission error
+
+    # Re-trigger ingestion (which will upsert and overwrite database rows)
+    records = await ingest_email(db, row)
+    return {"status": "re-ingested", "records_count": len(records)}

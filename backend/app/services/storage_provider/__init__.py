@@ -7,6 +7,8 @@ from functools import lru_cache
 from app.core.config import settings
 from app.services.storage_provider.base import StorageProvider
 
+_UNASSIGNED = "Unassigned"
+
 
 @lru_cache
 def get_storage_provider() -> StorageProvider:
@@ -22,17 +24,28 @@ def month_label(month: int, year: int) -> str:
     return f"{mname}-{year}"
 
 
+def _safe(name: str) -> str:
+    """Mirror _safe from local_provider without circular import."""
+    import re
+    name = (name or "").strip()
+    name = re.sub(r'[<>:"/\\|?*]+', "_", name)
+    return name or "Unknown"
+
+
 # ---- helpers used by the ingestion pipeline ----
-def save_file(employee: str, month: int, year: int, filename: str, data: bytes) -> str:
-    return get_storage_provider().save_file(employee, month_label(month, year), filename, data)
+def save_file(manager: str, employee: str, month: int, year: int, filename: str, data: bytes) -> str:
+    return get_storage_provider().save_file(
+        manager or _UNASSIGNED, employee, month_label(month, year), filename, data
+    )
 
 
-def save_text(employee: str, month: int, year: int, filename: str, text: str) -> str:
-    return get_storage_provider().save_text(employee, month_label(month, year), filename, text)
+def save_text(manager: str, employee: str, month: int, year: int, filename: str, text: str) -> str:
+    return get_storage_provider().save_text(
+        manager or _UNASSIGNED, employee, month_label(month, year), filename, text
+    )
 
 
-def folder_rel(employee: str, month: int, year: int) -> str:
-    # ensure it exists, return its relative path
-    get_storage_provider().create_month(employee, month_label(month, year))
-    from app.services.storage_provider.local_provider import _safe
-    return f"{_safe(employee)}/{_safe(month_label(month, year))}"
+def folder_rel(manager: str, employee: str, month: int, year: int) -> str:
+    mgr = manager or _UNASSIGNED
+    get_storage_provider().create_month(mgr, employee, month_label(month, year))
+    return f"{_safe(mgr)}/{_safe(employee)}/{_safe(month_label(month, year))}"

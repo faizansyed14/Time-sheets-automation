@@ -72,7 +72,7 @@ export interface DashboardRow {
   years: number[];
 }
 
-// ---- calls ----
+// ---- inbox ----
 export const fetchInbox = (q: string, status: string) =>
   api.get<EmailListItem[]>("/inbox", { params: { q: q || undefined, status: status || undefined } }).then((r) => r.data);
 
@@ -82,15 +82,23 @@ export const fetchEmail = (id: string) =>
 export const decideEmail = (id: string, accepted: boolean) =>
   api.post(`/inbox/${id}/decision`, { accepted }).then((r) => r.data);
 
+export const restoreEmail = (id: string) =>
+  api.post(`/inbox/${id}/restore`).then((r) => r.data);
+
+export const rerunExtraction = (id: string) =>
+  api.post(`/inbox/${id}/rerun`).then((r) => r.data);
+
 export const attachmentUrl = (msgId: string, attId: string) =>
   `/api/v1/inbox/${msgId}/attachments/${attId}`;
 
+// ---- dashboard / employees ----
 export const fetchDashboard = (year?: number) =>
   api.get<DashboardRow[]>("/employees", { params: { year } }).then((r) => r.data);
 
 export const fetchEmployeeRecords = (pk: string, year?: number) =>
   api.get<TimesheetRecord[]>(`/employees/${pk}/records`, { params: { year } }).then((r) => r.data);
 
+// ---- timesheets ----
 export const approveRecord = (id: string, approved: boolean) =>
   api.post<TimesheetRecord>(`/timesheets/${id}/approve`, { approved }).then((r) => r.data);
 
@@ -122,20 +130,29 @@ export interface SourceFile {
 export const recordSources = (id: string) =>
   api.get<SourceFile[]>(`/timesheets/${id}/sources`).then((r) => r.data);
 
-// ---- files / folders ----
+// ---- files / folders (3-level: Manager → Employee → Month) ----
+export interface ManagerFolder { name: string; rel_path: string; employee_count: number; }
 export interface EmployeeFolder { name: string; rel_path: string; month_count: number; }
 export interface MonthFolder { name: string; rel_path: string; file_count: number; }
 export interface FileItem { name: string; rel_path: string; size: number; content_type: string; }
 
-export const listFileEmployees = () => api.get<EmployeeFolder[]>("/files/employees").then((r) => r.data);
-export const listFileMonths = (emp: string) =>
-  api.get<MonthFolder[]>(`/files/employees/${encodeURIComponent(emp)}/months`).then((r) => r.data);
-export const listFileItems = (emp: string, month: string) =>
-  api.get<FileItem[]>(`/files/employees/${encodeURIComponent(emp)}/months/${encodeURIComponent(month)}/items`).then((r) => r.data);
+export const listFileManagers = () => api.get<ManagerFolder[]>("/files/managers").then((r) => r.data);
+export const listFileEmployees = (manager: string) =>
+  api.get<EmployeeFolder[]>(`/files/managers/${encodeURIComponent(manager)}/employees`).then((r) => r.data);
+export const listFileMonths = (manager: string, emp: string) =>
+  api.get<MonthFolder[]>(`/files/managers/${encodeURIComponent(manager)}/employees/${encodeURIComponent(emp)}/months`).then((r) => r.data);
+export const listFileItems = (manager: string, emp: string, month: string) =>
+  api.get<FileItem[]>(`/files/managers/${encodeURIComponent(manager)}/employees/${encodeURIComponent(emp)}/months/${encodeURIComponent(month)}/items`).then((r) => r.data);
+
 export const fileContentUrl = (relPath: string) => `/api/v1/files/content?rel_path=${encodeURIComponent(relPath)}`;
-export const createFileEmployee = (name: string) => api.post("/files/employees", { name }).then((r) => r.data);
-export const createFileMonth = (emp: string, month_label: string) =>
-  api.post(`/files/employees/${encodeURIComponent(emp)}/months`, { month_label }).then((r) => r.data);
+export const downloadZipUrl = (manager?: string) =>
+  `/api/v1/files/download-zip${manager ? `?manager=${encodeURIComponent(manager)}` : ""}`;
+
+export const createFileManager = (name: string) => api.post("/files/managers", { name }).then((r) => r.data);
+export const createFileEmployee = (manager: string, name: string) =>
+  api.post(`/files/managers/${encodeURIComponent(manager)}/employees`, { name }).then((r) => r.data);
+export const createFileMonth = (manager: string, emp: string, month_label: string) =>
+  api.post(`/files/managers/${encodeURIComponent(manager)}/employees/${encodeURIComponent(emp)}/months`, { month_label }).then((r) => r.data);
 export const renameFolder = (rel_path: string, new_name: string) =>
   api.patch("/files/folder", { rel_path, new_name }).then((r) => r.data);
 export const deleteFolder = (relPath: string) =>
@@ -149,6 +166,10 @@ export interface Employee {
   dco_number: string | null;
   account_manager: string | null;
   employee_email_id: string | null;
+  project: string | null;
+  contact_no: string | null;
+  location: string | null;
+  all_emails: string | null;
 }
 export type EmployeeInput = Omit<Employee, "id">;
 
@@ -156,6 +177,13 @@ export const fetchEmployeeMatcher = () => api.get<Employee[]>("/employee-matcher
 export const createEmployee = (e: EmployeeInput) => api.post<Employee>("/employee-matcher", e).then((r) => r.data);
 export const updateEmployee = (id: string, e: EmployeeInput) => api.put<Employee>(`/employee-matcher/${id}`, e).then((r) => r.data);
 export const deleteEmployee = (id: string) => api.delete(`/employee-matcher/${id}`).then((r) => r.data);
+
+export interface ImportSummary { inserted: number; updated: number; skipped: number; }
+export const importEmployees = (file: File) => {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  return api.post<ImportSummary>("/employee-matcher/import", form, { headers: { "Content-Type": "multipart/form-data" } }).then((r) => r.data);
+};
 
 // ---- upload ----
 export interface UploadResult {
