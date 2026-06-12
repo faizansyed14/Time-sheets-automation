@@ -17,13 +17,17 @@ from datetime import datetime, timezone
 # Employee Matcher list -> seeds all_employee_data
 # ---------------------------------------------------------------------------
 EMPLOYEE_MATCHER = [
-    # employee_id, name,            dco,       account_manager, email
-    ("EMP-1001", "Mohammed Ali", "DCO-552", "Sarah Khan", "mohammed.ali@company.com"),
-    ("EMP-1002", "Priya Sharma", "DCO-553", "Sarah Khan", "priya.sharma@company.com"),
-    ("EMP-1003", "John Mathew", "DCO-554", "David Lee", "john.mathew@company.com"),
-    ("EMP-1004", "Aisha Rahman", "DCO-555", "David Lee", "aisha.rahman@company.com"),
-    ("EMP-1005", "Carlos Mendes", "DCO-556", "Sarah Khan", "carlos.mendes@company.com"),
-    ("EMP-1006", "Fatima Noor", "DCO-557", "David Lee", "fatima.noor@company.com"),
+    # employee_id, name,            dco,       account_manager, email, location
+    ("EMP-1001", "Mohammed Ali", "DCO-552", "Sarah Khan", "mohammed.ali@company.com", "DXB"),
+    ("EMP-1002", "Priya Sharma", "DCO-553", "Sarah Khan", "priya.sharma@company.com", "DXB"),
+    ("EMP-1003", "John Mathew", "DCO-554", "David Lee", "john.mathew@company.com", "DXB"),
+    ("EMP-1004", "Aisha Rahman", "DCO-555", "David Lee", "aisha.rahman@company.com", "AUH"),
+    ("EMP-1005", "Carlos Mendes", "DCO-556", "Sarah Khan", "carlos.mendes@company.com", "DXB"),
+    ("EMP-1006", "Fatima Noor", "DCO-557", "David Lee", "fatima.noor@company.com", "AUH"),
+    # EMP-2001 exists in BOTH teams (different people!) — exercises the
+    # employee_id + name matching.
+    ("EMP-2001", "Rahul Verma", "DCO-601", "Sarah Khan", "rahul.verma@company.com", "DXB"),
+    ("EMP-2001", "Ahmed Hassan", None, "Omar Farouk", "ahmed.hassan@company.com", "AUH"),
 ]
 
 
@@ -186,6 +190,135 @@ MESSAGES = [
             },
         ],
         "approval": {"slot": "ap", "detected": True, "detail": "Approved by Sarah Khan (team lead)"},
+    },
+    {
+        # WEEKLY timesheets: one employee, one month, TWO files. Both must be
+        # accepted and MERGED into a single March record (not deduped away).
+        "message_id": "MSG-0007",
+        "sender_name": "Rahul Verma",
+        "sender_email": "rahul.verma@company.com",
+        "subject": "March 2026 weekly timesheets (Week 1-2 and Week 3-4) - Rahul",
+        "received_at": _dt("2026-04-01T09:30:00"),
+        "body_text": "Hi HR,\n\nOur client requires weekly timesheets, so March comes in two "
+                     "files: weeks 1-2 and weeks 3-4. Both attached with approval.\n\nRahul",
+        "cases": [
+            {
+                "slot": "ts1",
+                "doc": "pdf",
+                "emp_id": "EMP-2001",
+                "emp_name": "Rahul Verma",
+                "month": 3, "year": 2026,
+                "period_label": "Week 1-2 (01-14 Mar)",
+                "annual": ["2026-03-03", "2026-03-04"],
+                "public_holiday": [],
+                "issues": [],
+            },
+            {
+                "slot": "ts2",
+                "doc": "pdf",
+                "emp_id": "EMP-2001",
+                "emp_name": "Rahul Verma",
+                "month": 3, "year": 2026,
+                "period_label": "Week 3-4 (15-31 Mar)",
+                "sick": ["2026-03-19"],
+                "remote": ["2026-03-25"],
+                "public_holiday": [],
+                "issues": [],
+            },
+        ],
+        "approval": {"slot": "ap", "detected": True, "detail": "Approved by Sarah Khan on 31-Mar-2026"},
+    },
+    {
+        # SAME employee_id as Rahul (EMP-2001) but the AUH person. The name
+        # must route this to Ahmed Hassan, NOT Rahul Verma.
+        "message_id": "MSG-0008",
+        "sender_name": "Ahmed Hassan",
+        "sender_email": "ahmed.hassan@company.com",
+        "subject": "March 2026 Timesheet - Ahmed Hassan (AUH)",
+        "received_at": _dt("2026-04-01T10:05:00"),
+        "body_text": "Dear HR,\n\nPlease find my March timesheet attached.\n\nAhmed (Abu Dhabi office)",
+        "cases": [
+            {
+                "slot": "ts",
+                "doc": "pdf",
+                "emp_id": "EMP-2001",
+                "emp_name": "Ahmed Hassan",
+                "month": 3, "year": 2026,
+                "annual": ["2026-03-10", "2026-03-11"],
+                "public_holiday": [],
+                "issues": [],
+            },
+        ],
+        "approval": {"slot": "ap", "detected": True, "detail": "Approved by Omar Farouk on 31-Mar-2026"},
+    },
+    {
+        # Pipeline-failure showcase #1: an employee who is NOT in the matcher
+        # list, and a sheet with NO name / NO id printed on it.
+        "message_id": "MSG-0009",
+        "sender_name": "Zara Iqbal",
+        "sender_email": "zara.iqbal@contractor.com",
+        "subject": "Feb timesheets - new joiners",
+        "received_at": _dt("2026-03-02T15:45:00"),
+        "body_text": "Hello,\n\nTimesheets for February attached (mine and one from a colleague "
+                     "whose sheet template is missing the name field).\n\nZara",
+        "cases": [
+            {
+                "slot": "ts1",
+                "doc": "pdf",
+                "emp_id": "",
+                "emp_name": "Zara Iqbal",       # not in all_employee_data
+                "month": 2, "year": 2026,
+                "annual": ["2026-02-11"],
+                "public_holiday": [],
+                "issues": [],
+            },
+            {
+                "slot": "ts2",
+                "doc": "pdf",
+                "emp_id": "",
+                "emp_name": "",                  # nothing to identify the person
+                "month": 2, "year": 2026,
+                "sick": ["2026-02-12"],
+                "public_holiday": [],
+                "issues": [],
+            },
+        ],
+        "approval": None,
+    },
+    {
+        # Pipeline-failure showcase #2: a password-protected PDF and a sheet
+        # whose shared ID can't be disambiguated by the printed name.
+        "message_id": "MSG-0010",
+        "sender_name": "Omar Farouk",
+        "sender_email": "omar.farouk@company.com",
+        "subject": "March timesheets - protected file + unclear name",
+        "received_at": _dt("2026-04-02T08:20:00"),
+        "body_text": "HR,\n\nForwarding two March timesheets. One came back from the client "
+                     "password-protected; the other prints only initials.\n\nOmar",
+        "cases": [
+            {
+                "slot": "ts1",
+                "doc": "pdf",
+                "protected": True,               # rendered as an encrypted PDF
+                "emp_id": "EMP-1006",
+                "emp_name": "Fatima Noor",
+                "month": 3, "year": 2026,
+                "annual": ["2026-03-09"],
+                "public_holiday": [],
+                "issues": [],
+            },
+            {
+                "slot": "ts2",
+                "doc": "pdf",
+                "emp_id": "EMP-2001",            # shared AUH/DXB id...
+                "emp_name": "R. K.",             # ...and a name that fits nobody
+                "month": 3, "year": 2026,
+                "remote": ["2026-03-12"],
+                "public_holiday": [],
+                "issues": [],
+            },
+        ],
+        "approval": {"slot": "ap", "detected": True, "detail": "Approved by Omar Farouk"},
     },
 ]
 

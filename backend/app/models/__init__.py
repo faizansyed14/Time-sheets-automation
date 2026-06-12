@@ -1,5 +1,11 @@
 from app.models.email_message import EmailMessage, EmailStatus
 from app.models.employee import Employee
+from app.models.pipeline_file import (
+    FailureCode,
+    PipelineFile,
+    PipelineStage,
+    PipelineStatus,
+)
 from app.models.timesheet_record import (
     ApprovalStatus,
     TimesheetRecord,
@@ -13,4 +19,8 @@ __all__ = [
     "TimesheetRecord",
     "ValidationStatus",
     "ApprovalStatus",
+    "PipelineFile",
+    "PipelineStatus",
+    "PipelineStage",
+    "FailureCode",
 ]

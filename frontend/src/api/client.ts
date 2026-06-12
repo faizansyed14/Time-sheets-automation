@@ -2,7 +2,9 @@ import axios from "axios";
 
 export const api = axios.create({ baseURL: "/api/v1" });
 
-// ---- types ----
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 export interface EmailListItem {
   id: string;
   provider_message_id: string;
@@ -25,6 +27,15 @@ export interface Attachment {
 export interface EmailDetail extends EmailListItem {
   body_text: string | null;
   attachments: Attachment[];
+}
+
+export interface SourceFileEntry {
+  key: string | null;
+  filename: string | null;
+  source_id: string | null;
+  attachment_id: string | null;
+  ingested_at: string | null;
+  buckets: Record<string, string[]>;
 }
 
 export interface TimesheetRecord {
@@ -57,6 +68,8 @@ export interface TimesheetRecord {
   approval_status: "pending" | "approved" | "not_approved";
   source_email_id: string | null;
   storage_folder: string | null;
+  source_files: SourceFileEntry[];
+  source_file_count: number;
 }
 
 export interface DashboardRow {
@@ -72,41 +85,101 @@ export interface DashboardRow {
   years: number[];
 }
 
-// ---- inbox ----
-export const fetchInbox = (q: string, status: string) =>
-  api.get<EmailListItem[]>("/inbox", { params: { q: q || undefined, status: status || undefined } }).then((r) => r.data);
+// ---- pipeline tracker ----
+export type PipelineStatus = "processing" | "success" | "needs_review" | "failed" | "resolved";
 
-export const fetchEmail = (id: string) =>
-  api.get<EmailDetail>(`/inbox/${id}`).then((r) => r.data);
+export interface PipelineEvent {
+  stage: string;
+  status: "ok" | "warn" | "fail";
+  detail: string;
+  at: string;
+}
+
+export interface PipelineFile {
+  id: string;
+  filename: string;
+  content_type: string | null;
+  size_bytes: number | null;
+  source_kind: "upload" | "email";
+  source_id: string | null;
+  attachment_id: string | null;
+  status: PipelineStatus;
+  stage: string;
+  failure_code: string | null;
+  failure_label: string | null;
+  failure_detail: string | null;
+  events: PipelineEvent[];
+  employee_id: string | null;
+  employee_name: string | null;
+  month: number | null;
+  year: number | null;
+  record_id: string | null;
+  can_retry: boolean;
+  can_resolve_assign: boolean;
+  resolved_at: string | null;
+  resolution_note: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface PipelineStats {
+  total: number;
+  processing: number;
+  success: number;
+  needs_review: number;
+  failed: number;
+  resolved: number;
+  by_failure_code: Record<string, number>;
+  failure_labels: Record<string, string>;
+}
+
+// ---------------------------------------------------------------------------
+// Inbox
+// ---------------------------------------------------------------------------
+export const fetchInbox = (q: string, status: string) =>
+  api
+    .get<EmailListItem[]>("/inbox", { params: { q: q || undefined, status: status || undefined } })
+    .then((r) => r.data);
+
+export const fetchEmail = (id: string) => api.get<EmailDetail>(`/inbox/${id}`).then((r) => r.data);
 
 export const decideEmail = (id: string, accepted: boolean) =>
   api.post(`/inbox/${id}/decision`, { accepted }).then((r) => r.data);
 
-export const restoreEmail = (id: string) =>
-  api.post(`/inbox/${id}/restore`).then((r) => r.data);
+export const restoreEmail = (id: string) => api.post(`/inbox/${id}/restore`).then((r) => r.data);
 
-export const rerunExtraction = (id: string) =>
-  api.post(`/inbox/${id}/rerun`).then((r) => r.data);
+export const rerunExtraction = (id: string) => api.post(`/inbox/${id}/rerun`).then((r) => r.data);
 
 export const attachmentUrl = (msgId: string, attId: string) =>
-  `/api/v1/inbox/${msgId}/attachments/${attId}`;
+  `/api/v1/inbox/${msgId}/attachments/${encodeURIComponent(attId)}`;
 
-// ---- dashboard / employees ----
+// ---------------------------------------------------------------------------
+// Dashboard / employees
+// ---------------------------------------------------------------------------
 export const fetchDashboard = (year?: number) =>
   api.get<DashboardRow[]>("/employees", { params: { year } }).then((r) => r.data);
 
 export const fetchEmployeeRecords = (pk: string, year?: number) =>
-  api.get<TimesheetRecord[]>(`/employees/${pk}/records`, { params: { year } }).then((r) => r.data);
+  api
+    .get<TimesheetRecord[]>(`/employees/${encodeURIComponent(pk)}/records`, { params: { year } })
+    .then((r) => r.data);
 
-// ---- timesheets ----
+// ---------------------------------------------------------------------------
+// Timesheet records
+// ---------------------------------------------------------------------------
+export const fetchRecords = (params?: { year?: number; employee_id?: string }) =>
+  api.get<TimesheetRecord[]>("/timesheets", { params }).then((r) => r.data);
+
+export const fetchRecord = (id: string) =>
+  api.get<TimesheetRecord>(`/timesheets/${id}`).then((r) => r.data);
+
 export const approveRecord = (id: string, approved: boolean) =>
   api.post<TimesheetRecord>(`/timesheets/${id}/approve`, { approved }).then((r) => r.data);
 
 export const verifyRecord = (id: string) =>
   api.post<TimesheetRecord>(`/timesheets/${id}/verify`).then((r) => r.data);
 
-export const deleteRecord = (id: string) =>
-  api.delete(`/timesheets/${id}`).then((r) => r.data);
+export const deleteRecord = (id: string) => api.delete(`/timesheets/${id}`).then((r) => r.data);
 
 export interface TimesheetUpdate {
   annual_leave_dates?: string[];
@@ -130,7 +203,36 @@ export interface SourceFile {
 export const recordSources = (id: string) =>
   api.get<SourceFile[]>(`/timesheets/${id}/sources`).then((r) => r.data);
 
-// ---- files / folders (3-level: Manager → Employee → Month) ----
+// ---------------------------------------------------------------------------
+// Pipeline tracker
+// ---------------------------------------------------------------------------
+export const fetchPipeline = (params?: {
+  status?: string;
+  failure_code?: string;
+  source_kind?: string;
+  q?: string;
+}) => api.get<PipelineFile[]>("/pipeline", { params }).then((r) => r.data);
+
+export const fetchPipelineStats = () =>
+  api.get<PipelineStats>("/pipeline/stats").then((r) => r.data);
+
+export const resolvePipelineFile = (id: string, note: string) =>
+  api.post<PipelineFile>(`/pipeline/${id}/resolve`, { note }).then((r) => r.data);
+
+export const resolvePipelineAssign = (
+  id: string,
+  body: { employee_pk: string; month: number; year: number; note?: string }
+) => api.post<PipelineFile>(`/pipeline/${id}/resolve-assign`, body).then((r) => r.data);
+
+export const retryPipelineFile = (id: string) =>
+  api.post<PipelineFile>(`/pipeline/${id}/retry`).then((r) => r.data);
+
+export const deletePipelineFile = (id: string) =>
+  api.delete(`/pipeline/${id}`).then((r) => r.data);
+
+// ---------------------------------------------------------------------------
+// Files / folders (3-level: Manager → Employee → Month)
+// ---------------------------------------------------------------------------
 export interface ManagerFolder { name: string; rel_path: string; employee_count: number; }
 export interface EmployeeFolder { name: string; rel_path: string; month_count: number; }
 export interface MonthFolder { name: string; rel_path: string; file_count: number; }
@@ -140,25 +242,41 @@ export const listFileManagers = () => api.get<ManagerFolder[]>("/files/managers"
 export const listFileEmployees = (manager: string) =>
   api.get<EmployeeFolder[]>(`/files/managers/${encodeURIComponent(manager)}/employees`).then((r) => r.data);
 export const listFileMonths = (manager: string, emp: string) =>
-  api.get<MonthFolder[]>(`/files/managers/${encodeURIComponent(manager)}/employees/${encodeURIComponent(emp)}/months`).then((r) => r.data);
+  api
+    .get<MonthFolder[]>(
+      `/files/managers/${encodeURIComponent(manager)}/employees/${encodeURIComponent(emp)}/months`
+    )
+    .then((r) => r.data);
 export const listFileItems = (manager: string, emp: string, month: string) =>
-  api.get<FileItem[]>(`/files/managers/${encodeURIComponent(manager)}/employees/${encodeURIComponent(emp)}/months/${encodeURIComponent(month)}/items`).then((r) => r.data);
+  api
+    .get<FileItem[]>(
+      `/files/managers/${encodeURIComponent(manager)}/employees/${encodeURIComponent(emp)}/months/${encodeURIComponent(month)}/items`
+    )
+    .then((r) => r.data);
 
-export const fileContentUrl = (relPath: string) => `/api/v1/files/content?rel_path=${encodeURIComponent(relPath)}`;
+export const fileContentUrl = (relPath: string) =>
+  `/api/v1/files/content?rel_path=${encodeURIComponent(relPath)}`;
 export const downloadZipUrl = (manager?: string) =>
   `/api/v1/files/download-zip${manager ? `?manager=${encodeURIComponent(manager)}` : ""}`;
 
-export const createFileManager = (name: string) => api.post("/files/managers", { name }).then((r) => r.data);
+export const createFileManager = (name: string) =>
+  api.post("/files/managers", { name }).then((r) => r.data);
 export const createFileEmployee = (manager: string, name: string) =>
   api.post(`/files/managers/${encodeURIComponent(manager)}/employees`, { name }).then((r) => r.data);
 export const createFileMonth = (manager: string, emp: string, month_label: string) =>
-  api.post(`/files/managers/${encodeURIComponent(manager)}/employees/${encodeURIComponent(emp)}/months`, { month_label }).then((r) => r.data);
+  api
+    .post(`/files/managers/${encodeURIComponent(manager)}/employees/${encodeURIComponent(emp)}/months`, {
+      month_label,
+    })
+    .then((r) => r.data);
 export const renameFolder = (rel_path: string, new_name: string) =>
   api.patch("/files/folder", { rel_path, new_name }).then((r) => r.data);
 export const deleteFolder = (relPath: string) =>
   api.delete("/files/folder", { params: { rel_path: relPath } }).then((r) => r.data);
 
-// ---- employee_matcher (all_employee_data) ----
+// ---------------------------------------------------------------------------
+// Employee matcher (all_employee_data)
+// ---------------------------------------------------------------------------
 export interface Employee {
   id: string;
   employee_id: string;
@@ -174,33 +292,65 @@ export interface Employee {
 export type EmployeeInput = Omit<Employee, "id">;
 
 export const fetchEmployeeMatcher = () => api.get<Employee[]>("/employee-matcher").then((r) => r.data);
-export const createEmployee = (e: EmployeeInput) => api.post<Employee>("/employee-matcher", e).then((r) => r.data);
-export const updateEmployee = (id: string, e: EmployeeInput) => api.put<Employee>(`/employee-matcher/${id}`, e).then((r) => r.data);
-export const deleteEmployee = (id: string) => api.delete(`/employee-matcher/${id}`).then((r) => r.data);
+export const createEmployee = (e: EmployeeInput) =>
+  api.post<Employee>("/employee-matcher", e).then((r) => r.data);
+export const updateEmployee = (id: string, e: EmployeeInput) =>
+  api.put<Employee>(`/employee-matcher/${id}`, e).then((r) => r.data);
+export const deleteEmployee = (id: string) =>
+  api.delete(`/employee-matcher/${id}`).then((r) => r.data);
 
-export interface ImportSummary { inserted: number; updated: number; skipped: number; }
+export interface SkipDetail { sheet: string; row: number; id: string; name: string; reason: string; }
+export interface ImportSummary {
+  inserted: number;
+  updated: number;
+  skipped: number;
+  skipped_details?: SkipDetail[];
+}
 export const importEmployees = (file: File) => {
   const form = new FormData();
   form.append("file", file, file.name);
-  return api.post<ImportSummary>("/employee-matcher/import", form, { headers: { "Content-Type": "multipart/form-data" } }).then((r) => r.data);
+  return api
+    .post<ImportSummary>("/employee-matcher/import", form, {
+      headers: { "Content-Type": "multipart/form-data" },
+    })
+    .then((r) => r.data);
 };
 
-// ---- upload ----
+// ---------------------------------------------------------------------------
+// Upload
+// ---------------------------------------------------------------------------
 export interface UploadResult {
-  record_id: string;
+  pipeline_id: string;
+  filename: string;
+  status: PipelineStatus;
+  failure_code: string | null;
+  failure_detail: string | null;
+  record_id: string | null;
   employee_name: string | null;
   employee_id: string | null;
-  month: number;
-  year: number;
-  validation_status: "verified" | "manual_review";
+  month: number | null;
+  year: number | null;
+  validation_status: "verified" | "manual_review" | null;
   llm_summary: string | null;
   match_note: string | null;
 }
-export const uploadTimesheets = (files: File[]) => {
+export const uploadTimesheets = (files: File[], onProgress?: (pct: number) => void) => {
   const form = new FormData();
   files.forEach((f) => form.append("files", f, f.name));
-  return api.post<UploadResult[]>("/upload", form, { headers: { "Content-Type": "multipart/form-data" } }).then((r) => r.data);
+  return api
+    .post<UploadResult[]>("/upload", form, {
+      headers: { "Content-Type": "multipart/form-data" },
+      onUploadProgress: (e) =>
+        onProgress && e.total ? onProgress(Math.round((e.loaded / e.total) * 100)) : undefined,
+    })
+    .then((r) => r.data);
 };
+
+// ---------------------------------------------------------------------------
+// Misc
+// ---------------------------------------------------------------------------
+export interface Health { status: string; email_provider: string; extraction_engine: string; }
+export const fetchHealth = () => axios.get<Health>("/health").then((r) => r.data);
 
 export const MONTHS = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 export const MONTHS_LONG = ["", "January", "February", "March", "April", "May", "June",

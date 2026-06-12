@@ -269,14 +269,62 @@ def _bucket(data: dict, *keys) -> Any:
     return []
 
 
+def _coerce_month(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value if 1 <= value <= 12 else None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        if s.isdigit():
+            m = int(s)
+            return m if 1 <= m <= 12 else None
+        return _MONTH_NAMES.get(s.lower()[:3])
+    return None
+
+
+def _coerce_year(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 2000 else None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or not s.isdigit():
+            return None
+        y = int(s)
+        return y if y >= 2000 else None
+    return None
+
+
+def _infer_period(data: dict) -> tuple[int | None, int | None]:
+    """When month/year are blank, derive them from leave dates on the sheet."""
+    months: set[int] = set()
+    years: set[int] = set()
+    for key in (
+        "public_holidays", "annual_leaves", "work_from_home", "sick_leaves",
+        "unpaid_leaves", "unauthorized_absences", "paid_leaves",
+    ):
+        for raw in _bucket(data, key) or []:
+            parsed = _parse_one_leave_date(str(raw), None, None)
+            if parsed:
+                months.add(parsed.month)
+                years.add(parsed.year)
+    month = next(iter(months)) if len(months) == 1 else None
+    year = next(iter(years)) if len(years) == 1 else None
+    return month, year
+
+
 def parse_extraction(raw_json: dict[str, Any]) -> ExtractedTimesheet:
     data = raw_json or {}
-    month = data.get("month")
-    year = data.get("year")
-    if isinstance(month, str):
-        month = _MONTH_NAMES.get(month.strip().lower()[:3], None) or (int(month) if month.strip().isdigit() else None)
-    if isinstance(year, str) and year.strip().isdigit():
-        year = int(year)
+    month = _coerce_month(data.get("month"))
+    year = _coerce_year(data.get("year"))
+    if month is None or year is None:
+        inf_m, inf_y = _infer_period(data)
+        month = month or inf_m
+        year = year or inf_y
 
     return ExtractedTimesheet(
         employee_full_name=(data.get("employee_name") or data.get("employee_full_name") or None),

@@ -6,9 +6,11 @@ for the optional text cross-validation step.
 from __future__ import annotations
 
 import io
+import re
 import subprocess
 import tempfile
 import zipfile
+from html import unescape
 from pathlib import Path
 
 PDF_DPI = 300
@@ -146,17 +148,230 @@ def xlsx_to_images(xlsx_bytes: bytes) -> list[bytes]:
     return [_to_jpeg_bytes(img)]
 
 
-def eml_to_images(eml_bytes: bytes) -> list[bytes]:
+_TIMESHEET_MARKERS = (
+    "emp no", "employee id", "employee no", "emp id", "subject: timesheet", "timesheet -",
+)
+
+
+def _parse_eml(eml_bytes: bytes):
+    from email import policy
+    from email.parser import BytesParser
+
+    return BytesParser(policy=policy.default).parsebytes(eml_bytes)
+
+
+def _html_to_text(html: str) -> str:
+    """Flatten HTML tables into pipe-separated rows for the vision / text steps."""
+    h = html or ""
+    h = re.sub(r"(?i)</tr\s*>", "\n", h)
+    h = re.sub(r"(?i)</t[dh]\s*>", " | ", h)
+    h = re.sub(r"(?i)<br\s*/?>", "\n", h)
+    h = re.sub(r"<[^>]+>", "", h)
+    text = unescape(h)
+    lines: list[str] = []
+    for ln in text.splitlines():
+        ln = re.sub(r"\s+", " ", ln).strip()
+        if ln:
+            lines.append(ln)
+    return "\n".join(lines)
+
+
+def _score_timesheet_text(text: str) -> int:
+    low = (text or "").lower()
+    score = 0
+    for marker in _TIMESHEET_MARKERS:
+        if marker in low:
+            score += 50
+    for kw in ("sick leave", "annual leave", "public holiday", "weekend", "work from home", "wfh"):
+        score += low.count(kw) * 5
+    score += min(len(text) // 200, 40)
+    return score
+
+
+def _extract_eml_body_text(eml_bytes: bytes) -> str:
+    """Best-effort body text from an .eml (plain + HTML parts, reply chains included)."""
+    try:
+        msg = _parse_eml(eml_bytes)
+    except Exception:
+        return ""
+
+    chunks: list[str] = []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        ct = part.get_content_type()
+        try:
+            if ct == "text/plain":
+                chunks.append(part.get_content())
+            elif ct == "text/html":
+                chunks.append(_html_to_text(part.get_content()))
+        except Exception:
+            continue
+
+    if not chunks:
+        return ""
+
+    return max(chunks, key=_score_timesheet_text).strip()
+
+
+def _focus_timesheet_text(text: str) -> str:
+    """Drop reply headers / signatures; keep the forwarded timesheet block."""
+    lines = text.splitlines()
+    start = 0
+    for i, ln in enumerate(lines):
+        low = ln.lower().strip()
+        if any(m in low for m in _TIMESHEET_MARKERS):
+            start = i
+            break
+    focused = "\n".join(lines[start:]).strip()
+    return focused or text.strip()
+
+
+_INLINE_LOGO_MAX_BYTES = 20_000  # skip small inline images (email logos)
+
+
+def _part_file_type(part, payload: bytes) -> str | None:
+    """Resolve file type from filename, content-type, or magic bytes."""
+    filename = part.get_filename() or ""
+    ftype = detect_file_type(filename, payload)
+    if ftype != "unknown":
+        return ftype
+    ct = (part.get_content_type() or "").lower()
+    if ct == "application/pdf" or payload.startswith(b"%PDF"):
+        return "pdf"
+    if ct in (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+    ):
+        return "docx"
+    if ct in (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel",
+    ):
+        return "xlsx"
+    if ct.startswith("image/"):
+        return "image"
+    return None
+
+
+def _score_eml_attachment(filename: str, payload: bytes, ftype: str) -> int:
+    fn = (filename or "").lower()
+    score = 0
+    if any(k in fn for k in ("timesheet", "time sheet", "time-sheet")):
+        score += 120
+    if ftype == "pdf":
+        score += 60
+    elif ftype in ("docx", "xlsx"):
+        score += 50
+    elif ftype == "image":
+        score += 20
+    score += min(len(payload) // 8000, 40)
+    return score
+
+
+def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
+    """Return (filename, payload, file_type) for real timesheet attachments inside .eml."""
+    try:
+        msg = _parse_eml(eml_bytes)
+    except Exception:
+        return []
+
+    found: list[tuple[str, bytes, str]] = []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+
+        filename = part.get_filename() or ""
+        disposition = (part.get_content_disposition() or "").lower()
+        ftype = _part_file_type(part, payload)
+        if not ftype:
+            continue
+
+        if disposition == "attachment":
+            found.append((filename, payload, ftype))
+            continue
+
+        # Inline: skip logos; allow large inline PDFs / sheet images
+        if disposition == "inline":
+            if ftype in ("pdf", "docx", "xlsx"):
+                found.append((filename, payload, ftype))
+            elif ftype == "image" and len(payload) > _INLINE_LOGO_MAX_BYTES:
+                found.append((filename, payload, ftype))
+            continue
+
+        # No disposition — keep only recognisable document payloads
+        if ftype in ("pdf", "docx", "xlsx"):
+            found.append((filename, payload, ftype))
+
+    return found
+
+
+def _text_to_page_images(
+    text: str,
+    *,
+    width: int = 2400,
+    height: int = 3200,
+    line_h: int = 18,
+    char_w: int = 340,
+    lines_per_page: int = 160,
+) -> list[bytes]:
     from PIL import Image, ImageDraw
 
-    text = extract_document_text("eml", eml_bytes) or "(empty email)"
-    img = Image.new("RGB", (1800, 2400), (255, 255, 255))
-    d = ImageDraw.Draw(img)
-    y = 20
-    for ln in text.splitlines()[:120]:
-        d.text((20, y), ln[:240], fill=(0, 0, 0))
-        y += 20
-    return [_to_jpeg_bytes(img)]
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()] or ["(empty email)"]
+    images: list[bytes] = []
+    for offset in range(0, len(lines), lines_per_page):
+        page_lines = lines[offset : offset + lines_per_page]
+        img = Image.new("RGB", (width, height), (255, 255, 255))
+        d = ImageDraw.Draw(img)
+        y = 20
+        for ln in page_lines:
+            d.text((20, y), ln[:char_w], fill=(0, 0, 0))
+            y += line_h
+            if y > height - 30:
+                break
+        images.append(_to_jpeg_bytes(img))
+    return images
+
+
+def eml_best_attachment(eml_bytes: bytes) -> tuple[str, bytes, str] | None:
+    """Pick the single most likely timesheet file when an .eml has several attachments."""
+    attachments = _eml_collect_attachments(eml_bytes)
+    if not attachments:
+        return None
+    return max(attachments, key=lambda t: _score_eml_attachment(t[0], t[1], t[2]))
+
+
+def eml_attachment_save_name(filename: str, ftype: str) -> str:
+    name = (filename or "").strip()
+    if name:
+        return name
+    ext = {"pdf": ".pdf", "docx": ".docx", "xlsx": ".xlsx", "image": ".png"}.get(ftype, "")
+    return f"extracted_timesheet{ext}"
+
+
+def _eml_attachment_images(eml_bytes: bytes) -> list[bytes]:
+    """PDF / Office / large inline images attached to the email (not logos)."""
+    best = eml_best_attachment(eml_bytes)
+    if not best:
+        return []
+    _name, payload, ftype = best
+    try:
+        return to_images(ftype, payload)
+    except Exception:
+        return []
+
+
+def eml_to_images(eml_bytes: bytes) -> list[bytes]:
+    # 1) attached PDF / Office sheet (most reliable across varying email layouts)
+    attached = _eml_attachment_images(eml_bytes)
+    if attached:
+        return attached
+    # 2) timesheet embedded in forwarded email body (plain / HTML tables)
+    text = _focus_timesheet_text(_extract_eml_body_text(eml_bytes)) or "(empty email)"
+    return _text_to_page_images(text)
 
 
 def to_images(file_type: str, data: bytes) -> list[bytes]:
@@ -206,11 +421,13 @@ def extract_document_text(file_type: str, data: bytes) -> str:
                     lines.append(" | ".join(vals))
             return "\n".join(lines).strip()
         if file_type == "eml":
-            from email import policy
-            from email.parser import BytesParser
-            msg = BytesParser(policy=policy.default).parsebytes(data)
-            body = msg.get_body(preferencelist=("plain", "html"))
-            return (body.get_content() if body else "").strip()
+            best = eml_best_attachment(data)
+            if best:
+                _name, payload, ftype = best
+                doc_text = extract_document_text(ftype, payload)
+                if doc_text.strip():
+                    return doc_text.strip()
+            return _focus_timesheet_text(_extract_eml_body_text(data))
     except Exception:
         return ""
     return ""

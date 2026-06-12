@@ -1,0 +1,182 @@
+"""
+Pipeline tracker routes — full visibility of every file that entered the
+extraction pipeline: where it is, where it failed and why, plus Resolve
+(human sign-off) and Retry (re-run after fixing the cause).
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
+from app.schemas import PipelineFileOut, PipelineResolveAssignIn, PipelineResolveIn, PipelineStats
+from app.services.ingestion import can_resolve_assign, resolve_pipeline_with_employee, retry_pipeline_file
+
+router = APIRouter(prefix="/pipeline", tags=["pipeline"])
+
+# Human-readable labels the UI can show next to each failure code.
+FAILURE_LABELS: dict[str, str] = {
+    FailureCode.PROTECTED_PDF: "Protected PDF",
+    FailureCode.UNSUPPORTED_TYPE: "Unsupported file type",
+    FailureCode.EMPTY_FILE: "Empty file",
+    FailureCode.LLM_FAILED: "LLM extraction failed",
+    FailureCode.EXTRACTION_UNREADABLE: "Sheet unreadable",
+    FailureCode.NAME_NOT_FOUND: "Name not found",
+    FailureCode.MONTH_NOT_FOUND: "Month not found",
+    FailureCode.EMPLOYEE_NOT_MATCHED: "Employee not in matcher",
+    FailureCode.AMBIGUOUS_ID: "Ambiguous employee ID",
+    FailureCode.ID_NAME_MISMATCH: "ID / name mismatch",
+    FailureCode.VALIDATION_MISMATCH: "Validation mismatch",
+    FailureCode.STORAGE_ERROR: "Storage error",
+    FailureCode.DUPLICATE_FILE: "Duplicate file",
+    FailureCode.UNKNOWN: "Unknown error",
+}
+
+
+def _out(t: PipelineFile) -> PipelineFileOut:
+    return PipelineFileOut(
+        id=t.id, filename=t.filename, content_type=t.content_type, size_bytes=t.size_bytes,
+        source_kind=t.source_kind, source_id=t.source_id, attachment_id=t.attachment_id,
+        status=t.status, stage=t.stage, failure_code=t.failure_code,
+        failure_label=FAILURE_LABELS.get(t.failure_code or "", None),
+        failure_detail=t.failure_detail, events=t.events or [],
+        employee_id=t.employee_id, employee_name=t.employee_name,
+        month=t.month, year=t.year, record_id=t.record_id,
+        can_retry=bool(t.raw_path or (t.source_kind == "email" and t.attachment_id)),
+        can_resolve_assign=can_resolve_assign(t),
+        resolved_at=t.resolved_at, resolution_note=t.resolution_note,
+        created_at=t.created_at, updated_at=t.updated_at,
+    )
+
+
+@router.get("", response_model=list[PipelineFileOut])
+async def list_pipeline_files(
+    status: str | None = Query(default=None, description="processing|success|needs_review|failed|resolved"),
+    failure_code: str | None = Query(default=None),
+    source_kind: str | None = Query(default=None, description="upload|email"),
+    q: str | None = Query(default=None, description="search filename / employee"),
+    limit: int = Query(default=200, le=1000),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(PipelineFile)
+    if status:
+        stmt = stmt.where(PipelineFile.status == status)
+    if failure_code:
+        stmt = stmt.where(PipelineFile.failure_code == failure_code)
+    if source_kind:
+        stmt = stmt.where(PipelineFile.source_kind == source_kind)
+    rows = (await db.execute(stmt.order_by(PipelineFile.created_at.desc()).limit(limit))).scalars().all()
+    if q:
+        ql = q.lower().strip()
+        rows = [t for t in rows if ql in (t.filename or "").lower()
+                or ql in (t.employee_name or "").lower()
+                or ql in (t.employee_id or "").lower()]
+    return [_out(t) for t in rows]
+
+
+@router.get("/stats", response_model=PipelineStats)
+async def pipeline_stats(db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(select(PipelineFile))).scalars().all()
+    by_status: dict[str, int] = {}
+    by_failure: dict[str, int] = {}
+    for t in rows:
+        by_status[t.status] = by_status.get(t.status, 0) + 1
+        if t.status in (PipelineStatus.FAILED, PipelineStatus.NEEDS_REVIEW) and t.failure_code:
+            by_failure[t.failure_code] = by_failure.get(t.failure_code, 0) + 1
+    return PipelineStats(
+        total=len(rows),
+        processing=by_status.get(PipelineStatus.PROCESSING, 0),
+        success=by_status.get(PipelineStatus.SUCCESS, 0),
+        needs_review=by_status.get(PipelineStatus.NEEDS_REVIEW, 0),
+        failed=by_status.get(PipelineStatus.FAILED, 0),
+        resolved=by_status.get(PipelineStatus.RESOLVED, 0),
+        by_failure_code=by_failure,
+        failure_labels=FAILURE_LABELS,
+    )
+
+
+@router.get("/{pipeline_id}", response_model=PipelineFileOut)
+async def get_pipeline_file(pipeline_id: str, db: AsyncSession = Depends(get_db)):
+    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "Pipeline file not found")
+    return _out(t)
+
+
+@router.post("/{pipeline_id}/resolve", response_model=PipelineFileOut)
+async def resolve_pipeline_file(
+    pipeline_id: str, body: PipelineResolveIn, db: AsyncSession = Depends(get_db),
+):
+    """Human sign-off: mark a failed / needs-review file as resolved."""
+    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "Pipeline file not found")
+    if t.status not in (PipelineStatus.FAILED, PipelineStatus.NEEDS_REVIEW):
+        raise HTTPException(409, f"Only failed / needs-review files can be resolved (status is '{t.status}').")
+    t.status = PipelineStatus.RESOLVED
+    t.resolved_at = datetime.now(timezone.utc)
+    t.resolution_note = (body.note or "").strip() or "Marked resolved by reviewer."
+    t.events = (t.events or []) + [{
+        "stage": t.stage, "status": "ok",
+        "detail": f"Resolved by reviewer: {t.resolution_note}",
+        "at": t.resolved_at.isoformat(),
+    }]
+    await db.commit()
+    await db.refresh(t)
+    return _out(t)
+
+
+@router.post("/{pipeline_id}/resolve-assign", response_model=PipelineFileOut)
+async def resolve_pipeline_assign(
+    pipeline_id: str, body: PipelineResolveAssignIn, db: AsyncSession = Depends(get_db),
+):
+    """Pick the correct employee + period, re-run extraction and file the timesheet."""
+    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "Pipeline file not found")
+    if not (1 <= body.month <= 12 and body.year >= 2000):
+        raise HTTPException(400, "Invalid month or year.")
+    try:
+        _rec, t = await resolve_pipeline_with_employee(
+            db, t, employee_pk=body.employee_pk, month=body.month, year=body.year, note=body.note,
+        )
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(409, str(e))
+    if t.status == PipelineStatus.FAILED:
+        raise HTTPException(409, t.failure_detail or "Processing failed after manual assignment.")
+    return _out(t)
+
+
+@router.post("/{pipeline_id}/retry", response_model=PipelineFileOut)
+async def retry_pipeline(pipeline_id: str, db: AsyncSession = Depends(get_db)):
+    """Re-run the pipeline on the stored copy of the file (e.g. after adding
+    the missing employee to the matcher, or fixing the LLM key)."""
+    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "Pipeline file not found")
+    try:
+        _rec, t = await retry_pipeline_file(db, t)
+    except FileNotFoundError as e:
+        raise HTTPException(409, str(e))
+    return _out(t)
+
+
+@router.delete("/{pipeline_id}")
+async def delete_pipeline_file(pipeline_id: str, db: AsyncSession = Depends(get_db)):
+    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "Pipeline file not found")
+    await db.delete(t)
+    await db.commit()
+    return {"deleted": pipeline_id}
+
+
+@router.get("/meta/stages")
+async def pipeline_stages():
+    return {"stages": PipelineStage.ORDER, "failure_labels": FAILURE_LABELS}

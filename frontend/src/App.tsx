@@ -1,26 +1,25 @@
-import { Routes, Route } from "react-router-dom";
-import Layout from "./components/Layout";
+import { Route, Routes } from "react-router-dom";
+import Shell from "./components/Shell";
 import Dashboard from "./pages/Dashboard";
-import Inbox from "./pages/Inbox";
-import Upload from "./pages/Upload";
-import Files from "./pages/Files";
-import EmployeeMatcher from "./pages/EmployeeMatcher";
-import EmployeeMonth from "./pages/EmployeeMonth";
-import { ProgressProvider } from "./components/ui";
+import InboxPage from "./pages/Inbox";
+import UploadPage from "./pages/Upload";
+import PipelinePage from "./pages/Pipeline";
+import EmployeesPage from "./pages/Employees";
+import FilesPage from "./pages/Files";
+import RecordPage from "./pages/Record";
 
 export default function App() {
   return (
-    <ProgressProvider>
-      <Layout>
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/inbox" element={<Inbox />} />
-          <Route path="/upload" element={<Upload />} />
-          <Route path="/files" element={<Files />} />
-          <Route path="/employee-matcher" element={<EmployeeMatcher />} />
-          <Route path="/employee/:pk" element={<EmployeeMonth />} />
-        </Routes>
-      </Layout>
-    </ProgressProvider>
+    <Shell>
+      <Routes>
+        <Route path="/" element={<Dashboard />} />
+        <Route path="/inbox" element={<InboxPage />} />
+        <Route path="/upload" element={<UploadPage />} />
+        <Route path="/pipeline" element={<PipelinePage />} />
+        <Route path="/employees" element={<EmployeesPage />} />
+        <Route path="/files" element={<FilesPage />} />
+        <Route path="/records/:id" element={<RecordPage />} />
+      </Routes>
+    </Shell>
   );
 }

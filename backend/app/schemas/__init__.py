@@ -34,6 +34,15 @@ class DecisionIn(BaseModel):
     accepted: bool
 
 
+class SourceFileEntry(BaseModel):
+    key: str | None = None
+    filename: str | None = None
+    source_id: str | None = None
+    attachment_id: str | None = None
+    ingested_at: str | None = None
+    buckets: dict[str, list[str]] = {}
+
+
 class TimesheetOut(BaseModel):
     id: str
     employee_id: str | None
@@ -64,6 +73,8 @@ class TimesheetOut(BaseModel):
     approval_status: str
     source_email_id: str | None
     storage_folder: str | None
+    source_files: list[SourceFileEntry] = []
+    source_file_count: int = 0
 
 
 class DashboardRow(BaseModel):
@@ -120,14 +131,78 @@ class EmployeeOut(EmployeeIn):
 
 
 class UploadResult(BaseModel):
-    record_id: str
-    employee_name: str | None
+    """One uploaded file's outcome. record_id is None when the file failed
+    in the pipeline — pipeline_id always points at the tracker row."""
+    pipeline_id: str
+    filename: str
+    status: str                       # success | needs_review | failed
+    failure_code: str | None = None
+    failure_detail: str | None = None
+    record_id: str | None = None
+    employee_name: str | None = None
+    employee_id: str | None = None
+    month: int | None = None
+    year: int | None = None
+    validation_status: str | None = None
+    llm_summary: str | None = None
+    match_note: str | None = None
+
+
+# ---- pipeline tracker ----
+class PipelineEvent(BaseModel):
+    stage: str
+    status: str          # ok | warn | fail
+    detail: str
+    at: str
+
+
+class PipelineFileOut(BaseModel):
+    id: str
+    filename: str
+    content_type: str | None
+    size_bytes: int | None
+    source_kind: str
+    source_id: str | None
+    attachment_id: str | None
+    status: str
+    stage: str
+    failure_code: str | None
+    failure_label: str | None
+    failure_detail: str | None
+    events: list[PipelineEvent]
     employee_id: str | None
+    employee_name: str | None
+    month: int | None
+    year: int | None
+    record_id: str | None
+    can_retry: bool
+    can_resolve_assign: bool
+    resolved_at: datetime | None
+    resolution_note: str | None
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+class PipelineStats(BaseModel):
+    total: int
+    processing: int
+    success: int
+    needs_review: int
+    failed: int
+    resolved: int
+    by_failure_code: dict[str, int]
+    failure_labels: dict[str, str]
+
+
+class PipelineResolveIn(BaseModel):
+    note: str | None = None
+
+
+class PipelineResolveAssignIn(BaseModel):
+    employee_pk: str
     month: int
     year: int
-    validation_status: str
-    llm_summary: str | None
-    match_note: str | None
+    note: str | None = None
 
 
 class SkipDetail(BaseModel):
