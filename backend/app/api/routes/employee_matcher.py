@@ -33,11 +33,17 @@ async def list_employees(db: AsyncSession = Depends(get_db)):
     return [_out(e) for e in rows]
 
 
+def _same_identity(a_name: str, b_name: str) -> bool:
+    return a_name.strip().lower() == b_name.strip().lower()
+
+
 @router.post("", response_model=EmployeeOut, status_code=201)
 async def create_employee(body: EmployeeIn, db: AsyncSession = Depends(get_db)):
-    dup = (await db.execute(select(Employee).where(Employee.employee_id == body.employee_id))).scalar_one_or_none()
-    if dup:
-        raise HTTPException(409, f"Employee ID {body.employee_id} already exists.")
+    # The same employee_id may exist for DIFFERENT people (AUH vs DXB teams),
+    # so the duplicate key is (employee_id, name) — not the ID alone.
+    rows = (await db.execute(select(Employee).where(Employee.employee_id == body.employee_id))).scalars().all()
+    if any(_same_identity(r.name, body.name) for r in rows):
+        raise HTTPException(409, f"Employee {body.employee_id} / {body.name} already exists.")
     e = Employee(**body.model_dump())
     db.add(e)
     await db.commit()
@@ -50,9 +56,9 @@ async def update_employee(pk: str, body: EmployeeIn, db: AsyncSession = Depends(
     e = (await db.execute(select(Employee).where(Employee.id == pk))).scalar_one_or_none()
     if not e:
         raise HTTPException(404, "Employee not found")
-    other = (await db.execute(select(Employee).where(Employee.employee_id == body.employee_id))).scalar_one_or_none()
-    if other and other.id != pk:
-        raise HTTPException(409, f"Employee ID {body.employee_id} already used by another row.")
+    others = (await db.execute(select(Employee).where(Employee.employee_id == body.employee_id))).scalars().all()
+    if any(o.id != pk and _same_identity(o.name, body.name) for o in others):
+        raise HTTPException(409, f"Employee {body.employee_id} / {body.name} already used by another row.")
     for k, v in body.model_dump().items():
         setattr(e, k, v)
     await db.commit()

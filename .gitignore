@@ -4,7 +4,18 @@ __pycache__/
 .venv/
 data/
 storage/
+employees_data/
+test/
 .env
+
+# local data / fixtures (not source)
+*.xlsx
+*.xls
+*.csv
+*.eml
+*.pdf
+*.docx
+
 # frontend
 node_modules/
 dist/

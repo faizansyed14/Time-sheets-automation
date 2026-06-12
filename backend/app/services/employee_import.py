@@ -179,12 +179,15 @@ async def import_employees_from_bytes(
 
     inserted = updated = skipped = 0
     skipped_details = []
-    seen_ids: set[str] = set()
+    # The same employee_id legitimately exists on BOTH the DXB and AUH sheets
+    # (different people). Dedupe on (id, name) so cross-team rows all import;
+    # only a literal repeat of the same person in the file is skipped.
+    seen_keys: set[tuple[str, str]] = set()
 
     for rec in records:
         emp_id = (rec.get("employee_id") or "").strip()
         emp_name = (rec.get("name") or "").strip()
-        
+
         row_num = rec.get("_row", 0)
         sheet_name = rec.get("_sheet", "Unknown")
 
@@ -198,21 +201,28 @@ async def import_employees_from_bytes(
                 "reason": "Missing ID or Name"
             })
             continue
-        if emp_id in seen_ids:
+        key = (emp_id, emp_name.lower())
+        if key in seen_keys:
             skipped += 1
             skipped_details.append({
                 "sheet": sheet_name,
                 "row": row_num,
                 "id": emp_id,
                 "name": emp_name,
-                "reason": "Duplicate ID in file"
+                "reason": "Duplicate ID + Name in file"
             })
             continue
-        seen_ids.add(emp_id)
+        seen_keys.add(key)
 
-        existing = (
+        # Upsert key is (employee_id, name): the AUH person and the DXB person
+        # who share an ID stay separate rows.
+        candidates = (
             await db.execute(select(Employee).where(Employee.employee_id == emp_id))
-        ).scalar_one_or_none()
+        ).scalars().all()
+        existing = next(
+            (c for c in candidates if (c.name or "").strip().lower() == emp_name.lower()),
+            None,
+        )
 
         if existing:
             for k, v in rec.items():

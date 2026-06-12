@@ -4,13 +4,17 @@ all_employee_data — the authoritative employee matcher list.
 Extracted employee_id / name from a timesheet is matched against this table
 so records are filed under the correct person (and so we can detect who is
 MISSING for a given month).
+
+NOTE: employee_id is NOT unique on its own — the AUH and DXB teams have
+overlapping ID ranges, so the same employee_id can exist twice with different
+names. Identity is (employee_id, name); matching disambiguates by name.
 """
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, func
+from sqlalchemy import DateTime, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -22,10 +26,13 @@ def _uuid() -> str:
 
 class Employee(Base):
     __tablename__ = "all_employee_data"
+    __table_args__ = (
+        UniqueConstraint("employee_id", "name", name="uq_employee_id_name"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
 
-    employee_id: Mapped[str] = mapped_column(String, index=True, unique=True)
+    employee_id: Mapped[str] = mapped_column(String, index=True)
     name: Mapped[str] = mapped_column(String, index=True)
     dco_number: Mapped[str | None] = mapped_column(String, nullable=True)
     account_manager: Mapped[str | None] = mapped_column(String, nullable=True)

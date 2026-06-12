@@ -28,11 +28,14 @@ def _render_timesheet_pdf(case: dict) -> bytes:
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, "MONTHLY TIMESHEET", ln=True)
+    title = "WEEKLY TIMESHEET" if case.get("period_label") else "MONTHLY TIMESHEET"
+    pdf.cell(0, 10, title, ln=True)
     pdf.set_font("Helvetica", "", 11)
-    pdf.cell(0, 8, f"Employee Name: {case['emp_name']}", ln=True)
+    pdf.cell(0, 8, f"Employee Name: {case.get('emp_name') or '(not printed)'}", ln=True)
     pdf.cell(0, 8, f"Employee ID: {case.get('emp_id') or '(not printed)'}", ln=True)
     pdf.cell(0, 8, f"Month: {_MONTHS[case['month']]} {case['year']}", ln=True)
+    if case.get("period_label"):
+        pdf.cell(0, 8, f"Period: {case['period_label']}", ln=True)
     pdf.ln(4)
 
     rows: list[tuple[str, str]] = []
@@ -61,7 +64,24 @@ def _render_timesheet_pdf(case: dict) -> bytes:
         pdf.cell(80, 8, status, border=1, ln=True)
 
     out = pdf.output(dest="S")
-    return bytes(out) if isinstance(out, (bytes, bytearray)) else out.encode("latin-1")
+    data = bytes(out) if isinstance(out, (bytes, bytearray)) else out.encode("latin-1")
+    if case.get("protected"):
+        data = _encrypt_pdf(data)
+    return data
+
+
+def _encrypt_pdf(pdf_bytes: bytes, password: str = "secret123") -> bytes:
+    """Password-protect a PDF so the pipeline's protection check can be demoed."""
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        return doc.tobytes(
+            encryption=fitz.PDF_ENCRYPT_AES_256,
+            owner_pw=password, user_pw=password,
+        )
+    finally:
+        doc.close()
 
 
 def _render_timesheet_docx(case: dict) -> bytes:
@@ -69,9 +89,11 @@ def _render_timesheet_docx(case: dict) -> bytes:
 
     doc = Document()
     doc.add_heading("Monthly Timesheet", level=1)
-    doc.add_paragraph(f"Employee Name: {case['emp_name']}")
+    doc.add_paragraph(f"Employee Name: {case.get('emp_name') or '(not printed)'}")
     doc.add_paragraph(f"Employee ID: {case.get('emp_id') or '(not printed)'}")
     doc.add_paragraph(f"Month: {_MONTHS[case['month']]} {case['year']}")
+    if case.get("period_label"):
+        doc.add_paragraph(f"Period: {case['period_label']}")
 
     table = doc.add_table(rows=1, cols=2)
     table.style = "Light Grid Accent 1"
@@ -111,6 +133,14 @@ def _render_approval_png(detail: str, emp_name: str) -> bytes:
     return bio.getvalue()
 
 
+def _case_filename(c: dict, ext: str) -> str:
+    """Unique per attachment — weekly sheets for the same person/month must
+    not collide (the period label keeps Week 1-2 and Week 3-4 apart)."""
+    base = (c.get("emp_name") or "Unknown").replace(" ", "_").replace(".", "")
+    period = f"_{c['period_label'].split(' ')[0].replace('-', 'to')}" if c.get("period_label") else ""
+    return f"{base}_{_MONTHS[c['month']] or 'NoMonth'}_{c['year']}{period}_{c['slot']}.{ext}"
+
+
 def _build_attachments(msg: dict) -> list[ProviderAttachment]:
     atts: list[ProviderAttachment] = []
     for c in msg["cases"]:
@@ -122,7 +152,7 @@ def _build_attachments(msg: dict) -> list[ProviderAttachment]:
         )
         atts.append(ProviderAttachment(
             attachment_id=mock_data.attachment_id(msg["message_id"], c["slot"]),
-            filename=f"{c['emp_name'].replace(' ', '_')}_{_MONTHS[c['month']]}_{c['year']}.{ext}",
+            filename=_case_filename(c, ext),
             content_type=ctype,
             size=0,
             kind="timesheet",
@@ -186,8 +216,7 @@ class MockEmailProvider(EmailProvider):
             raise FileNotFoundError(attachment_id)
         if case["doc"] == "docx":
             data = _render_timesheet_docx(case)
-            name = f"{case['emp_name'].replace(' ', '_')}.docx"
-            return data, name, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            return data, _case_filename(case, "docx"), \
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         data = _render_timesheet_pdf(case)
-        name = f"{case['emp_name'].replace(' ', '_')}.pdf"
-        return data, name, "application/pdf"
+        return data, _case_filename(case, "pdf"), "application/pdf"

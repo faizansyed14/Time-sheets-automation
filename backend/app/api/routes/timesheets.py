@@ -45,6 +45,8 @@ def to_out(r: TimesheetRecord) -> TimesheetOut:
         approval_status=r.approval_status,
         source_email_id=r.source_email_id,
         storage_folder=r.storage_folder,
+        source_files=r.source_files or [],
+        source_file_count=r.source_file_count,
     )
 
 
@@ -134,6 +136,19 @@ async def update_record(record_id: str, body: TimesheetUpdate, db: AsyncSession 
     r.absent_dates = cleaned["absent"]
     r.public_holiday_dates = cleaned["public_holiday"]
     r.hr_flags = flags
+    # A manual edit becomes the single source of truth for this month —
+    # otherwise a later weekly-file merge would resurrect dates the reviewer
+    # deliberately removed.
+    from datetime import datetime as _dt2, timezone as _tz
+    prior = [e.get("filename") for e in (r.source_files or [])
+             if e.get("filename") and e.get("key") != "manual_edit"]
+    r.source_files = [{
+        "key": "manual_edit",
+        "filename": "Manual edit" + (f" (was: {', '.join(prior)})" if prior else ""),
+        "source_id": None, "attachment_id": None,
+        "ingested_at": _dt2.now(_tz.utc).isoformat(),
+        "buckets": cleaned,
+    }]
     if flags:
         r.validation_status = ValidationStatus.MANUAL_REVIEW
         r.llm_summary = "Needs review: " + " ".join(flags[:6])

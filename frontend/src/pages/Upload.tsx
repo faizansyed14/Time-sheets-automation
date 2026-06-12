@@ -1,210 +1,215 @@
-import { useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useCallback, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  UploadCloud,
+  FileText,
+  X,
+  CheckCircle2,
+  AlertTriangle,
+  XCircle,
+  ExternalLink,
+  Layers,
+} from "lucide-react";
 import { uploadTimesheets, MONTHS_LONG, type UploadResult } from "../api/client";
-import { Badge, Button, useGlobalProgress } from "../components/ui";
+import { cn, formatBytes } from "../lib/utils";
+import { Button, Card, PageHeader } from "../components/ui";
+import StoredFilesPreview from "../components/StoredFilesPreview";
+import { FailureChip } from "../components/status";
+import { useToast } from "../components/toast";
 
-export default function Upload() {
+export default function UploadPage() {
   const qc = useQueryClient();
-  const { isProcessing, setIsProcessing } = useGlobalProgress();
+  const { toast } = useToast();
   const inputRef = useRef<HTMLInputElement>(null);
-  const [files, setFiles] = useState<File[]>([]);
-  const [results, setResults] = useState<UploadResult[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [drag, setDrag] = useState(false);
+  const [queue, setQueue] = useState<File[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [results, setResults] = useState<UploadResult[]>([]);
 
-  const add = (list: FileList | null) => {
-    if (!list) return;
-    setFiles((prev) => [...prev, ...Array.from(list)]);
-    setResults(null); 
-    setError(null);
+  const addFiles = useCallback((list: FileList | File[]) => {
+    const files = Array.from(list).filter((f) =>
+      /\.(pdf|docx|xlsx|png|jpe?g|eml)$/i.test(f.name)
+    );
+    setQueue((q) => {
+      const names = new Set(q.map((f) => f.name));
+      return [...q, ...files.filter((f) => !names.has(f.name))];
+    });
+  }, []);
+
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragging(false);
+    addFiles(e.dataTransfer.files);
   };
 
   const run = async () => {
-    if (!files.length) return;
-    setIsProcessing(true);
-    setError(null);
-    setResults(null);
+    if (!queue.length) return;
+    setBusy(true);
+    setProgress(0);
     try {
-      const res = await uploadTimesheets(files);
-      setResults(res);
-      setFiles([]);
+      const res = await uploadTimesheets(queue, setProgress);
+      setResults((r) => [...res, ...r]);
+      setQueue([]);
+      const ok = res.filter((r) => r.status === "success").length;
+      const review = res.filter((r) => r.status === "needs_review").length;
+      const failed = res.filter((r) => r.status === "failed").length;
+      if (failed) toast("error", `${failed} file(s) failed`, "Open the Pipeline page for the exact reason — nothing was lost.");
+      if (review) toast("warning", `${review} file(s) need review`);
+      if (ok && !failed && !review) toast("success", `${ok} file(s) processed cleanly`);
+      qc.invalidateQueries({ queryKey: ["pipeline"] });
+      qc.invalidateQueries({ queryKey: ["pipeline-stats"] });
       qc.invalidateQueries({ queryKey: ["dashboard"] });
+      qc.invalidateQueries({ queryKey: ["files"] });
     } catch (e: any) {
-      setError(e?.response?.data?.detail ?? "High-volume upload failed. Please check file formats.");
+      toast("error", "Upload failed", e?.response?.data?.detail ?? String(e));
     } finally {
-      setIsProcessing(false);
+      setBusy(false);
     }
   };
 
   return (
-    <div className="space-y-10">
-      <header>
-        <h1 className="text-4xl font-bold tracking-tight text-ink">Direct Upload</h1>
-        <p className="mt-2 text-slate-500 font-medium max-w-xl">
-          Instantly process timesheets via manual drop. Supports batch extraction for PDF, DOCX, and high-res images.
-        </p>
-      </header>
+    <div className="mx-auto max-w-4xl animate-fade-up">
+      <PageHeader
+        title="Upload timesheets"
+        subtitle="Runs the exact same pipeline as accepting an email. Weekly or 15-day sheets for the same month merge automatically into one record."
+      />
 
-      {/* Dropzone Container */}
-      <div className="grid gap-8 lg:grid-cols-2">
+      <Card className="p-6">
         <div
-          onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
-          onDragLeave={() => setDrag(false)}
-          onDrop={(e) => { e.preventDefault(); setDrag(false); add(e.dataTransfer.files); }}
-          className={`relative group cursor-pointer h-80 rounded-[2.5rem] border-2 border-dashed transition-all duration-500 flex flex-col items-center justify-center p-12 overflow-hidden ${
-            drag ? "border-petrol-400 bg-petrol-50/50 scale-[1.01]" : "border-slate-200 bg-white hover:border-petrol-300 hover:shadow-soft"
-          }`}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragging(true);
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={onDrop}
           onClick={() => inputRef.current?.click()}
+          className={cn(
+            "flex cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed px-6 py-12 transition-colors",
+            dragging
+              ? "border-brand-500 bg-brand-50"
+              : "border-slate-300 bg-slate-50/60 hover:border-brand-400 hover:bg-brand-50/40"
+          )}
         >
-          {/* Animated Background Mesh */}
-          <div className="absolute inset-0 opacity-[0.03] group-hover:opacity-[0.06] transition-opacity pointer-events-none">
-             <div className="absolute -top-20 -left-20 w-80 h-80 bg-petrol-500 rounded-full blur-[100px] animate-pulse" />
-             <div className="absolute -bottom-20 -right-20 w-80 h-80 bg-sky-500 rounded-full blur-[100px] animate-pulse" style={{animationDelay: '1s'}} />
+          <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-brand-100">
+            <UploadCloud className="h-7 w-7 text-brand-600" />
           </div>
-
+          <div className="text-center">
+            <p className="text-sm font-semibold text-slate-700">
+              Drop timesheets here, or <span className="text-brand-600">browse</span>
+            </p>
+            <p className="mt-1 text-xs text-slate-400">
+              PDF · DOCX · XLSX · PNG/JPG · EML — multiple files per month welcome (weekly / 15-day sheets)
+            </p>
+          </div>
           <input
             ref={inputRef}
             type="file"
             multiple
             accept=".pdf,.docx,.xlsx,.png,.jpg,.jpeg,.eml"
             className="hidden"
-            onChange={(e) => add(e.target.files)}
+            onChange={(e) => {
+              if (e.target.files) addFiles(e.target.files);
+              e.target.value = "";
+            }}
           />
-          
-          <div className="relative">
-            <div className={`h-20 w-20 rounded-3xl mb-6 flex items-center justify-center transition-all duration-500 ${drag ? 'bg-petrol-500 text-white shadow-lift' : 'bg-slate-50 text-slate-400'}`}>
-              <UploadCloudIcon className="w-10 h-10" />
+        </div>
+
+        {queue.length > 0 && (
+          <div className="mt-5">
+            <div className="space-y-2">
+              {queue.map((f) => (
+                <div
+                  key={f.name}
+                  className="flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-2"
+                >
+                  <FileText className="h-4 w-4 shrink-0 text-slate-400" />
+                  <span className="min-w-0 flex-1 truncate text-sm text-slate-700">{f.name}</span>
+                  <span className="text-xs text-slate-400">{formatBytes(f.size)}</span>
+                  <button
+                    onClick={() => setQueue((q) => q.filter((x) => x.name !== f.name))}
+                    className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-rose-500"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+            </div>
+            {busy && (
+              <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-slate-200">
+                <div
+                  className="h-full rounded-full bg-brand-600 transition-all"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+            )}
+            <div className="mt-4 flex justify-end gap-2">
+              <Button variant="secondary" onClick={() => setQueue([])} disabled={busy}>
+                Clear
+              </Button>
+              <Button onClick={run} disabled={busy}>
+                <UploadCloud className="h-4 w-4" />
+                {busy ? "Processing…" : `Process ${queue.length} file${queue.length > 1 ? "s" : ""}`}
+              </Button>
             </div>
           </div>
-          
-          <div className="text-center relative z-10">
-            <p className="text-base font-bold text-ink mb-1">Drop documents here to start extraction</p>
-            <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">Supports PDF, Word, Images & Excel</p>
+        )}
+      </Card>
+
+      {results.length > 0 && (
+        <Card className="mt-6">
+          <div className="border-b border-slate-100 px-5 py-3.5">
+            <h2 className="text-sm font-bold text-slate-800">Results</h2>
           </div>
-        </div>
-
-        {/* Queue Panel */}
-        <div className="flex flex-col">
-           <div className={`flex-1 rounded-[2.5rem] border border-slate-200/60 bg-white p-8 shadow-soft flex flex-col ${files.length === 0 ? 'items-center justify-center border-dashed' : ''}`}>
-             {files.length === 0 ? (
-               <div className="text-center">
-                 <div className="h-12 w-12 bg-slate-50 rounded-2xl flex items-center justify-center mx-auto mb-4">
-                   <ListIcon className="w-6 h-6 text-slate-200" />
-                 </div>
-                 <p className="text-sm font-bold text-slate-300 uppercase tracking-widest leading-loose">Queue is currently empty</p>
-               </div>
-             ) : (
-               <div className="w-full h-full flex flex-col">
-                 <div className="flex items-center justify-between mb-8">
-                    <span className="text-[11px] font-bold text-slate-400 uppercase tracking-[0.2em] px-2 border-l-4 border-petrol-500">Processing Queue</span>
-                    <Badge tone="petrol">{files.length} Files Selected</Badge>
-                 </div>
-                 
-                 <div className="flex-1 space-y-3 overflow-y-auto max-h-[300px] pr-2 custom-scrollbar">
-                    {files.map((f, i) => (
-                      <div key={i} className="group flex items-center justify-between p-4 rounded-2xl bg-slate-50 border border-slate-100 hover:bg-white hover:border-slate-200 transition-all duration-200 shadow-sm">
-                        <div className="flex items-center gap-4 min-w-0">
-                          <div className="h-10 w-10 shrink-0 bg-white rounded-xl flex items-center justify-center shadow-sm text-slate-300 group-hover:text-petrol-500 transition-colors">
-                            <FileIcon className="w-5 h-5" />
-                          </div>
-                          <div className="truncate pr-4">
-                            <p className="text-xs font-bold text-ink truncate uppercase tracking-tight">{f.name}</p>
-                            <p className="text-[10px] font-medium text-slate-400">{(f.size / 1024).toFixed(0)} KB • Pending Analysis</p>
-                          </div>
-                        </div>
-                        <button
-                          onClick={() => setFiles((p) => p.filter((_, idx) => idx !== i))}
-                          className="h-8 w-8 rounded-lg text-slate-300 hover:text-rose-500 hover:bg-rose-50 transition-all"
-                        >
-                          <TrashIcon className="w-4 h-4 mx-auto" />
-                        </button>
-                      </div>
-                    ))}
-                 </div>
-
-                 <div className="mt-8 pt-6 border-t border-slate-100 flex items-center justify-between">
-                    <button onClick={() => setFiles([])} className="text-xs font-bold text-slate-400 hover:text-ink transition-colors uppercase tracking-widest px-2">Clear All</button>
-                    <Button 
-                      onClick={run} 
-                      loading={isProcessing} 
-                      className="px-10 py-4 shadow-lift"
-                    >
-                      Extract & Match Identities
-                    </Button>
-                 </div>
-               </div>
-             )}
-           </div>
-        </div>
-      </div>
-
-      {error && (
-        <div className="rounded-3xl border border-rose-200 bg-rose-50/50 p-6 flex items-center gap-4 animate-in slide-in-from-top-2">
-           <div className="h-10 w-10 shrink-0 bg-white shadow-sm rounded-xl flex items-center justify-center text-rose-500">
-             <AlertIcon className="w-5 h-5" />
-           </div>
-           <p className="text-sm font-bold text-rose-700">{error}</p>
-        </div>
-      )}
-
-      {results && (
-        <div className="space-y-6 animate-in slide-in-from-bottom-8 duration-700">
-          <div className="flex items-center justify-between px-2">
-            <h2 className="text-xl font-bold tracking-tight text-ink">Extraction Summary</h2>
-            <Badge tone="emerald">Success</Badge>
+          <div className="divide-y divide-slate-100">
+            {results.map((r) => (
+              <div key={r.pipeline_id} className="flex items-start gap-3 px-5 py-3.5">
+                {r.status === "success" ? (
+                  <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-500" />
+                ) : r.status === "needs_review" ? (
+                  <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
+                ) : (
+                  <XCircle className="mt-0.5 h-5 w-5 shrink-0 text-rose-500" />
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-sm font-semibold text-slate-800">{r.filename}</p>
+                    <FailureChip code={r.failure_code} label={r.failure_code} />
+                  </div>
+                  <p className="mt-0.5 text-xs leading-5 text-slate-500">
+                    {r.employee_name && (
+                      <span className="font-medium text-slate-600">
+                        {r.employee_name}
+                        {r.month ? ` — ${MONTHS_LONG[r.month]} ${r.year}` : ""} ·{" "}
+                      </span>
+                    )}
+                    {r.failure_detail ?? r.llm_summary ?? ""}
+                  </p>
+                  {r.record_id && (r.status === "success" || r.status === "needs_review") && (
+                    <StoredFilesPreview recordId={r.record_id} />
+                  )}
+                </div>
+                {r.record_id ? (
+                  <Link
+                    to={`/records/${r.record_id}`}
+                    className="flex shrink-0 items-center gap-1 text-xs font-semibold text-brand-600 hover:text-brand-700"
+                  >
+                    View record <ExternalLink className="h-3.5 w-3.5" />
+                  </Link>
+                ) : (
+                  <Link
+                    to="/pipeline"
+                    className="flex shrink-0 items-center gap-1 text-xs font-semibold text-rose-500 hover:text-rose-600"
+                  >
+                    See in pipeline <Layers className="h-3.5 w-3.5" />
+                  </Link>
+                )}
+              </div>
+            ))}
           </div>
-          
-          <div className="overflow-hidden rounded-[2.5rem] border border-slate-200/60 bg-white shadow-lift">
-             <table className="w-full text-left text-sm border-separate border-spacing-0">
-               <thead>
-                 <tr className="bg-slate-50/50 text-[10px] font-bold uppercase tracking-[0.15em] text-slate-400">
-                    <th className="px-10 py-5 border-b border-slate-100">Identity Result</th>
-                    <th className="px-10 py-5 border-b border-slate-100">Validation Status</th>
-                    <th className="px-10 py-5 border-b border-slate-100">AI Intelligence Summary</th>
-                 </tr>
-               </thead>
-               <tbody className="divide-y divide-slate-50">
-                  {results.map((r) => (
-                    <tr key={r.record_id} className="group hover:bg-slate-50/30 transition-colors">
-                      <td className="px-10 py-6">
-                         <div className="flex flex-col">
-                           <span className="font-bold text-ink uppercase tracking-tight">{r.employee_name ?? "Unknown"}</span>
-                           <span className="text-[10px] font-bold text-slate-400 font-mono mt-0.5 tracking-tighter">
-                             {r.employee_id ?? "UNSPECIFIED"} • {r.month > 0 ? `${MONTHS_LONG[r.month]} ${r.year}` : '-'}
-                           </span>
-                         </div>
-                      </td>
-                      <td className="px-10 py-6">
-                        {r.validation_status === "verified" ? <Badge tone="emerald">Verified</Badge> : <Badge tone="amber">Audit Needed</Badge>}
-                      </td>
-                      <td className="px-10 py-6">
-                        <div className="max-w-md">
-                          <p className="text-xs font-bold text-slate-600 line-clamp-1">{r.llm_summary}</p>
-                          {r.match_note && <p className="text-[10px] font-medium text-slate-400 mt-1 italic italic-slate-300">“{r.match_note}”</p>}
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-               </tbody>
-             </table>
-             <div className="px-10 py-6 bg-slate-50 flex items-center justify-between border-t border-slate-100">
-                <span className="text-xs font-bold text-slate-400 uppercase tracking-widest italic">All results committed to archive metadata</span>
-                <Link to="/" className="text-xs font-bold text-petrol-600 hover:text-petrol-700 flex items-center gap-2 group transition-all uppercase tracking-widest pr-4">
-                  Go to Dashboard <ArrowRightIcon className="w-3 h-3 group-hover:translate-x-1 transition-transform" />
-                </Link>
-             </div>
-          </div>
-        </div>
+        </Card>
       )}
     </div>
   );
 }
-
-// Icons
-function UploadCloudIcon({ className }: { className?: string }) { return <svg className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242M12 12v9m-4-4 4 4 4-4"/></svg> }
-function ListIcon({ className }: { className?: string }) { return <svg className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg> }
-function TrashIcon({ className }: { className?: string }) { return <svg className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2M10 11v6M14 11v6"/></svg> }
-function FileIcon({ className }: { className?: string }) { return <svg className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg> }
-function AlertIcon({ className }: { className?: string }) { return <svg className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg> }
-function ArrowRightIcon({ className }: { className?: string }) { return <svg className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M5 12h14M12 5l7 7-7 7"/></svg> }

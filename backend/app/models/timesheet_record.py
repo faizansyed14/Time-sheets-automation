@@ -83,6 +83,13 @@ class TimesheetRecord(Base):
     source_email_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
     storage_folder: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # Every file that contributed to this month (weekly / 15-day timesheets).
+    # Each entry keeps its own buckets so re-uploading the same file replaces
+    # its contribution instead of duplicating it:
+    # [{"key", "filename", "source_id", "attachment_id", "ingested_at",
+    #   "buckets": {"annual": [...], "remote": [...], ...}}]
+    source_files: Mapped[list] = mapped_column(JSON, default=list)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     # convenience counts (computed on write)
@@ -109,3 +116,7 @@ class TimesheetRecord(Base):
     @property
     def public_holiday_count(self) -> int:
         return len(self.public_holiday_dates or [])
+
+    @property
+    def source_file_count(self) -> int:
+        return len(self.source_files or [])

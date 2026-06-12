@@ -1,6 +1,42 @@
-# Timesheet Intelligence Portal
+# Timesheets Automation — Timesheet Intelligence Portal
 
 Email-driven timesheet leave extraction with manager approval.
+
+## What's new in v2
+
+1. **Multiple files per month (weekly / 15-day timesheets).** Some clients send
+   a month as several files. Each file's extracted dates are stored as a
+   *contribution* on the monthly record (`source_files`) and the record's
+   buckets are the **union** of all contributions — a second file for the same
+   employee + month **merges** instead of being treated as a duplicate.
+   Re-uploading the same file replaces its own contribution (idempotent), and
+   dates claimed by two *different* files raise a review flag. A manual edit of
+   the record becomes the single source of truth for that month.
+
+2. **Duplicate employee IDs across AUH and DXB.** `employee_id` is no longer
+   globally unique — identity is **(employee_id, name)**. Matching resolves a
+   shared ID by the name on the sheet (exact, then fuzzy); if the name can't
+   pick a side the file fails as `ambiguous_id` instead of being filed under
+   the wrong person. The Excel importer also keys on (ID, name), so AUH rows
+   are no longer skipped as "duplicate ID".
+
+3. **Pipeline tracker.** Every file that enters the pipeline (email accept OR
+   upload) gets an audit row that walks through stages
+   `received → protection_check → extraction → identification → matching →
+   validation → filing → recorded` and ends as **success / needs_review /
+   failed / resolved**. Failures carry an exact reason: `protected_pdf`,
+   `llm_failed`, `name_not_found`, `month_not_found`, `employee_not_matched`,
+   `ambiguous_id`, `id_name_mismatch`, `validation_mismatch`,
+   `unsupported_type`, `storage_error`, … Nothing fails silently anymore.
+   The Pipeline page has a **Resolve** button (human sign-off with a note) and
+   a **Retry** button (re-runs the stored copy of the file after you fix the
+   cause — e.g. after adding the missing employee to the matcher).
+
+4. **New SaaS frontend.** Complete rewrite: sidebar app shell, KPI dashboard,
+   split-pane inbox, drag-and-drop upload with per-file outcomes, pipeline
+   tracker with stage timelines, employee matcher with AUH/DXB shared-ID
+   indicators, three-pane file vault and a full record page with editable
+   leave buckets. Works against the same mock/real provider seams.
 
 You review incoming timesheet emails **inside the app**, accept or reject each one,
 and accepted emails flow through an extraction pipeline that reads the leave data,
@@ -105,14 +141,24 @@ frontend/
     pages/               Dashboard • Inbox • EmployeeMonth
 ```
 
-### The pipeline (on Accept)
+### The pipeline (on Accept or Upload)
 1. Read the manager-approval screenshot once → detected approved? + detail.
-2. For **each** timesheet attachment (one email may carry several people):
-   - extract leave buckets → run validation (duplicates, out-of-month, overlaps) → green/yellow + summary
-   - match identity against `all_employee_data`
-   - file the sheet + approval screenshot + `extraction_result.json` under `<Employee>/<Month-Year>/`
-   - upsert a `TimesheetRecord` (dedupe on employee + month + year)
+2. For **each** timesheet file (one email may carry several people — or several
+   weekly sheets for the same person), a `PipelineFile` tracker row is created
+   and the file walks through:
+   - **protection check** — type accepted? PDF password-protected? (`protected_pdf`)
+   - **extraction (LLM)** — engine errors become `llm_failed`, not 500s
+   - **identification** — usable name/ID (`name_not_found`) and month (`month_not_found`)?
+   - **matching** — employee_id **and** name vs `all_employee_data`; shared
+     AUH/DXB IDs resolved by name, otherwise `ambiguous_id`
+   - **validation** — duplicates, out-of-month, cross-file overlaps → flags
+   - **filing** — sheet + approval + `extraction_result.json` under
+     `<Manager>/<Employee>/<Month-Year>/`
+   - **record** — upsert into the month's `TimesheetRecord`, merging this
+     file's dates with any earlier weekly/15-day files for the same month
 3. Mark the email **ingested**. (Reject just archives it — never reaches the pipeline.)
+4. Failures appear on the **Pipeline** page with the exact stage + reason and
+   can be **Resolved** (sign-off) or **Retried** (re-run from the stored copy).
 
 ---
 
