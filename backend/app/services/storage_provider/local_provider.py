@@ -22,6 +22,12 @@ def _safe(name: str) -> str:
     return name or "Unknown"
 
 
+def _is_hidden(name: str) -> bool:
+    """Internal folders (e.g. a legacy '_pipeline' raw-copy dir) are hidden from
+    the File Vault browser. Anything starting with '_' or '.' is skipped."""
+    return name.startswith("_") or name.startswith(".")
+
+
 class LocalStorageProvider(StorageProvider):
     @property
     def root(self) -> Path:
@@ -37,11 +43,11 @@ class LocalStorageProvider(StorageProvider):
     def list_managers(self) -> list[ManagerFolder]:
         out = []
         for d in sorted(self.root.iterdir()) if self.root.exists() else []:
-            if d.is_dir():
+            if d.is_dir() and not _is_hidden(d.name):
                 out.append(ManagerFolder(
                     name=d.name,
                     rel_path=d.name,
-                    employee_count=sum(1 for e in d.iterdir() if e.is_dir()),
+                    employee_count=sum(1 for e in d.iterdir() if e.is_dir() and not _is_hidden(e.name)),
                 ))
         return out
 

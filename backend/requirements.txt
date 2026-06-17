@@ -15,6 +15,14 @@ Pillow==11.3.0
 PyMuPDF==1.26.4
 openpyxl==3.1.5
 
+# High-fidelity email/HTML -> image rendering (real "screenshot" of the email
+# with table borders + colours), pure-Python (no browser). On Debian/Ubuntu it
+# needs the Pango/Cairo system libs:
+#   apt-get install libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 libffi-dev
+# If WeasyPrint or its libs are absent, rendering falls back to LibreOffice,
+# then to a clean TrueType text image — extraction still works either way.
+weasyprint==69.0
+
 # --- Postgres (your production DB): uncomment + set DATABASE_URL ---
 # asyncpg==0.30.0
 

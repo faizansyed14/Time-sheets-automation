@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     # Structure:  storage/<employee_name>/<Month-Year>/<files>
     storage_root: str = str(BACKEND_ROOT / "storage")
 
+    # Where the pipeline keeps a private copy of each original file so a failed
+    # file can be retried. This lives OUTSIDE storage_root so it never shows up
+    # in the File Vault browser.
+    pipeline_raw_root: str = str(BACKEND_ROOT / "data" / "pipeline_raw")
+
     # Which email provider to use: "mock" now, "graph" later.
     email_provider: str = "mock"
 
@@ -71,6 +76,12 @@ class Settings(BaseSettings):
     @property
     def storage_path(self) -> Path:
         p = Path(self.storage_root)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def pipeline_raw_path(self) -> Path:
+        p = Path(self.pipeline_raw_root)
         p.mkdir(parents=True, exist_ok=True)
         return p
 

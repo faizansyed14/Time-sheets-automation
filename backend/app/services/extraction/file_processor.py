@@ -5,6 +5,8 @@ for the optional text cross-validation step.
 """
 from __future__ import annotations
 
+import calendar
+import datetime as _dt
 import io
 import re
 import subprocess
@@ -17,6 +19,71 @@ PDF_DPI = 300
 PDF_MAX_PAGES = 10
 JPEG_QUALITY = 90
 IMAGE_MAX_SIDE = 2200
+
+# ---------------------------------------------------------------------------
+# Shared date / attendance-grid scanning (used by the mock + vision engines)
+# ---------------------------------------------------------------------------
+_MONTH_NUM = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
+_MONTH_NUM.update({m.lower(): i for i, m in enumerate(calendar.month_abbr) if m})
+
+_ISO_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_DMY_RE = re.compile(r"\b(\d{1,2})[ \-/]+([A-Za-z]{3,9})[ \-/,]+(\d{4})\b")
+_MDY_RE = re.compile(r"\b([A-Za-z]{3,9})[ \-/]+(\d{1,2})[ \-/,]+(\d{4})\b")
+# A clock time like "8:30 AM" / "17:00" → marks a day as worked/present.
+_TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:[AaPp]\.?[Mm]\.?)?\b")
+_WEEKEND_WORDS = ("weekend", "wekend", "week end", "rest day", "off day", "weekly off")
+
+
+def _emit_iso(y: int, mo: int | None, d: int) -> str | None:
+    try:
+        return _dt.date(y, mo, d).isoformat() if mo else None
+    except (ValueError, TypeError):
+        return None
+
+
+def find_dates_in_text(text: str) -> list[tuple[int, int, str]]:
+    """Return (start, end, iso_date) for every ISO / 'DD Mon YYYY' / 'Mon DD, YYYY'
+    date in the text, de-duplicated and ordered by position."""
+    out: list[tuple[int, int, str]] = []
+    for m in _ISO_RE.finditer(text):
+        iso = _emit_iso(int(m[1]), int(m[2]), int(m[3]))
+        if iso:
+            out.append((m.start(), m.end(), iso))
+    for m in _DMY_RE.finditer(text):
+        iso = _emit_iso(int(m[3]), _MONTH_NUM.get(m[2].lower()), int(m[1]))
+        if iso:
+            out.append((m.start(), m.end(), iso))
+    for m in _MDY_RE.finditer(text):
+        iso = _emit_iso(int(m[3]), _MONTH_NUM.get(m[1].lower()), int(m[2]))
+        if iso:
+            out.append((m.start(), m.end(), iso))
+    out.sort()
+    deduped: list[tuple[int, int, str]] = []
+    last_end = -1
+    for s, e, iso in out:
+        if s >= last_end:
+            deduped.append((s, e, iso))
+            last_end = e
+    return deduped
+
+
+def scan_attendance_grid(text: str) -> tuple[set[str], set[str]]:
+    """For a daily-grid timesheet, return (present_days, weekend_days) as ISO
+    date sets. 'present' = a clock time / hours appear next to the date;
+    'weekend' = a weekend marker appears. Used to detect working days that have
+    NEITHER hours NOR a leave entry (i.e. unaccounted days)."""
+    present: set[str] = set()
+    weekend: set[str] = set()
+    dates = find_dates_in_text(text or "")
+    for i, (_s, e, iso) in enumerate(dates):
+        seg_end = dates[i + 1][0] if i + 1 < len(dates) else min(len(text), e + 60)
+        segment = text[e:seg_end]
+        low = segment.lower()
+        if _TIME_RE.search(segment):
+            present.add(iso)
+        elif any(w in low for w in _WEEKEND_WORDS):
+            weekend.add(iso)
+    return present, weekend
 
 
 def _to_jpeg_bytes(img, quality: int = JPEG_QUALITY) -> bytes:
@@ -77,6 +144,24 @@ def image_to_images(image_bytes: bytes, max_side: int = IMAGE_MAX_SIDE) -> list[
     return [_to_jpeg_bytes(img)]
 
 
+def _soffice_to_pdf(in_path: Path, out_dir: Path) -> bytes | None:
+    """Run LibreOffice headless to convert any supported file to PDF.
+
+    Uses a per-call private user profile so concurrent ingests don't collide on
+    the default profile lock (a common cause of silent failures)."""
+    profile = out_dir / "_lo_profile"
+    cmd = ["soffice", "--headless", "--nologo", "--nofirststartwizard", "--norestore",
+           f"-env:UserInstallation=file://{profile}",
+           "--convert-to", "pdf", "--outdir", str(out_dir), str(in_path)]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=120)
+    except Exception:
+        return None
+    pdfs = [p for p in out_dir.glob("*.pdf")]
+    return pdfs[0].read_bytes() if pdfs else None
+
+
 def _office_to_pdf_bytes(file_bytes: bytes, ext: str) -> bytes | None:
     """Convert docx/xlsx -> PDF via LibreOffice headless, if soffice is installed."""
     if not file_bytes or ext not in {"docx", "xlsx"}:
@@ -87,15 +172,84 @@ def _office_to_pdf_bytes(file_bytes: bytes, ext: str) -> bytes | None:
         out_dir = td_path / "out"
         out_dir.mkdir(parents=True, exist_ok=True)
         in_path.write_bytes(file_bytes)
-        cmd = ["soffice", "--headless", "--nologo", "--nofirststartwizard", "--norestore",
-               "--convert-to", "pdf", "--outdir", str(out_dir), str(in_path)]
+        return _soffice_to_pdf(in_path, out_dir)
+
+
+def _weasyprint_html_to_pdf(html: str) -> bytes | None:
+    """Render HTML+CSS to PDF with WeasyPrint — a true visual render that keeps
+    table borders, background colours and layout (a real 'screenshot' of the
+    email). Pure-Python, no browser needed. Returns None if unavailable."""
+    try:
+        from weasyprint import HTML
+    except Exception:
+        return None
+
+    # Don't hit the network: inline (cid:) logos and remote/tracking images are
+    # returned as empty so rendering is fast, offline and safe. data: URIs are
+    # handled natively by WeasyPrint.
+    def _fetch(url: str):
+        if url.startswith("data:"):
+            from weasyprint.urls import default_url_fetcher
+            return default_url_fetcher(url)
+        return {"string": b"", "mime_type": "image/png"}
+
+    wrapper = (
+        "<style>@page{size:A4;margin:10mm;} "
+        "body{font-family:Arial,Helvetica,'DejaVu Sans',sans-serif;} "
+        "table{border-collapse:collapse;} img{max-width:100%;} "
+        # keep table rows whole so nothing is cut across a page break
+        "tr,td,th{break-inside:avoid;page-break-inside:avoid;}</style>"
+    )
+    try:
+        return HTML(string=wrapper + html, url_fetcher=_fetch).write_pdf()
+    except Exception:
+        return None
+
+
+def _html_to_pdf_bytes(html: str) -> bytes | None:
+    """Render an HTML document to PDF, preferring a high-fidelity engine.
+      1) WeasyPrint  — keeps colours, table lines, layout (pure-Python)
+      2) LibreOffice — headless Writer/Web (works where soffice is installed)
+    Returns None if neither is available so callers fall back to a text image."""
+    if not (html or "").strip():
+        return None
+    pdf = _weasyprint_html_to_pdf(html)
+    if pdf:
+        return pdf
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        in_path = td_path / "email.html"
+        out_dir = td_path / "out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        in_path.write_text(html, encoding="utf-8")
+        return _soffice_to_pdf(in_path, out_dir)
+
+
+# Legible TrueType font for text-render fallbacks (much clearer than PIL's
+# default bitmap font, which is a major reason rendered text was unreadable).
+_FONT_PATHS = (
+    "DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+)
+_FONT_CACHE: dict[int, object] = {}
+
+
+def _load_font(size: int):
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+    from PIL import ImageFont
+    font = None
+    for p in _FONT_PATHS:
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=90)
+            font = ImageFont.truetype(p, size)
+            break
         except Exception:
-            return None
-        pdfs = list(out_dir.glob("*.pdf"))
-        return pdfs[0].read_bytes() if pdfs else None
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+    _FONT_CACHE[size] = font
+    return font
 
 
 def docx_to_images(docx_bytes: bytes) -> list[bytes]:
@@ -312,28 +466,177 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
 def _text_to_page_images(
     text: str,
     *,
-    width: int = 2400,
-    height: int = 3200,
-    line_h: int = 18,
-    char_w: int = 340,
-    lines_per_page: int = 160,
+    width: int = 1654,      # ~A4 at 200 DPI
+    height: int = 2339,
+    font_size: int = 26,
+    margin: int = 60,
 ) -> list[bytes]:
+    """Render plain text to clean, legible A4 page images using a TrueType font
+    (with word wrapping). Used as the fallback when LibreOffice isn't available
+    to render the email HTML."""
     from PIL import Image, ImageDraw
 
-    lines = [ln for ln in (text or "").splitlines() if ln.strip()] or ["(empty email)"]
+    font = _load_font(font_size)
+    line_h = int(font_size * 1.4)
+    raw_lines = [ln.rstrip() for ln in (text or "").splitlines()] or ["(empty email)"]
+
+    # word-wrap to the page width
+    probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    max_w = width - 2 * margin
+
+    def _wrap(line: str) -> list[str]:
+        if not line:
+            return [""]
+        words, out, cur = line.split(" "), [], ""
+        for w in words:
+            trial = f"{cur} {w}".strip()
+            if probe.textlength(trial, font=font) <= max_w:
+                cur = trial
+            else:
+                if cur:
+                    out.append(cur)
+                cur = w
+        out.append(cur)
+        return out
+
+    wrapped: list[str] = []
+    for ln in raw_lines:
+        wrapped.extend(_wrap(ln))
+
+    lines_per_page = max(1, (height - 2 * margin) // line_h)
     images: list[bytes] = []
-    for offset in range(0, len(lines), lines_per_page):
-        page_lines = lines[offset : offset + lines_per_page]
+    for off in range(0, len(wrapped), lines_per_page):
         img = Image.new("RGB", (width, height), (255, 255, 255))
         d = ImageDraw.Draw(img)
-        y = 20
-        for ln in page_lines:
-            d.text((20, y), ln[:char_w], fill=(0, 0, 0))
+        y = margin
+        for ln in wrapped[off : off + lines_per_page]:
+            d.text((margin, y), ln, fill=(20, 20, 20), font=font)
             y += line_h
-            if y > height - 30:
-                break
         images.append(_to_jpeg_bytes(img))
-    return images
+    return images or [_to_jpeg_bytes(Image.new("RGB", (width, height), (255, 255, 255)))]
+
+
+def _eml_subject_and_body_html(eml_bytes: bytes) -> tuple[str, str | None, str]:
+    """Return (subject, html_body_or_None, plain_body) for an .eml."""
+    msg = _parse_eml(eml_bytes)
+    subject = msg.get("subject", "") or ""
+    html_body: str | None = None
+    plain_body = ""
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        ct = part.get_content_type()
+        try:
+            if ct == "text/html" and html_body is None:
+                html_body = part.get_content()
+            elif ct == "text/plain" and not plain_body:
+                plain_body = part.get_content()
+        except Exception:
+            continue
+    return subject, html_body, plain_body
+
+
+def _trim_whitespace(img, bg=(255, 255, 255), pad: int = 16):
+    """Crop the surrounding white border off a rendered page image."""
+    from PIL import Image, ImageChops
+
+    bgimg = Image.new("RGB", img.size, bg)
+    diff = ImageChops.difference(img.convert("RGB"), bgimg)
+    bbox = diff.getbbox()
+    if not bbox:
+        return img
+    l, t, r, b = bbox
+    l, t = max(0, l - pad), max(0, t - pad)
+    r, b = min(img.width, r + pad), min(img.height, b + pad)
+    return img.crop((l, t, r, b))
+
+
+def pdf_to_single_image(pdf_bytes: bytes, dpi: int = 200, gap: int = 12) -> bytes:
+    """Render a (possibly multi-page) PDF into ONE continuous tall image, with
+    each page's whitespace trimmed and the pages stacked vertically. Because
+    table rows are kept whole (CSS break-inside:avoid), nothing is cut mid-row,
+    so the timesheet reads as a single uninterrupted screenshot for the LLM."""
+    import fitz
+    from PIL import Image
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    pages: list = []
+    for i in range(doc.page_count):
+        pix = doc.load_page(i).get_pixmap(matrix=mat, alpha=False)
+        im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        pages.append(_trim_whitespace(im))
+    doc.close()
+    if not pages:
+        raise ValueError("empty PDF")
+    if len(pages) == 1:
+        return _to_jpeg_bytes(pages[0])
+    width = max(p.width for p in pages)
+    height = sum(p.height for p in pages) + gap * (len(pages) - 1)
+    canvas = Image.new("RGB", (width, height), (255, 255, 255))
+    y = 0
+    for p in pages:
+        canvas.paste(p, (0, y))
+        y += p.height + gap
+    return _to_jpeg_bytes(canvas)
+
+
+def eml_body_to_images(eml_bytes: bytes) -> list[bytes]:
+    """Render the EMAIL ITSELF (Subject + body) to ONE continuous tall image —
+    the inline timesheet table renders crisply (WeasyPrint → LibreOffice) with
+    full colours/borders, stitched into a single screenshot so nothing is split
+    across a page break. Saved as evidence AND sent to the vision model. Falls
+    back to a clean TrueType text render if no HTML engine is available."""
+    try:
+        subject, html_body, plain_body = _eml_subject_and_body_html(eml_bytes)
+    except Exception:
+        return [_stitch_text_images(_extract_eml_body_text(eml_bytes))]
+
+    header = f"<p style='font-family:sans-serif'><b>Subject:</b> {unescape_safe(subject)}</p><hr/>"
+    if html_body:
+        doc = (
+            "<html><head><meta charset='utf-8'>"
+            "<style>body{font-family:Arial,Helvetica,sans-serif;font-size:11pt;} "
+            "table{border-collapse:collapse;} "
+            "tr,td,th{break-inside:avoid;page-break-inside:avoid;}</style>"
+            f"</head><body>{header}{html_body}</body></html>"
+        )
+    else:
+        from html import escape as _esc
+        doc = f"<html><body>{header}<pre style='font-family:monospace;font-size:11pt'>{_esc(plain_body)}</pre></body></html>"
+
+    pdf = _html_to_pdf_bytes(doc)
+    if pdf:
+        try:
+            return [pdf_to_single_image(pdf)]
+        except Exception:
+            pass
+    # Fallback: legible text render (no HTML engine available)
+    text = f"Subject: {subject}\n\n" + _focus_timesheet_text(_extract_eml_body_text(eml_bytes))
+    return [_stitch_text_images(text)]
+
+
+def _stitch_text_images(text: str) -> bytes:
+    """Stitch the multi-page TrueType text render into one tall image."""
+    from PIL import Image
+
+    pages = [Image.open(io.BytesIO(b)).convert("RGB") for b in _text_to_page_images(text)]
+    if len(pages) == 1:
+        return _to_jpeg_bytes(_trim_whitespace(pages[0]))
+    pages = [_trim_whitespace(p) for p in pages]
+    width = max(p.width for p in pages)
+    height = sum(p.height for p in pages) + 12 * (len(pages) - 1)
+    canvas = Image.new("RGB", (width, height), (255, 255, 255))
+    y = 0
+    for p in pages:
+        canvas.paste(p, (0, y))
+        y += p.height + 12
+    return _to_jpeg_bytes(canvas)
+
+
+def unescape_safe(s: str) -> str:
+    return unescape(s or "")
 
 
 def eml_best_attachment(eml_bytes: bytes) -> tuple[str, bytes, str] | None:
@@ -365,13 +668,14 @@ def _eml_attachment_images(eml_bytes: bytes) -> list[bytes]:
 
 
 def eml_to_images(eml_bytes: bytes) -> list[bytes]:
-    # 1) attached PDF / Office sheet (most reliable across varying email layouts)
+    # 1) a real attached PDF / Office sheet is the most faithful source
     attached = _eml_attachment_images(eml_bytes)
     if attached:
         return attached
-    # 2) timesheet embedded in forwarded email body (plain / HTML tables)
-    text = _focus_timesheet_text(_extract_eml_body_text(eml_bytes)) or "(empty email)"
-    return _text_to_page_images(text)
+    # 2) otherwise render the EMAIL ITSELF (Subject + body) — the inline
+    #    timesheet table renders crisply via LibreOffice, with a clean
+    #    TrueType text fallback if LibreOffice isn't available.
+    return eml_body_to_images(eml_bytes)
 
 
 def to_images(file_type: str, data: bytes) -> list[bytes]:

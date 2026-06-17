@@ -25,7 +25,11 @@ from app.services.extraction.base import (
     ExtractionEngine,
     TimesheetExtraction,
 )
-from app.services.extraction.validation import validate
+from app.services.extraction.validation import (
+    unaccounted_flag,
+    unaccounted_working_days,
+    validate,
+)
 
 _WEEKEND = {"Saturday", "Sunday"}
 
@@ -48,6 +52,10 @@ class VisionExtractionEngine(ExtractionEngine):
 
         images = fp.to_images(ftype, data)
         model = settings.extraction_model
+        # Authoritative cell/text content (for .eml this reads the embedded
+        # attachment) — handed to the model so a poor image render can't make
+        # it hallucinate names/IDs/dates.
+        doc_text = fp.extract_document_text(ftype, data)
         raw = await vision_client.extract_timesheet(
             images_jpeg=images,
             prompt=parser.EXTRACTION_PROMPT,
@@ -55,8 +63,15 @@ class VisionExtractionEngine(ExtractionEngine):
             model=model,
             image_detail=settings.vision_image_detail,
             file_bytes=data, file_type=ftype, filename=filename,
+            aux_text=doc_text,
         )
         parsed = parser.parse_extraction(parser.extract_json_from_vllm_response(raw))
+
+        # Drop hallucinated placeholder identities so they never reach matching.
+        from app.services.matching import _is_placeholder_name
+        emp_name = parsed.employee_full_name
+        if emp_name and _is_placeholder_name(emp_name):
+            emp_name = None
 
         month = parsed.month or 0
         year = parsed.year or 0
@@ -72,25 +87,43 @@ class VisionExtractionEngine(ExtractionEngine):
         }
         cleaned, flags = validate(buckets, month, year)
 
+        # Daily-grid sheets: flag weekdays with neither hours nor a leave entry
+        # (genuine gaps a reviewer must confirm). Uses the same document text.
+        try:
+            present, weekend = fp.scan_attendance_grid(doc_text)
+            if len(present) >= 5:
+                accounted = {d for v in cleaned.values() for d in v}
+                gaps = unaccounted_working_days(month, year, present, weekend, accounted)
+                uf = unaccounted_flag(gaps)
+                if uf:
+                    flags = flags + [uf]
+        except Exception:
+            pass
+
         # optional text cross-validation (mirrors your worker's diff step)
         if settings.enable_text_validation and (settings.openai_api_key or "").strip():
             try:
-                flags += await self._text_crosscheck(ftype, data, cleaned, month, year)
+                period_flag, date_flags = await self._text_crosscheck(
+                    doc_text, cleaned, month, year)
+                # A period disagreement is the single most important signal that
+                # the main read is wrong (e.g. it said Jan 2023 but the dates are
+                # May 2026); surface it first and clearly.
+                flags = ([period_flag] if period_flag else []) + flags + date_flags
             except Exception:
                 pass
 
         flags = list(dict.fromkeys(flags))  # dedupe, keep order
         status = "manual_review" if flags else "verified"
+        total = sum(len(v) for v in cleaned.values())
+        mname = calendar.month_name[month] if 1 <= month <= 12 else month
         if flags:
-            summary = "Needs review: " + " ".join(flags[:6])
+            summary = "Needs review: " + " ".join(flags[:4])
         else:
-            total = sum(len(v) for v in cleaned.values())
-            mname = calendar.month_name[month] if 1 <= month <= 12 else month
             summary = f"Clean extraction — {total} leave/holiday day(s) for {mname} {year}."
 
         return TimesheetExtraction(
             employee_id=(parsed.employee_id or None),
-            employee_name=(parsed.employee_full_name or None),
+            employee_name=(emp_name or None),
             month=month, year=year,
             annual_leave_dates=cleaned["annual"],
             remote_work_dates=cleaned["remote"],
@@ -101,19 +134,47 @@ class VisionExtractionEngine(ExtractionEngine):
             validation_status=status, summary=summary, hr_flags=flags,
         )
 
-    async def _text_crosscheck(self, ftype, data, cleaned, month, year) -> list[str]:
-        doc_text = fp.extract_document_text(ftype, data)
-        if not doc_text.strip():
-            return []
+    async def _text_crosscheck(self, doc_text, cleaned, month, year) -> tuple[str | None, list[str]]:
+        """Compare the main read against an independent text read of the same
+        file. Returns (period_flag, date_flags):
+          - period_flag: set when the two reads disagree on the MONTH/YEAR (the
+            strongest sign the main read is wrong). In that case the per-date
+            diffs are just noise, so they are suppressed and only this one clear
+            flag is returned.
+          - date_flags: concise per-category differences when the period agrees.
+        """
+        if not (doc_text or "").strip():
+            return None, []
         prompt = parser.build_text_extraction_prompt(doc_text)
         raw = await vision_client.validate_extraction(
             prompt, system_prompt=parser.TEXT_EXTRACTION_SYSTEM, model=settings.validation_model
         )
         tx = parser.parse_text_extraction(raw)
 
+        import calendar as _cal
+        from collections import Counter
+
+        # ---- period sanity: where do the text-read dates actually fall? ----
+        text_dates = []
+        for lst in (tx.annual_dates, tx.sick_dates, tx.public_holiday_dates,
+                    tx.unpaid_dates, tx.absent_dates, tx.work_from_home_dates):
+            for d in lst or []:
+                pd = parser._parse_one_leave_date(str(d), None, None)
+                if pd:
+                    text_dates.append(pd)
+        if text_dates:
+            (ty, tm), cnt = Counter((d.year, d.month) for d in text_dates).most_common(1)[0]
+            if (tm, ty) != (month, year) and cnt >= max(2, len(text_dates) // 2):
+                vis_p = f"{_cal.month_name[month]} {year}" if (1 <= month <= 12 and year) else "an unclear period"
+                period_flag = (
+                    f"Likely wrong period — the main read recorded this as {vis_p}, but the file's "
+                    f"own text shows the dates fall in {_cal.month_name[tm]} {ty}. Please confirm the "
+                    f"correct month/year before approving."
+                )
+                return period_flag, []
+
+        # ---- same period: concise per-category date differences ----
         def _norm(dates) -> set[str]:
-            # Normalise both passes to ISO so "2026-02-17" and "17-Feb-2026"
-            # are treated as the same day (avoids false "differ" flags).
             out: set[str] = set()
             for d in dates or []:
                 pd = parser._parse_one_leave_date(str(d), month, year)
@@ -121,25 +182,60 @@ class VisionExtractionEngine(ExtractionEngine):
             return out
 
         out: list[str] = []
-        pairs = [("Annual", cleaned["annual"], tx.annual_dates),
-                 ("Sick", cleaned["sick"], tx.sick_dates),
-                 ("Public holiday", cleaned["public_holiday"], tx.public_holiday_dates),
-                 ("Unpaid", cleaned["unpaid"], tx.unpaid_dates),
-                 ("Absent", cleaned["absent"], tx.absent_dates)]
+        pairs = [("annual leave", cleaned["annual"], tx.annual_dates),
+                 ("sick leave", cleaned["sick"], tx.sick_dates),
+                 ("public holiday", cleaned["public_holiday"], tx.public_holiday_dates),
+                 ("unpaid leave", cleaned["unpaid"], tx.unpaid_dates),
+                 ("absent", cleaned["absent"], tx.absent_dates)]
         for label, vis, txt in pairs:
             nvis, ntxt = _norm(vis), _norm(txt)
-            if nvis != ntxt:
-                only_vis = sorted(nvis - ntxt)
-                only_txt = sorted(ntxt - nvis)
-                vis_str = ", ".join(sorted(nvis)) or "none"
-                txt_str = ", ".join(sorted(ntxt)) or "none"
-                detail = f"validation: {label} differ — vision found [{vis_str}], text found [{txt_str}]."
-                if only_vis:
-                    detail += f" Only in vision: {', '.join(only_vis)}."
-                if only_txt:
-                    detail += f" Only in text: {', '.join(only_txt)}."
-                out.append(detail)
-        return out
+            if nvis == ntxt:
+                continue
+            out.append(self._crosscheck_flag(label, sorted(nvis - ntxt), sorted(ntxt - nvis)))
+        return None, out
+
+    @staticmethod
+    def _examples(dates: list[str], n: int = 3) -> str:
+        """Format up to n ISO dates as '06 May, 08 May, 09 May …'."""
+        import datetime as _dt
+        shown = []
+        for d in dates[:n]:
+            try:
+                shown.append(_dt.date.fromisoformat(d).strftime("%d %b"))
+            except Exception:
+                shown.append(d)
+        more = " …" if len(dates) > n else ""
+        return ", ".join(shown) + more
+
+    def _crosscheck_flag(self, label: str, only_vis: list[str], only_txt: list[str]) -> str:
+        """A concise, readable cross-check flag — counts + a few example dates,
+        never a full dump of every date."""
+        if only_txt and not only_vis:
+            return (f"Cross-check: a second read of the file flagged "
+                    f"{len(only_txt)} possible {label} day(s) the main read missed "
+                    f"({self._examples(only_txt)}). Please confirm before approving.")
+        if only_vis and not only_txt:
+            return (f"Cross-check: {len(only_vis)} {label} day(s) from the main read "
+                    f"were not confirmed by the second read "
+                    f"({self._examples(only_vis)}). Please verify.")
+        return (f"Cross-check: the two reads of this file disagree on {label} — "
+                f"{len(only_vis)} only in the main read ({self._examples(only_vis)}) and "
+                f"{len(only_txt)} only in the second read ({self._examples(only_txt)}). "
+                f"Please confirm the correct dates.")
+
+    async def summarize(self, context: dict) -> str | None:
+        """Polished plain-English summary via the SUMMARY prompt (vision mode)."""
+        if not (settings.openai_api_key or "").strip():
+            return None
+        try:
+            prompt = parser.build_summary_prompt(context)
+            raw = await vision_client.validate_extraction(
+                prompt, system_prompt=parser.SUMMARY_SYSTEM, model=settings.validation_model)
+            text = parser._collect_text(raw).strip()
+            text = text.replace("```", "").strip()
+            return text or None
+        except Exception:
+            return None
 
     async def extract_approval(
         self, data: bytes, message_id: str, attachment_id: str,

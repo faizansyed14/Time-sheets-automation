@@ -63,10 +63,18 @@ Do not infer or output attendance summary numbers (days present, weekend counts,
 
 
 EXTRACTION_PROMPT = """Extract timesheet data and return ONLY the JSON below. No markdown. No explanation.
-MANDATORY FIELDS — these must NEVER be empty:
+
+⚠ NEVER invent or copy example values. Do NOT output placeholder names such as
+"John Doe"/"Jane Doe", placeholder IDs such as "SMC-12345", or a guessed year
+such as 2023. Read the ACTUAL values from THIS document. If a field genuinely
+cannot be read, leave it as an empty string "" — an empty field is correct, a
+made-up field is a serious error. The month and year MUST come from the dates
+and header on this sheet, never a default.
+
+KEY FIELDS:
 
 employee_name — Look for labels: "Employee Name", "Name", "Employee"
-employee_id — Look for: "EMP NO", "Emp No.", "Employee ID", "Employee Code", "SMC-", or any ID/code near the name
+employee_id — Look for: "EMP NO", "Emp No.", "Employee ID", "Employee Code", "DCO", or any ID/code near the name
 
 ═══════════════════════════════════════
 LEAVE EXTRACTION RULES — READ CAREFULLY
@@ -154,6 +162,80 @@ def build_text_extraction_prompt(document_text: str) -> str:
     if len(doc) > TEXT_EXTRACT_DOC_MAX_LEN:
         doc = doc[:TEXT_EXTRACT_DOC_MAX_LEN] + "\n\n[... document truncated for length ...]"
     return TEXT_EXTRACTION_PROMPT.replace("{document_text}", doc)
+
+
+# ---------------------------------------------------------------------------
+# Review summary — turns the structured extraction + validation issues into a
+# short, plain-English note an HR reviewer can read at a glance. This is the
+# "proper summary" prompt: no raw date arrays, no jargon, just what was found
+# and what (if anything) needs a human's attention.
+# ---------------------------------------------------------------------------
+SUMMARY_SYSTEM = (
+    "You are an HR assistant who writes a short, clear review note about ONE "
+    "employee's monthly timesheet. Write 2–4 plain-English sentences. "
+    "No markdown, no headings, no bullet points, and never paste raw date "
+    "arrays. Start with the employee, month and the headline leave counts. "
+    "If issues are listed, explain each one in human terms and say what the "
+    "reviewer should check or confirm. If there are no issues, say the sheet "
+    "looks clean and is ready for approval. Use only the data provided — never "
+    "invent dates, counts, names or approvals."
+)
+
+SUMMARY_PROMPT = """Write the review note for this timesheet.
+
+Employee: {employee}
+Period: {period}
+Files contributing to this month: {n_files}
+
+Leave counts (category: number of days):
+{counts}
+
+Example dates per category (already validated, ISO format):
+{samples}
+
+Issues detected by the system ({n_issues}):
+{issues}
+
+Guidance:
+- If "Issues detected" is "none", confirm the sheet is clean and ready for approval.
+- Otherwise, summarise the leave picture in one sentence, then explain the
+  issue(s) in clear language (e.g. a date written twice, a date that falls
+  outside the stated month, the header month disagreeing with the actual
+  dates, or a second read of the file disagreeing with the main read) and tell
+  the reviewer what to confirm.
+- Keep it to 2–4 sentences. Do not list every date."""
+
+
+def build_summary_prompt(context: dict) -> str:
+    """Render SUMMARY_PROMPT from a context dict produced by the pipeline."""
+    import calendar as _cal
+
+    month = context.get("month") or 0
+    year = context.get("year") or ""
+    mname = _cal.month_name[month] if isinstance(month, int) and 1 <= month <= 12 else str(month)
+    leaves: dict[str, list[str]] = context.get("leaves") or {}
+    labels = {
+        "annual": "Annual leave", "remote": "Work from home", "sick": "Sick leave",
+        "unpaid": "Unpaid leave", "absent": "Absent", "public_holiday": "Public holiday",
+    }
+    count_lines, sample_lines = [], []
+    for key, label in labels.items():
+        dates = leaves.get(key) or []
+        if dates:
+            count_lines.append(f"- {label}: {len(dates)}")
+            sample = ", ".join(dates[:6]) + (" …" if len(dates) > 6 else "")
+            sample_lines.append(f"- {label}: {sample}")
+    issues = context.get("issues") or []
+    issues_block = "none" if not issues else "\n".join(f"- {i}" for i in issues)
+    return SUMMARY_PROMPT.format(
+        employee=context.get("employee") or "Unknown employee",
+        period=f"{mname} {year}".strip(),
+        n_files=context.get("n_files") or 1,
+        counts="\n".join(count_lines) or "- (no leave recorded)",
+        samples="\n".join(sample_lines) or "- (none)",
+        n_issues=len(issues),
+        issues=issues_block,
+    )
 
 
 _MONTH_NAMES = {

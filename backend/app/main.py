@@ -26,6 +26,12 @@ async def lifespan(app: FastAPI):
         await migrate()
     except Exception:
         pass
+    # Relocate any legacy pipeline raw-copy folder out of the File Vault tree.
+    try:
+        from app.services.ingestion import relocate_legacy_pipeline_raw
+        relocate_legacy_pipeline_raw()
+    except Exception:
+        pass
     # Seed the demo employee matcher list only if the mock data module is present.
     # (Delete app/seed/mock_data.py + mock providers to remove mock entirely;
     #  this block then safely no-ops.)

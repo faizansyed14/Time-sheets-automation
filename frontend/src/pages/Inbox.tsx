@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Mail,
   Paperclip,
@@ -25,6 +25,7 @@ import { cn, formatDateTime, initials, avatarColor } from "../lib/utils";
 import { FilePreviewModal, PreviewableFileRow } from "../components/FilePreview";
 import { Badge, Button, Card, EmptyState, PageHeader, Select, Skeleton, Spinner } from "../components/ui";
 import { useToast } from "../components/toast";
+import { useDebounced, useSentinel } from "../lib/useInfinite";
 import type { PreviewFile } from "../lib/filePreview";
 
 function StatusBadge({ status }: { status: EmailListItem["status"] }) {
@@ -53,10 +54,19 @@ export default function InboxPage() {
 
   useEffect(() => setPreview(null), [selected]);
 
-  const { data: emails, isLoading } = useQuery({
-    queryKey: ["inbox", q, status],
-    queryFn: () => fetchInbox(q, status),
+  const dq = useDebounced(q, 350);
+  const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
+    queryKey: ["inbox", dq, status],
+    queryFn: ({ pageParam }) => fetchInbox(dq, status, pageParam as number),
+    initialPageParam: 0,
+    getNextPageParam: (last) => (last.has_more ? last.offset + last.items.length : undefined),
   });
+  const emails = data?.pages.flatMap((p) => p.items) ?? [];
+  const total = data?.pages[0]?.total ?? 0;
+  const sentinelRef = useSentinel(
+    () => hasNextPage && !isFetchingNextPage && fetchNextPage(),
+    !!hasNextPage
+  );
 
   const { data: detail, isLoading: loadingDetail } = useQuery({
     queryKey: ["email", selected],
@@ -142,7 +152,7 @@ export default function InboxPage() {
                 <Skeleton className="h-16" />
                 <Skeleton className="h-16" />
               </div>
-            ) : !emails?.length ? (
+            ) : !emails.length ? (
               <EmptyState icon={<Mail className="h-6 w-6" />} title="No emails found" />
             ) : (
               emails.map((m) => (
@@ -187,6 +197,17 @@ export default function InboxPage() {
                   </span>
                 </button>
               ))
+            )}
+            <div ref={sentinelRef} />
+            {isFetchingNextPage && (
+              <div className="flex items-center justify-center gap-2 py-3 text-xs text-slate-400">
+                <Spinner className="h-4 w-4" /> Loading more…
+              </div>
+            )}
+            {!isLoading && emails.length > 0 && (
+              <p className="px-4 py-2 text-center text-[11px] text-slate-400">
+                Showing {emails.length} of {total}
+              </p>
             )}
           </div>
         </Card>

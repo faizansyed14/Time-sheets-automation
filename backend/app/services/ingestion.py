@@ -51,7 +51,9 @@ from app.services.extraction.file_processor import (
     detect_file_type,
     eml_attachment_save_name,
     eml_best_attachment,
+    eml_body_to_images,
 )
+from app.services.extraction.validation import summarize as summarize_record
 from app.services.extraction.validation import validate
 from app.services.matching import MatchCode
 
@@ -94,13 +96,14 @@ def _fail(t: PipelineFile, stage: str, code: str, detail: str) -> None:
 
 
 def _save_raw_copy(t: PipelineFile, filename: str, data: bytes) -> None:
-    """Keep the original bytes under storage/_pipeline/<id>/ so Retry works."""
+    """Keep the original bytes under data/pipeline_raw/<id>/ (OUTSIDE the File
+    Vault's storage root) so Retry works without polluting the browsable tree."""
     try:
         safe = re.sub(r'[<>:"/\\|?*]+', "_", filename or "file") or "file"
-        folder = settings.storage_path / "_pipeline" / t.id
+        folder = settings.pipeline_raw_path / t.id
         folder.mkdir(parents=True, exist_ok=True)
         (folder / safe).write_bytes(data)
-        t.raw_path = f"_pipeline/{t.id}/{safe}"
+        t.raw_path = f"{t.id}/{safe}"
     except Exception:
         t.raw_path = None
 
@@ -108,13 +111,49 @@ def _save_raw_copy(t: PipelineFile, filename: str, data: bytes) -> None:
 def read_raw_copy(t: PipelineFile) -> bytes | None:
     if not t.raw_path:
         return None
+    rel = t.raw_path
+    # Candidate locations, newest layout first:
+    #   1) data/pipeline_raw/<id>/<file>           (current)
+    #   2) legacy "_pipeline/<id>/<file>" under storage root
+    #   3) legacy path with the "_pipeline/" prefix stripped, under the new root
+    candidates = []
+    if rel.startswith("_pipeline/"):
+        candidates.append(settings.storage_path / rel)
+        candidates.append(settings.pipeline_raw_path / rel[len("_pipeline/"):])
+    else:
+        candidates.append(settings.pipeline_raw_path / rel)
+        candidates.append(settings.storage_path / "_pipeline" / rel)
+    for p in candidates:
+        try:
+            p = p.resolve()
+            if p.is_file():
+                return p.read_bytes()
+        except Exception:
+            continue
+    return None
+
+
+def relocate_legacy_pipeline_raw() -> None:
+    """One-time cleanup: older builds stored retry copies under
+    storage/_pipeline/<id>/, which made them appear in the File Vault. Move any
+    such folder into data/pipeline_raw/ so it disappears from the vault while
+    keeping Retry working. Best-effort; safe to run on every startup."""
+    import shutil
+    legacy = settings.storage_path / "_pipeline"
+    if not legacy.is_dir():
+        return
+    dest_root = settings.pipeline_raw_path
+    for child in legacy.iterdir():
+        target = dest_root / child.name
+        if child.is_dir() and not target.exists():
+            try:
+                shutil.move(str(child), str(target))
+            except Exception:
+                continue
     try:
-        p = (settings.storage_path / t.raw_path).resolve()
-        if settings.storage_path.resolve() not in p.parents:
-            return None
-        return p.read_bytes()
+        legacy.rmdir()  # only succeeds if now empty
     except Exception:
-        return None
+        pass
 
 
 def _pdf_is_protected(data: bytes) -> bool:
@@ -216,6 +255,9 @@ async def ingest_timesheet_bytes(
             source_kind=source_kind, source_id=source_id, attachment_id=attachment_id,
         )
         db.add(tracker)
+        # Populate the primary key now so the raw-copy folder (data/pipeline_raw/<id>/)
+        # has a real id — otherwise uploads could never be retried.
+        await db.flush()
     else:  # retry: reset the previous outcome
         tracker.status = PipelineStatus.PROCESSING
         tracker.failure_code = None
@@ -362,15 +404,21 @@ async def ingest_timesheet_bytes(
         _event(tracker, PipelineStage.VALIDATION, "warn" if flags else "ok",
                ("Validation raised: " + " ".join(flags[:4])) if flags else "Validation clean.")
 
-    total = sum(len(v) for v in cleaned.values())
     mname = calendar.month_name[period_month]
-    if flags:
-        summary = "Needs review: " + " ".join(flags[:6])
-    elif len(entries) > 1:
-        summary = (f"Clean — {total} leave/holiday day(s) for {mname} {period_year} "
-                   f"across {len(entries)} timesheet files.")
-    else:
-        summary = ext.summary or f"Clean extraction — {total} leave/holiday day(s) for {mname} {period_year}."
+    # Clean, human-readable summary. Prefer the engine's polished LLM note
+    # (vision mode); always fall back to the deterministic summarizer so the
+    # record never shows a raw dump of dates.
+    summary_ctx = {
+        "employee": employee_name, "month": period_month, "year": period_year,
+        "leaves": cleaned, "issues": flags, "n_files": len(entries),
+    }
+    summary: str | None = None
+    try:
+        summary = await engine.summarize(summary_ctx)
+    except Exception:
+        summary = None
+    if not summary:
+        summary = summarize_record(cleaned, flags, period_month, period_year, len(entries))
 
     # ---- stage: filing on disk (best-effort; never blocks record creation) ----
     folder_rel = None
@@ -387,6 +435,18 @@ async def ingest_timesheet_bytes(
                     account_manager, employee_name, period_month, period_year,
                     eml_extracted_name, att_payload,
                 )
+            else:
+                # Inline timesheet (no attachment): save the rendered image of
+                # the email (Subject + body) — the same image sent to the model.
+                try:
+                    imgs = eml_body_to_images(data)
+                    for idx, img in enumerate(imgs[:8], 1):
+                        nm = "email_view.jpg" if len(imgs) == 1 else f"email_view_p{idx}.jpg"
+                        sp.save_file(account_manager, employee_name, period_month, period_year, nm, img)
+                    if imgs:
+                        eml_extracted_name = "email_view.jpg"
+                except Exception:
+                    pass
         if approval_bytes is not None:
             sp.save_file(account_manager, employee_name, period_month, period_year, approval_name, approval_bytes)
         sp.save_text(account_manager, employee_name, period_month, period_year, "extraction_result.json", _json.dumps({

@@ -78,11 +78,31 @@ export interface DashboardRow {
   employee_name: string | null;
   account_manager: string | null;
   dco_number: string | null;
+  location: string | null;
   status: "green" | "yellow";
   record_count: number;
   needs_review_count: number;
   pending_approval_count: number;
   years: number[];
+  submitted_months: number[];
+  in_matcher: boolean;
+  has_records: boolean;
+}
+
+export interface DashboardSummary {
+  year: number;
+  month: number;
+  total_employees: number;
+  submitted_this_month: number;
+  missing_this_month: number;
+  needs_review: number;
+  pending_approval: number;
+  missing_employees: string[];
+  rows: DashboardRow[];
+  filtered_total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
 }
 
 // ---- pipeline tracker ----
@@ -134,11 +154,30 @@ export interface PipelineStats {
 }
 
 // ---------------------------------------------------------------------------
+// Pagination
+// ---------------------------------------------------------------------------
+export interface Page<T> {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+}
+export const PAGE_SIZE = 200;
+
+// ---------------------------------------------------------------------------
 // Inbox
 // ---------------------------------------------------------------------------
-export const fetchInbox = (q: string, status: string) =>
+export const fetchInbox = (
+  q: string,
+  status: string,
+  offset = 0,
+  limit = PAGE_SIZE
+) =>
   api
-    .get<EmailListItem[]>("/inbox", { params: { q: q || undefined, status: status || undefined } })
+    .get<Page<EmailListItem>>("/inbox", {
+      params: { q: q || undefined, status: status || undefined, offset, limit },
+    })
     .then((r) => r.data);
 
 export const fetchEmail = (id: string) => api.get<EmailDetail>(`/inbox/${id}`).then((r) => r.data);
@@ -158,6 +197,29 @@ export const attachmentUrl = (msgId: string, attId: string) =>
 // ---------------------------------------------------------------------------
 export const fetchDashboard = (year?: number) =>
   api.get<DashboardRow[]>("/employees", { params: { year } }).then((r) => r.data);
+
+export const fetchCoverage = (params: {
+  year?: number;
+  month?: number;
+  q?: string;
+  location?: string;
+  only_missing?: boolean;
+  offset?: number;
+  limit?: number;
+}) =>
+  api
+    .get<DashboardSummary>("/employees/coverage", {
+      params: {
+        year: params.year,
+        month: params.month,
+        q: params.q || undefined,
+        location: params.location || undefined,
+        only_missing: params.only_missing || undefined,
+        offset: params.offset ?? 0,
+        limit: params.limit ?? PAGE_SIZE,
+      },
+    })
+    .then((r) => r.data);
 
 export const fetchEmployeeRecords = (pk: string, year?: number) =>
   api
@@ -211,7 +273,21 @@ export const fetchPipeline = (params?: {
   failure_code?: string;
   source_kind?: string;
   q?: string;
-}) => api.get<PipelineFile[]>("/pipeline", { params }).then((r) => r.data);
+  offset?: number;
+  limit?: number;
+}) =>
+  api
+    .get<Page<PipelineFile>>("/pipeline", {
+      params: {
+        status: params?.status || undefined,
+        failure_code: params?.failure_code || undefined,
+        source_kind: params?.source_kind || undefined,
+        q: params?.q || undefined,
+        offset: params?.offset ?? 0,
+        limit: params?.limit ?? PAGE_SIZE,
+      },
+    })
+    .then((r) => r.data);
 
 export const fetchPipelineStats = () =>
   api.get<PipelineStats>("/pipeline/stats").then((r) => r.data);

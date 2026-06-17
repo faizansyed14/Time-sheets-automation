@@ -2,8 +2,21 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Generic, TypeVar
 
 from pydantic import BaseModel
+
+T = TypeVar("T")
+
+
+class Page(BaseModel, Generic[T]):
+    """A paginated slice of a larger result set. `has_more` drives the
+    frontend's infinite scroll (keep loading the next offset until false)."""
+    items: list[T]
+    total: int          # total rows matching the filter/search (whole DB)
+    limit: int
+    offset: int
+    has_more: bool
 
 
 class AttachmentOut(BaseModel):
@@ -83,11 +96,34 @@ class DashboardRow(BaseModel):
     employee_name: str | None
     account_manager: str | None
     dco_number: str | None
+    location: str | None = None
     status: str          # "green" | "yellow"
     record_count: int
     needs_review_count: int
     pending_approval_count: int
     years: list[int]
+    # Coverage: which months (1-12) this employee submitted in the focus year,
+    # whether they are a matcher employee, and whether they have any record yet.
+    submitted_months: list[int] = []
+    in_matcher: bool = True
+    has_records: bool = True
+
+
+class DashboardSummary(BaseModel):
+    year: int
+    month: int                       # focus month for the "missing" figure
+    total_employees: int             # employees in the matcher (global)
+    submitted_this_month: int        # global
+    missing_this_month: int          # global
+    needs_review: int                # employees with at least one flagged record (global)
+    pending_approval: int            # employees with at least one unapproved record (global)
+    missing_employees: list[str] = []  # sample of names missing the focus month
+    # ---- paginated rows (infinite scroll) ----
+    rows: list[DashboardRow] = []
+    filtered_total: int = 0          # rows matching the q / location / only_missing filter
+    limit: int = 200
+    offset: int = 0
+    has_more: bool = False
 
 
 class ApprovalIn(BaseModel):
