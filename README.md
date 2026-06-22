@@ -2,6 +2,10 @@
 
 Email-driven timesheet leave extraction with manager approval.
 
+> **System architecture (auth, RBAC, OTP/CAPTCHA, Redis, Celery, LangChain,
+> admin config, Docker, tests):** see **[docs/SYSTEM.md](docs/SYSTEM.md)**.
+> Run the test suite with `bash scripts/test.sh`. Default admin: `admin` / `admin`.
+
 ## What's new in v2
 
 1. **Multiple files per month (weekly / 15-day timesheets).** Some clients send

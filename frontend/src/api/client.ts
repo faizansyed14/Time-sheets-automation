@@ -3,6 +3,60 @@ import axios from "axios";
 export const api = axios.create({ baseURL: "/api/v1" });
 
 // ---------------------------------------------------------------------------
+// Auth token + device fingerprint
+// ---------------------------------------------------------------------------
+const TOKEN_KEY = "ts_token";
+const FP_KEY = "ts_fp";
+
+export function getToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+export function setToken(token: string | null) {
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+  else localStorage.removeItem(TOKEN_KEY);
+}
+export function deviceFingerprint(): string {
+  let fp = localStorage.getItem(FP_KEY);
+  if (!fp) {
+    fp = (crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)) + "-" + (navigator.language || "");
+    localStorage.setItem(FP_KEY, fp);
+  }
+  return fp;
+}
+
+/** Append the access token as a query param. Used for URLs the BROWSER loads
+ *  directly (PDF/image previews, file downloads) where headers can't be set. */
+export function withAuthParam(url: string): string {
+  const t = getToken();
+  if (!t) return url;
+  return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(t);
+}
+
+// Attach the bearer token + fingerprint to every request.
+api.interceptors.request.use((config) => {
+  const token = getToken();
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  config.headers["X-Fingerprint"] = deviceFingerprint();
+  return config;
+});
+
+// On 401 (expired/invalid session) drop the token and bounce to /login.
+let onUnauthorized: (() => void) | null = null;
+export function setUnauthorizedHandler(fn: () => void) {
+  onUnauthorized = fn;
+}
+api.interceptors.response.use(
+  (r) => r,
+  (error) => {
+    if (error?.response?.status === 401 && getToken()) {
+      setToken(null);
+      onUnauthorized?.();
+    }
+    return Promise.reject(error);
+  }
+);
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 export interface EmailListItem {
@@ -190,7 +244,7 @@ export const restoreEmail = (id: string) => api.post(`/inbox/${id}/restore`).the
 export const rerunExtraction = (id: string) => api.post(`/inbox/${id}/rerun`).then((r) => r.data);
 
 export const attachmentUrl = (msgId: string, attId: string) =>
-  `/api/v1/inbox/${msgId}/attachments/${encodeURIComponent(attId)}`;
+  withAuthParam(`/api/v1/inbox/${msgId}/attachments/${encodeURIComponent(attId)}`);
 
 // ---------------------------------------------------------------------------
 // Dashboard / employees
@@ -331,9 +385,9 @@ export const listFileItems = (manager: string, emp: string, month: string) =>
     .then((r) => r.data);
 
 export const fileContentUrl = (relPath: string) =>
-  `/api/v1/files/content?rel_path=${encodeURIComponent(relPath)}`;
+  withAuthParam(`/api/v1/files/content?rel_path=${encodeURIComponent(relPath)}`);
 export const downloadZipUrl = (manager?: string) =>
-  `/api/v1/files/download-zip${manager ? `?manager=${encodeURIComponent(manager)}` : ""}`;
+  withAuthParam(`/api/v1/files/download-zip${manager ? `?manager=${encodeURIComponent(manager)}` : ""}`);
 
 export const createFileManager = (name: string) =>
   api.post("/files/managers", { name }).then((r) => r.data);
@@ -431,3 +485,87 @@ export const fetchHealth = () => axios.get<Health>("/health").then((r) => r.data
 export const MONTHS = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 export const MONTHS_LONG = ["", "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December"];
+
+// ===========================================================================
+// Auth
+// ===========================================================================
+export type AuthRole = "admin" | "user";
+export type AuthModeT = "otp" | "captcha";
+
+export interface AuthUser {
+  id: string;
+  username: string;
+  email: string | null;
+  role: AuthRole;
+  auth_mode: AuthModeT;
+  is_active: boolean;
+  last_login_at: string | null;
+}
+
+export interface LoginResult {
+  status: "authenticated" | "otp_required" | "captcha_required";
+  access_token?: string | null;
+  login_token?: string | null;
+  captcha_id?: string | null;
+  user?: AuthUser | null;
+  message?: string | null;
+  debug_otp?: string | null;
+}
+export interface TokenResult {
+  status: string;
+  access_token: string;
+  user: AuthUser;
+}
+
+const fp = () => deviceFingerprint();
+
+export const authLogin = (username: string, password: string) =>
+  api.post<LoginResult>("/auth/login", { username, password, fingerprint: fp() }).then((r) => r.data);
+
+export const authVerifyOtp = (login_token: string, code: string) =>
+  api.post<TokenResult>("/auth/verify-otp", { login_token, code, fingerprint: fp() }).then((r) => r.data);
+
+export const authResendOtp = (login_token: string) =>
+  api.post<LoginResult>("/auth/resend-otp", { login_token, fingerprint: fp() }).then((r) => r.data);
+
+export const authVerifyCaptcha = (login_token: string, captcha_id: string, answer: string) =>
+  api.post<TokenResult>("/auth/verify-captcha", { login_token, captcha_id, answer, fingerprint: fp() }).then((r) => r.data);
+
+export const authMe = () => api.get<AuthUser>("/auth/me").then((r) => r.data);
+export const authLogout = () => api.post("/auth/logout").then((r) => r.data);
+export const captchaUrl = () => `/api/v1/auth/captcha?t=${Date.now()}`;
+
+// ===========================================================================
+// Admin — users
+// ===========================================================================
+export const adminListUsers = () => api.get<AuthUser[]>("/admin/users").then((r) => r.data);
+export const adminCreateUser = (body: {
+  username: string; password: string; email?: string | null; role: AuthRole; auth_mode: AuthModeT;
+}) => api.post<AuthUser>("/admin/users", body).then((r) => r.data);
+export const adminUpdateUser = (id: string, body: Partial<{
+  email: string | null; role: AuthRole; auth_mode: AuthModeT; is_active: boolean; password: string;
+}>) => api.patch<AuthUser>(`/admin/users/${id}`, body).then((r) => r.data);
+export const adminSwitchAuthMode = (id: string, mode: AuthModeT) =>
+  api.post<AuthUser>(`/admin/users/${id}/auth-mode`, null, { params: { mode } }).then((r) => r.data);
+export const adminDeleteUser = (id: string) => api.delete(`/admin/users/${id}`).then((r) => r.data);
+
+// ===========================================================================
+// Admin — config
+// ===========================================================================
+export interface ConfigItem {
+  key: string;
+  value: unknown;
+  category: "provider" | "model" | "prompt" | "general";
+  is_secret: boolean;
+}
+export interface ProviderTestResult {
+  ok: boolean; provider: string; model: string;
+  latency_ms?: number | null; reply?: string | null; error?: string | null;
+}
+export const adminGetConfig = () => api.get<ConfigItem[]>("/admin/config").then((r) => r.data);
+export const adminUpdateConfig = (values: Record<string, unknown>) =>
+  api.put<ConfigItem[]>("/admin/config", { values }).then((r) => r.data);
+export const adminTestConfig = (provider?: string, prompt?: string) =>
+  api.post<ProviderTestResult>("/admin/config/test", { provider, prompt: prompt || "Reply with the single word: OK" }).then((r) => r.data);
+export const adminPromptDefaults = () =>
+  api.get<Record<string, string>>("/admin/config/prompts/defaults").then((r) => r.data);

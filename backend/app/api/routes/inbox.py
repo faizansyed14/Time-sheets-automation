@@ -4,9 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.email_message import EmailMessage, EmailStatus
 from app.models.timesheet_record import TimesheetRecord
@@ -60,6 +61,15 @@ async def _sync_message(db: AsyncSession, msg) -> EmailMessage:
     return row
 
 
+async def _purge_mock_inbox(db: AsyncSession) -> None:
+    """Drop demo rows (MSG-*) cached while EMAIL_PROVIDER was mock."""
+    if settings.email_provider != "graph":
+        return
+    await db.execute(
+        delete(EmailMessage).where(EmailMessage.provider_message_id.like("MSG-%"))
+    )
+
+
 def _to_list_item(row: EmailMessage) -> EmailListItem:
     return EmailListItem(
         id=row.id,
@@ -89,8 +99,13 @@ async def list_inbox(
     # from the DB. (Sync runs once per request; only on the first page to keep
     # scrolling cheap.)
     if offset == 0:
-        for m in await provider.list_messages(None):
+        try:
+            messages = await provider.list_messages(None)
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        for m in messages:
             await _sync_message(db, m)
+        await _purge_mock_inbox(db)
         await db.commit()
 
     base = select(EmailMessage)

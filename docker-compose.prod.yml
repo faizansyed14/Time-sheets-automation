@@ -1,0 +1,87 @@
+# PRODUCTION stack: Postgres + Redis + uvicorn (4 workers) + Celery worker
+# (concurrency 4) + nginx-served frontend (also reverse-proxies the API).
+# Same services as dev — just more workers and larger resource limits.
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+# or: bash scripts/prod/start.sh        (see commands/prod.txt for all commands)
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-timesheet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-timesheet}
+      POSTGRES_DB: ${POSTGRES_DB:-timesheet}
+    volumes: [pg_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-timesheet}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "2.00", memory: 2048M }
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 512M }
+
+  backend:
+    build: { context: ./backend }
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+    env_file: [.env]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CELERY_TASK_ALWAYS_EAGER: "false"
+    volumes:
+      - backend_storage:/app/storage
+    expose: ["8000"]
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "4.00", memory: 4096M }
+
+  worker:
+    build: { context: ./backend }
+    command: celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=4
+    env_file: [.env]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CELERY_TASK_ALWAYS_EAGER: "false"
+    volumes:
+      - backend_storage:/app/storage
+    restart: unless-stopped
+    depends_on:
+      redis: { condition: service_healthy }
+      db: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "2.00", memory: 2048M }
+
+  frontend:
+    build: { context: ./frontend, target: prod }
+    ports: ["80:80"]
+    restart: unless-stopped
+    depends_on: [backend]
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 256M }
+
+volumes:
+  pg_data:
+  redis_data:
+  backend_storage:

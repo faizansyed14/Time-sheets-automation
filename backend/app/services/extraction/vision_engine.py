@@ -58,8 +58,8 @@ class VisionExtractionEngine(ExtractionEngine):
         doc_text = fp.extract_document_text(ftype, data)
         raw = await vision_client.extract_timesheet(
             images_jpeg=images,
-            prompt=parser.EXTRACTION_PROMPT,
-            system_prompt=parser.SYSTEM_PROMPT,
+            prompt=parser.get_prompt("extraction"),
+            system_prompt=parser.get_prompt("system"),
             model=model,
             image_detail=settings.vision_image_detail,
             file_bytes=data, file_type=ftype, filename=filename,

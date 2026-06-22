@@ -164,6 +164,25 @@ def build_text_extraction_prompt(document_text: str) -> str:
     return TEXT_EXTRACTION_PROMPT.replace("{document_text}", doc)
 
 
+# Admin-editable prompt overrides (populated by config_service at startup / on
+# save). Empty means "use the built-in default below".
+_PROMPT_OVERRIDES: dict[str, str | None] = {"system": None, "extraction": None, "summary": None}
+
+
+def set_prompt_overrides(overrides: dict) -> None:
+    for k in ("system", "extraction", "summary"):
+        if k in overrides:
+            _PROMPT_OVERRIDES[k] = (overrides[k] or None)
+
+
+def get_prompt(name: str) -> str:
+    """Return the admin override if set, else the built-in prompt."""
+    override = _PROMPT_OVERRIDES.get(name)
+    if override:
+        return override
+    return {"system": SYSTEM_PROMPT, "extraction": EXTRACTION_PROMPT, "summary": SUMMARY_PROMPT}[name]
+
+
 # ---------------------------------------------------------------------------
 # Review summary — turns the structured extraction + validation issues into a
 # short, plain-English note an HR reviewer can read at a glance. This is the
@@ -227,7 +246,7 @@ def build_summary_prompt(context: dict) -> str:
             sample_lines.append(f"- {label}: {sample}")
     issues = context.get("issues") or []
     issues_block = "none" if not issues else "\n".join(f"- {i}" for i in issues)
-    return SUMMARY_PROMPT.format(
+    return get_prompt("summary").format(
         employee=context.get("employee") or "Unknown employee",
         period=f"{mname} {year}".strip(),
         n_files=context.get("n_files") or 1,

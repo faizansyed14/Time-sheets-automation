@@ -21,6 +21,8 @@ class Settings(BaseSettings):
 
     app_name: str = "Timesheet Intelligence Portal"
     api_prefix: str = "/api/v1"
+    # Deployment environment: "dev" | "prod". Loaded from .env / .env.<env>.
+    environment: str = "dev"
 
     # SQLite by default so the app runs with zero external services.
     # For production swap to Postgres, e.g.
@@ -66,12 +68,70 @@ class Settings(BaseSettings):
     # CORS for the Vite dev server.
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
-    # ----- Microsoft Graph (only used when email_provider="graph") -----
+    # ----- Microsoft Graph (email_provider="graph" + OTP delivery) -----
     graph_tenant_id: str = ""
     graph_client_id: str = ""
     graph_client_secret: str = ""
     graph_mailbox: str = ""          # e.g. timesheets@yourcompany.com
     graph_folder: str = "Inbox"      # folder to watch
+    graph_otp_sender: str = ""       # mailbox OTP emails are sent FROM (defaults to graph_mailbox)
+
+    # ===================== Infrastructure =====================
+    # Redis — caching + Celery broker/result backend + rate-limit windows.
+    # If unreachable the app transparently falls back to an in-process cache.
+    redis_url: str = "redis://localhost:6379/0"
+    cache_enabled: bool = True
+    cache_ttl_seconds: int = 300
+
+    # Celery — background work (OTP email, async ingestion). In dev/tests with
+    # CELERY_TASK_ALWAYS_EAGER=true tasks run inline so no worker is required.
+    celery_broker_url: str = ""      # defaults to redis_url
+    celery_result_backend: str = ""  # defaults to redis_url
+    celery_task_always_eager: bool = True
+
+    # ===================== Auth / Security =====================
+    auth_enabled: bool = True
+    jwt_secret: str = "change-me-in-prod-please-use-a-long-random-string"
+    jwt_algorithm: str = "HS256"
+    access_token_ttl_minutes: int = 60 * 8        # session length
+    login_token_ttl_minutes: int = 10             # short-lived "password ok, awaiting 2FA" token
+
+    # Default admin (seeded on first boot). Override in .env for production.
+    default_admin_username: str = "admin"
+    default_admin_password: str = "admin"
+    default_admin_email: str = "admin@example.com"
+
+    # OTP lifecycle
+    otp_length: int = 6
+    otp_ttl_seconds: int = 300                    # expiry
+    otp_max_attempts: int = 5                     # wrong-code attempts before lockout
+    otp_resend_limit: int = 3                     # resends allowed within a login session
+    otp_resend_cooldown_seconds: int = 30
+
+    # Rate limiting (sliding-window, per identifier+route)
+    login_rate_max: int = 10                      # attempts
+    login_rate_window_seconds: int = 300          # per 5 min
+    otp_verify_rate_max: int = 20
+    otp_verify_rate_window_seconds: int = 300
+
+    # CAPTCHA
+    captcha_length: int = 6
+    captcha_ttl_seconds: int = 180
+
+    # Device fingerprint must stay consistent through a login flow
+    fingerprint_required: bool = True
+
+    @property
+    def is_prod(self) -> bool:
+        return self.environment.lower().startswith("prod")
+
+    @property
+    def broker_url(self) -> str:
+        return self.celery_broker_url or self.redis_url
+
+    @property
+    def result_backend(self) -> str:
+        return self.celery_result_backend or self.redis_url
 
     @property
     def storage_path(self) -> Path:
