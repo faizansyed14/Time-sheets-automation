@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
 from app.schemas import Page, PipelineFileOut, PipelineResolveAssignIn, PipelineResolveIn, PipelineStats
-from app.services.ingestion import can_resolve_assign, resolve_pipeline_with_employee, retry_pipeline_file
+from app.services.pipeline.ingestion import can_resolve_assign, resolve_pipeline_with_employee, retry_pipeline_file
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 

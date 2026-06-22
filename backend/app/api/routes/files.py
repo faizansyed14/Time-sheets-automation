@@ -7,11 +7,11 @@ STORAGE_PROVIDER=onedrive.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel
 
 from app.services import storage_provider as sp
-from app.services.archive_export import build_zip
+from app.services.storage_provider.archive import build_zip
 
 router = APIRouter(prefix="/files", tags=["files"])
 

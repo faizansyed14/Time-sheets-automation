@@ -121,8 +121,8 @@ export default function Login() {
           <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-violet-600 shadow-lg">
             <Zap className="h-6 w-6 text-white" />
           </div>
-          <h1 className="text-xl font-bold text-white">TimeSheets</h1>
-          <p className="text-xs text-slate-400">Intelligence Portal</p>
+          <h1 className="text-xl font-bold text-white">TimeSight</h1>
+          <p className="text-xs text-slate-400">Timesheet Intelligence Portal</p>
         </div>
 
         <div className="rounded-2xl bg-white p-6 shadow-pop">

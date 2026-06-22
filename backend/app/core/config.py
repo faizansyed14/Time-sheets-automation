@@ -24,25 +24,40 @@ class Settings(BaseSettings):
     # Deployment environment: "dev" | "prod". Loaded from .env / .env.<env>.
     environment: str = "dev"
 
-    # SQLite by default so the app runs with zero external services.
-    # For production swap to Postgres, e.g.
-    #   postgresql+asyncpg://user:pass@host:5432/timesheets
-    database_url: str = f"sqlite+aiosqlite:///{BACKEND_ROOT / 'data' / 'app.db'}"
+    # ===================== Database (PostgreSQL only) =====================
+    # Every environment uses Postgres. For AWS RDS just point this at the RDS
+    # endpoint — no code changes:
+    #   postgresql+asyncpg://USER:PASS@my-db.xxxx.rds.amazonaws.com:5432/timesheet
+    database_url: str = "postgresql+asyncpg://timesheet:timesheet@localhost:5432/timesheet"
+    db_pool_size: int = 5
+    db_max_overflow: int = 10
+    # Use NullPool (a fresh connection per operation). Enabled in the test suite
+    # so asyncpg connections never cross pytest-asyncio's per-test event loops.
+    db_nullpool: bool = False
 
-    # Where pulled timesheets + LLM results are filed on disk.
-    # Structure:  storage/<employee_name>/<Month-Year>/<files>
+    # Where pulled timesheets + LLM results are filed.
+    # local: storage/<Manager>/<Employee>/<Month-Year>/<files>
     storage_root: str = str(BACKEND_ROOT / "storage")
 
     # Where the pipeline keeps a private copy of each original file so a failed
     # file can be retried. This lives OUTSIDE storage_root so it never shows up
-    # in the File Vault browser.
+    # in the File Vault browser. (Local-disk providers only.)
     pipeline_raw_root: str = str(BACKEND_ROOT / "data" / "pipeline_raw")
 
     # Which email provider to use: "mock" now, "graph" later.
     email_provider: str = "mock"
 
-    # Which file store to use: "local" now, "onedrive" later.
+    # Which file store to use: "local" | "s3" | "onedrive".
+    # Switch to AWS S3 by setting STORAGE_PROVIDER=s3 + the S3_* values below.
     storage_provider: str = "local"
+
+    # ----- AWS S3 storage (storage_provider="s3") -----
+    s3_bucket: str = ""
+    s3_prefix: str = "timesheets"            # key prefix (acts as the root folder)
+    s3_region: str = "us-east-1"
+    aws_access_key_id: str | None = None     # omit on EC2/ECS to use the IAM role
+    aws_secret_access_key: str | None = None
+    s3_endpoint_url: str | None = None       # for MinIO / S3-compatible stores
 
     # Which extraction engine to use: "mock" now, "vision" for your real LLM.
     extraction_engine: str = "mock"

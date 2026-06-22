@@ -1,13 +1,18 @@
 """
-Seed all_employee_data from the mock employee matcher list.
+Seed all_employee_data from the demo employee matcher list (mock_data.EMPLOYEE_MATCHER).
 
-Idempotent: running it twice won't create duplicates. Called on startup.
+Not run on startup — invoke manually:
+    python seed_employees.py
+    docker compose -f docker-compose.dev.yml exec backend python seed_employees.py
 """
 from __future__ import annotations
+
+import asyncio
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import SessionLocal
 from app.models.employee import Employee
 from app.seed.mock_data import EMPLOYEE_MATCHER
 
@@ -15,7 +20,6 @@ from app.seed.mock_data import EMPLOYEE_MATCHER
 async def seed_employee_matcher(db: AsyncSession) -> int:
     created = 0
     for employee_id, name, dco, manager, email, location in EMPLOYEE_MATCHER:
-        # Identity is (employee_id, name): AUH and DXB can share an ID.
         exists = (
             await db.execute(select(Employee).where(
                 Employee.employee_id == employee_id, Employee.name == name))
@@ -35,3 +39,13 @@ async def seed_employee_matcher(db: AsyncSession) -> int:
         created += 1
     await db.commit()
     return created
+
+
+async def main() -> None:
+    async with SessionLocal() as db:
+        created = await seed_employee_matcher(db)
+    print(f"Done — {created} demo employee(s) added (existing rows skipped).")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

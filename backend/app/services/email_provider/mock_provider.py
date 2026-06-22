@@ -7,7 +7,6 @@ will with Graph. No network, no credentials.
 """
 from __future__ import annotations
 
-import calendar
 import io
 
 from app.seed import mock_data

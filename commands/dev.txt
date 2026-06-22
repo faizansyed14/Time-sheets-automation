@@ -6,7 +6,6 @@
 ==========================================================================
 with start script
 ./scripts/dev/start.sh
-
 # ---- setup (once) ----
 cp .env.dev .env    # then edit .env
 

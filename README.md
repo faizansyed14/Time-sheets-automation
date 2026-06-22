@@ -48,7 +48,7 @@ validates it, matches the employee against your employee matcher list, and files
 per-employee / per-month folder. A dashboard rolls every employee up to a
 green (clear) / yellow (needs review) status.
 
-This build runs **end-to-end on mocks** out of the box (SQLite, mock mailbox, mock LLM),
+This build runs **end-to-end on mocks** out of the box (mock mailbox, mock LLM),
 and includes your **real prompts + vision client + file conversion** ported in, ready to
 activate with `EXTRACTION_ENGINE=vision`. Three clean seams swap mock → real:
 email (Graph), extraction (your LLM), and DB (Postgres).
@@ -73,8 +73,8 @@ email (Graph), extraction (your LLM), and DB (Postgres).
 |---|---|---|---|
 | Email | `EMAIL_PROVIDER` | `mock` | `graph` (Microsoft Graph) |
 | Extraction | `EXTRACTION_ENGINE` | `mock` | `vision` (your real LLM) |
-| File store | `STORAGE_PROVIDER` | `local` | `onedrive` (OneDrive/SharePoint) |
-| Database | `DATABASE_URL` | SQLite | Postgres |
+| File store | `STORAGE_PROVIDER` | `local` | `s3` (AWS S3) · `onedrive` |
+| Database | `DATABASE_URL` | PostgreSQL (local/Docker) | AWS RDS |
 
 **Deleting mock entirely:** set the three providers to their real values, then remove
 `app/seed/mock_data.py`, `app/services/email_provider/mock_provider.py`, and
@@ -85,15 +85,23 @@ and the factories only import a mock module when its provider is selected — so
 
 ## Quick start
 
+> **Easiest path is Docker** (`bash scripts/dev/start.sh`) — it brings up
+> PostgreSQL + Redis + the Celery worker + frontend. The manual steps below need
+> a reachable PostgreSQL (set `DATABASE_URL`, or `docker compose -f
+> docker-compose.dev.yml up -d db redis`).
+
 ### 1. Backend (terminal 1)
 ```bash
 cd backend
 python -m venv .venv && source .venv/bin/activate     # optional
 pip install -r requirements.txt
+# point at your Postgres (Docker db service, local, or AWS RDS):
+export DATABASE_URL=postgresql+asyncpg://timesheet:timesheet@localhost:5432/timesheet
 uvicorn app.main:app --reload --port 8000
 ```
 - API: http://localhost:8000
 - Interactive docs: http://localhost:8000/docs
+- Sign in with **admin / admin** (configurable in `.env`).
 
 ### 2. Frontend (terminal 2)
 ```bash
@@ -103,7 +111,7 @@ npm run dev
 ```
 - App: http://localhost:5173  (Vite proxies `/api/*` to the backend automatically)
 
-On first boot the backend creates a SQLite DB, seeds the mock employee matcher list
+On first boot the backend creates its PostgreSQL tables, seeds the mock employee matcher list
 (`all_employee_data`), and the inbox shows 6 mock emails.
 
 ### Try the flow
@@ -124,25 +132,20 @@ Mock emails are designed to exercise every path:
 
 ## Architecture
 
+Full architecture, project structure, auth/RBAC, Redis/Celery, LangChain, admin
+config, Docker dev/prod and DB/storage portability (AWS RDS / S3) are documented
+in **[docs/SYSTEM.md](docs/SYSTEM.md)**. High level:
+
 ```
-backend/
-  app/
-    core/         config + async DB (SQLite now, Postgres later)
-    models/       Employee (all_employee_data), EmailMessage, TimesheetRecord
-    schemas/      Pydantic response models
-    services/
-      email_provider/   base interface • mock_provider • graph_provider (stub)
-      extraction/       base interface • mock_engine • validation (real checks)
-      matching.py       employee match: exact id → exact name → fuzzy name
-      storage.py        files -> storage/<Employee>/<Month-Year>/
-      ingestion.py      the pipeline (runs on Accept)
-    api/routes/   inbox • timesheets • employees
-    seed/         mock_data (single source of truth) + employee matcher seeder
-frontend/
-  src/
-    api/client.ts        typed API calls
-    components/           Layout • RecordDetail • ui
-    pages/               Dashboard • Inbox • EmployeeMonth
+backend/app/
+  core/      config · database (PostgreSQL/asyncpg) · cache · celery_app · security · crypto
+  models/    auth_users · app_config · all_employee_data · email · timesheet · pipeline
+  api/       deps (RBAC) · routes/ (auth, admin, inbox, pipeline, employees, upload, files)
+  services/  auth/ · config/ · employee/ · extraction/ · llm/ · pipeline/ ·
+             storage_provider/{local,s3,onedrive} · tasks (Celery)
+  seed/  migrations/  tests/
+frontend/src/  api/client.ts · components/ · pages/ (Dashboard, Inbox, Upload,
+               Pipeline, Employees, Files, Record, Login, admin/{Settings,Users})
 ```
 
 ### The pipeline (on Accept or Upload)
@@ -214,7 +217,7 @@ docker compose -f docker-compose.postgres.yml up -d
 DATABASE_URL=postgresql+asyncpg://timesheet:timesheet@localhost:5432/timesheet_db
 # uncomment asyncpg in requirements.txt
 ```
-The schema uses JSON columns + string PKs, so it runs unchanged on SQLite or Postgres.
+The schema uses JSON columns + string PKs on PostgreSQL (asyncpg); point DATABASE_URL at AWS RDS to use a managed instance.
 For production use Alembic migrations instead of `create_all`.
 
 ### Other production notes

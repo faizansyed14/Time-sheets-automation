@@ -15,7 +15,6 @@ this seamlessly and additionally reads scanned/image timesheets.
 from __future__ import annotations
 
 import calendar
-import datetime as dt
 import re
 from collections import Counter
 

@@ -44,28 +44,11 @@ _DOC_TYPES = {
 _MIN_INLINE_BYTES = 6000  # skip tiny inline images (signatures/logos)
 
 _msal_app = None
-_SECRET_ID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
-
-
-def _validate_graph_credentials() -> None:
-    secret = (settings.graph_client_secret or "").strip()
-    if not secret:
-        raise RuntimeError("GRAPH_CLIENT_SECRET is not set.")
-    if _SECRET_ID_RE.match(secret):
-        raise RuntimeError(
-            "GRAPH_CLIENT_SECRET looks like a Secret ID (UUID), not the secret Value. "
-            "Azure Portal → App registrations → Certificates & secrets → create/copy "
-            "the Value column (shown once at creation), not the Secret ID."
-        )
 
 
 def _get_msal_app():
     global _msal_app
     if _msal_app is None:
-        _validate_graph_credentials()
         try:
             import msal
         except ImportError as e:
@@ -73,7 +56,7 @@ def _get_msal_app():
         _msal_app = msal.ConfidentialClientApplication(
             client_id=settings.graph_client_id,
             authority=f"https://login.microsoftonline.com/{settings.graph_tenant_id}",
-            client_credential=settings.graph_client_secret.strip(),
+            client_credential=settings.graph_client_secret,
         )
     return _msal_app
 
@@ -83,14 +66,9 @@ async def _token() -> str:
         app = _get_msal_app()
         res = app.acquire_token_for_client(scopes=_SCOPE)
         if "access_token" not in res:
-            err = res.get("error") or "unknown"
-            desc = res.get("error_description") or ""
-            if err == "invalid_client" and "7000215" in desc:
-                raise RuntimeError(
-                    "Invalid GRAPH_CLIENT_SECRET — use the secret Value from Azure "
-                    "(Certificates & secrets), not the Secret ID. If the secret expired, create a new one."
-                )
-            raise RuntimeError(f"Graph token error: {err} — {desc}")
+            raise RuntimeError(
+                f"Graph token error: {res.get('error')} — {res.get('error_description')}"
+            )
         return res["access_token"]
     return await asyncio.to_thread(_acquire)
 

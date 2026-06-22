@@ -68,7 +68,7 @@ class VisionExtractionEngine(ExtractionEngine):
         parsed = parser.parse_extraction(parser.extract_json_from_vllm_response(raw))
 
         # Drop hallucinated placeholder identities so they never reach matching.
-        from app.services.matching import _is_placeholder_name
+        from app.services.pipeline.matching import _is_placeholder_name
         emp_name = parsed.employee_full_name
         if emp_name and _is_placeholder_name(emp_name):
             emp_name = None

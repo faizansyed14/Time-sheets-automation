@@ -12,7 +12,11 @@ _UNASSIGNED = "Unassigned"
 
 @lru_cache
 def get_storage_provider() -> StorageProvider:
-    if settings.storage_provider == "onedrive":
+    provider = (settings.storage_provider or "local").lower()
+    if provider == "s3":
+        from app.services.storage_provider.s3_provider import S3StorageProvider
+        return S3StorageProvider()
+    if provider == "onedrive":
         from app.services.storage_provider.onedrive_provider import OneDriveStorageProvider
         return OneDriveStorageProvider()
     from app.services.storage_provider.local_provider import LocalStorageProvider

@@ -68,8 +68,12 @@ async def _extract_openai(images_jpeg, prompt, system_prompt, model, image_detai
     api_key = (settings.openai_api_key or "").strip()
     if not api_key or api_key.lower() == "change-me":
         raise RuntimeError("OPENAI_API_KEY is not set. Add it in .env.")
-    # Use the stable /v1/chat/completions path for all files. The aux_text 
-    # (authoritative text) already handles accuracy for docs/spreadsheets.
+    if file_type in {"pdf", "docx", "xlsx"} and file_bytes:
+        try:
+            return await _openai_by_file_id(file_bytes, filename or f"timesheet.{file_type}",
+                                            file_type, prompt, system_prompt, model, api_key)
+        except Exception:
+            pass  # fall back to images
     return await _openai_by_images(images_jpeg, prompt, system_prompt, model, image_detail, api_key)
 
 
