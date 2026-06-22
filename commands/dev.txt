@@ -1,0 +1,42 @@
+==========================================================================
+ DEVELOPMENT — Docker commands
+ Stack: Postgres + Redis + backend (1 reload worker) + Celery worker
+        (concurrency 1) + Vite frontend. Same as prod, fewer resources.
+ File:  docker-compose.dev.yml      Env: .env  (copy from .env.dev)
+==========================================================================
+with start script
+./scripts/dev/start.sh
+
+# ---- setup (once) ----
+cp .env.dev .env    # then edit .env
+
+# ---- start / stop (or use scripts/dev/start.sh | stop.sh) ----
+docker compose -f docker-compose.dev.yml --env-file .env up --build
+docker compose -f docker-compose.dev.yml --env-file .env up --build -d   # detached
+docker compose -f docker-compose.dev.yml down                                # stop
+docker compose -f docker-compose.dev.yml down --volumes                      # stop + wipe db/storage
+
+# ---- logs ----
+docker compose -f docker-compose.dev.yml logs -f
+docker compose -f docker-compose.dev.yml logs -f backend
+docker compose -f docker-compose.dev.yml logs -f worker
+
+# ---- status / restart a single service ----
+docker compose -f docker-compose.dev.yml ps
+docker compose -f docker-compose.dev.yml restart backend
+docker compose -f docker-compose.dev.yml build backend
+
+# ---- shells ----
+docker compose -f docker-compose.dev.yml exec backend bash
+docker compose -f docker-compose.dev.yml exec db psql -U timesheet -d timesheet
+
+# ---- run the test suite inside the backend container ----
+docker compose -f docker-compose.dev.yml exec backend python -m pytest
+
+# ---- one-off Celery worker (if you scale it down) ----
+docker compose -f docker-compose.dev.yml exec backend \
+  celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=1
+
+# ---- URLs ----
+# Frontend:  http://localhost:5173        Backend API: http://localhost:8000
+# API docs:  http://localhost:8000/docs   Login:       admin / admin

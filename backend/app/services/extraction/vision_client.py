@@ -14,6 +14,35 @@ import httpx
 from app.core.config import settings
 
 
+_AUX_TEXT_MAX = 24_000
+
+
+def _augment_prompt_with_text(prompt: str, aux_text: str | None) -> str:
+    """Append the document's machine-extracted text as an AUTHORITATIVE source.
+
+    For spreadsheets / .eml attachments the rendered image can be low quality
+    (e.g. no LibreOffice to render an .xlsx), which is exactly when a vision
+    model tends to hallucinate placeholder values. The exact cell text removes
+    that ambiguity, so we hand it to the model and tell it to trust it."""
+    txt = (aux_text or "").strip()
+    if not txt:
+        return prompt
+    if len(txt) > _AUX_TEXT_MAX:
+        txt = txt[:_AUX_TEXT_MAX] + "\n[... truncated ...]"
+    return (
+        prompt
+        + "\n\n═══════════════════════════════════════\n"
+        + "AUTHORITATIVE DOCUMENT TEXT (extracted directly from the file)\n"
+        + "═══════════════════════════════════════\n"
+        + "Trust this text over the image for the employee name, employee ID, "
+        + "month, year and every date. Use the image only for layout/column "
+        + "headers. If a value is not present here or in the image, leave it "
+        + "EMPTY — never output an example/placeholder.\n---\n"
+        + txt
+        + "\n---"
+    )
+
+
 async def extract_timesheet(
     images_jpeg: list[bytes],
     prompt: str,
@@ -23,7 +52,9 @@ async def extract_timesheet(
     file_bytes: bytes | None,
     file_type: str | None,
     filename: str | None,
+    aux_text: str | None = None,
 ) -> dict:
+    prompt = _augment_prompt_with_text(prompt, aux_text)
     m = (model or "").strip()
     is_gpt = m.startswith(("gpt-4", "gpt-5")) or m.lower() in {"gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-5.4"}
     if is_gpt:
@@ -37,12 +68,8 @@ async def _extract_openai(images_jpeg, prompt, system_prompt, model, image_detai
     api_key = (settings.openai_api_key or "").strip()
     if not api_key or api_key.lower() == "change-me":
         raise RuntimeError("OPENAI_API_KEY is not set. Add it in .env.")
-    if file_type in {"pdf", "docx", "xlsx"} and file_bytes:
-        try:
-            return await _openai_by_file_id(file_bytes, filename or f"timesheet.{file_type}",
-                                            file_type, prompt, system_prompt, model, api_key)
-        except Exception:
-            pass  # fall back to images
+    # Use the stable /v1/chat/completions path for all files. The aux_text 
+    # (authoritative text) already handles accuracy for docs/spreadsheets.
     return await _openai_by_images(images_jpeg, prompt, system_prompt, model, image_detail, api_key)
 
 

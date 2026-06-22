@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
   CheckCircle2,
@@ -32,6 +32,8 @@ import { cn, formatBytes, formatDateTime } from "../lib/utils";
 import { Button, Card, EmptyState, Modal, PageHeader, Select, Skeleton } from "../components/ui";
 import { FailureChip, PipelineStatusBadge, StageTimeline } from "../components/status";
 import { useToast } from "../components/toast";
+import { useDebounced, useSentinel } from "../lib/useInfinite";
+import { Spinner } from "../components/ui";
 
 type Filter = "" | "failed" | "needs_review" | "success" | "resolved" | "processing";
 
@@ -86,16 +88,27 @@ export default function PipelinePage() {
     queryFn: fetchPipelineStats,
     refetchInterval: 15_000,
   });
-  const { data: files, isLoading } = useQuery({
-    queryKey: ["pipeline", statusFilter, codeFilter, sourceFilter],
-    queryFn: () =>
+  const dq = useDebounced(q, 350);
+  const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
+    queryKey: ["pipeline", statusFilter, codeFilter, sourceFilter, dq],
+    queryFn: ({ pageParam }) =>
       fetchPipeline({
         status: statusFilter || undefined,
         failure_code: codeFilter || undefined,
         source_kind: sourceFilter || undefined,
+        q: dq || undefined,
+        offset: pageParam as number,
       }),
+    initialPageParam: 0,
+    getNextPageParam: (last) => (last.has_more ? last.offset + last.items.length : undefined),
     refetchInterval: 15_000,
   });
+  const items = data?.pages.flatMap((p) => p.items) ?? [];
+  const total = data?.pages[0]?.total ?? 0;
+  const sentinelRef = useSentinel(
+    () => hasNextPage && !isFetchingNextPage && fetchNextPage(),
+    !!hasNextPage
+  );
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["pipeline"] });
@@ -160,18 +173,6 @@ export default function PipelinePage() {
       invalidate();
     },
   });
-
-  const visible = useMemo(
-    () =>
-      (files ?? []).filter(
-        (f) =>
-          !q ||
-          f.filename.toLowerCase().includes(q.toLowerCase()) ||
-          (f.employee_name ?? "").toLowerCase().includes(q.toLowerCase()) ||
-          (f.employee_id ?? "").toLowerCase().includes(q.toLowerCase())
-      ),
-    [files, q]
-  );
 
   const failureCodes = Object.entries(stats?.by_failure_code ?? {});
 
@@ -263,7 +264,7 @@ export default function PipelinePage() {
             <option value="upload">Upload</option>
           </Select>
           <p className="ml-auto text-xs text-slate-400">
-            {visible.length} file{visible.length !== 1 && "s"}
+            {items.length} of {total} file{total !== 1 && "s"}
           </p>
         </div>
 
@@ -273,7 +274,7 @@ export default function PipelinePage() {
             <Skeleton className="h-12" />
             <Skeleton className="h-12" />
           </div>
-        ) : visible.length === 0 ? (
+        ) : items.length === 0 ? (
           <EmptyState
             icon={<Activity className="h-6 w-6" />}
             title="Nothing here"
@@ -281,7 +282,7 @@ export default function PipelinePage() {
           />
         ) : (
           <div className="divide-y divide-slate-100">
-            {visible.map((f) => {
+            {items.map((f) => {
               const expanded = open === f.id;
               return (
                 <div key={f.id}>
@@ -392,6 +393,12 @@ export default function PipelinePage() {
                 </div>
               );
             })}
+            <div ref={sentinelRef} />
+            {isFetchingNextPage && (
+              <div className="flex items-center justify-center gap-2 py-4 text-xs text-slate-400">
+                <Spinner className="h-4 w-4" /> Loading more…
+              </div>
+            )}
           </div>
         )}
       </Card>

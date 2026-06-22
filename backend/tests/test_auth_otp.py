@@ -1,0 +1,121 @@
+"""End-to-end auth: admin bypass, OTP lifecycle, RBAC, rate limits."""
+import pytest
+
+from tests.conftest import auth_headers
+
+
+async def _make_user(client, admin_token, username="alice", mode="otp", email="alice@example.com", pw="Password123"):
+    r = await client.post("/api/v1/admin/users", headers=auth_headers(admin_token),
+                          json={"username": username, "password": pw, "email": email,
+                                "role": "user", "auth_mode": mode})
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+async def test_admin_bypasses_otp(client):
+    r = await client.post("/api/v1/auth/login", json={"username": "admin", "password": "admin"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "authenticated"
+    assert body["access_token"]
+    assert body["user"]["role"] == "admin"
+
+
+async def test_wrong_password_rejected(client):
+    r = await client.post("/api/v1/auth/login", json={"username": "admin", "password": "nope"})
+    assert r.status_code == 401
+
+
+async def test_otp_full_lifecycle(client, admin_token):
+    await _make_user(client, admin_token, username="otpuser", mode="otp")
+    # step 1: password -> otp_required + debug code (dev only)
+    r = await client.post("/api/v1/auth/login", json={"username": "otpuser", "password": "Password123"})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["status"] == "otp_required"
+    assert data["login_token"]
+    code = data["debug_otp"]
+    assert code and len(code) == 6
+
+    # wrong code -> 401 with attempts remaining
+    bad = await client.post("/api/v1/auth/verify-otp",
+                            json={"login_token": data["login_token"], "code": "000000"})
+    assert bad.status_code == 401
+
+    # correct code -> access token
+    ok = await client.post("/api/v1/auth/verify-otp",
+                           json={"login_token": data["login_token"], "code": code})
+    assert ok.status_code == 200, ok.text
+    token = ok.json()["access_token"]
+
+    # the access token works on a protected route
+    me = await client.get("/api/v1/auth/me", headers=auth_headers(token))
+    assert me.status_code == 200
+    assert me.json()["username"] == "otpuser"
+
+
+async def test_otp_single_use(client, admin_token):
+    await _make_user(client, admin_token, username="otponce", email="o@e.com")
+    r = (await client.post("/api/v1/auth/login", json={"username": "otponce", "password": "Password123"})).json()
+    code = r["debug_otp"]
+    first = await client.post("/api/v1/auth/verify-otp", json={"login_token": r["login_token"], "code": code})
+    assert first.status_code == 200
+    # reusing the same code/flow fails (consumed)
+    second = await client.post("/api/v1/auth/verify-otp", json={"login_token": r["login_token"], "code": code})
+    assert second.status_code == 401
+
+
+async def test_otp_resend_gives_new_code(client, admin_token):
+    await _make_user(client, admin_token, username="resend", email="r@e.com")
+    r = (await client.post("/api/v1/auth/login", json={"username": "resend", "password": "Password123"})).json()
+    old = r["debug_otp"]
+    rs = await client.post("/api/v1/auth/resend-otp", json={"login_token": r["login_token"]})
+    assert rs.status_code == 200, rs.text
+    new = rs.json()["debug_otp"]
+    assert new and new != old
+    # old code no longer valid, new code works
+    assert (await client.post("/api/v1/auth/verify-otp",
+            json={"login_token": r["login_token"], "code": old})).status_code == 401
+    assert (await client.post("/api/v1/auth/verify-otp",
+            json={"login_token": r["login_token"], "code": new})).status_code == 200
+
+
+async def test_fingerprint_mismatch_blocks_verify(client, admin_token):
+    await _make_user(client, admin_token, username="fp", email="fp@e.com")
+    r = (await client.post("/api/v1/auth/login", json={"username": "fp", "password": "Password123"})).json()
+    # verify with a different fingerprint header
+    bad = await client.post("/api/v1/auth/verify-otp",
+                            headers={"X-Fingerprint": "different"},
+                            json={"login_token": r["login_token"], "code": r["debug_otp"]})
+    assert bad.status_code == 401
+
+
+async def test_protected_routes_require_auth(client):
+    # no token
+    assert (await client.get("/api/v1/pipeline")).status_code == 401
+    # admin route forbidden for non-admin
+    # (build a normal user token)
+    r = await client.post("/api/v1/auth/login", json={"username": "admin", "password": "admin"})
+    admin_token = r.json()["access_token"]
+    await _make_user(client, admin_token, username="plainuser", email="p@e.com")
+    login = (await client.post("/api/v1/auth/login", json={"username": "plainuser", "password": "Password123"})).json()
+    verify = await client.post("/api/v1/auth/verify-otp",
+                               json={"login_token": login["login_token"], "code": login["debug_otp"]})
+    user_token = verify.json()["access_token"]
+    forbidden = await client.get("/api/v1/admin/users", headers=auth_headers(user_token))
+    assert forbidden.status_code == 403
+
+
+async def test_login_rate_limit(client, admin_token):
+    from app.core.config import settings
+    await _make_user(client, admin_token, username="brute", email="b@e.com")
+    original = settings.login_rate_max
+    settings.login_rate_max = 5  # tighten just for this test
+    try:
+        statuses = []
+        for _ in range(9):
+            rr = await client.post("/api/v1/auth/login", json={"username": "brute", "password": "wrong"})
+            statuses.append(rr.status_code)
+        assert 429 in statuses, statuses
+    finally:
+        settings.login_rate_max = original

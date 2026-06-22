@@ -8,12 +8,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
-from app.schemas import PipelineFileOut, PipelineResolveAssignIn, PipelineResolveIn, PipelineStats
+from app.schemas import Page, PipelineFileOut, PipelineResolveAssignIn, PipelineResolveIn, PipelineStats
 from app.services.ingestion import can_resolve_assign, resolve_pipeline_with_employee, retry_pipeline_file
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
@@ -53,29 +53,39 @@ def _out(t: PipelineFile) -> PipelineFileOut:
     )
 
 
-@router.get("", response_model=list[PipelineFileOut])
+@router.get("", response_model=Page[PipelineFileOut])
 async def list_pipeline_files(
     status: str | None = Query(default=None, description="processing|success|needs_review|failed|resolved"),
     failure_code: str | None = Query(default=None),
     source_kind: str | None = Query(default=None, description="upload|email"),
-    q: str | None = Query(default=None, description="search filename / employee"),
-    limit: int = Query(default=200, le=1000),
+    q: str | None = Query(default=None, description="search filename / employee (whole table)"),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(PipelineFile)
+    """Paginated pipeline tracker. Filters + search run in SQL across the whole
+    table so scrolling/searching never misses rows beyond the current page."""
+    base = select(PipelineFile)
     if status:
-        stmt = stmt.where(PipelineFile.status == status)
+        base = base.where(PipelineFile.status == status)
     if failure_code:
-        stmt = stmt.where(PipelineFile.failure_code == failure_code)
+        base = base.where(PipelineFile.failure_code == failure_code)
     if source_kind:
-        stmt = stmt.where(PipelineFile.source_kind == source_kind)
-    rows = (await db.execute(stmt.order_by(PipelineFile.created_at.desc()).limit(limit))).scalars().all()
-    if q:
-        ql = q.lower().strip()
-        rows = [t for t in rows if ql in (t.filename or "").lower()
-                or ql in (t.employee_name or "").lower()
-                or ql in (t.employee_id or "").lower()]
-    return [_out(t) for t in rows]
+        base = base.where(PipelineFile.source_kind == source_kind)
+    if q and q.strip():
+        like = f"%{q.strip().lower()}%"
+        base = base.where(or_(
+            func.lower(PipelineFile.filename).like(like),
+            func.lower(PipelineFile.employee_name).like(like),
+            func.lower(PipelineFile.employee_id).like(like),
+        ))
+
+    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
+    rows = (await db.execute(
+        base.order_by(PipelineFile.created_at.desc()).limit(limit).offset(offset)
+    )).scalars().all()
+    return Page(items=[_out(t) for t in rows], total=total, limit=limit, offset=offset,
+                has_more=offset + len(rows) < total)
 
 
 @router.get("/stats", response_model=PipelineStats)

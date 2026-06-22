@@ -149,14 +149,9 @@ async def update_record(record_id: str, body: TimesheetUpdate, db: AsyncSession 
         "ingested_at": _dt2.now(_tz.utc).isoformat(),
         "buckets": cleaned,
     }]
-    if flags:
-        r.validation_status = ValidationStatus.MANUAL_REVIEW
-        r.llm_summary = "Needs review: " + " ".join(flags[:6])
-    else:
-        r.validation_status = ValidationStatus.VERIFIED
-        total = sum(len(v) for v in cleaned.values())
-        mname = _cal.month_name[r.month] if 1 <= r.month <= 12 else r.month
-        r.llm_summary = f"Edited & verified — {total} leave/holiday day(s) for {mname} {r.year}."
+    from app.services.extraction.validation import summarize as _summarize
+    r.validation_status = ValidationStatus.MANUAL_REVIEW if flags else ValidationStatus.VERIFIED
+    r.llm_summary = "Edited — " + _summarize(cleaned, flags, r.month, r.year)
     await db.commit()
     await db.refresh(r)
     return to_out(r)

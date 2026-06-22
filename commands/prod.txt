@@ -1,0 +1,41 @@
+==========================================================================
+ PRODUCTION — Docker commands
+ Stack: Postgres + Redis + backend (4 workers) + Celery worker
+        (concurrency 4) + nginx frontend (serves SPA + proxies API).
+ File:  docker-compose.prod.yml     Env: .env  (copy from .env.prod)
+ IMPORTANT: edit .env and replace every CHANGE_ME secret first.
+==========================================================================
+
+# ---- setup (once) ----
+cp .env.prod .env    # replace all CHANGE_ME values
+
+# ---- start / stop (or use scripts/prod/start.sh | stop.sh) ----
+docker compose -f docker-compose.prod.yml --env-file .env up --build -d
+docker compose -f docker-compose.prod.yml down                               # stop (keeps data)
+docker compose -f docker-compose.prod.yml down --volumes                     # stop + DROP DB (irreversible)
+
+# ---- logs ----
+docker compose -f docker-compose.prod.yml logs -f
+docker compose -f docker-compose.prod.yml logs -f backend worker
+
+# ---- status / scale the worker ----
+docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.prod.yml up -d --scale worker=3
+
+# ---- rebuild + rolling update after a code change ----
+docker compose -f docker-compose.prod.yml build
+docker compose -f docker-compose.prod.yml up -d
+
+# ---- shells / DB ----
+docker compose -f docker-compose.prod.yml exec backend bash
+docker compose -f docker-compose.prod.yml exec db psql -U timesheet -d timesheet
+
+# ---- database backup / restore ----
+docker compose -f docker-compose.prod.yml exec db \
+  pg_dump -U timesheet timesheet > backup_$(date +%F).sql
+cat backup.sql | docker compose -f docker-compose.prod.yml exec -T db \
+  psql -U timesheet -d timesheet
+
+# ---- health ----
+curl -fsS http://localhost/health        # via nginx -> backend
+# App: http://localhost      (nginx serves the SPA and proxies /api,/auth,/health)

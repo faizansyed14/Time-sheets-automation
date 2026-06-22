@@ -47,3 +47,12 @@ class ExtractionEngine(ABC):
         self, data: bytes, message_id: str, attachment_id: str,
     ) -> ApprovalExtraction:
         ...
+
+    async def summarize(self, context: dict) -> str | None:
+        """Optional: produce a polished plain-English review summary for a whole
+        month's record (after files are merged and validated). Return None to
+        let the pipeline fall back to the deterministic summarizer.
+
+        context = {employee, month, year, leaves: {bucket: [iso dates]},
+                   issues: [str], n_files: int}"""
+        return None

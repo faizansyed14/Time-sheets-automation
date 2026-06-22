@@ -41,8 +41,9 @@ def build_zip(manager: str | None = None) -> bytes:
 
 
 def _add_tree(zf: zipfile.ZipFile, directory: Path, base: Path) -> None:
-    """Recursively add all files under `directory` to the zip, paths relative to `base`."""
+    """Recursively add all files under `directory` to the zip, paths relative to `base`.
+    Internal folders (e.g. a legacy '_pipeline' raw-copy dir) are skipped."""
     for item in sorted(directory.rglob("*")):
-        if item.is_file():
+        if item.is_file() and not any(part.startswith(("_", ".")) for part in item.relative_to(base).parts[:-1]):
             arcname = str(item.relative_to(base))
             zf.write(item, arcname=arcname)

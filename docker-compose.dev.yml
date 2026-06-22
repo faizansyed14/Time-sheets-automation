@@ -1,0 +1,93 @@
+# DEVELOPMENT stack — structurally IDENTICAL to production (Postgres + Redis +
+# backend + Celery worker + auth + real task queue), only with fewer workers and
+# smaller resource limits, plus hot-reload + source mounts for fast iteration.
+#
+#   docker compose -f docker-compose.dev.yml --env-file .env up --build
+# or: bash scripts/dev/start.sh        (see commands/dev.txt for all commands)
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-timesheet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-timesheet}
+      POSTGRES_DB: ${POSTGRES_DB:-timesheet}
+    ports: ["5432:5432"]                # exposed in dev for psql/debugging
+    volumes: [pg_data_dev:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-timesheet}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 256M }
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M }
+
+  backend:
+    build: { context: ./backend }
+    # dev: single hot-reloading process (prod runs --workers 4)
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-timesheet}:${POSTGRES_PASSWORD:-timesheet}@db:5432/${POSTGRES_DB:-timesheet}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_TASK_ALWAYS_EAGER: "false"   # real queue, same as prod
+    volumes:
+      - ./backend:/app                    # hot reload
+      - backend_storage_dev:/app/storage
+    ports: ["8000:8000"]
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "1.00", memory: 1024M }
+
+  worker:
+    build: { context: ./backend }
+    # dev: concurrency 1 (prod runs 4)
+    command: celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=1
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-timesheet}:${POSTGRES_PASSWORD:-timesheet}@db:5432/${POSTGRES_DB:-timesheet}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_TASK_ALWAYS_EAGER: "false"
+    volumes:
+      - ./backend:/app
+      - backend_storage_dev:/app/storage
+    depends_on:
+      redis: { condition: service_healthy }
+      db: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 512M }
+
+  frontend:
+    build: { context: ./frontend, target: dev }
+    command: npm run dev -- --host 0.0.0.0
+    environment:
+      VITE_PROXY_TARGET: http://backend:8000   # reach the backend service
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports: ["5173:5173"]
+    depends_on: [backend]
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 512M }
+
+volumes:
+  pg_data_dev:
+  backend_storage_dev:

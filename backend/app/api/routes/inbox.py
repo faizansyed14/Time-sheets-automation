@@ -4,9 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.email_message import EmailMessage, EmailStatus
 from app.models.timesheet_record import TimesheetRecord
@@ -15,6 +16,7 @@ from app.schemas import (
     DecisionIn,
     EmailDetail,
     EmailListItem,
+    Page,
 )
 from app.services.email_provider import get_email_provider
 from app.services.ingestion import ingest_email
@@ -59,6 +61,15 @@ async def _sync_message(db: AsyncSession, msg) -> EmailMessage:
     return row
 
 
+async def _purge_mock_inbox(db: AsyncSession) -> None:
+    """Drop demo rows (MSG-*) cached while EMAIL_PROVIDER was mock."""
+    if settings.email_provider != "graph":
+        return
+    await db.execute(
+        delete(EmailMessage).where(EmailMessage.provider_message_id.like("MSG-%"))
+    )
+
+
 def _to_list_item(row: EmailMessage) -> EmailListItem:
     return EmailListItem(
         id=row.id,
@@ -73,25 +84,49 @@ def _to_list_item(row: EmailMessage) -> EmailListItem:
     )
 
 
-@router.get("", response_model=list[EmailListItem])
+@router.get("", response_model=Page[EmailListItem])
 async def list_inbox(
-    q: str | None = Query(default=None, description="search subject/sender/body"),
+    q: str | None = Query(default=None, description="search subject/sender/body (whole inbox)"),
     status: str | None = Query(default=None, description="new | archived | ingested"),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
+    """Paginated, server-side searched inbox. The search hits the whole table
+    (subject / sender / body) in SQL, not just the current page."""
     provider = get_email_provider()
-    messages = await provider.list_messages(q)
-    rows: list[EmailMessage] = []
-    for m in messages:
-        rows.append(await _sync_message(db, m))
-    await db.commit()
-    for r in rows:
-        await db.refresh(r)
-    items = [_to_list_item(r) for r in rows]
+    # Discover any new provider messages so the table is current, then page
+    # from the DB. (Sync runs once per request; only on the first page to keep
+    # scrolling cheap.)
+    if offset == 0:
+        try:
+            messages = await provider.list_messages(None)
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        for m in messages:
+            await _sync_message(db, m)
+        await _purge_mock_inbox(db)
+        await db.commit()
+
+    base = select(EmailMessage)
     if status:
-        items = [i for i in items if i.status == status]
-    items.sort(key=lambda i: (i.received_at or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
-    return items
+        base = base.where(EmailMessage.status == status)
+    if q and q.strip():
+        like = f"%{q.strip().lower()}%"
+        base = base.where(or_(
+            func.lower(EmailMessage.subject).like(like),
+            func.lower(EmailMessage.sender_name).like(like),
+            func.lower(EmailMessage.sender_email).like(like),
+            func.lower(EmailMessage.body_text).like(like),
+        ))
+
+    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
+    rows = (await db.execute(
+        base.order_by(EmailMessage.received_at.desc()).limit(limit).offset(offset)
+    )).scalars().all()
+    items = [_to_list_item(r) for r in rows]
+    return Page(items=items, total=total, limit=limit, offset=offset,
+                has_more=offset + len(items) < total)
 
 
 @router.get("/{provider_message_id}", response_model=EmailDetail)

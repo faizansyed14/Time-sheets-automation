@@ -1,3 +1,5 @@
+from app.models.app_config import AppConfig, ConfigCategory
+from app.models.auth import AuthMode, Role, User
 from app.models.email_message import EmailMessage, EmailStatus
 from app.models.employee import Employee
 from app.models.pipeline_file import (
@@ -23,4 +25,9 @@ __all__ = [
     "PipelineStatus",
     "PipelineStage",
     "FailureCode",
+    "User",
+    "Role",
+    "AuthMode",
+    "AppConfig",
+    "ConfigCategory",
 ]
