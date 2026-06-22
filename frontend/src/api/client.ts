@@ -249,9 +249,6 @@ export const attachmentUrl = (msgId: string, attId: string) =>
 // ---------------------------------------------------------------------------
 // Dashboard / employees
 // ---------------------------------------------------------------------------
-export const fetchDashboard = (year?: number) =>
-  api.get<DashboardRow[]>("/employees", { params: { year } }).then((r) => r.data);
-
 export const fetchCoverage = (params: {
   year?: number;
   month?: number;

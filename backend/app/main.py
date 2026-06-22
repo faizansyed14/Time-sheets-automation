@@ -40,18 +40,11 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     try:
-        from app.services.ingestion import relocate_legacy_pipeline_raw
+        from app.services.pipeline.ingestion import relocate_legacy_pipeline_raw
         relocate_legacy_pipeline_raw()
     except Exception:
         pass
     async with SessionLocal() as db:
-        # Demo employee list — only when running mock email (not Graph/production).
-        if settings.email_provider == "mock":
-            try:
-                from app.seed.seed_employee_matcher import seed_employee_matcher
-                await seed_employee_matcher(db)
-            except Exception:
-                pass
         # default admin + apply any saved AI config to the live process
         try:
             from app.seed.seed_admin import seed_admin
@@ -59,7 +52,7 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
         try:
-            from app.services.config_service import load_and_apply
+            from app.services.config.service import load_and_apply
             await load_and_apply(db)
         except Exception:
             pass

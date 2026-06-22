@@ -1,25 +1,30 @@
 """
 Shared test fixtures.
 
-Each test run gets an isolated SQLite DB + storage dir (via env), the app's
-tables created, the default admin seeded, and an httpx AsyncClient bound to the
-ASGI app. Celery runs eager and the cache uses its in-memory fallback, so no
-Redis/worker is needed.
+Tests run against PostgreSQL (the only supported database) — set
+TEST_DATABASE_URL or it defaults to a local `timesheet_test` DB. Tables are
+dropped + recreated at session start for isolation, the default admin is
+seeded, and an httpx AsyncClient is bound to the ASGI app. Celery runs eager and
+the cache uses its in-memory fallback, so no Redis/worker is needed.
 """
 from __future__ import annotations
 
 import os
 import tempfile
-import uuid
 
 import pytest
 import pytest_asyncio
 
 # ---- isolate every test session from the dev DB/storage BEFORE app import ----
 _TMP = tempfile.mkdtemp(prefix="ts_tests_")
+_TEST_DB = os.environ.get(
+    "TEST_DATABASE_URL",
+    "postgresql+asyncpg://timesheet:timesheet@localhost:5432/timesheet_test",
+)
 os.environ.update(
     ENVIRONMENT="dev",
-    DATABASE_URL=f"sqlite+aiosqlite:///{_TMP}/test_{uuid.uuid4().hex}.db",
+    DATABASE_URL=_TEST_DB,
+    DB_NULLPOOL="true",                    # fresh connection per op (asyncpg + per-test loops)
     STORAGE_ROOT=f"{_TMP}/storage",
     PIPELINE_RAW_ROOT=f"{_TMP}/pipeline_raw",
     AUTH_ENABLED="true",
@@ -47,6 +52,11 @@ from app.main import app  # noqa: E402
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
 async def _setup_db():
+    # clean slate: drop + recreate all tables on the test database
+    from app.core.database import Base, engine
+    import app.models  # noqa: F401  (register tables)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
     await init_db()
     from app.core.database import SessionLocal
     from app.seed.seed_admin import seed_admin

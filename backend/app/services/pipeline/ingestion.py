@@ -32,7 +32,6 @@ import calendar
 import json as _json
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,7 +41,7 @@ from app.models.email_message import EmailMessage, EmailStatus
 from app.models.employee import Employee
 from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
 from app.models.timesheet_record import ApprovalStatus, TimesheetRecord, ValidationStatus
-from app.services import matching
+from app.services.pipeline import matching
 from app.services import storage_provider as sp
 from app.services.email_provider import get_email_provider
 from app.services.extraction import get_extraction_engine
@@ -55,7 +54,7 @@ from app.services.extraction.file_processor import (
 )
 from app.services.extraction.validation import summarize as summarize_record
 from app.services.extraction.validation import validate
-from app.services.matching import MatchCode
+from app.services.pipeline.matching import MatchCode
 
 BUCKET_FIELDS = {
     "annual": "annual_leave_dates",

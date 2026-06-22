@@ -85,6 +85,6 @@ async def import_from_excel(
     if not file.filename or not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(400, "Only .xlsx files are accepted.")
     data = await file.read()
-    from app.services.employee_import import import_employees_from_bytes
+    from app.services.employee.import_service import import_employees_from_bytes
     summary = await import_employees_from_bytes(db, data)
     return summary

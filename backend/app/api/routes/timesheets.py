@@ -1,7 +1,6 @@
 """Timesheet record routes — detail view + manager Approve/Not-approve sign-off."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
@@ -90,7 +89,6 @@ async def update_record(record_id: str, body: TimesheetUpdate, db: AsyncSession 
     record auto-returns to 'verified', otherwise it stays 'manual_review'."""
     from app.services.extraction.validation import validate as _validate
     from app.models.timesheet_record import ValidationStatus
-    import calendar as _cal
 
     r = (await db.execute(select(TimesheetRecord).where(TimesheetRecord.id == record_id))).scalar_one_or_none()
     if not r:

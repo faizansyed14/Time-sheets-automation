@@ -54,7 +54,7 @@ def process_upload_task(filename: str, content_type: str, data_b64: str):
     import base64
 
     from app.core.database import SessionLocal
-    from app.services.ingestion import ingest_upload
+    from app.services.pipeline.ingestion import ingest_upload
 
     data = base64.b64decode(data_b64)
 

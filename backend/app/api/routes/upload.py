@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.schemas import UploadResult
-from app.services.ingestion import ingest_upload
+from app.services.pipeline.ingestion import ingest_upload
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 

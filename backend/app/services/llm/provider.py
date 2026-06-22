@@ -21,7 +21,7 @@ from functools import lru_cache
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.config_service import get_overlay
+from app.services.config.service import get_overlay
 
 # Per-provider defaults: (base_url_key, api_key_key, default_model)
 PROVIDERS = {
@@ -35,15 +35,10 @@ def _build_model(provider: str, model: str, base_url: str, api_key: str, tempera
     """Construct (and cache) a LangChain chat model for the given provider."""
     from langchain_openai import ChatOpenAI
 
-    # If base_url is the standard OpenAI one, we omit it so the library 
-    # uses its internal default (avoiding 404s from trailing slashes or /v1 mixups).
-    # We only pass it if it's a custom endpoint (like vLLM or DeepSeek).
-    actual_base = base_url if (base_url and "api.openai.com" not in base_url) else None
-
     return ChatOpenAI(
         model=model,
         api_key=api_key or "missing",
-        base_url=actual_base,
+        base_url=base_url or None,
         temperature=temperature,
         timeout=60,
         max_retries=1,

@@ -33,7 +33,7 @@ from app.schemas.auth import (
     ProviderTestResult,
     UserOut,
 )
-from app.services import config_service
+from app.services.config import service as config_service
 from app.services.llm import provider as llm_provider
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])

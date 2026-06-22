@@ -19,11 +19,11 @@ from __future__ import annotations
 import secrets
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import client_fingerprint, get_current_user
+from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.security import (
     create_access_token,
