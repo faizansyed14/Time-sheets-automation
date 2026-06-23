@@ -12,10 +12,10 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.deps import require_user
+from app.api.deps import require_write
 from app.api.routes import (
     admin,
     auth,
@@ -31,21 +31,31 @@ from app.core.config import settings
 from app.core.database import SessionLocal, init_db
 
 
+def _assert_prod_secrets() -> None:
+    """Fail closed in production if the JWT secret is weak/default (OWASP A02)."""
+    if not settings.is_prod:
+        return
+    weak = (not settings.jwt_secret
+            or len(settings.jwt_secret) < 32
+            or "change-me" in settings.jwt_secret.lower())
+    if weak:
+        raise RuntimeError(
+            "Refusing to start in prod with a weak JWT_SECRET. Set a long random "
+            "value, e.g. `python -c \"import secrets; print(secrets.token_urlsafe(48))\"`."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _assert_prod_secrets()
     # Schema management:
     #   - Docker / prod / AWS RDS: Alembic owns the schema. Set
     #     AUTO_CREATE_TABLES=false; `alembic upgrade head` runs before the app
     #     starts (see the compose `command` and scripts/db/migrate.sh).
     #   - Local quick-start / tests (AUTO_CREATE_TABLES=true, the default):
-    #     create any missing tables and apply the legacy idempotent patch.
+    #     create any missing tables from the models.
     if settings.auto_create_tables:
         await init_db()
-        try:
-            from app.migrations.upgrade_v2 import migrate
-            await migrate()
-        except Exception:
-            pass
     try:
         from app.services.pipeline.ingestion import relocate_legacy_pipeline_raw
         relocate_legacy_pipeline_raw()
@@ -70,20 +80,38 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=settings.cors_origins,         # explicit origins (never "*")
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Fingerprint"],
     expose_headers=["X-Captcha-Id"],
 )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Baseline OWASP security headers on every API response."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    response.headers.setdefault(
+        "Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    if settings.is_prod:
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+    return response
+
 
 # public
 app.include_router(auth.router, prefix=settings.api_prefix)
 # admin (admin role enforced inside the router)
 app.include_router(admin.router, prefix=settings.api_prefix)
 
-# business routes — require an authenticated user
-_protected = [Depends(require_user)]
+# business routes — authenticated; viewers may read but not mutate (require_write
+# allows safe methods for everyone and blocks writes for the read-only role).
+_protected = [Depends(require_write)]
 app.include_router(inbox.router, prefix=settings.api_prefix, dependencies=_protected)
 app.include_router(timesheets.router, prefix=settings.api_prefix, dependencies=_protected)
 app.include_router(employees.router, prefix=settings.api_prefix, dependencies=_protected)

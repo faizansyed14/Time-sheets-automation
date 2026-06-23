@@ -1,8 +1,10 @@
 """
 Seed the default admin from .env on first boot (idempotent).
 
-Username/password/email come from DEFAULT_ADMIN_* settings. The admin's role
-bypasses OTP. Change the credentials in .env for production.
+Username/password/email come from DEFAULT_ADMIN_* settings. The admin uses 2FA
+like every other role; the bootstrap admin defaults to **CAPTCHA** so the first
+login needs no email delivery (an admin can later switch itself to OTP from the
+Users page). Change all DEFAULT_ADMIN_* credentials in .env before going live.
 """
 from __future__ import annotations
 
@@ -24,7 +26,7 @@ async def seed_admin(db: AsyncSession) -> bool:
         email=settings.default_admin_email or None,
         password_hash=hash_password(settings.default_admin_password),
         role=Role.ADMIN,
-        auth_mode=AuthMode.OTP,  # ignored for admins (they bypass 2FA)
+        auth_mode=AuthMode.CAPTCHA,  # bootstrap admin uses CAPTCHA (no email needed)
     ))
     await db.commit()
     return True

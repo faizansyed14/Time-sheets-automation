@@ -134,7 +134,9 @@ Mock emails are designed to exercise every path:
 
 Full architecture, project structure, auth/RBAC, Redis/Celery, LangChain, admin
 config, Docker dev/prod and DB/storage portability (AWS RDS / S3) are documented
-in **[docs/SYSTEM.md](docs/SYSTEM.md)**. High level:
+in **[docs/SYSTEM.md](docs/SYSTEM.md)**. Security & privacy posture (2FA for all
+roles, the `admin`/`user`/`viewer` RBAC model, token revocation, OWASP/GDPR
+mapping) is in **[docs/SECURITY.md](docs/SECURITY.md)**. High level:
 
 ```
 backend/app/
@@ -143,7 +145,7 @@ backend/app/
   api/       deps (RBAC) · routes/ (auth, admin, inbox, pipeline, employees, upload, files)
   services/  auth/ · config/ · employee/ · extraction/ · llm/ · pipeline/ ·
              storage_provider/{local,s3,onedrive} · tasks (Celery)
-  seed/  migrations/  tests/
+  seed/  alembic/ (migrations)  tests/
 frontend/src/  api/client.ts · components/ · pages/ (Dashboard, Inbox, Upload,
                Pipeline, Employees, Files, Record, Login, admin/{Settings,Users})
 ```

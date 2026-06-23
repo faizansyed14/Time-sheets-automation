@@ -21,9 +21,11 @@ def _uuid() -> str:
 
 
 class Role:
-    ADMIN = "admin"
-    USER = "user"
-    ALL = (ADMIN, USER)
+    ADMIN = "admin"     # full access (users, config, all reads + writes)
+    USER = "user"       # standard operator: all business reads + writes
+    VIEWER = "viewer"   # read-only: may view everything, may not mutate anything
+    ALL = (ADMIN, USER, VIEWER)
+    WRITERS = (ADMIN, USER)   # roles allowed to perform mutations
 
 
 class AuthMode:
@@ -40,7 +42,8 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String, nullable=True)   # OTP delivery address
     password_hash: Mapped[str] = mapped_column(String)
     role: Mapped[str] = mapped_column(String, default=Role.USER, index=True)
-    # Second factor used after a correct password. Admins bypass OTP entirely.
+    # Second factor (OTP/CAPTCHA) required after a correct password — for EVERY
+    # role, including admins.
     auth_mode: Mapped[str] = mapped_column(String, default=AuthMode.OTP)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 

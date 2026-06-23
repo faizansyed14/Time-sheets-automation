@@ -58,8 +58,8 @@ bash scripts/dev/start.sh        # or scripts/prod/start.sh
 # -> db starts -> backend runs `alembic upgrade head` -> uvicorn -> worker
 ```
 
-`AUTO_CREATE_TABLES=false` tells `app/main.py` to skip the legacy
-`create_all` + `upgrade_v2` path, so Alembic is fully in charge.
+`AUTO_CREATE_TABLES=false` tells `app/main.py` to skip the `create_all` path, so
+Alembic is fully in charge.
 
 > **Local quick-start without Alembic** is still supported: leave
 > `AUTO_CREATE_TABLES=true` (the default in `backend/.env`) and the app creates
@@ -120,7 +120,7 @@ DATABASE_URL=postgresql+asyncpg://USER:PASS@localhost:5432/timesheet \
 
 This writes the `alembic_version` row without touching your tables. From then
 on, `alembic upgrade head` only applies *new* migrations. The baseline
-(`0001_baseline`) already reflects the post-`upgrade_v2` shape
+(`0001_baseline`) already reflects the current schema
 (`timesheet_records.source_files` and the `uq_employee_id_name` composite
 unique), so a stamped legacy DB is consistent.
 
@@ -145,11 +145,5 @@ reach RDS can run them:
 
 Always take an RDS snapshot before applying a migration to production data.
 
----
-
-## The legacy `upgrade_v2.py`
-
-`backend/app/migrations/upgrade_v2.py` is the old idempotent, best-effort patch
-script. It is now **superseded by the baseline migration** and only runs on the
-local `AUTO_CREATE_TABLES=true` path. It is kept for backwards compatibility
-with existing local databases and can be removed once everyone is on Alembic.
+> The old `app/migrations/upgrade_v2.py` best-effort patch script has been
+> **removed** — Alembic's `0001_baseline` supersedes it.

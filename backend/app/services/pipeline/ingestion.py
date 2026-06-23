@@ -314,8 +314,7 @@ async def ingest_timesheet_bytes(
            f"Sheet identifies '{ext.employee_name or ext.employee_id}' for "
            f"{calendar.month_name[period_month]} {period_year}.")
 
-    # ---- stage: matching (employee_id AND name — AUH/DXB share IDs) ----
-    review_flags_extra: list[str] = []
+    # ---- stage: matching (employee_id AND name must agree — AUH/DXB share IDs) ----
     if manual_employee_pk:
         matched = (
             await db.execute(select(Employee).where(Employee.id == manual_employee_pk))
@@ -339,11 +338,7 @@ async def ingest_timesheet_bytes(
             _fail(tracker, PipelineStage.MATCHING, code, m.note)
             return None, tracker
         matched = m.employee
-        if m.code == MatchCode.ID_NAME_MISMATCH:
-            _event(tracker, PipelineStage.MATCHING, "warn", m.note)
-            review_flags_extra.append(m.note)
-        else:
-            _event(tracker, PipelineStage.MATCHING, "ok", m.note)
+        _event(tracker, PipelineStage.MATCHING, "ok", m.note)
     employee_name = matched.name
     account_manager = matched.account_manager
     tracker.employee_name = employee_name
@@ -372,7 +367,7 @@ async def ingest_timesheet_bytes(
     entries = _merge_source_files(prior_entries, new_entry)
     merged, overlap_flags = _union_buckets(entries)
     cleaned, flags = validate(merged, period_month, period_year)
-    flags = list(dict.fromkeys((ext.hr_flags or []) + overlap_flags + flags + review_flags_extra))
+    flags = list(dict.fromkeys((ext.hr_flags or []) + overlap_flags + flags))
     validation_status = ValidationStatus.MANUAL_REVIEW if flags else ValidationStatus.VERIFIED
     if len(entries) > 1:
         _event(tracker, PipelineStage.VALIDATION,
@@ -490,10 +485,6 @@ async def ingest_timesheet_bytes(
         tracker.status = PipelineStatus.NEEDS_REVIEW
         tracker.failure_code = FailureCode.STORAGE_ERROR
         tracker.failure_detail = storage_warn
-    elif m.code == MatchCode.ID_NAME_MISMATCH:
-        tracker.status = PipelineStatus.NEEDS_REVIEW
-        tracker.failure_code = FailureCode.ID_NAME_MISMATCH
-        tracker.failure_detail = m.note
     elif validation_status == ValidationStatus.MANUAL_REVIEW:
         tracker.status = PipelineStatus.NEEDS_REVIEW
         tracker.failure_code = FailureCode.VALIDATION_MISMATCH

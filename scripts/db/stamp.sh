@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Mark an EXISTING database (whose tables were already created by the old
-# create_all / upgrade_v2 startup path) as being at the Alembic baseline,
-# WITHOUT trying to re-create the tables.
+# create_all startup path) as being at the Alembic baseline, WITHOUT trying to
+# re-create the tables.
 #
 # Run this ONCE when adopting Alembic on a database that already has data
 # (e.g. an RDS instance the app has been writing to):

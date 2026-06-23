@@ -1,7 +1,7 @@
-"""End-to-end auth: admin bypass, OTP lifecycle, RBAC, rate limits."""
+"""End-to-end auth: admin 2FA, OTP lifecycle, RBAC (incl. viewer), rate limits."""
 import pytest
 
-from tests.conftest import auth_headers
+from tests.conftest import auth_headers, login_2fa
 
 
 async def _make_user(client, admin_token, username="alice", mode="otp", email="alice@example.com", pw="Password123"):
@@ -12,13 +12,19 @@ async def _make_user(client, admin_token, username="alice", mode="otp", email="a
     return r.json()
 
 
-async def test_admin_bypasses_otp(client):
+async def test_admin_requires_2fa_captcha_default(client):
+    # Admins go through 2FA like everyone else (no bypass); the bootstrap admin
+    # defaults to CAPTCHA so the first login needs no email.
     r = await client.post("/api/v1/auth/login", json={"username": "admin", "password": "admin"})
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "authenticated"
-    assert body["access_token"]
+    assert body["status"] == "captcha_required"
     assert body["user"]["role"] == "admin"
+    assert body["captcha_id"] and body["login_token"]
+    # completing the second factor yields a working admin token
+    token = await login_2fa(client, "admin", "admin")
+    me = await client.get("/api/v1/auth/me", headers=auth_headers(token))
+    assert me.status_code == 200 and me.json()["role"] == "admin"
 
 
 async def test_wrong_password_rejected(client):
@@ -93,10 +99,8 @@ async def test_fingerprint_mismatch_blocks_verify(client, admin_token):
 async def test_protected_routes_require_auth(client):
     # no token
     assert (await client.get("/api/v1/pipeline")).status_code == 401
-    # admin route forbidden for non-admin
-    # (build a normal user token)
-    r = await client.post("/api/v1/auth/login", json={"username": "admin", "password": "admin"})
-    admin_token = r.json()["access_token"]
+    # admin route forbidden for non-admin (build a normal user token)
+    admin_token = await login_2fa(client, "admin", "admin")
     await _make_user(client, admin_token, username="plainuser", email="p@e.com")
     login = (await client.post("/api/v1/auth/login", json={"username": "plainuser", "password": "Password123"})).json()
     verify = await client.post("/api/v1/auth/verify-otp",
@@ -104,6 +108,43 @@ async def test_protected_routes_require_auth(client):
     user_token = verify.json()["access_token"]
     forbidden = await client.get("/api/v1/admin/users", headers=auth_headers(user_token))
     assert forbidden.status_code == 403
+
+
+async def test_viewer_role_is_read_only(client, admin_token):
+    r = await client.post("/api/v1/admin/users", headers=auth_headers(admin_token),
+                          json={"username": "vonly", "password": "Password123", "email": "vo@e.com",
+                                "role": "viewer", "auth_mode": "otp"})
+    assert r.status_code == 201, r.text
+    token = await login_2fa(client, "vonly", "Password123")
+    # viewer CAN read
+    assert (await client.get("/api/v1/pipeline", headers=auth_headers(token))).status_code == 200
+    # viewer CANNOT write — blocked at the router (403) before reaching the handler
+    w = await client.delete("/api/v1/pipeline/nope", headers=auth_headers(token))
+    assert w.status_code == 403, w.text
+    # and cannot reach admin routes at all
+    assert (await client.get("/api/v1/admin/users", headers=auth_headers(token))).status_code == 403
+
+
+async def test_password_policy_enforced(client, admin_token):
+    r = await client.post("/api/v1/admin/users", headers=auth_headers(admin_token),
+                          json={"username": "shortpw", "password": "123", "email": "s@e.com",
+                                "role": "user", "auth_mode": "otp"})
+    assert r.status_code == 400, r.text
+
+
+async def test_otp_mode_requires_email(client, admin_token):
+    r = await client.post("/api/v1/admin/users", headers=auth_headers(admin_token),
+                          json={"username": "noemail", "password": "Password123",
+                                "role": "user", "auth_mode": "otp"})
+    assert r.status_code == 400, r.text
+
+
+async def test_logout_revokes_token(client, admin_token):
+    assert (await client.get("/api/v1/auth/me", headers=auth_headers(admin_token))).status_code == 200
+    out = await client.post("/api/v1/auth/logout", headers=auth_headers(admin_token))
+    assert out.status_code == 200
+    # the revoked token no longer works
+    assert (await client.get("/api/v1/auth/me", headers=auth_headers(admin_token))).status_code == 401
 
 
 async def test_login_rate_limit(client, admin_token):

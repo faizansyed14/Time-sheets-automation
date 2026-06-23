@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import {
+  authLogout,
   authMe,
   getToken,
   setToken,
@@ -11,6 +12,8 @@ interface AuthCtx {
   user: AuthUser | null;
   loading: boolean;
   isAdmin: boolean;
+  isViewer: boolean;
+  canWrite: boolean;        // false for the read-only "viewer" role
   setSession: (token: string, user: AuthUser) => void;
   logout: () => void;
 }
@@ -19,6 +22,8 @@ const Ctx = createContext<AuthCtx>({
   user: null,
   loading: true,
   isAdmin: false,
+  isViewer: false,
+  canWrite: false,
   setSession: () => {},
   logout: () => {},
 });
@@ -48,12 +53,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(u);
   };
   const logout = () => {
+    // Best-effort server-side revocation (denylist the token), then clear locally.
+    authLogout().catch(() => {});
     setToken(null);
     setUser(null);
   };
 
+  const role = user?.role;
   return (
-    <Ctx.Provider value={{ user, loading, isAdmin: user?.role === "admin", setSession, logout }}>
+    <Ctx.Provider
+      value={{
+        user,
+        loading,
+        isAdmin: role === "admin",
+        isViewer: role === "viewer",
+        canWrite: role === "admin" || role === "user",
+        setSession,
+        logout,
+      }}
+    >
       {children}
     </Ctx.Provider>
   );

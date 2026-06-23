@@ -4,7 +4,7 @@ Creates the full current schema:
     auth_users, app_config, all_employee_data, email_messages,
     pipeline_files, timesheet_records
 
-This is the post-`upgrade_v2` shape, i.e. it already includes
+This reflects the current model shape, i.e. it already includes
 `timesheet_records.source_files` and the composite unique constraint
 `uq_employee_id_name` on `all_employee_data(employee_id, name)`.
 

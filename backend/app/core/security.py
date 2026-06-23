@@ -4,8 +4,8 @@ Security primitives: password hashing (bcrypt) and JWT tokens.
 Two token kinds:
   - "login"  : short-lived, issued after a correct password while the second
                factor (OTP/CAPTCHA) is still pending. Carries the login flow id.
-  - "access" : full session token issued after the factor is satisfied (or
-               immediately for an admin who bypasses OTP). Carries role.
+  - "access" : full session token issued after the second factor is satisfied.
+               Carries the role and a unique jti (so it can be revoked at logout).
 """
 from __future__ import annotations
 
@@ -58,9 +58,27 @@ def create_login_token(user_id: str, flow_id: str, fingerprint: str) -> str:
 
 def create_access_token(user_id: str, username: str, role: str) -> str:
     return _encode(
-        {"sub": user_id, "typ": "access", "username": username, "role": role},
+        {"sub": user_id, "typ": "access", "username": username, "role": role,
+         "jti": secrets.token_urlsafe(16)},
         settings.access_token_ttl_minutes,
     )
+
+
+def is_token_revoked_key(jti: str) -> str:
+    """Cache key under which a revoked (logged-out) token's jti is stored."""
+    return f"revoked_jti:{jti}"
+
+
+def token_remaining_seconds(payload: dict) -> int:
+    """Seconds until a decoded token expires (>= 0), for sizing a denylist TTL."""
+    exp = payload.get("exp")
+    if not exp:
+        return 0
+    try:
+        remaining = int(exp - dt.datetime.now(dt.timezone.utc).timestamp())
+    except Exception:
+        return 0
+    return max(0, remaining)
 
 
 # --------------------------- misc ---------------------------
