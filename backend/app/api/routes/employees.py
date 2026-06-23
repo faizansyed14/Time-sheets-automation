@@ -23,6 +23,10 @@ async def coverage(
     month: int | None = Query(default=None),
     q: str | None = Query(default=None, description="search name / ID / manager (whole matcher)"),
     location: str | None = Query(default=None, description="DXB | AUH"),
+    status: str | None = Query(
+        default=None,
+        description="submitted | missing | needs_review | approved | not_approved | pending_approval",
+    ),
     only_missing: bool = Query(default=False, description="only employees missing the focus month"),
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -30,7 +34,9 @@ async def coverage(
 ):
     """Submission coverage for a focus month. Headline counts are computed with
     cheap aggregate queries over the WHOLE dataset; the per-employee rows are
-    searched in SQL and returned one page (200) at a time for infinite scroll."""
+    filtered/searched in SQL across the whole matcher and returned one page (200)
+    at a time for infinite scroll — so the status dropdown and search reflect ALL
+    data, never just the current page."""
     now = datetime.now(timezone.utc)
     focus_year = year or now.year
     focus_month = month or (now.month if focus_year == now.year else 12)
@@ -38,11 +44,16 @@ async def coverage(
     # ---- global headline counts (aggregates, not full-table scans) ----
     total_employees = (await db.execute(select(func.count()).select_from(Employee))).scalar_one()
 
-    submitted_subq = (
-        select(TimesheetRecord.matched_employee_pk)
-        .where(TimesheetRecord.year == focus_year, TimesheetRecord.month == focus_month,
-               TimesheetRecord.matched_employee_pk.is_not(None))
-        .distinct()
+    def _pk_subq(*conds):
+        """Distinct matched employee PKs whose records satisfy `conds`."""
+        return (
+            select(TimesheetRecord.matched_employee_pk)
+            .where(TimesheetRecord.matched_employee_pk.is_not(None), *conds)
+            .distinct()
+        )
+
+    submitted_subq = _pk_subq(
+        TimesheetRecord.year == focus_year, TimesheetRecord.month == focus_month
     )
     submitted_this_month = (
         await db.execute(select(func.count()).select_from(submitted_subq.subquery()))
@@ -76,6 +87,31 @@ async def coverage(
         ))
     if only_missing:
         emp_q = emp_q.where(Employee.id.not_in(submitted_subq))
+
+    # Server-side status filter (applies across the WHOLE matcher, not just the
+    # loaded page). Scoped to the focus year so it tracks the dashboard KPIs.
+    if status:
+        s = status.strip().lower()
+        if s == "submitted":
+            emp_q = emp_q.where(Employee.id.in_(submitted_subq))
+        elif s == "missing":
+            emp_q = emp_q.where(Employee.id.not_in(submitted_subq))
+        elif s == "needs_review":
+            emp_q = emp_q.where(Employee.id.in_(_pk_subq(
+                TimesheetRecord.year == focus_year,
+                TimesheetRecord.validation_status == ValidationStatus.MANUAL_REVIEW)))
+        elif s == "approved":
+            emp_q = emp_q.where(Employee.id.in_(_pk_subq(
+                TimesheetRecord.year == focus_year,
+                TimesheetRecord.approval_status == ApprovalStatus.APPROVED)))
+        elif s == "not_approved":
+            emp_q = emp_q.where(Employee.id.in_(_pk_subq(
+                TimesheetRecord.year == focus_year,
+                TimesheetRecord.approval_status == ApprovalStatus.NOT_APPROVED)))
+        elif s == "pending_approval":
+            emp_q = emp_q.where(Employee.id.in_(_pk_subq(
+                TimesheetRecord.year == focus_year,
+                TimesheetRecord.approval_status == ApprovalStatus.PENDING)))
 
     filtered_total = (await db.execute(select(func.count()).select_from(emp_q.subquery()))).scalar_one()
     page_emps = (await db.execute(

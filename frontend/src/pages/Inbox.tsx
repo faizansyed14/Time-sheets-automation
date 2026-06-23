@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Mail,
@@ -63,9 +63,13 @@ export default function InboxPage() {
   });
   const emails = data?.pages.flatMap((p) => p.items) ?? [];
   const total = data?.pages[0]?.total ?? 0;
+  // The list scrolls inside its own panel, so the sentinel must observe that
+  // container (not the viewport) for auto-loading to fire as you scroll.
+  const scrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useSentinel(
     () => hasNextPage && !isFetchingNextPage && fetchNextPage(),
-    !!hasNextPage
+    !!hasNextPage,
+    scrollRef
   );
 
   const { data: detail, isLoading: loadingDetail } = useQuery({
@@ -145,7 +149,7 @@ export default function InboxPage() {
               <option value="archived">Archived</option>
             </Select>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto">
+          <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
             {isLoading ? (
               <div className="space-y-2 p-4">
                 <Skeleton className="h-16" />

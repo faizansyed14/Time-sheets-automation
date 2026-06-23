@@ -20,20 +20,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.employee import Employee
 
+_BATCH_FLUSH = 200
+
 
 def _norm(s: Any) -> str:
     """Strip whitespace; return empty string for None/NaN."""
     if s is None:
         return ""
     text = str(s).strip()
-    # openpyxl sometimes gives float for numeric IDs e.g. 1001.0
     if text.endswith(".0") and text[:-2].isdigit():
         text = text[:-2]
     return text
 
 
+def _norm_name(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip()).lower()
+
+
+def _identity_key(employee_id: str, name: str) -> tuple[str, str]:
+    return (employee_id.strip(), _norm_name(name))
+
+
 def _first_email(raw: str) -> str | None:
-    """Return first address from a semicolon- or comma-separated email list."""
     if not raw:
         return None
     for addr in re.split(r"[;,]", raw):
@@ -44,19 +52,16 @@ def _first_email(raw: str) -> str | None:
 
 
 def _parse_sheet_dxb(ws) -> list[dict]:
-    """Parse the DXB sheet into normalised dicts."""
-    # Find the header row (first row that has "Emp ID")
     header_row_num = None
     header_idx = {}
     for i, row in enumerate(ws.iter_rows()):
         cells = [_norm(c.value) for c in row]
         if "Emp ID" in cells or "emp id" in [c.lower() for c in cells]:
-            header_row = cells
             header_row_num = i + 1
             for j, h in enumerate(cells):
                 header_idx[h.lower().strip()] = j
             break
-    if header_row is None:
+    if header_row_num is None:
         return []
 
     records = []
@@ -64,12 +69,8 @@ def _parse_sheet_dxb(ws) -> list[dict]:
         row_num = header_row_num + 1 + i
         cells = [_norm(c.value) for c in row]
         if all(c == "" for c in cells):
-            continue  # blank row
+            continue
 
-        def g(key: str) -> str:
-            return cells[header_idx[key]] if key in header_idx and header_idx[key] < len(cells) else ""
-
-        # Try lowercased lookups
         def gl(keys: list[str]) -> str:
             for k in keys:
                 v = cells[header_idx[k]] if k in header_idx and header_idx[k] < len(cells) else ""
@@ -100,7 +101,6 @@ def _parse_sheet_dxb(ws) -> list[dict]:
 
 
 def _parse_sheet_auh(ws) -> list[dict]:
-    """Parse the AUH sheet into normalised dicts."""
     header_idx: dict[str, int] = {}
     header_row_num = None
     for i, row in enumerate(ws.iter_rows()):
@@ -148,13 +148,20 @@ def _parse_sheet_auh(ws) -> list[dict]:
     return records
 
 
-async def import_employees_from_bytes(
-    db: AsyncSession, data: bytes
-) -> dict:
-    """
-    Parse the xlsx bytes, upsert all rows into all_employee_data.
-    Returns {inserted, updated, skipped}.
-    """
+async def _load_index(db: AsyncSession) -> dict[tuple[str, str], Employee]:
+    """One query — map (employee_id, normalised name) -> row."""
+    rows = (await db.execute(select(Employee))).scalars().all()
+    return {_identity_key(e.employee_id, e.name or ""): e for e in rows}
+
+
+def _apply_fields(row: Employee, rec: dict) -> None:
+    for k, v in rec.items():
+        if not k.startswith("_"):
+            setattr(row, k, v or None)
+
+
+async def import_employees_from_bytes(db: AsyncSession, data: bytes) -> dict:
+    """Parse xlsx bytes, upsert into all_employee_data. Returns import summary."""
     try:
         import openpyxl
     except ImportError:
@@ -171,83 +178,70 @@ async def import_employees_from_bytes(
         elif "auh" in name_lower:
             records.extend(_parse_sheet_auh(ws))
         else:
-            # Try both parsers; take whichever gives results
             r = _parse_sheet_dxb(ws)
             if not r:
                 r = _parse_sheet_auh(ws)
             records.extend(r)
 
+    index = await _load_index(db)
     inserted = updated = skipped = 0
-    skipped_details = []
-    # The same employee_id legitimately exists on BOTH the DXB and AUH sheets
-    # (different people). Dedupe on (id, name) so cross-team rows all import;
-    # only a literal repeat of the same person in the file is skipped.
+    skipped_details: list[dict] = []
     seen_keys: set[tuple[str, str]] = set()
+    touched = 0
 
-    for rec in records:
-        emp_id = (rec.get("employee_id") or "").strip()
-        emp_name = (rec.get("name") or "").strip()
+    with db.no_autoflush:
+        for rec in records:
+            emp_id = (rec.get("employee_id") or "").strip()
+            emp_name = (rec.get("name") or "").strip()
+            row_num = rec.get("_row", 0)
+            sheet_name = rec.get("_sheet", "Unknown")
 
-        row_num = rec.get("_row", 0)
-        sheet_name = rec.get("_sheet", "Unknown")
+            if not emp_id or not emp_name:
+                skipped += 1
+                skipped_details.append({
+                    "sheet": sheet_name, "row": row_num,
+                    "id": emp_id, "name": emp_name, "reason": "Missing ID or Name",
+                })
+                continue
 
-        if not emp_id or not emp_name:
-            skipped += 1
-            skipped_details.append({
-                "sheet": sheet_name,
-                "row": row_num,
-                "id": emp_id,
-                "name": emp_name,
-                "reason": "Missing ID or Name"
-            })
-            continue
-        key = (emp_id, emp_name.lower())
-        if key in seen_keys:
-            skipped += 1
-            skipped_details.append({
-                "sheet": sheet_name,
-                "row": row_num,
-                "id": emp_id,
-                "name": emp_name,
-                "reason": "Duplicate ID + Name in file"
-            })
-            continue
-        seen_keys.add(key)
+            key = _identity_key(emp_id, emp_name)
+            if key in seen_keys:
+                skipped += 1
+                skipped_details.append({
+                    "sheet": sheet_name, "row": row_num,
+                    "id": emp_id, "name": emp_name, "reason": "Duplicate ID + Name in file",
+                })
+                continue
+            seen_keys.add(key)
 
-        # Upsert key is (employee_id, name): the AUH person and the DXB person
-        # who share an ID stay separate rows.
-        candidates = (
-            await db.execute(select(Employee).where(Employee.employee_id == emp_id))
-        ).scalars().all()
-        existing = next(
-            (c for c in candidates if (c.name or "").strip().lower() == emp_name.lower()),
-            None,
-        )
+            existing = index.get(key)
+            if existing:
+                _apply_fields(existing, rec)
+                updated += 1
+            else:
+                row = Employee(
+                    employee_id=emp_id,
+                    name=emp_name,
+                    dco_number=rec.get("dco_number"),
+                    account_manager=rec.get("account_manager") or None,
+                    employee_email_id=rec.get("employee_email_id") or None,
+                    project=rec.get("project") or None,
+                    contact_no=rec.get("contact_no") or None,
+                    location=rec.get("location"),
+                    all_emails=rec.get("all_emails") or None,
+                )
+                db.add(row)
+                index[key] = row
+                inserted += 1
 
-        if existing:
-            for k, v in rec.items():
-                if not k.startswith("_"):
-                    setattr(existing, k, v or None)
-            updated += 1
-        else:
-            e = Employee(
-                employee_id=emp_id,
-                name=emp_name,
-                dco_number=rec.get("dco_number"),
-                account_manager=rec.get("account_manager") or None,
-                employee_email_id=rec.get("employee_email_id") or None,
-                project=rec.get("project") or None,
-                contact_no=rec.get("contact_no") or None,
-                location=rec.get("location"),
-                all_emails=rec.get("all_emails") or None,
-            )
-            db.add(e)
-            inserted += 1
+            touched += 1
+            if touched % _BATCH_FLUSH == 0:
+                await db.flush()
 
     await db.commit()
     return {
-        "inserted": inserted, 
-        "updated": updated, 
+        "inserted": inserted,
+        "updated": updated,
         "skipped": skipped,
-        "skipped_details": skipped_details
+        "skipped_details": skipped_details,
     }

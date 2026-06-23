@@ -146,3 +146,16 @@ async def public_view(db: AsyncSession) -> list[dict]:
             val = SECRET_MASK if val else ""
         out.append({"key": key, "value": val, "category": meta["category"], "is_secret": meta["secret"]})
     return out
+
+
+async def reveal_secret(db: AsyncSession, key: str) -> str:
+    """Return the *plaintext* value of a secret config key (admin-only).
+
+    Backs the "show key" toggle in AI Settings so an admin can confirm exactly
+    which key is in use. Returns "" when the key isn't a known secret or nothing
+    is stored yet."""
+    meta = CONFIG_KEYS.get(key)
+    if not meta or not meta["secret"]:
+        raise KeyError(key)
+    overlay = await get_overlay(db)          # secrets are decrypted in the overlay
+    return overlay.get(key) or ""

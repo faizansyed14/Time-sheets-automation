@@ -40,6 +40,9 @@ langchain-community==0.4.2
 # --- PostgreSQL driver (the only supported database; works for AWS RDS too) ---
 asyncpg==0.31.0
 
+# --- Database migrations (schema versioning for RDS / prod) ---
+alembic==1.13.2
+
 # --- AWS S3 storage (STORAGE_PROVIDER=s3) ---
 boto3==1.43.33
 

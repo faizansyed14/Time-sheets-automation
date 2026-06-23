@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://timesheet:timesheet@localhost:5432/timesheet"
     db_pool_size: int = 5
     db_max_overflow: int = 10
+    # Schema bootstrap strategy.
+    #   True  (default) -> create any missing tables on startup via SQLAlchemy
+    #                      (handy for local quick-start and the test suite).
+    #   False           -> Alembic is the single source of truth; run
+    #                      `alembic upgrade head` before the app boots. Docker
+    #                      and AWS/RDS deployments set AUTO_CREATE_TABLES=false.
+    auto_create_tables: bool = True
     # Use NullPool (a fresh connection per operation). Enabled in the test suite
     # so asyncpg connections never cross pytest-asyncio's per-test event loops.
     db_nullpool: bool = False

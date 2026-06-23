@@ -249,11 +249,20 @@ export const attachmentUrl = (msgId: string, attId: string) =>
 // ---------------------------------------------------------------------------
 // Dashboard / employees
 // ---------------------------------------------------------------------------
+export type CoverageStatus =
+  | "submitted"
+  | "missing"
+  | "needs_review"
+  | "approved"
+  | "not_approved"
+  | "pending_approval";
+
 export const fetchCoverage = (params: {
   year?: number;
   month?: number;
   q?: string;
   location?: string;
+  status?: CoverageStatus | "";
   only_missing?: boolean;
   offset?: number;
   limit?: number;
@@ -265,6 +274,7 @@ export const fetchCoverage = (params: {
         month: params.month,
         q: params.q || undefined,
         location: params.location || undefined,
+        status: params.status || undefined,
         only_missing: params.only_missing || undefined,
         offset: params.offset ?? 0,
         limit: params.limit ?? PAGE_SIZE,
@@ -280,9 +290,6 @@ export const fetchEmployeeRecords = (pk: string, year?: number) =>
 // ---------------------------------------------------------------------------
 // Timesheet records
 // ---------------------------------------------------------------------------
-export const fetchRecords = (params?: { year?: number; employee_id?: string }) =>
-  api.get<TimesheetRecord[]>("/timesheets", { params }).then((r) => r.data);
-
 export const fetchRecord = (id: string) =>
   api.get<TimesheetRecord>(`/timesheets/${id}`).then((r) => r.data);
 
@@ -439,6 +446,7 @@ export const importEmployees = (file: File) => {
   return api
     .post<ImportSummary>("/employee-matcher/import", form, {
       headers: { "Content-Type": "multipart/form-data" },
+      timeout: 600_000, // large Excel + remote RDS can take several minutes
     })
     .then((r) => r.data);
 };
@@ -562,7 +570,30 @@ export interface ProviderTestResult {
 export const adminGetConfig = () => api.get<ConfigItem[]>("/admin/config").then((r) => r.data);
 export const adminUpdateConfig = (values: Record<string, unknown>) =>
   api.put<ConfigItem[]>("/admin/config", { values }).then((r) => r.data);
+export const adminRevealSecret = (key: string) =>
+  api.get<{ key: string; value: string }>(`/admin/config/reveal/${key}`).then((r) => r.data.value);
 export const adminTestConfig = (provider?: string, prompt?: string) =>
   api.post<ProviderTestResult>("/admin/config/test", { provider, prompt: prompt || "Reply with the single word: OK" }).then((r) => r.data);
 export const adminPromptDefaults = () =>
   api.get<Record<string, string>>("/admin/config/prompts/defaults").then((r) => r.data);
+
+/** Provider → the secret/base-URL config keys + common model choices, so the
+ *  AI Settings page only shows the fields for the active provider. Model lists
+ *  are suggestions — the inputs remain editable for anything not listed. */
+export const AI_PROVIDERS = {
+  openai: {
+    label: "OpenAI",
+    keyField: "openai_api_key",
+    baseField: "openai_base_url",
+    extractionModels: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"],
+    validationModels: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
+  },
+  deepseek: {
+    label: "DeepSeek",
+    keyField: "deepseek_api_key",
+    baseField: "deepseek_base_url",
+    extractionModels: ["deepseek-chat", "deepseek-reasoner"],
+    validationModels: ["deepseek-chat", "deepseek-reasoner"],
+  },
+} as const;
+export type AiProviderId = keyof typeof AI_PROVIDERS;

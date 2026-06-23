@@ -33,12 +33,19 @@ from app.core.database import SessionLocal, init_db
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
-    try:
-        from app.migrations.upgrade_v2 import migrate
-        await migrate()
-    except Exception:
-        pass
+    # Schema management:
+    #   - Docker / prod / AWS RDS: Alembic owns the schema. Set
+    #     AUTO_CREATE_TABLES=false; `alembic upgrade head` runs before the app
+    #     starts (see the compose `command` and scripts/db/migrate.sh).
+    #   - Local quick-start / tests (AUTO_CREATE_TABLES=true, the default):
+    #     create any missing tables and apply the legacy idempotent patch.
+    if settings.auto_create_tables:
+        await init_db()
+        try:
+            from app.migrations.upgrade_v2 import migrate
+            await migrate()
+        except Exception:
+            pass
     try:
         from app.services.pipeline.ingestion import relocate_legacy_pipeline_raw
         relocate_legacy_pipeline_raw()
