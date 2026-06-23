@@ -11,6 +11,7 @@ Users:
 Config (prompts, AI provider + keys, model controls):
   GET    /admin/config               current values (secrets masked)
   PUT    /admin/config               update a batch of values
+  GET    /admin/config/reveal/{key}  plaintext of one secret (the "show" toggle)
   POST   /admin/config/test          live-test the configured provider
   GET    /admin/config/prompts/defaults  built-in prompt text (to pre-fill the editor)
 """
@@ -135,6 +136,16 @@ async def update_config(body: ConfigUpdate, admin: User = Depends(require_admin)
         raise HTTPException(400, f"Unknown config keys: {bad}")
     await config_service.set_settings(db, body.values, updated_by=admin.username)
     return [ConfigItem(**c) for c in await config_service.public_view(db)]
+
+
+@router.get("/config/reveal/{key}")
+async def reveal_config_secret(key: str, db: AsyncSession = Depends(get_db)):
+    """Return the plaintext value of a secret key so the admin can confirm which
+    key is in use (backs the "show" toggle in AI Settings)."""
+    try:
+        return {"key": key, "value": await config_service.reveal_secret(db, key)}
+    except KeyError:
+        raise HTTPException(400, f"'{key}' is not a revealable secret key")
 
 
 @router.post("/config/test", response_model=ProviderTestResult)

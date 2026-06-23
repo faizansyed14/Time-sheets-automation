@@ -12,6 +12,7 @@ import base64
 import httpx
 
 from app.core.config import settings
+from app.core.openai_url import openai_urls
 
 
 _AUX_TEXT_MAX = 24_000
@@ -78,7 +79,7 @@ async def _extract_openai(images_jpeg, prompt, system_prompt, model, image_detai
 
 
 async def _openai_by_images(images_jpeg, prompt, system_prompt, model, image_detail, api_key) -> dict:
-    base_url = str(settings.openai_base_url).rstrip("/")
+    api_root, _ = openai_urls(settings.openai_base_url)
     detail = (image_detail or "").strip().lower()
     if detail not in {"low", "high"}:
         detail = "low"
@@ -100,19 +101,19 @@ async def _openai_by_images(images_jpeg, prompt, system_prompt, model, image_det
         payload["temperature"] = 0.0
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=httpx.Timeout(settings.openai_timeout)) as client:
-        r = await client.post(f"{base_url}/v1/chat/completions", json=payload, headers=headers)
+        r = await client.post(f"{api_root}/v1/chat/completions", json=payload, headers=headers)
         if r.status_code != 200:
             raise RuntimeError(f"OpenAI returned {r.status_code}: {r.text[:500]}")
         return r.json()
 
 
 async def _openai_by_file_id(file_bytes, filename, file_type, prompt, system_prompt, model, api_key) -> dict:
-    base_url = str(settings.openai_base_url).rstrip("/")
+    api_root, _ = openai_urls(settings.openai_base_url)
     mime = {"pdf": "application/pdf",
             "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}.get(file_type, "application/octet-stream")
     async with httpx.AsyncClient(timeout=httpx.Timeout(settings.openai_timeout)) as client:
-        fr = await client.post(f"{base_url}/v1/files",
+        fr = await client.post(f"{api_root}/v1/files",
                                headers={"Authorization": f"Bearer {api_key}"},
                                data={"purpose": "user_data"},
                                files={"file": (filename, file_bytes, mime)})
@@ -132,7 +133,7 @@ async def _openai_by_file_id(file_bytes, filename, file_type, prompt, system_pro
             payload["reasoning"] = {"effort": "high"}
         else:
             payload["max_output_tokens"] = 4096
-        rr = await client.post(f"{base_url}/v1/responses", json=payload,
+        rr = await client.post(f"{api_root}/v1/responses", json=payload,
                                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
         if rr.status_code != 200:
             raise RuntimeError(f"responses {rr.status_code}: {rr.text[:300]}")
@@ -169,14 +170,14 @@ async def validate_extraction(prompt: str, system_prompt: str | None, model: str
     api_key = (settings.openai_api_key or "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY required for text validation.")
-    base_url = str(settings.openai_base_url).rstrip("/")
+    api_root, _ = openai_urls(settings.openai_base_url)
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
     payload: dict = {"model": model, "messages": messages, "temperature": 0.0, "max_tokens": 8192}
     async with httpx.AsyncClient(timeout=httpx.Timeout(settings.openai_timeout)) as client:
-        r = await client.post(f"{base_url}/v1/chat/completions", json=payload,
+        r = await client.post(f"{api_root}/v1/chat/completions", json=payload,
                               headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
         if r.status_code != 200:
             raise RuntimeError(f"validation {r.status_code}: {r.text[:300]}")

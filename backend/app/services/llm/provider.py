@@ -21,6 +21,7 @@ from functools import lru_cache
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.openai_url import openai_urls
 from app.services.config.service import get_overlay
 
 # Per-provider defaults: (base_url_key, api_key_key, default_model)
@@ -35,10 +36,12 @@ def _build_model(provider: str, model: str, base_url: str, api_key: str, tempera
     """Construct (and cache) a LangChain chat model for the given provider."""
     from langchain_openai import ChatOpenAI
 
+    _, langchain_base = openai_urls(base_url) if provider == "openai" else (base_url, base_url)
+
     return ChatOpenAI(
         model=model,
         api_key=api_key or "missing",
-        base_url=base_url or None,
+        base_url=langchain_base or None,
         temperature=temperature,
         timeout=60,
         max_retries=1,
@@ -77,13 +80,30 @@ async def chat(db: AsyncSession, prompt: str, system: str | None = None, kind: s
 async def test_provider(db: AsyncSession, provider: str | None, prompt: str) -> dict:
     """Build the model and do a tiny round-trip. Used by the admin Test button.
     Never raises — returns a structured result the UI can show."""
-    p, model, base_url, api_key = await _resolve(db, "extraction", provider)
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+
+    p, _, base_url, api_key = await _resolve(db, "extraction", provider)
+    model = "gpt-4o-mini" if p == "openai" else (PROVIDERS.get(p) or PROVIDERS["openai"])["model"]
     if not api_key:
         return {"ok": False, "provider": p, "model": model, "error": "No API key configured for this provider."}
     t0 = time.time()
     try:
-        reply = await chat(db, prompt, system="You are a connectivity test. Be terse.")
+        llm = _build_model(p, model, base_url, api_key, 0.0)
+        chain = (
+            ChatPromptTemplate.from_messages([
+                ("system", "You are a connectivity test. Be terse."),
+                ("human", "{input}"),
+            ])
+            | llm
+            | StrOutputParser()
+        )
+        reply = await chain.ainvoke({"input": prompt})
         return {"ok": True, "provider": p, "model": model,
                 "latency_ms": int((time.time() - t0) * 1000), "reply": (reply or "").strip()[:200]}
     except Exception as e:
-        return {"ok": False, "provider": p, "model": model, "error": str(e)[:300]}
+        err = str(e)[:300]
+        if "404" in err and p == "openai":
+            _, lb = openai_urls(base_url)
+            err += f" (base_url={lb!r} — use https://api.openai.com or https://api.openai.com/v1)"
+        return {"ok": False, "provider": p, "model": model, "error": err}

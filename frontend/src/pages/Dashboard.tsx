@@ -19,6 +19,7 @@ import {
   fetchPipelineStats,
   MONTHS,
   MONTHS_LONG,
+  type CoverageStatus,
   type DashboardRow,
 } from "../api/client";
 import { avatarColor, cn, initials } from "../lib/utils";
@@ -142,17 +143,19 @@ export default function Dashboard() {
   const [open, setOpen] = useState<string | null>(null);
   const [q, setQ] = useState("");
   const [loc, setLoc] = useState("");
+  const [statusFilter, setStatusFilter] = useState<CoverageStatus | "">("");
   const [onlyMissing, setOnlyMissing] = useState(false);
 
   const dq = useDebounced(q, 350);
   const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
-    queryKey: ["coverage", year, month, dq, loc, onlyMissing],
+    queryKey: ["coverage", year, month, dq, loc, statusFilter, onlyMissing],
     queryFn: ({ pageParam }) =>
       fetchCoverage({
         year,
         month,
         q: dq || undefined,
         location: loc || undefined,
+        status: statusFilter || undefined,
         only_missing: onlyMissing,
         offset: pageParam as number,
       }),
@@ -268,6 +271,20 @@ export default function Dashboard() {
               <option value="">All locations</option>
               <option value="DXB">DXB</option>
               <option value="AUH">AUH</option>
+            </Select>
+            <Select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value as CoverageStatus | "")}
+              className="py-1.5 text-xs"
+              title={`Status for ${MONTHS_LONG[month]} ${year}`}
+            >
+              <option value="">All statuses</option>
+              <option value="submitted">Submitted</option>
+              <option value="missing">Missing</option>
+              <option value="needs_review">Needs review</option>
+              <option value="approved">Approved</option>
+              <option value="not_approved">Not approved</option>
+              <option value="pending_approval">Pending approval</option>
             </Select>
             <input
               value={q}

@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Save, FlaskConical, RotateCcw, Loader2, CheckCircle2, XCircle, Cpu, KeySquare, FileText } from "lucide-react";
+import { Save, FlaskConical, RotateCcw, Loader2, CheckCircle2, XCircle, Cpu, KeySquare, FileText, Eye, EyeOff } from "lucide-react";
 import {
   adminGetConfig,
   adminPromptDefaults,
+  adminRevealSecret,
   adminTestConfig,
   adminUpdateConfig,
+  AI_PROVIDERS,
+  type AiProviderId,
   type ConfigItem,
   type ProviderTestResult,
 } from "../../api/client";
@@ -19,6 +22,7 @@ export default function AdminSettings() {
   const { data, isLoading, refetch } = useQuery({ queryKey: ["admin-config"], queryFn: adminGetConfig });
   const [form, setForm] = useState<Record<string, unknown>>({});
   const [dirty, setDirty] = useState<Record<string, boolean>>({});
+  const [shown, setShown] = useState<Record<string, boolean>>({});
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null);
@@ -29,6 +33,7 @@ export default function AdminSettings() {
       data.forEach((c) => (f[c.key] = c.value));
       setForm(f);
       setDirty({});
+      setShown({});
     }
   }, [data]);
 
@@ -83,17 +88,71 @@ export default function AdminSettings() {
     toast("info", "Loaded built-in prompts", "Review and Save to apply.");
   };
 
+  // Reveal a stored secret: fetch the plaintext (admin-only) on first show, and
+  // re-mask on hide if it wasn't edited — so the admin can confirm the live key.
+  const toggleReveal = async (k: string) => {
+    const next = !shown[k];
+    if (next && form[k] === SECRET_MASK) {
+      try {
+        const v = await adminRevealSecret(k);
+        setForm((f) => ({ ...f, [k]: v }));
+      } catch (e: any) {
+        toast("error", "Could not reveal key", e?.response?.data?.detail ?? String(e));
+        return;
+      }
+    } else if (!next && !dirty[k] && byKey[k]?.value) {
+      setForm((f) => ({ ...f, [k]: SECRET_MASK })); // restore mask if untouched
+    }
+    setShown((s) => ({ ...s, [k]: next }));
+  };
+
   if (isLoading) return <div className="space-y-3"><Skeleton className="h-40" /><Skeleton className="h-40" /></div>;
 
-  const SecretInput = ({ k, label }: { k: string; label: string }) => (
+  const provider = (String(form["ai_provider"] ?? "openai") as AiProviderId);
+  const pmeta = AI_PROVIDERS[provider] ?? AI_PROVIDERS.openai;
+
+  // Rendered as plain functions (not <Components/>) so the inputs keep focus
+  // across re-renders while typing.
+  const secretField = (k: string, label: string) => {
+    const isShown = !!shown[k];
+    return (
+      <Field label={label}>
+        <div className="relative">
+          <Input
+            type={isShown ? "text" : "password"}
+            className="pr-10"
+            value={String(form[k] ?? "")}
+            onChange={(e) => set(k, e.target.value)}
+            onFocus={(e) => { if (e.target.value === SECRET_MASK) set(k, ""); }}
+            placeholder={byKey[k]?.value ? "saved — type to replace, or show to view" : "not set"}
+          />
+          <button
+            type="button"
+            onClick={() => toggleReveal(k)}
+            title={isShown ? "Hide key" : "Show key"}
+            className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+          >
+            {isShown ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+          </button>
+        </div>
+        <p className="mt-1 text-[11px] text-slate-400">
+          {byKey[k]?.value ? "A key is saved." : "No key saved yet."}
+        </p>
+      </Field>
+    );
+  };
+
+  const modelField = (k: string, label: string, options: readonly string[]) => (
     <Field label={label}>
       <Input
-        type="password"
+        list={`models-${k}`}
         value={String(form[k] ?? "")}
         onChange={(e) => set(k, e.target.value)}
-        onFocus={(e) => { if (e.target.value === SECRET_MASK) set(k, ""); }}
-        placeholder={byKey[k]?.value ? "saved — type to replace" : "not set"}
+        placeholder="e.g. gpt-4o"
       />
+      <datalist id={`models-${k}`}>
+        {options.map((m) => <option key={m} value={m} />)}
+      </datalist>
     </Field>
   );
 
@@ -132,22 +191,26 @@ export default function AdminSettings() {
         </Card>
       )}
 
-      {/* providers */}
+      {/* providers — only the ACTIVE provider's fields are shown */}
       <Card className="mb-5 p-5">
         <h2 className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-800"><KeySquare className="h-4 w-4 text-slate-400" /> Provider &amp; API keys</h2>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Active provider">
-            <Select className="w-full" value={String(form["ai_provider"] ?? "openai")} onChange={(e) => set("ai_provider", e.target.value)}>
-              <option value="openai">OpenAI</option>
-              <option value="deepseek">DeepSeek</option>
+            <Select className="w-full" value={provider} onChange={(e) => set("ai_provider", e.target.value)}>
+              {Object.entries(AI_PROVIDERS).map(([id, m]) => (
+                <option key={id} value={id}>{m.label}</option>
+              ))}
             </Select>
           </Field>
           <div />
-          <SecretInput k="openai_api_key" label="OpenAI API key" />
-          <Field label="OpenAI base URL"><Input value={String(form["openai_base_url"] ?? "")} onChange={(e) => set("openai_base_url", e.target.value)} /></Field>
-          <SecretInput k="deepseek_api_key" label="DeepSeek API key" />
-          <Field label="DeepSeek base URL"><Input value={String(form["deepseek_base_url"] ?? "")} onChange={(e) => set("deepseek_base_url", e.target.value)} /></Field>
+          {secretField(pmeta.keyField, `${pmeta.label} API key`)}
+          <Field label={`${pmeta.label} base URL`}>
+            <Input value={String(form[pmeta.baseField] ?? "")} onChange={(e) => set(pmeta.baseField, e.target.value)} />
+          </Field>
         </div>
+        <p className="mt-3 text-xs text-slate-400">
+          Showing settings for <span className="font-semibold text-slate-600">{pmeta.label}</span> only. Switch the active provider to edit another.
+        </p>
       </Card>
 
       {/* model controls */}
@@ -160,14 +223,14 @@ export default function AdminSettings() {
               <option value="vision">vision (LLM)</option>
             </Select>
           </Field>
-          <Field label="Extraction model"><Input value={String(form["extraction_model"] ?? "")} onChange={(e) => set("extraction_model", e.target.value)} /></Field>
+          {modelField("extraction_model", "Extraction model", pmeta.extractionModels)}
           <Field label="Vision image detail">
             <Select className="w-full" value={String(form["vision_image_detail"] ?? "high")} onChange={(e) => set("vision_image_detail", e.target.value)}>
               <option value="high">high</option>
               <option value="low">low</option>
             </Select>
           </Field>
-          <Field label="Validation model"><Input value={String(form["validation_model"] ?? "")} onChange={(e) => set("validation_model", e.target.value)} /></Field>
+          {modelField("validation_model", "Validation model", pmeta.validationModels)}
           <Field label="Text cross-validation">
             <label className="flex items-center gap-2 pt-2 text-sm text-slate-600">
               <input type="checkbox" checked={Boolean(form["enable_text_validation"])} onChange={(e) => set("enable_text_validation", e.target.checked)} className="h-4 w-4 rounded border-slate-300 text-brand-600" />

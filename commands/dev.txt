@@ -6,6 +6,9 @@
 ==========================================================================
 with start script
 ./scripts/dev/start.sh
+
+to delete data(pipelinefiles,timesheet_records,email_messages,employe matcher)
+docker compose -f "c:\Users\FAIZAN\Downloads\timesheet-portal\docker-compose.dev.yml" exec backend python -m app.seed.clear_business_data 2>&1
 # ---- setup (once) ----
 cp .env.dev .env    # then edit .env
 

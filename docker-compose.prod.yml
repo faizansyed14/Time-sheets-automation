@@ -39,11 +39,14 @@ services:
 
   backend:
     build: { context: ./backend }
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+    # Apply DB migrations (Alembic) THEN serve. A single migrating entrypoint
+    # avoids races; the worker waits for this service to become healthy.
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"
     env_file: [.env]
     environment:
       REDIS_URL: redis://redis:6379/0
       CELERY_TASK_ALWAYS_EAGER: "false"
+      AUTO_CREATE_TABLES: "false"         # Alembic owns the schema (see command)
     volumes:
       - backend_storage:/app/storage
     expose: ["8000"]
@@ -62,12 +65,15 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       CELERY_TASK_ALWAYS_EAGER: "false"
+      AUTO_CREATE_TABLES: "false"
     volumes:
       - backend_storage:/app/storage
     restart: unless-stopped
     depends_on:
       redis: { condition: service_healthy }
       db: { condition: service_healthy }
+      # wait for the backend to finish `alembic upgrade head` before consuming tasks
+      backend: { condition: service_healthy }
     deploy:
       resources:
         limits: { cpus: "2.00", memory: 2048M }

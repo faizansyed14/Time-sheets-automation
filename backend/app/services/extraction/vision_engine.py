@@ -18,6 +18,7 @@ import calendar
 import httpx
 
 from app.core.config import settings
+from app.core.openai_url import openai_urls
 from app.services.extraction import file_processor as fp
 from app.services.extraction import parser, vision_client
 from app.services.extraction.base import (
@@ -245,7 +246,7 @@ class VisionExtractionEngine(ExtractionEngine):
             return ApprovalExtraction(detected=False, detail="No OpenAI key for approval reading.")
         try:
             b64 = base64.b64encode(data).decode("utf-8")
-            base_url = str(settings.openai_base_url).rstrip("/")
+            api_root, _ = openai_urls(settings.openai_base_url)
             payload = {
                 "model": settings.extraction_model if not settings.extraction_model.startswith("gpt-5") else "gpt-4o",
                 "messages": [{"role": "user", "content": [
@@ -256,7 +257,7 @@ class VisionExtractionEngine(ExtractionEngine):
                 "max_tokens": 200, "temperature": 0.0,
             }
             async with httpx.AsyncClient(timeout=httpx.Timeout(settings.openai_timeout)) as client:
-                r = await client.post(f"{base_url}/v1/chat/completions", json=payload,
+                r = await client.post(f"{api_root}/v1/chat/completions", json=payload,
                                       headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
                 r.raise_for_status()
                 import json
