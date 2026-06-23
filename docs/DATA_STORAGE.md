@@ -16,7 +16,7 @@ and S3.
 |---|------|---------------|----------------------|
 | 1 | **Relational data** — users, employee records, ingested-email IDs + state, pipeline audit rows, timesheet records, app config | **PostgreSQL** | RDS (managed) or the local `db` container |
 | 2 | **Filed timesheet files** — the File Vault: `Manager/Employee/Month/<file>` plus extracted `*.json` | **Object storage** | S3 (when `STORAGE_PROVIDER=s3`) or local disk |
-| 3 | **Raw retry copies** — a private byte-for-byte copy of each ingested file so a *failed* file can be retried | **Local disk only** (`data/pipeline_raw/`) | Container filesystem / Docker volume |
+| 3 | **Raw retry copies** — a private byte-for-byte copy of each ingested file so a *failed* file can be retried (auto-deleted once it succeeds/resolves) | **S3** at `timesheets/_pipeline-raw/` when on S3, else local `data/pipeline_raw/` | S3 (hidden sub-folder) or container disk |
 
 ### 1. Relational data → **RDS** (this is the critical data)
 
@@ -48,17 +48,29 @@ Uploads, the extracted JSON, browsing, download, ZIP export, rename, and delete
 all go straight to S3 (`backend/app/services/storage_provider/s3_provider.py`).
 Nothing is written to the local `storage/` folder in this mode.
 
-### 3. Raw retry copies → **local disk (NOT S3, NOT RDS)**
+### 3. Raw retry copies → **S3 (separate prefix) when on S3, else local disk**
 
-⚠️ **Important nuance.** The pipeline keeps a private copy of each original file
-under `data/pipeline_raw/<pipeline_id>/` so a file that *failed* (e.g. employee
-not yet in the matcher) can be retried after you fix the cause. This path uses
-the local filesystem **regardless of `STORAGE_PROVIDER`** — it does **not** go
-to S3.
+The pipeline keeps a private copy of each original file so a file that *failed*
+(e.g. employee not yet in the matcher) can be retried after you fix the cause.
+Where the copy lives now depends on `STORAGE_PROVIDER`
+(`backend/app/services/pipeline/raw_store.py`):
 
-- `pipeline_files.raw_path` stores the relative path to that local copy.
-- These copies are **not business-critical**: they only enable the Retry button
-  for failed/needs-review files. Successfully filed files already live in S3.
+- **`STORAGE_PROVIDER=s3`** → stored in S3 at
+  `<S3_PREFIX>/<S3_RAW_PREFIX>/<id>/<file>` — i.e. **inside `timesheets/`**
+  (default `timesheets/_pipeline-raw/…`). It's **visible in the S3 console** and
+  covered by an IAM policy scoped to `timesheets/*`, but the leading `_` keeps it
+  **hidden from the in-app File Vault** (which skips folders starting with `_`).
+  **Nothing is written to local disk.**
+- **local / onedrive** → stored on local disk under `data/pipeline_raw/<id>/`.
+
+**It no longer grows without bound.** The copy is deleted automatically once the
+file no longer needs a retry — i.e. it is **processed successfully, resolved, or
+its pipeline entry is deleted**. Only **failed / needs-review** files keep an
+original around.
+
+- `pipeline_files.raw_path` stores the relative key (`<id>/<file>`).
+- These copies are **not business-critical**: they only power the Retry button.
+  Successfully filed files already live in the S3 vault.
 
 ---
 
@@ -72,14 +84,13 @@ With `DATABASE_URL` → RDS and `STORAGE_PROVIDER=s3`:
   volume become unused — you should stop starting them (see below).
 - ✅ **Filed files → S3.** The `backend_storage` volume / `storage/` folder
   becomes unused for filed files.
-- ⚠️ **Raw retry copies → still on the container's local disk** under
-  `data/pipeline_raw/`. In dev this lands in the `./backend` bind mount; in
-  prod it lives on the container filesystem and is **lost on rebuild** unless
-  you mount it (see recommendation). This only affects the ability to retry
-  *failed* files, not your filed data.
+- ✅ **Raw retry copies → S3** at `timesheets/<S3_RAW_PREFIX>/…` (inside the
+  vault but hidden from the File Vault UI), **not local disk**, and auto-deleted
+  once a file succeeds/resolves. So with S3 there's effectively **nothing of
+  substance left on the container disk**.
 
-In short: **RDS + S3 hold the real data; Docker volumes hold nothing important
-once you switch; one local-disk folder keeps non-critical retry copies.**
+In short: **RDS + S3 hold everything; Docker volumes and the local folders hold
+nothing important once you switch to S3 + RDS.**
 
 ---
 
@@ -104,8 +115,9 @@ once you switch; one local-disk folder keeps non-critical retry copies.**
    ```
    (Redis is still needed for Celery + caching unless you use ElastiCache.)
 
-3. **Persist the raw-retry folder in prod** (optional but recommended) so Retry
-   survives a container rebuild — add a volume for `data/`:
+3. **Raw retry copies need no local volume on S3** — they go to S3 under
+   `S3_RAW_PREFIX` and are pruned automatically. (Only if you stay on
+   `STORAGE_PROVIDER=local` would you persist `data/` on a volume:)
    ```yaml
    backend:
      volumes:
@@ -138,5 +150,6 @@ once you switch; one local-disk folder keeps non-critical retry copies.**
                                          │ Postgres │   │  bucket  │
                                          └──────────┘   └──────────┘
 
-   data/pipeline_raw/  ──▶  local disk / Docker volume   (non-critical retry copies only)
+   raw retry copies  ──▶  S3 under S3_RAW_PREFIX (or local data/pipeline_raw/ when
+                          STORAGE_PROVIDER=local) · auto-deleted on success/resolve
 ```

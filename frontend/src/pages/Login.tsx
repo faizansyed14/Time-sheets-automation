@@ -115,17 +115,21 @@ export default function Login() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-slate-900 via-brand-950 to-slate-900 p-4">
+    <div className="bg-grid flex min-h-screen items-center justify-center bg-slate-50 p-4">
       <div className="w-full max-w-sm animate-fade-up">
-        <div className="mb-6 flex flex-col items-center gap-2 text-center">
-          <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-violet-600 shadow-lg">
+        <div className="mb-6 flex flex-col items-center gap-2.5 text-center">
+          <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-brand-600 shadow-card ring-1 ring-brand-700/20">
             <Zap className="h-6 w-6 text-white" />
           </div>
-          <h1 className="text-xl font-bold text-white">TimeSight</h1>
-          <p className="text-xs text-slate-400">Timesheet Intelligence Portal</p>
+          <h1 className="text-xl font-semibold tracking-tight text-slate-900">TimeSight</h1>
+          <p className="text-xs text-slate-500">Timesheet Intelligence Portal</p>
         </div>
 
-        <div className="rounded-2xl bg-white p-6 shadow-pop">
+        <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-pop">
+          <div className="mb-5 border-b border-slate-100 pb-4">
+            <h2 className="text-sm font-semibold text-slate-800">Sign in to your account</h2>
+            <p className="mt-0.5 text-xs text-slate-500">Use your administrator-issued credentials.</p>
+          </div>
           {err && (
             <div className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
               {err}
@@ -207,8 +211,8 @@ export default function Login() {
             </form>
           )}
         </div>
-        <p className="mt-4 text-center text-[11px] text-slate-500">
-          Default admin: <span className="font-mono">admin / admin</span> · change in .env
+        <p className="mt-4 text-center text-[11px] text-slate-400">
+          Default admin: <span className="font-mono text-slate-500">admin / admin</span> · change in .env
         </p>
       </div>
     </div>

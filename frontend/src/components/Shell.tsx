@@ -58,14 +58,14 @@ export default function Shell({ children }: { children: ReactNode }) {
   return (
     <div className="flex h-screen overflow-hidden">
       {/* ------------------------- Sidebar ------------------------- */}
-      <aside className="flex w-60 shrink-0 flex-col bg-slate-900 text-slate-300">
+      <aside className="flex w-60 shrink-0 flex-col border-r border-slate-800/60 bg-slate-950 text-slate-300">
         <div className="flex items-center gap-2.5 px-5 pb-5 pt-6">
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-violet-600 shadow-lg shadow-brand-900/40">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-brand-600 ring-1 ring-brand-400/20">
             <Zap className="h-5 w-5 text-white" />
           </div>
           <div>
-            <p className="text-[15px] font-bold leading-tight text-white">Timesheets</p>
-            <p className="text-[11px] leading-tight text-slate-400">Intelligence</p>
+            <p className="text-[15px] font-semibold leading-tight tracking-tight text-white">Timesheets</p>
+            <p className="text-[11px] leading-tight text-slate-500">Intelligence</p>
           </div>
         </div>
 
@@ -79,8 +79,8 @@ export default function Shell({ children }: { children: ReactNode }) {
                 cn(
                   "group flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
                   isActive
-                    ? "bg-brand-600/90 text-white shadow-sm"
-                    : "text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+                    ? "bg-brand-600 text-white shadow-xs"
+                    : "text-slate-400 hover:bg-slate-800/70 hover:text-white"
                 )
               }
             >
@@ -120,7 +120,7 @@ export default function Shell({ children }: { children: ReactNode }) {
           )}
         </nav>
 
-        <div className="mx-3 mb-4 rounded-xl bg-slate-800/70 p-3">
+        <div className="mx-3 mb-4 rounded-xl bg-slate-900 p-3 ring-1 ring-slate-800/80">
           <p className="mb-2 text-[10px] font-bold uppercase tracking-wider text-slate-500">
             System
           </p>

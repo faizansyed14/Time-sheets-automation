@@ -11,6 +11,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import datacache
 from app.core.database import get_db
 from app.schemas import UploadResult
 from app.services.pipeline.ingestion import ingest_upload
@@ -47,4 +48,5 @@ async def upload_timesheets(
             llm_summary=rec.llm_summary if rec else None,
             match_note=rec.match_note if rec else None,
         ))
+    await datacache.bust_pipeline()
     return results

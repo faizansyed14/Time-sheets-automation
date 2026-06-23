@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import datacache
 from app.core.database import get_db
 from app.models.email_message import EmailMessage, EmailStatus
 from app.models.timesheet_record import TimesheetRecord
@@ -176,6 +177,7 @@ async def decide(provider_message_id: str, body: DecisionIn, db: AsyncSession = 
         return {"status": "archived", "records_created": 0}
 
     records = await ingest_email(db, row)
+    await datacache.bust_pipeline()
     return {"status": "ingested", "records_created": len(records),
             "record_ids": [r.id for r in records]}
 
@@ -232,4 +234,5 @@ async def rerun_extraction(provider_message_id: str, db: AsyncSession = Depends(
 
     # Re-trigger ingestion (which will upsert and overwrite database rows)
     records = await ingest_email(db, row)
+    await datacache.bust_pipeline()
     return {"status": "re-ingested", "records_count": len(records)}

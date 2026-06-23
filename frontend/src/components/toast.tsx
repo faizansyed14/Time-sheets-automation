@@ -24,6 +24,14 @@ const ICONS: Record<ToastKind, ReactNode> = {
   info: <Info className="h-5 w-5 text-sky-500" />,
 };
 
+// Colored left accent bar per kind (via a before: pseudo-element).
+const ACCENT: Record<ToastKind, string> = {
+  success: "before:bg-emerald-500",
+  error: "before:bg-rose-500",
+  warning: "before:bg-amber-500",
+  info: "before:bg-sky-500",
+};
+
 let nextId = 1;
 
 export function ToastProvider({ children }: { children: ReactNode }) {
@@ -45,13 +53,14 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <Ctx.Provider value={{ toast }}>
       {children}
-      <div className="pointer-events-none fixed bottom-4 right-4 z-[100] flex w-96 max-w-[calc(100vw-2rem)] flex-col gap-2">
+      <div className="pointer-events-none fixed bottom-4 right-4 z-[100] flex w-96 max-w-[calc(100vw-2rem)] flex-col gap-2.5">
         {toasts.map((t) => (
           <div
             key={t.id}
             className={cn(
-              "pointer-events-auto flex items-start gap-3 rounded-xl border bg-white p-3.5 shadow-pop animate-fade-up",
-              t.kind === "error" ? "border-rose-200" : "border-slate-200"
+              "pointer-events-auto flex items-start gap-3 overflow-hidden rounded-xl border border-slate-200/80 bg-white p-3.5 pl-4 shadow-pop animate-scale-in",
+              "before:absolute before:inset-y-0 before:left-0 before:w-1 relative",
+              ACCENT[t.kind]
             )}
           >
             <div className="mt-0.5 shrink-0">{ICONS[t.kind]}</div>

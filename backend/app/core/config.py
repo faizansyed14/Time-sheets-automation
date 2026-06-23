@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     # ----- AWS S3 storage (storage_provider="s3") -----
     s3_bucket: str = ""
     s3_prefix: str = "timesheets"            # key prefix (acts as the root folder)
+    # Raw retry copies (originals kept only so a failed file can be retried) are
+    # stored under  <s3_prefix>/<s3_raw_prefix>/  on S3 — i.e. a folder INSIDE
+    # timesheets/ so it's visible in the S3 console and covered by a policy scoped
+    # to timesheets/*. The leading "_" keeps it hidden from the File Vault browser
+    # (which skips folders starting with "_" or ".").
+    s3_raw_prefix: str = "_pipeline-raw"
     s3_region: str = "us-east-1"
     aws_access_key_id: str | None = None     # omit on EC2/ECS to use the IAM role
     aws_secret_access_key: str | None = None
