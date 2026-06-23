@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import datacache
 from app.core.database import get_db
 from app.models.timesheet_record import ApprovalStatus, TimesheetRecord
 from app.schemas import ApprovalIn, TimesheetOut, TimesheetUpdate
@@ -80,6 +81,7 @@ async def approve_record(record_id: str, body: ApprovalIn, db: AsyncSession = De
     r.approval_status = ApprovalStatus.APPROVED if body.approved else ApprovalStatus.NOT_APPROVED
     await db.commit()
     await db.refresh(r)
+    await datacache.bust_coverage()
     return to_out(r)
 
 
@@ -152,6 +154,7 @@ async def update_record(record_id: str, body: TimesheetUpdate, db: AsyncSession 
     r.llm_summary = "Edited — " + _summarize(cleaned, flags, r.month, r.year)
     await db.commit()
     await db.refresh(r)
+    await datacache.bust_coverage()
     return to_out(r)
 
 
@@ -167,6 +170,7 @@ async def verify_record(record_id: str, db: AsyncSession = Depends(get_db)):
     r.llm_summary = (r.llm_summary or "") + "  [Manually verified by reviewer.]"
     await db.commit()
     await db.refresh(r)
+    await datacache.bust_coverage()
     return to_out(r)
 
 
@@ -177,6 +181,7 @@ async def delete_record(record_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(404, "Record not found")
     await db.delete(r)
     await db.commit()
+    await datacache.bust_coverage()
     return {"deleted": record_id}
 
 

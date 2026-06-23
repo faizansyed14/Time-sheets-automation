@@ -5,19 +5,35 @@
 @layer base {
   html {
     @apply antialiased;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
   }
   body {
     @apply bg-slate-50 text-slate-900;
+    /* Inter contextual alternates + tabular figures for clean dashboards */
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+  /* Tighter, more deliberate heading rhythm (enterprise typography scale). */
+  h1, h2, h3, h4 {
+    @apply tracking-tight text-slate-900;
+  }
+  /* Align numbers in tables / KPIs. */
+  table, .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+  ::selection {
+    @apply bg-brand-100 text-brand-900;
   }
   ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
+    width: 9px;
+    height: 9px;
   }
   ::-webkit-scrollbar-track {
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    @apply rounded-full bg-slate-300;
+    @apply rounded-full bg-slate-300/80;
   }
   ::-webkit-scrollbar-thumb:hover {
     @apply bg-slate-400;
@@ -27,5 +43,10 @@
 @layer components {
   .scrollbar-thin {
     scrollbar-width: thin;
+  }
+  /* Subtle dotted surface used behind the auth screen — minimal, not a gradient. */
+  .bg-grid {
+    background-image: radial-gradient(rgb(148 163 184 / 0.18) 1px, transparent 1px);
+    background-size: 22px 22px;
   }
 }

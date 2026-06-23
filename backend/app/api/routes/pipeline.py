@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import datacache
 from app.core.database import get_db
 from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
 from app.schemas import Page, PipelineFileOut, PipelineResolveAssignIn, PipelineResolveIn, PipelineStats
@@ -90,23 +91,28 @@ async def list_pipeline_files(
 
 @router.get("/stats", response_model=PipelineStats)
 async def pipeline_stats(db: AsyncSession = Depends(get_db)):
-    rows = (await db.execute(select(PipelineFile))).scalars().all()
-    by_status: dict[str, int] = {}
-    by_failure: dict[str, int] = {}
-    for t in rows:
-        by_status[t.status] = by_status.get(t.status, 0) + 1
-        if t.status in (PipelineStatus.FAILED, PipelineStatus.NEEDS_REVIEW) and t.failure_code:
-            by_failure[t.failure_code] = by_failure.get(t.failure_code, 0) + 1
-    return PipelineStats(
-        total=len(rows),
-        processing=by_status.get(PipelineStatus.PROCESSING, 0),
-        success=by_status.get(PipelineStatus.SUCCESS, 0),
-        needs_review=by_status.get(PipelineStatus.NEEDS_REVIEW, 0),
-        failed=by_status.get(PipelineStatus.FAILED, 0),
-        resolved=by_status.get(PipelineStatus.RESOLVED, 0),
-        by_failure_code=by_failure,
-        failure_labels=FAILURE_LABELS,
-    )
+    async def _compute() -> dict:
+        rows = (await db.execute(select(PipelineFile))).scalars().all()
+        by_status: dict[str, int] = {}
+        by_failure: dict[str, int] = {}
+        for t in rows:
+            by_status[t.status] = by_status.get(t.status, 0) + 1
+            if t.status in (PipelineStatus.FAILED, PipelineStatus.NEEDS_REVIEW) and t.failure_code:
+                by_failure[t.failure_code] = by_failure.get(t.failure_code, 0) + 1
+        return {
+            "total": len(rows),
+            "processing": by_status.get(PipelineStatus.PROCESSING, 0),
+            "success": by_status.get(PipelineStatus.SUCCESS, 0),
+            "needs_review": by_status.get(PipelineStatus.NEEDS_REVIEW, 0),
+            "failed": by_status.get(PipelineStatus.FAILED, 0),
+            "resolved": by_status.get(PipelineStatus.RESOLVED, 0),
+            "by_failure_code": by_failure,
+            "failure_labels": FAILURE_LABELS,
+        }
+
+    # Cached (short TTL) — the UI polls this every 15s from several screens.
+    data = await datacache.get_or_set(datacache.NS_PIPELINE, "stats", datacache.TTL_STATS, _compute)
+    return PipelineStats(**data)
 
 
 @router.get("/{pipeline_id}", response_model=PipelineFileOut)
@@ -135,8 +141,12 @@ async def resolve_pipeline_file(
         "detail": f"Resolved by reviewer: {t.resolution_note}",
         "at": t.resolved_at.isoformat(),
     }]
+    # Resolved => no longer awaiting a retry, so drop the raw copy.
+    from app.services.pipeline.ingestion import purge_raw_copy
+    purge_raw_copy(t)
     await db.commit()
     await db.refresh(t)
+    await datacache.bust_pipeline()
     return _out(t)
 
 
@@ -160,6 +170,7 @@ async def resolve_pipeline_assign(
         raise HTTPException(409, str(e))
     if t.status == PipelineStatus.FAILED:
         raise HTTPException(409, t.failure_detail or "Processing failed after manual assignment.")
+    await datacache.bust_pipeline()
     return _out(t)
 
 
@@ -174,6 +185,7 @@ async def retry_pipeline(pipeline_id: str, db: AsyncSession = Depends(get_db)):
         _rec, t = await retry_pipeline_file(db, t)
     except FileNotFoundError as e:
         raise HTTPException(409, str(e))
+    await datacache.bust_pipeline()
     return _out(t)
 
 
@@ -182,8 +194,12 @@ async def delete_pipeline_file(pipeline_id: str, db: AsyncSession = Depends(get_
     t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
     if not t:
         raise HTTPException(404, "Pipeline file not found")
+    # Remove the retry copy (S3 or local) before dropping the tracker row.
+    from app.services.pipeline.ingestion import purge_raw_copy
+    purge_raw_copy(t)
     await db.delete(t)
     await db.commit()
+    await datacache.bust_pipeline()
     return {"deleted": pipeline_id}
 
 

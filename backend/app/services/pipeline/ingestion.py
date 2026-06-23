@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import calendar
 import json as _json
-import re
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -42,6 +41,7 @@ from app.models.employee import Employee
 from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
 from app.models.timesheet_record import ApprovalStatus, TimesheetRecord, ValidationStatus
 from app.services.pipeline import matching
+from app.services.pipeline import raw_store
 from app.services import storage_provider as sp
 from app.services.email_provider import get_email_provider
 from app.services.extraction import get_extraction_engine
@@ -95,41 +95,22 @@ def _fail(t: PipelineFile, stage: str, code: str, detail: str) -> None:
 
 
 def _save_raw_copy(t: PipelineFile, filename: str, data: bytes) -> None:
-    """Keep the original bytes under data/pipeline_raw/<id>/ (OUTSIDE the File
-    Vault's storage root) so Retry works without polluting the browsable tree."""
-    try:
-        safe = re.sub(r'[<>:"/\\|?*]+', "_", filename or "file") or "file"
-        folder = settings.pipeline_raw_path / t.id
-        folder.mkdir(parents=True, exist_ok=True)
-        (folder / safe).write_bytes(data)
-        t.raw_path = f"{t.id}/{safe}"
-    except Exception:
-        t.raw_path = None
+    """Keep the original bytes (OUTSIDE the File Vault) so Retry works. Stored in
+    S3 under settings.s3_raw_prefix when STORAGE_PROVIDER=s3, else on local disk
+    under data/pipeline_raw/<id>/ — see services/pipeline/raw_store.py."""
+    t.raw_path = raw_store.save_raw(t.id, filename, data)
 
 
 def read_raw_copy(t: PipelineFile) -> bytes | None:
-    if not t.raw_path:
-        return None
-    rel = t.raw_path
-    # Candidate locations, newest layout first:
-    #   1) data/pipeline_raw/<id>/<file>           (current)
-    #   2) legacy "_pipeline/<id>/<file>" under storage root
-    #   3) legacy path with the "_pipeline/" prefix stripped, under the new root
-    candidates = []
-    if rel.startswith("_pipeline/"):
-        candidates.append(settings.storage_path / rel)
-        candidates.append(settings.pipeline_raw_path / rel[len("_pipeline/"):])
-    else:
-        candidates.append(settings.pipeline_raw_path / rel)
-        candidates.append(settings.storage_path / "_pipeline" / rel)
-    for p in candidates:
-        try:
-            p = p.resolve()
-            if p.is_file():
-                return p.read_bytes()
-        except Exception:
-            continue
-    return None
+    return raw_store.read_raw(t.raw_path)
+
+
+def purge_raw_copy(t: PipelineFile) -> None:
+    """Delete the retry copy and forget it. Done once a file no longer needs a
+    retry — i.e. it succeeded, was resolved, or its tracker row is deleted — so
+    only failed / needs-review files keep an original around."""
+    raw_store.delete_raw(t.raw_path)
+    t.raw_path = None
 
 
 def relocate_legacy_pipeline_raw() -> None:
@@ -527,6 +508,10 @@ async def ingest_timesheet_bytes(
            f"{mname} {period_year} ({len(entries)} file(s) on this month).")
     if manual_employee_pk and resolution_note:
         tracker.resolution_note = resolution_note.strip()
+    # Success => the retry copy is no longer needed (re-upload if you ever must
+    # re-run a clean file). Only failed / needs-review files keep their original.
+    if tracker.status == PipelineStatus.SUCCESS:
+        purge_raw_copy(tracker)
     return rec, tracker
 
 

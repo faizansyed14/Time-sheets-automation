@@ -21,12 +21,12 @@ function fieldSlug(label: string) {
 type Variant = "primary" | "secondary" | "ghost" | "danger" | "success";
 const VARIANTS: Record<Variant, string> = {
   primary:
-    "bg-brand-600 text-white hover:bg-brand-700 shadow-sm disabled:bg-brand-300",
+    "bg-brand-600 text-white hover:bg-brand-700 shadow-xs disabled:bg-brand-300 disabled:shadow-none",
   secondary:
-    "bg-white text-slate-700 border border-slate-300 hover:bg-slate-50 shadow-sm disabled:text-slate-400",
+    "bg-white text-slate-700 ring-1 ring-inset ring-slate-200 hover:bg-slate-50 hover:ring-slate-300 shadow-xs disabled:text-slate-400 disabled:shadow-none",
   ghost: "text-slate-600 hover:bg-slate-100 disabled:text-slate-300",
-  danger: "bg-rose-600 text-white hover:bg-rose-700 shadow-sm disabled:bg-rose-300",
-  success: "bg-emerald-600 text-white hover:bg-emerald-700 shadow-sm disabled:bg-emerald-300",
+  danger: "bg-rose-600 text-white hover:bg-rose-700 shadow-xs disabled:bg-rose-300",
+  success: "bg-emerald-600 text-white hover:bg-emerald-700 shadow-xs disabled:bg-emerald-300",
 };
 
 export function Button({
@@ -38,7 +38,7 @@ export function Button({
   return (
     <button
       className={cn(
-        "inline-flex items-center justify-center gap-1.5 rounded-lg font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-1 disabled:cursor-not-allowed",
+        "inline-flex items-center justify-center gap-1.5 rounded-lg font-semibold transition-all duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 active:scale-[.98] disabled:cursor-not-allowed disabled:active:scale-100",
         size === "sm" ? "px-2.5 py-1.5 text-xs" : "px-3.5 py-2 text-sm",
         VARIANTS[variant],
         className
@@ -51,7 +51,7 @@ export function Button({
 /* ----------------------------- Card ----------------------------- */
 export function Card({ className, children }: { className?: string; children: ReactNode }) {
   return (
-    <div className={cn("rounded-xl border border-slate-200 bg-white shadow-card", className)}>
+    <div className={cn("rounded-xl border border-slate-200/80 bg-white shadow-card", className)}>
       {children}
     </div>
   );
@@ -94,7 +94,7 @@ export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElem
   return (
     <input
       className={cn(
-        "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100",
+        "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 shadow-xs transition-shadow placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10",
         className
       )}
       {...props}
@@ -106,7 +106,7 @@ export function Select({ className, children, ...props }: SelectHTMLAttributes<H
   return (
     <select
       className={cn(
-        "rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100",
+        "rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 shadow-xs transition-shadow focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10",
         className
       )}
       {...props}
@@ -175,10 +175,10 @@ export function Modal({
   if (!open) return null;
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-slate-900/50 backdrop-blur-[2px]" onClick={onClose} />
+      <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm animate-overlay-in" onClick={onClose} />
       <div
         className={cn(
-          "relative max-h-[90vh] w-full overflow-y-auto rounded-2xl bg-white p-6 shadow-pop animate-fade-up",
+          "relative max-h-[90vh] w-full overflow-y-auto rounded-2xl border border-slate-200/60 bg-white p-6 shadow-pop animate-scale-in",
           wide ? "max-w-3xl" : "max-w-lg"
         )}
       >
@@ -230,10 +230,10 @@ export function Drawer({
   if (!open) return null;
   return createPortal(
     <div className="fixed inset-0 z-50">
-      <div className="absolute inset-0 bg-slate-900/50 backdrop-blur-[2px]" onClick={onClose} />
+      <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm animate-overlay-in" onClick={onClose} />
       <div
         className={cn(
-          "absolute inset-y-0 right-0 w-full overflow-y-auto bg-white shadow-pop animate-slide-in",
+          "absolute inset-y-0 right-0 w-full overflow-y-auto border-l border-slate-200/60 bg-white shadow-pop animate-slide-in",
           width
         )}
       >
@@ -295,8 +295,8 @@ export function PageHeader({
   return (
     <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
       <div>
-        <h1 className="text-xl font-bold tracking-tight text-slate-900">{title}</h1>
-        {subtitle && <p className="mt-1 text-sm text-slate-500">{subtitle}</p>}
+        <h1 className="text-[22px] font-semibold leading-tight tracking-tight text-slate-900">{title}</h1>
+        {subtitle && <p className="mt-1 text-sm leading-relaxed text-slate-500">{subtitle}</p>}
       </div>
       {actions && <div className="flex items-center gap-2">{actions}</div>}
     </div>

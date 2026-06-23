@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import datacache
 from app.core.database import get_db
 from app.models.employee import Employee
 from app.schemas import EmployeeIn, EmployeeOut, ImportSummary
@@ -29,8 +30,14 @@ def _out(e: Employee) -> EmployeeOut:
 
 @router.get("", response_model=list[EmployeeOut])
 async def list_employees(db: AsyncSession = Depends(get_db)):
-    rows = (await db.execute(select(Employee).order_by(Employee.name))).scalars().all()
-    return [_out(e) for e in rows]
+    async def _compute() -> list[dict]:
+        rows = (await db.execute(select(Employee).order_by(Employee.name))).scalars().all()
+        return [_out(e).model_dump() for e in rows]
+
+    # Cached — the matcher list is read on the Employees page and in the
+    # resolve-assign modal; busted whenever a row is added/edited/deleted/imported.
+    return await datacache.get_or_set(
+        datacache.NS_EMPLOYEES, "list", datacache.TTL_EMPLOYEES, _compute)
 
 
 def _same_identity(a_name: str, b_name: str) -> bool:
@@ -48,6 +55,7 @@ async def create_employee(body: EmployeeIn, db: AsyncSession = Depends(get_db)):
     db.add(e)
     await db.commit()
     await db.refresh(e)
+    await datacache.bust_employees()
     return _out(e)
 
 
@@ -63,6 +71,7 @@ async def update_employee(pk: str, body: EmployeeIn, db: AsyncSession = Depends(
         setattr(e, k, v)
     await db.commit()
     await db.refresh(e)
+    await datacache.bust_employees()
     return _out(e)
 
 
@@ -73,6 +82,7 @@ async def delete_employee(pk: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(404, "Employee not found")
     await db.delete(e)
     await db.commit()
+    await datacache.bust_employees()
     return {"deleted": pk}
 
 
@@ -91,4 +101,5 @@ async def import_from_excel(
     except Exception as exc:
         await db.rollback()
         raise HTTPException(500, f"Import failed: {exc}") from exc
+    await datacache.bust_employees()
     return summary

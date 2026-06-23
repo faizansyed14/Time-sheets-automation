@@ -23,8 +23,11 @@ export default {
         },
       },
       boxShadow: {
-        card: "0 1px 2px 0 rgb(15 23 42 / 0.04), 0 1px 3px 0 rgb(15 23 42 / 0.06)",
-        pop: "0 10px 38px -10px rgb(15 23 42 / 0.25), 0 10px 20px -15px rgb(15 23 42 / 0.2)",
+        // Subtle, layered, enterprise depth — no heavy drop shadows.
+        xs: "0 1px 2px 0 rgb(15 23 42 / 0.05)",
+        card: "0 1px 2px -1px rgb(15 23 42 / 0.06), 0 1px 3px 0 rgb(15 23 42 / 0.05)",
+        "card-hover": "0 2px 4px -2px rgb(15 23 42 / 0.08), 0 4px 12px -4px rgb(15 23 42 / 0.08)",
+        pop: "0 8px 24px -8px rgb(15 23 42 / 0.18), 0 16px 40px -12px rgb(15 23 42 / 0.16)",
       },
       keyframes: {
         "fade-up": {
@@ -35,10 +38,20 @@ export default {
           "0%": { transform: "translateX(100%)" },
           "100%": { transform: "translateX(0)" },
         },
+        "scale-in": {
+          "0%": { opacity: "0", transform: "translateY(8px) scale(.98)" },
+          "100%": { opacity: "1", transform: "translateY(0) scale(1)" },
+        },
+        "overlay-in": {
+          "0%": { opacity: "0" },
+          "100%": { opacity: "1" },
+        },
       },
       animation: {
         "fade-up": "fade-up .25s ease-out both",
         "slide-in": "slide-in .25s cubic-bezier(.32,.72,.35,1) both",
+        "scale-in": "scale-in .2s cubic-bezier(.16,1,.3,1) both",
+        "overlay-in": "overlay-in .2s ease-out both",
       },
     },
   },

@@ -9,6 +9,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.timesheets import to_out
+from app.core import datacache
 from app.core.database import get_db
 from app.models.employee import Employee
 from app.models.timesheet_record import ApprovalStatus, TimesheetRecord, ValidationStatus
@@ -41,9 +42,6 @@ async def coverage(
     focus_year = year or now.year
     focus_month = month or (now.month if focus_year == now.year else 12)
 
-    # ---- global headline counts (aggregates, not full-table scans) ----
-    total_employees = (await db.execute(select(func.count()).select_from(Employee))).scalar_one()
-
     def _pk_subq(*conds):
         """Distinct matched employee PKs whose records satisfy `conds`."""
         return (
@@ -55,23 +53,36 @@ async def coverage(
     submitted_subq = _pk_subq(
         TimesheetRecord.year == focus_year, TimesheetRecord.month == focus_month
     )
-    submitted_this_month = (
-        await db.execute(select(func.count()).select_from(submitted_subq.subquery()))
-    ).scalar_one()
-    missing_this_month = max(0, total_employees - submitted_this_month)
 
-    needs_review = (await db.execute(
-        select(func.count(func.distinct(TimesheetRecord.matched_employee_pk)))
-        .where(TimesheetRecord.year == focus_year,
-               TimesheetRecord.validation_status == ValidationStatus.MANUAL_REVIEW,
-               TimesheetRecord.matched_employee_pk.is_not(None))
-    )).scalar_one()
-    pending_approval = (await db.execute(
-        select(func.count(func.distinct(TimesheetRecord.matched_employee_pk)))
-        .where(TimesheetRecord.year == focus_year,
-               TimesheetRecord.approval_status != ApprovalStatus.APPROVED,
-               TimesheetRecord.matched_employee_pk.is_not(None))
-    )).scalar_one()
+    # ---- global headline counts (cached per focus month; busted on writes) ----
+    async def _aggregates() -> dict:
+        total = (await db.execute(select(func.count()).select_from(Employee))).scalar_one()
+        submitted = (await db.execute(
+            select(func.count()).select_from(submitted_subq.subquery()))).scalar_one()
+        nrev = (await db.execute(
+            select(func.count(func.distinct(TimesheetRecord.matched_employee_pk)))
+            .where(TimesheetRecord.year == focus_year,
+                   TimesheetRecord.validation_status == ValidationStatus.MANUAL_REVIEW,
+                   TimesheetRecord.matched_employee_pk.is_not(None)))).scalar_one()
+        pend = (await db.execute(
+            select(func.count(func.distinct(TimesheetRecord.matched_employee_pk)))
+            .where(TimesheetRecord.year == focus_year,
+                   TimesheetRecord.approval_status != ApprovalStatus.APPROVED,
+                   TimesheetRecord.matched_employee_pk.is_not(None)))).scalar_one()
+        sample = (await db.execute(
+            select(Employee.name).where(Employee.id.not_in(submitted_subq))
+            .order_by(Employee.name).limit(50))).scalars().all()
+        return {"total_employees": total, "submitted_this_month": submitted,
+                "needs_review": nrev, "pending_approval": pend, "missing_sample": list(sample)}
+
+    agg = await datacache.get_or_set(
+        datacache.NS_COVERAGE, f"agg:{focus_year}-{focus_month}", datacache.TTL_COVERAGE, _aggregates)
+    total_employees = agg["total_employees"]
+    submitted_this_month = agg["submitted_this_month"]
+    missing_this_month = max(0, total_employees - submitted_this_month)
+    needs_review = agg["needs_review"]
+    pending_approval = agg["pending_approval"]
+    missing_sample = agg["missing_sample"]
 
     # ---- filtered + paginated employee rows ----
     emp_q = select(Employee)
@@ -144,11 +155,7 @@ async def coverage(
             in_matcher=True, has_records=bool(items),
         ))
 
-    # a small sample of who is missing the focus month (for the KPI tooltip)
-    missing_sample = (await db.execute(
-        select(Employee.name).where(Employee.id.not_in(submitted_subq)).order_by(Employee.name).limit(50)
-    )).scalars().all()
-
+    # missing_sample (for the KPI tooltip) is part of the cached aggregates above.
     return DashboardSummary(
         year=focus_year, month=focus_month,
         total_employees=total_employees,
