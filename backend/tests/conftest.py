@@ -73,13 +73,33 @@ async def client():
         yield c
 
 
-@pytest_asyncio.fixture
-async def admin_token(client) -> str:
-    r = await client.post("/api/v1/auth/login", json={"username": "admin", "password": "admin"})
+async def login_2fa(client, username: str, password: str) -> str:
+    """Full login including the second factor — every role uses 2FA now (admins
+    default to CAPTCHA, users to OTP). The debug OTP code is returned in non-prod
+    and the CAPTCHA answer is read from the cache, so tests can complete either."""
+    from app.core.cache import cache
+    r = await client.post("/api/v1/auth/login", json={"username": username, "password": password})
     assert r.status_code == 200, r.text
     data = r.json()
-    assert data["status"] == "authenticated"
-    return data["access_token"]
+    if data["status"] == "authenticated":
+        return data["access_token"]
+    if data["status"] == "otp_required":
+        v = await client.post("/api/v1/auth/verify-otp",
+                              json={"login_token": data["login_token"], "code": data["debug_otp"]})
+    elif data["status"] == "captcha_required":
+        answer = await cache.get(f"captcha:{data['captcha_id']}")
+        v = await client.post("/api/v1/auth/verify-captcha",
+                              json={"login_token": data["login_token"],
+                                    "captcha_id": data["captcha_id"], "answer": answer})
+    else:
+        raise AssertionError(f"unexpected login status: {data}")
+    assert v.status_code == 200, v.text
+    return v.json()["access_token"]
+
+
+@pytest_asyncio.fixture
+async def admin_token(client) -> str:
+    return await login_2fa(client, "admin", "admin")
 
 
 def auth_headers(token: str) -> dict:

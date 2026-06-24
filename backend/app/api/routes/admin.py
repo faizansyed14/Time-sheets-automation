@@ -40,6 +40,14 @@ from app.services.llm import provider as llm_provider
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
 
+MIN_PASSWORD_LEN = 8
+
+
+def _check_password(pw: str) -> None:
+    if not pw or len(pw) < MIN_PASSWORD_LEN:
+        raise HTTPException(400, f"Password must be at least {MIN_PASSWORD_LEN} characters.")
+
+
 def _user_out(u: User) -> UserOut:
     return UserOut(id=u.id, username=u.username, email=u.email, role=u.role,
                    auth_mode=u.auth_mode, is_active=u.is_active, last_login_at=u.last_login_at)
@@ -61,7 +69,9 @@ async def create_user(body: AdminUserCreate, db: AsyncSession = Depends(get_db))
     dup = (await db.execute(select(User).where(User.username == body.username))).scalar_one_or_none()
     if dup:
         raise HTTPException(409, "Username already exists")
-    if body.auth_mode == AuthMode.OTP and body.role != Role.ADMIN and not body.email:
+    _check_password(body.password)
+    # Every role (including admin) uses 2FA, so OTP mode always needs an email.
+    if body.auth_mode == AuthMode.OTP and not body.email:
         raise HTTPException(400, "An email is required for OTP delivery")
     u = User(username=body.username, email=str(body.email) if body.email else None,
              password_hash=hash_password(body.password), role=body.role, auth_mode=body.auth_mode)
@@ -89,7 +99,11 @@ async def update_user(user_id: str, body: AdminUserUpdate, db: AsyncSession = De
     if body.is_active is not None:
         u.is_active = body.is_active
     if body.password:
+        _check_password(body.password)
         u.password_hash = hash_password(body.password)
+    # Don't strand a user in OTP mode with no delivery address.
+    if u.auth_mode == AuthMode.OTP and not u.email:
+        raise HTTPException(400, "This user uses OTP — an email is required.")
     await db.commit()
     await db.refresh(u)
     return _user_out(u)
@@ -102,7 +116,7 @@ async def switch_auth_mode(user_id: str, mode: str, db: AsyncSession = Depends(g
     u = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if not u:
         raise HTTPException(404, "User not found")
-    if mode == AuthMode.OTP and not u.email and u.role != Role.ADMIN:
+    if mode == AuthMode.OTP and not u.email:
         raise HTTPException(400, "Assign an email before switching this user to OTP")
     u.auth_mode = mode
     await db.commit()

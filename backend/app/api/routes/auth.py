@@ -19,21 +19,24 @@ from __future__ import annotations
 import secrets
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.core.cache import cache
 from app.core.config import settings
 from app.core.security import (
     create_access_token,
     create_login_token,
     decode_token,
     fingerprint_hash,
+    is_token_revoked_key,
+    token_remaining_seconds,
     verify_password,
 )
 from app.core.database import get_db
-from app.models.auth import AuthMode, Role, User
+from app.models.auth import AuthMode, User
 from app.schemas.auth import (
     LoginIn,
     LoginResult,
@@ -92,11 +95,7 @@ async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_
 
     fp = _fp_from(request, body.fingerprint)
 
-    # Admins bypass the second factor entirely.
-    if user.role == Role.ADMIN:
-        token = await _issue_session(db, user)
-        return LoginResult(status="authenticated", access_token=token, user=_user_out(user))
-
+    # Every role — including admins — must pass the second factor (OTP/CAPTCHA).
     flow_id = secrets.token_urlsafe(16)
     login_token = create_login_token(user.id, flow_id, fp)
 
@@ -196,9 +195,17 @@ async def me(user: User = Depends(get_current_user)):
 
 
 @router.post("/logout")
-async def logout():
-    # Stateless JWT: the client discards the token. (A denylist could be added
-    # here if hard server-side revocation is required.)
+async def logout(authorization: str | None = Header(default=None)):
+    """Real server-side logout: denylist this token's jti until it would have
+    expired, so a stolen/leaked token can't be reused after sign-out."""
+    token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    if token:
+        payload = decode_token(token)
+        if payload and payload.get("jti"):
+            await cache.set(is_token_revoked_key(payload["jti"]), "1",
+                            ttl=token_remaining_seconds(payload) or 1)
     return {"status": "logged_out"}
 
 

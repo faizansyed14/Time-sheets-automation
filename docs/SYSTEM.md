@@ -7,7 +7,7 @@ suite.
 ```
 ┌──────────┐     ┌─────────────────────────── backend (FastAPI) ───────────────────────────┐
 │ frontend │ ──► │ api/routes  auth · admin · inbox · pipeline · employees · upload · files  │
-│  (React) │     │ api/deps    RBAC dependencies (require_user / require_admin)              │
+│  (React) │     │ api/deps    RBAC (require_user / require_write / require_admin)           │
 │  nginx   │     │ services    auth/ · config/ · employee/ · extraction/ · llm/ · pipeline/  │
 └──────────┘     │             storage_provider/{local,s3,onedrive} · tasks (Celery)         │
                  │ core        config · database · cache · celery_app · security · crypto    │

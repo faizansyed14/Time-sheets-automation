@@ -1,44 +1,36 @@
 """
 Match an extracted (employee_id, name) against all_employee_data.
 
+Matching is STRICT: a confident match requires BOTH the employee_id AND the
+name to agree on the SAME matcher row. We never match on the ID alone or the
+name alone, and we never search the whole table by name — that would risk
+filing a sheet under the wrong person. Anything that isn't a clean ID+name
+agreement returns no match (employee=None) and is flagged in the pipeline
+tracker for a human to assign.
+
 employee_id is NOT globally unique — the AUH and DXB teams have overlapping ID
-ranges, so the same ID can belong to two different people (with different
-names). Matching therefore always considers BOTH the ID and the name:
+ranges, so the same ID can belong to two different people. The name decides
+which one; if it can't, the file is flagged as ambiguous rather than guessed.
 
-  1. employee_id lookup:
-       - one candidate  -> confirm with the name when one was extracted
-                           (a strong name disagreement is flagged, not silently
-                            accepted)
-       - many candidates (AUH + DXB share the ID) -> disambiguate by exact
-         then fuzzy name; if the name can't pick a side, the match is
-         AMBIGUOUS and the file goes to the pipeline tracker instead of being
-         filed under the wrong person
-  2. exact (case-insensitive) name
-  3. fuzzy name (rapidfuzz) above threshold  -> handles "Mohd Ali" vs "Mohammed Ali"
-
-Returns a MatchResult carrying the matched Employee (or None), a
-human-readable note, and a machine code the pipeline tracker uses.
+Returns a MatchResult carrying the matched Employee (or None), a human-readable
+note, and a machine code the pipeline tracker uses.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from rapidfuzz import fuzz, process
-from sqlalchemy import func, select
+from rapidfuzz import fuzz
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.employee import Employee
 
-# A fuzzy name match must clear BOTH the overall score and a token-overlap
-# floor. The overall score alone can't separate a real abbreviation from a
-# hallucination — "Mohd Ali" → "Mohammed Ali" and "John Doe" → "John Murphy
-# Ibanez Santos" BOTH score WRatio 85. The token floor splits them cleanly:
-# the first has token_sort_ratio 80 (kept), the second 36 (rejected).
+# A fuzzy name match (used ONLY to confirm the sheet name against the row(s) the
+# ID already points to — never as a global name search) must clear both an
+# overall score and a token-overlap floor, so "Mohd Ali" ≈ "Mohammed Ali" is
+# accepted while "John Doe" vs "John Murphy Ibanez" is not.
 FUZZY_THRESHOLD = 82
 FUZZY_TOKEN_FLOOR = 70
-# Below this, a name printed on the sheet is considered a different person
-# than the one the ID points to (used to flag ID/name disagreements).
-NAME_AGREEMENT_THRESHOLD = 60
 
 # Obvious placeholder / example values an LLM may emit when it cannot read the
 # sheet. These must NEVER be matched to a real employee.
@@ -60,22 +52,10 @@ def _is_placeholder_name(name: str) -> bool:
     return len(letters) < 2
 
 
-def _fuzzy_ok(a: str, b: str) -> tuple[bool, float]:
-    """True + score when a/b are a confident fuzzy match (both the overall
-    score and the token-overlap floor are met)."""
-    score = fuzz.WRatio(a, b)
-    token = fuzz.token_sort_ratio(a, b)
-    return (score >= FUZZY_THRESHOLD and token >= FUZZY_TOKEN_FLOOR), score
-
-
 class MatchCode:
-    ID_AND_NAME = "id_and_name"        # id + name both agree (strongest)
-    ID_ONLY = "id_only"                # id matched, no name on the sheet
-    ID_NAME_MISMATCH = "id_name_mismatch"  # id matched but name disagrees -> review
-    NAME_EXACT = "name_exact"
-    NAME_FUZZY = "name_fuzzy"
+    ID_AND_NAME = "id_and_name"        # id + name both agree on one row (the ONLY match)
     AMBIGUOUS_ID = "ambiguous_id"      # shared AUH/DXB id, name can't disambiguate
-    NO_MATCH = "no_match"
+    NO_MATCH = "no_match"              # id or name missing / not found / disagree
     NO_IDENTITY = "no_identity"        # nothing extracted to match on
 
 
@@ -94,108 +74,81 @@ async def match_employee(
     db: AsyncSession, extracted_id: str | None, extracted_name: str | None
 ) -> MatchResult:
     name_norm = (extracted_name or "").strip().lower()
-    # A placeholder / hallucinated name must not drive matching. Keep the ID
-    # (it may still be valid), but treat the name as absent so we never fuzzy
-    # match "John Doe" onto a real person.
     name_is_placeholder = bool(name_norm) and _is_placeholder_name(name_norm)
     if name_is_placeholder:
-        name_norm = ""
+        name_norm = ""           # a placeholder name counts as no name
+    id_norm = (extracted_id or "").strip()
 
-    # ---- 1) employee_id (may return several rows: AUH/DXB share IDs) ----
-    if extracted_id and extracted_id.strip():
-        candidates = (
-            await db.execute(select(Employee).where(Employee.employee_id == extracted_id.strip()))
-        ).scalars().all()
-
-        if len(candidates) == 1:
-            emp = candidates[0]
-            if not name_norm:
-                return MatchResult(emp, f"Matched by employee ID ({extracted_id}); no name on sheet.",
-                                   MatchCode.ID_ONLY)
-            score = fuzz.WRatio(name_norm, emp.name.strip().lower())
-            if emp.name.strip().lower() == name_norm or score >= NAME_AGREEMENT_THRESHOLD:
-                return MatchResult(emp, f"Matched by employee ID ({extracted_id}) + name "
-                                        f"({extracted_name} ≈ {emp.name}).", MatchCode.ID_AND_NAME)
-            return MatchResult(
-                emp,
-                f'ID {extracted_id} belongs to "{emp.name}"{_loc(emp)} but the sheet says '
-                f'"{extracted_name}" — please confirm the right person.',
-                MatchCode.ID_NAME_MISMATCH,
-            )
-
-        if len(candidates) > 1:
-            # Shared ID (AUH + DXB). The name decides which person this is.
-            if name_norm:
-                exact = [c for c in candidates if c.name.strip().lower() == name_norm]
-                if len(exact) == 1:
-                    emp = exact[0]
-                    return MatchResult(emp, f"Matched by employee ID ({extracted_id}) + exact name "
-                                            f"({emp.name}{_loc(emp)}) — ID is shared across teams.",
-                                       MatchCode.ID_AND_NAME)
-                scored = sorted(
-                    ((fuzz.WRatio(name_norm, c.name.strip().lower()),
-                      fuzz.token_sort_ratio(name_norm, c.name.strip().lower()), c)
-                     for c in candidates),
-                    key=lambda t: t[0], reverse=True,
-                )
-                best_score, best_token, best = scored[0]
-                second_score = scored[1][0] if len(scored) > 1 else 0
-                if (best_score >= FUZZY_THRESHOLD and best_token >= FUZZY_TOKEN_FLOOR
-                        and best_score - second_score >= 5):
-                    return MatchResult(
-                        best,
-                        f'Matched by employee ID ({extracted_id}) + fuzzy name: "{extracted_name}" → '
-                        f'"{best.name}"{_loc(best)} ({int(best_score)}% confidence) — ID is shared across teams.',
-                        MatchCode.ID_AND_NAME,
-                    )
-            shared = ", ".join(f"{c.name}{_loc(c)}" for c in candidates)
-            return MatchResult(
-                None,
-                f"Employee ID {extracted_id} is shared by multiple people ({shared}) and the name "
-                f'on the sheet ("{extracted_name or "none"}") does not clearly identify one of them.',
-                MatchCode.AMBIGUOUS_ID,
-            )
-
-    if not name_norm:
-        if name_is_placeholder:
-            return MatchResult(
-                None,
-                f'The sheet only yielded a placeholder name ("{extracted_name}") with no usable '
-                "employee ID — it could not be read reliably. Please assign the correct employee.",
-                MatchCode.NO_MATCH,
-            )
+    # ---- both an ID and a real name are REQUIRED ----
+    if not id_norm and not name_norm:
         return MatchResult(None, "No employee ID or name found on the sheet to match.",
                            MatchCode.NO_IDENTITY)
+    if not id_norm:
+        return MatchResult(
+            None,
+            f'Only a name ("{extracted_name}") was found — an employee ID is also required '
+            "to match. Please assign the correct employee.",
+            MatchCode.NO_MATCH,
+        )
+    if not name_norm:
+        why = "only a placeholder name" if name_is_placeholder else "no employee name"
+        return MatchResult(
+            None,
+            f'Employee ID {id_norm} was found but {why} — both the ID and the name are '
+            "required to match. Please assign the correct employee.",
+            MatchCode.NO_MATCH,
+        )
 
-    # ---- 2) exact name ----
-    rows = (
-        await db.execute(select(Employee).where(func.lower(func.trim(Employee.name)) == name_norm))
+    # ---- look up by ID (AUH/DXB may share an ID -> several candidates) ----
+    candidates = (
+        await db.execute(select(Employee).where(Employee.employee_id == id_norm))
     ).scalars().all()
-    if len(rows) == 1:
-        return MatchResult(rows[0], f"Matched by exact name ({extracted_name}).", MatchCode.NAME_EXACT)
-    if len(rows) > 1:
-        shared = ", ".join(f"{r.employee_id}{_loc(r)}" for r in rows)
-        return MatchResult(None, f'Multiple employees are named "{extracted_name}" ({shared}); '
-                                 "an employee ID is needed to tell them apart.", MatchCode.AMBIGUOUS_ID)
+    if not candidates:
+        return MatchResult(
+            None,
+            f'No employee with ID {id_norm} in the matcher (sheet name "{extracted_name}"). '
+            "Add them to the matcher or assign the correct employee.",
+            MatchCode.NO_MATCH,
+        )
 
-    # ---- 3) fuzzy name ----
-    all_emps = (await db.execute(select(Employee))).scalars().all()
-    if not all_emps:
-        return MatchResult(None, "Employee matcher list is empty.", MatchCode.NO_MATCH)
-    choices = {f"{e.id}": e for e in all_emps}
-    best = process.extractOne(
-        name_norm, {k: v.name.strip().lower() for k, v in choices.items()}, scorer=fuzz.WRatio
+    # ---- the name must agree with exactly one candidate (exact, else strong fuzzy) ----
+    exact = [c for c in candidates if c.name.strip().lower() == name_norm]
+    if len(exact) == 1:
+        emp = exact[0]
+        return MatchResult(
+            emp, f"Matched by employee ID ({id_norm}) + name ({emp.name}{_loc(emp)}).",
+            MatchCode.ID_AND_NAME,
+        )
+    if len(exact) > 1:
+        return MatchResult(
+            None, f'Employee ID {id_norm} + name "{extracted_name}" matches multiple rows — ambiguous.',
+            MatchCode.AMBIGUOUS_ID,
+        )
+
+    # fuzzy ONLY against the ID's own candidate rows (tolerate OCR / abbreviations)
+    scored = sorted(
+        ((fuzz.WRatio(name_norm, c.name.strip().lower()),
+          fuzz.token_sort_ratio(name_norm, c.name.strip().lower()), c) for c in candidates),
+        key=lambda t: t[0], reverse=True,
     )
-    if best:
-        matched = choices[best[2]]
-        ok, _ = _fuzzy_ok(name_norm, matched.name.strip().lower())
-        if ok:
-            return MatchResult(
-                matched,
-                f'Fuzzy match: "{extracted_name}" → "{matched.name}"{_loc(matched)} '
-                f"({int(best[1])}% confidence).",
-                MatchCode.NAME_FUZZY,
-            )
+    best_score, best_token, best = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else 0
+    if (best_score >= FUZZY_THRESHOLD and best_token >= FUZZY_TOKEN_FLOOR
+            and (len(candidates) == 1 or best_score - second_score >= 5)):
+        return MatchResult(
+            best,
+            f'Matched by employee ID ({id_norm}) + name "{extracted_name}" → '
+            f'"{best.name}"{_loc(best)} ({int(best_score)}% confidence).',
+            MatchCode.ID_AND_NAME,
+        )
 
-    return MatchResult(None, f'No employee matcher entry found for "{extracted_name}".',
-                       MatchCode.NO_MATCH)
+    # ID exists but the name does NOT agree with it -> NOT matched, flag for assignment.
+    who = ", ".join(f"{c.name}{_loc(c)}" for c in candidates)
+    code = MatchCode.AMBIGUOUS_ID if len(candidates) > 1 else MatchCode.NO_MATCH
+    return MatchResult(
+        None,
+        f'Employee ID {id_norm} belongs to {who}, but the sheet name "{extracted_name}" '
+        "does not match — not matched. Please assign the correct employee.",
+        code,
+    )
+

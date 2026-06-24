@@ -494,7 +494,7 @@ export const MONTHS_LONG = ["", "January", "February", "March", "April", "May", 
 // ===========================================================================
 // Auth
 // ===========================================================================
-export type AuthRole = "admin" | "user";
+export type AuthRole = "admin" | "user" | "viewer";
 export type AuthModeT = "otp" | "captcha";
 
 export interface AuthUser {
