@@ -381,9 +381,6 @@ def _focus_timesheet_text(text: str) -> str:
     return focused or text.strip()
 
 
-_INLINE_LOGO_MAX_BYTES = 20_000  # skip small inline images (email logos)
-
-
 def _part_file_type(part, payload: bytes) -> str | None:
     """Resolve file type from filename, content-type, or magic bytes."""
     filename = part.get_filename() or ""
@@ -424,7 +421,14 @@ def _score_eml_attachment(filename: str, payload: bytes, ftype: str) -> int:
 
 
 def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
-    """Return (filename, payload, file_type) for real timesheet attachments inside .eml."""
+    """Return (filename, payload, file_type) for real timesheet attachments inside .eml.
+
+    Excluded:
+    - Any part with a Content-Id header: these are CID-inline images (logos,
+      banners, signatures) referenced from the HTML body — never timesheet docs.
+    - Images with inline/no-disposition and no CID: likely decorative graphics.
+    Only images that are explicitly Content-Disposition: attachment are kept.
+    """
     try:
         msg = _parse_eml(eml_bytes)
     except Exception:
@@ -438,6 +442,11 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
         if not payload:
             continue
 
+        # CID-referenced parts are embedded HTML resources (logos, signatures).
+        cid = (part.get("Content-Id") or "").strip()
+        if cid:
+            continue
+
         filename = part.get_filename() or ""
         disposition = (part.get_content_disposition() or "").lower()
         ftype = _part_file_type(part, payload)
@@ -445,20 +454,13 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
             continue
 
         if disposition == "attachment":
+            # Explicit file attachment — keep all supported document types.
             found.append((filename, payload, ftype))
-            continue
-
-        # Inline: skip logos; allow large inline PDFs / sheet images
-        if disposition == "inline":
-            if ftype in ("pdf", "docx", "xlsx"):
-                found.append((filename, payload, ftype))
-            elif ftype == "image" and len(payload) > _INLINE_LOGO_MAX_BYTES:
-                found.append((filename, payload, ftype))
-            continue
-
-        # No disposition — keep only recognisable document payloads
-        if ftype in ("pdf", "docx", "xlsx"):
+        elif ftype in ("pdf", "docx", "xlsx"):
+            # Inline or no-disposition document (e.g. embedded PDF) — keep.
             found.append((filename, payload, ftype))
+        # Images without an explicit attachment disposition are skipped —
+        # they are decorative graphics, not standalone timesheet files.
 
     return found
 

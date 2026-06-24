@@ -174,7 +174,7 @@ export interface PipelineFile {
   filename: string;
   content_type: string | null;
   size_bytes: number | null;
-  source_kind: "upload" | "email";
+  source_kind: "upload" | "email" | "manual";
   source_id: string | null;
   attachment_id: string | null;
   status: PipelineStatus;
@@ -393,6 +393,72 @@ export const fileContentUrl = (relPath: string) =>
 export const downloadZipUrl = (manager?: string) =>
   withAuthParam(`/api/v1/files/download-zip${manager ? `?manager=${encodeURIComponent(manager)}` : ""}`);
 
+export type EmlParsed = {
+  subject: string;
+  from_: string;
+  to: string;
+  date: string;
+  body_text: string;
+  body_html: string;
+  attachments: { filename: string; content_type: string; size: number; data_b64?: string }[];
+};
+
+/**
+ * Fetch parsed EML content for a file identified by its existing content URL.
+ * Handles file-vault, inbox-attachment, and pipeline raw-preview URL shapes.
+ */
+export function fetchEmlPreview(fileUrl: string): Promise<EmlParsed> {
+  try {
+    const u = new URL(fileUrl, window.location.origin);
+    // File vault: /api/v1/files/content?rel_path=...
+    if (u.pathname.includes("/files/content")) {
+      const rel = u.searchParams.get("rel_path");
+      if (rel) return api.get<EmlParsed>(`/files/eml-preview?rel_path=${encodeURIComponent(rel)}`).then((r) => r.data);
+    }
+    // Inbox attachment: /api/v1/inbox/{msgId}/attachments/{attId}
+    const att = u.pathname.match(/\/inbox\/([^/]+)\/attachments\/([^/]+)$/);
+    if (att) return api.get<EmlParsed>(`/inbox/${att[1]}/attachments/${encodeURIComponent(att[2])}/eml-preview`).then((r) => r.data);
+    // Pipeline raw copy: /api/v1/pipeline/{id}/raw-preview
+    const pip = u.pathname.match(/\/pipeline\/([^/]+)\/raw-preview$/);
+    if (pip) return api.get<EmlParsed>(`/pipeline/${pip[1]}/raw-eml-preview`).then((r) => r.data);
+  } catch { /* fall through */ }
+  return Promise.reject(new Error("Cannot derive EML preview URL from: " + fileUrl));
+}
+
+/** Authenticated URL for the stored raw pipeline file (for inline preview). */
+export const pipelineRawUrl = (id: string): string =>
+  withAuthParam(`/api/v1/pipeline/${id}/raw-preview`);
+
+/**
+ * Resolve a failed/needs-review pipeline file via manual leave entry.
+ * Same data shape as uploadManual but updates the existing tracker and
+ * purges the S3 raw copy on success.
+ */
+export const pipelineManualFix = (
+  id: string,
+  body: {
+    employee_pk: string;
+    month: number;
+    year: number;
+    buckets: Record<string, string[]>;
+    note?: string;
+    files?: File[];
+  }
+) => {
+  const form = new FormData();
+  form.append("employee_pk", body.employee_pk);
+  form.append("month", String(body.month));
+  form.append("year", String(body.year));
+  form.append("buckets", JSON.stringify(body.buckets));
+  if (body.note) form.append("note", body.note);
+  (body.files ?? []).forEach((f) => form.append("files", f, f.name));
+  return api
+    .post<PipelineFile>(`/pipeline/${id}/manual-fix`, form, {
+      headers: { "Content-Type": "multipart/form-data" },
+    })
+    .then((r) => r.data);
+};
+
 export const createFileManager = (name: string) =>
   api.post("/files/managers", { name }).then((r) => r.data);
 export const createFileEmployee = (manager: string, name: string) =>
@@ -478,6 +544,26 @@ export const uploadTimesheets = (files: File[], onProgress?: (pct: number) => vo
       onUploadProgress: (e) =>
         onProgress && e.total ? onProgress(Math.round((e.loaded / e.total) * 100)) : undefined,
     })
+    .then((r) => r.data);
+};
+
+export const uploadManual = (body: {
+  employee_pk: string;
+  month: number;
+  year: number;
+  buckets: Record<string, string[]>;
+  note?: string;
+  files: File[];
+}) => {
+  const form = new FormData();
+  form.append("employee_pk", body.employee_pk);
+  form.append("month", String(body.month));
+  form.append("year", String(body.year));
+  form.append("buckets", JSON.stringify(body.buckets));
+  if (body.note) form.append("note", body.note);
+  body.files.forEach((f) => form.append("files", f, f.name));
+  return api
+    .post<UploadResult>("/upload/manual", form, { headers: { "Content-Type": "multipart/form-data" } })
     .then((r) => r.data);
 };
 

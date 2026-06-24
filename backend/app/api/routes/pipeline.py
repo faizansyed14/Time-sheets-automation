@@ -7,7 +7,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import json as _json
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -201,6 +203,133 @@ async def delete_pipeline_file(pipeline_id: str, db: AsyncSession = Depends(get_
     await db.commit()
     await datacache.bust_pipeline()
     return {"deleted": pipeline_id}
+
+
+_MANUAL_BUCKETS = ("annual", "remote", "sick", "unpaid", "absent", "public_holiday")
+
+
+@router.post("/{pipeline_id}/manual-fix", response_model=PipelineFileOut)
+async def pipeline_manual_fix(
+    pipeline_id: str,
+    employee_pk: str = Form(...),
+    month: int = Form(...),
+    year: int = Form(...),
+    buckets: str = Form("{}"),
+    note: str | None = Form(default=None),
+    files: list[UploadFile] = File(default=[]),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve a failed/needs-review file by manually entering leave data.
+
+    Identical to /upload/manual but re-uses (and resolves) the existing
+    pipeline tracker instead of creating a new one. Raw copy is purged on
+    success so the S3 _pipeline-raw object is deleted.
+    """
+    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "Pipeline file not found")
+    if t.status not in (PipelineStatus.FAILED, PipelineStatus.NEEDS_REVIEW):
+        raise HTTPException(409, f"Only failed/needs-review files can be fixed (status: '{t.status}').")
+    if not (1 <= month <= 12 and year >= 2000):
+        raise HTTPException(400, "Invalid month or year.")
+
+    try:
+        parsed = _json.loads(buckets or "{}")
+        if not isinstance(parsed, dict):
+            raise ValueError
+    except Exception:
+        raise HTTPException(400, "`buckets` must be a JSON object of bucket -> date list.")
+    bucket_data = {
+        b: [str(d).strip() for d in (parsed.get(b) or []) if str(d).strip()]
+        for b in _MANUAL_BUCKETS
+    }
+
+    attachments: list[tuple[str, str, bytes]] = []
+    for f in files or []:
+        data = await f.read()
+        if data:
+            attachments.append((f.filename or "attachment",
+                                 f.content_type or "application/octet-stream", data))
+
+    from app.services.pipeline.ingestion import ingest_manual_entry, purge_raw_copy, read_raw_copy
+
+    # If the reviewer didn't attach a replacement file, carry the original raw
+    # file forward as the record attachment so it is stored in the File Vault.
+    if not attachments and t.raw_path:
+        raw_bytes = read_raw_copy(t)
+        if raw_bytes:
+            import mimetypes as _mt
+            fn = t.filename or "attachment"
+            ct = _mt.guess_type(fn)[0] or "application/octet-stream"
+            attachments.append((fn, ct, raw_bytes))
+    try:
+        rec, new_tracker = await ingest_manual_entry(
+            db, employee_pk=employee_pk, month=month, year=year,
+            buckets=bucket_data, attachments=attachments, note=note,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    # ingest_manual_entry created its own tracker — delete it; the original t
+    # is the authoritative audit row for this file.
+    await db.delete(new_tracker)
+
+    # Update original tracker to reflect the manual resolution.
+    t.record_id = rec.id
+    t.status = PipelineStatus.SUCCESS
+    t.failure_code = None
+    t.failure_detail = None
+    t.resolved_at = datetime.now(timezone.utc)
+    t.resolution_note = (note or "").strip() or "Resolved via manual entry."
+    t.month = rec.month
+    t.year = rec.year
+    t.employee_name = rec.employee_name
+    t.employee_id = rec.employee_id
+    t.events = (t.events or []) + [{
+        "stage": "recorded", "status": "ok",
+        "detail": f"Manually resolved by reviewer: {t.resolution_note}",
+        "at": t.resolved_at.isoformat(),
+    }]
+    purge_raw_copy(t)
+    await db.commit()
+    await db.refresh(t)
+    await datacache.bust_pipeline()
+    return _out(t)
+
+
+@router.get("/{pipeline_id}/raw-preview")
+async def pipeline_raw_preview(pipeline_id: str, db: AsyncSession = Depends(get_db)):
+    """Serve the stored raw file for inline preview (PDF / image / EML download)."""
+    from fastapi import Response as _Response
+    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "Pipeline file not found")
+    from app.services.pipeline.ingestion import read_raw_copy
+    data = read_raw_copy(t)
+    if not data:
+        raise HTTPException(404, "Raw file copy is no longer available")
+    ctype = t.content_type or "application/octet-stream"
+    fname = t.filename or "file"
+    inline_types = ("image/", "application/pdf", "message/", "text/")
+    disp = "inline" if any(ctype.startswith(p) for p in inline_types) else "attachment"
+    return _Response(content=data, media_type=ctype,
+                     headers={"Content-Disposition": f'{disp}; filename="{fname}"'})
+
+
+@router.get("/{pipeline_id}/raw-eml-preview")
+async def pipeline_raw_eml_preview(pipeline_id: str, db: AsyncSession = Depends(get_db)):
+    """Parse the raw EML file and return structured content as JSON for the viewer."""
+    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "Pipeline file not found")
+    if not (t.filename or "").lower().endswith(".eml"):
+        raise HTTPException(400, "Not an EML file")
+    from app.services.pipeline.ingestion import read_raw_copy
+    data = read_raw_copy(t)
+    if not data:
+        raise HTTPException(404, "Raw file copy is no longer available")
+    from app.services.extraction.eml_parser import parse_eml
+    return parse_eml(data)
 
 
 @router.get("/meta/stages")

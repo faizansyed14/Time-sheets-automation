@@ -5,7 +5,7 @@ export type PreviewFile = {
 };
 
 const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"]);
-const PREVIEW_EXTS = new Set([...IMAGE_EXTS, "pdf"]);
+const PREVIEW_EXTS = new Set([...IMAGE_EXTS, "pdf", "eml"]);
 
 function ext(filename: string) {
   return filename.split(".").pop()?.toLowerCase() ?? "";
@@ -16,9 +16,14 @@ export function isPdf(filename: string, contentType?: string | null) {
   return ct === "application/pdf" || ext(filename) === "pdf";
 }
 
+export function isEml(filename: string, contentType?: string | null) {
+  const ct = contentType?.toLowerCase() ?? "";
+  return ext(filename) === "eml" || ct === "message/rfc822";
+}
+
 export function isPreviewable(filename: string, contentType?: string | null) {
   const ct = contentType?.toLowerCase() ?? "";
-  if (ct.startsWith("image/") || ct === "application/pdf") return true;
+  if (ct.startsWith("image/") || ct === "application/pdf" || ct === "message/rfc822") return true;
   return PREVIEW_EXTS.has(ext(filename));
 }
 

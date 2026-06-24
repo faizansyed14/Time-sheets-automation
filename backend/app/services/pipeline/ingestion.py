@@ -65,11 +65,14 @@ BUCKET_FIELDS = {
     "public_holiday": "public_holiday_dates",
 }
 
-# Failed / flagged files a reviewer can complete by picking the right employee.
+# Failed / flagged files a reviewer can complete by picking the right employee
+# and/or providing the period. The pipeline re-runs extraction on the raw copy.
 RESOLVABLE_MATCH_CODES = frozenset({
     FailureCode.AMBIGUOUS_ID,
     FailureCode.EMPLOYEE_NOT_MATCHED,
     FailureCode.ID_NAME_MISMATCH,
+    FailureCode.NAME_NOT_FOUND,    # LLM found period but no identity — pick employee
+    FailureCode.MONTH_NOT_FOUND,   # LLM found identity but no period — pick period
 })
 
 
@@ -577,6 +580,128 @@ async def ingest_upload(
     await db.commit()
     if rec is not None:
         await db.refresh(rec)
+    await db.refresh(tracker)
+    return rec, tracker
+
+
+async def ingest_manual_entry(
+    db: AsyncSession, *, employee_pk: str, month: int, year: int,
+    buckets: dict[str, list[str]],
+    attachments: list[tuple[str, str, bytes]] | None = None,
+    note: str | None = None,
+) -> tuple[TimesheetRecord, PipelineFile]:
+    """Create/merge a monthly record from MANUALLY entered leave data (no LLM),
+    optionally with attached files. Runs the SAME vault filing + validation +
+    pipeline-tracker flow as upload/email. The employee MUST be picked from the
+    matcher (strict identity — we never guess)."""
+    attachments = attachments or []
+    if not (1 <= month <= 12 and year >= 2000):
+        raise ValueError("Invalid month or year.")
+    matched = (await db.execute(select(Employee).where(Employee.id == employee_pk))).scalar_one_or_none()
+    if not matched:
+        raise ValueError("Selected employee was not found in the matcher list.")
+
+    employee_name = matched.name
+    account_manager = matched.account_manager
+
+    tracker = PipelineFile(
+        filename=(attachments[0][0] if attachments else "Manual entry"),
+        content_type=(attachments[0][1] if attachments else "application/json"),
+        size_bytes=sum(len(a[2]) for a in attachments),
+        source_kind="manual", source_id=f"manual:{matched.employee_id}:{month}-{year}",
+    )
+    db.add(tracker)
+    await db.flush()
+    _event(tracker, PipelineStage.RECEIVED, "ok",
+           f"Manual entry for {employee_name} — {calendar.month_name[month]} {year} "
+           f"({len(attachments)} attachment(s)).")
+    tracker.employee_name = employee_name
+    tracker.employee_id = matched.employee_id
+    tracker.month, tracker.year = month, year
+    _event(tracker, PipelineStage.MATCHING, "ok",
+           f"Manually assigned to {employee_name} ({matched.employee_id}).")
+
+    entry = {
+        "key": "manual_entry", "filename": "Manual entry",
+        "source_id": tracker.source_id, "attachment_id": None, "ingested_at": _now_iso(),
+        "buckets": {b: list(buckets.get(b, []) or []) for b in BUCKET_FIELDS},
+    }
+    existing = await _find_existing(db, matched.id, matched.employee_id, employee_name, month, year)
+    prior = (existing.source_files if existing else []) or []
+    entries = _merge_source_files(prior, entry)
+    merged, overlap_flags = _union_buckets(entries)
+    cleaned, flags = validate(merged, month, year)
+    flags = list(dict.fromkeys(overlap_flags + flags))
+    validation_status = ValidationStatus.MANUAL_REVIEW if flags else ValidationStatus.VERIFIED
+    _event(tracker, PipelineStage.VALIDATION, "warn" if flags else "ok",
+           ("Validation raised: " + " ".join(flags[:4])) if flags else "Validation clean.")
+    summary = summarize_record(cleaned, flags, month, year, len(entries))
+
+    folder_rel = None
+    storage_warn = None
+    try:
+        for (fn, _ct, dat) in attachments:
+            sp.save_file(account_manager, employee_name, month, year, fn, dat)
+        sp.save_text(account_manager, employee_name, month, year, "extraction_result.json", _json.dumps({
+            "employee": {"matched_id": matched.employee_id, "matched_name": matched.name,
+                         "location": matched.location, "dco_number": matched.dco_number,
+                         "account_manager": account_manager, "match_note": "Manual entry."},
+            "period": {"month": month, "year": year},
+            "leaves": {k: cleaned[k] for k in BUCKET_FIELDS},
+            "validation": {"status": validation_status, "summary": summary, "flags": flags},
+            "manual": {"note": note}, "ingested_at": _now_iso(),
+        }, indent=2, default=str))
+        folder_rel = sp.folder_rel(account_manager, employee_name, month, year)
+        _event(tracker, PipelineStage.FILING, "ok", f"Filed under {folder_rel}.")
+    except Exception as e:
+        storage_warn = f"Could not file on disk: {str(e)[:200]}"
+        _event(tracker, PipelineStage.FILING, "warn", storage_warn)
+
+    rec = existing or TimesheetRecord()
+    rec.extracted_employee_id = matched.employee_id
+    rec.extracted_employee_name = matched.name
+    rec.matched_employee_pk = matched.id
+    rec.employee_id = matched.employee_id
+    rec.employee_name = employee_name
+    rec.account_manager = account_manager
+    rec.dco_number = matched.dco_number
+    rec.match_note = (note or "").strip() or "Manual entry."
+    rec.month, rec.year = month, year
+    rec.calendar_days = calendar.monthrange(year, month)[1]
+    for bucket, field in BUCKET_FIELDS.items():
+        setattr(rec, field, cleaned[bucket])
+    rec.source_files = entries
+    rec.validation_status = validation_status
+    rec.llm_summary = summary
+    rec.hr_flags = flags
+    if not existing:
+        rec.approval_detected = False
+        rec.approval_detail = "Manually entered — pending manager sign-off."
+        rec.approval_status = ApprovalStatus.PENDING
+    rec.source_email_id = tracker.source_id
+    if folder_rel:
+        rec.storage_folder = folder_rel
+    if not existing:
+        db.add(rec)
+    await db.flush()
+
+    tracker.record_id = rec.id
+    if storage_warn:
+        tracker.status = PipelineStatus.NEEDS_REVIEW
+        tracker.failure_code = FailureCode.STORAGE_ERROR
+        tracker.failure_detail = storage_warn
+    elif validation_status == ValidationStatus.MANUAL_REVIEW:
+        tracker.status = PipelineStatus.NEEDS_REVIEW
+        tracker.failure_code = FailureCode.VALIDATION_MISMATCH
+        tracker.failure_detail = "; ".join(flags[:6])
+    else:
+        tracker.status = PipelineStatus.SUCCESS
+    _event(tracker, PipelineStage.RECORDED,
+           "ok" if tracker.status == PipelineStatus.SUCCESS else "warn",
+           f"Record {'updated' if existing else 'created'} for {employee_name} — "
+           f"{calendar.month_name[month]} {year}.")
+    await db.commit()
+    await db.refresh(rec)
     await db.refresh(tracker)
     return rec, tracker
 
