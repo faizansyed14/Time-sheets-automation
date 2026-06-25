@@ -88,12 +88,25 @@ app.add_middleware(
 )
 
 
+# Inline previews (<iframe>/<img>) load these paths on the same origin as the SPA.
+_EMBEDDABLE_PATH_MARKERS = ("/files/content", "/attachments/", "/raw-preview")
+
+
+def _embeddable_preview_path(path: str) -> bool:
+    return any(marker in path for marker in _EMBEDDABLE_PATH_MARKERS)
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     """Baseline OWASP security headers on every API response."""
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "DENY")
+    if _embeddable_preview_path(request.url.path):
+        # SAMEORIGIN: allow in-app PDF/image previews; still block external embeds.
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
+        response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'self'")
+    else:
+        response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
     response.headers.setdefault(

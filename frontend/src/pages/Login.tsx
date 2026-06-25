@@ -54,9 +54,11 @@ export default function Login() {
         toast("info", "Verification code sent", res.message ?? undefined);
       } else if (res.status === "captcha_required") {
         setLoginToken(res.login_token!);
-        setCaptchaId(res.captcha_id!);
-        setCaptchaImg(captchaUrl());
         setStage("captcha");
+        // refreshCaptcha fetches the image AND captures the id from the response header
+        // so they are always in sync. DO NOT use res.captcha_id here — that image was
+        // never returned to the client (backend discards the PNG on /login).
+        await refreshCaptcha();
       }
     } catch (e: any) {
       setErr(e?.response?.data?.detail ?? "Login failed");

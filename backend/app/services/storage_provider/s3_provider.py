@@ -110,6 +110,46 @@ class S3StorageProvider(StorageProvider):
                     content_type=mimetypes.guess_type(name)[0] or "application/octet-stream"))
         return sorted(out, key=lambda f: f.name)
 
+    def iter_files(self, manager: str | None = None):
+        """Fast bulk export: ONE paginated listing of every key under the vault
+        prefix, then fetch objects in PARALLEL. Replaces the per-folder
+        list_managers→employees→months→items walk (many sequential round-trips)
+        that made 'Download all as ZIP' slow on S3."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        base = (self.prefix + "/") if self.prefix else ""
+        mgr_safe = _safe(manager) if manager else None
+        keys: list[tuple[str, str]] = []   # (zip_path, s3_key)
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=base):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                rel = key[len(base):] if base else key
+                if not rel or rel.endswith("/"):
+                    continue
+                parts = rel.split("/")
+                # skip internal prefixes (raw retry copies _pipeline-raw, .*) and markers
+                if parts[0].startswith(("_", ".")) or parts[-1] == _KEEP:
+                    continue
+                if mgr_safe and parts[0] != mgr_safe:
+                    continue
+                keys.append((rel, key))
+
+        def _fetch(item: tuple[str, str]):
+            rel, key = item
+            try:
+                body = self._client.get_object(Bucket=self.bucket, Key=key)["Body"].read()
+                return rel, body
+            except Exception:
+                return rel, None
+
+        if not keys:
+            return
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            for rel, data in ex.map(_fetch, keys):
+                if data is not None:
+                    yield rel, data
+
     # ---- reading ----
     def read_file(self, rel_path: str) -> tuple[bytes, str, str]:
         key = self._key(*[_safe(p) for p in rel_path.split("/")[:-1]] + [rel_path.split("/")[-1]])

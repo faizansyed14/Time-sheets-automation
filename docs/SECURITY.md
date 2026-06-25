@@ -33,7 +33,8 @@ defence-in-depth: the security boundary is the API, not the frontend.
 
 ## Transport & headers (OWASP A05)
 - Baseline security headers on every response: `X-Content-Type-Options`,
-  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+  `X-Frame-Options: DENY` (file/attachment preview routes use `SAMEORIGIN` so
+  in-app PDF/image iframes work), `Referrer-Policy: no-referrer`,
   `Cross-Origin-Opener-Policy`, `Permissions-Policy`, and **HSTS** in production.
 - **CORS** is restricted to explicit origins (never `*`) with a fixed method and
   header allow-list.

@@ -7,6 +7,7 @@ import {
   XCircle,
   AlertTriangle,
   BadgeCheck,
+  Columns2,
   RotateCcw,
   ChevronDown,
   ChevronRight,
@@ -20,13 +21,12 @@ import {
   deletePipelineFile,
   fetchPipeline,
   fetchPipelineStats,
-  resolvePipelineAssign,
   resolvePipelineFile,
   retryPipelineFile,
   MONTHS,
   type PipelineFile,
 } from "../api/client";
-import ResolveAssignModal from "../components/ResolveAssignModal";
+import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
 import StoredFilesPreview from "../components/StoredFilesPreview";
 import { cn, formatBytes, formatDateTime } from "../lib/utils";
 import { Button, Card, EmptyState, Modal, PageHeader, Select, Skeleton } from "../components/ui";
@@ -128,30 +128,11 @@ export default function PipelinePage() {
       toast("error", "Could not resolve", e?.response?.data?.detail ?? String(e)),
   });
 
-  const assignMut = useMutation({
-    mutationFn: ({
-      id,
-      body,
-    }: {
-      id: string;
-      body: { employee_pk: string; month: number; year: number; note?: string };
-    }) => resolvePipelineAssign(id, body),
-    onSuccess: (t) => {
-      const ok = t.status === "success";
-      toast(
-        ok ? "success" : "warning",
-        ok ? "File processed" : "Processed with flags",
-        ok
-          ? `${t.filename} filed for ${t.employee_name} — ${MONTHS[t.month ?? 0]} ${t.year}.`
-          : t.failure_detail ?? "Record created but needs review."
-      );
-      setAssigning(null);
-      invalidate();
-      qc.invalidateQueries({ queryKey: ["files"] });
-    },
-    onError: (e: any) =>
-      toast("error", "Could not complete", e?.response?.data?.detail ?? String(e)),
-  });
+  const onAssignSaved = () => {
+    setAssigning(null);
+    invalidate();
+    qc.invalidateQueries({ queryKey: ["files"] });
+  };
 
   const retryMut = useMutation({
     mutationFn: retryPipelineFile,
@@ -348,18 +329,27 @@ export default function PipelinePage() {
 
                       <div className="mt-5 flex flex-wrap items-center gap-2">
                         {(f.status === "failed" || f.status === "needs_review") && (
-                          <Button
-                            size="sm"
-                            onClick={() => {
-                              if (f.can_resolve_assign) setAssigning(f);
-                              else {
+                          <>
+                            {f.can_resolve_assign && (
+                              <Button
+                                size="sm"
+                                onClick={() => setAssigning(f)}
+                              >
+                                <Columns2 className="h-4 w-4" /> Compare &amp; Fix
+                              </Button>
+                            )}
+                            <Button
+                              size="sm"
+                              variant={f.can_resolve_assign ? "secondary" : "primary"}
+                              onClick={() => {
                                 setResolving(f);
                                 setNote("");
-                              }
-                            }}
-                          >
-                            <BadgeCheck className="h-4 w-4" /> Resolve
-                          </Button>
+                              }}
+                            >
+                              <BadgeCheck className="h-4 w-4" />
+                              {f.can_resolve_assign ? "Mark resolved" : "Resolve"}
+                            </Button>
+                          </>
                         )}
                         {f.can_retry && f.status !== "processing" && (
                           <Button
@@ -403,11 +393,10 @@ export default function PipelinePage() {
         )}
       </Card>
 
-      <ResolveAssignModal
+      <PipelineCompareFixModal
         file={assigning}
-        pending={assignMut.isPending}
         onClose={() => setAssigning(null)}
-        onProceed={(body) => assigning && assignMut.mutate({ id: assigning.id, body })}
+        onSaved={onAssignSaved}
       />
 
       <Modal

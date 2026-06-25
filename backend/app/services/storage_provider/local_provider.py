@@ -92,6 +92,25 @@ class LocalStorageProvider(StorageProvider):
                     ))
         return out
 
+    def iter_files(self, manager: str | None = None):
+        """Fast bulk walk for ZIP export — one rglob, no per-folder stat calls."""
+        root = self.root
+        if not root.exists():
+            return
+        base = self._abs(_safe(manager)) if manager else root
+        if not base.exists():
+            return
+        for p in sorted(base.rglob("*")):
+            if not p.is_file():
+                continue
+            parts = p.relative_to(root).parts
+            if parts and _is_hidden(parts[0]):   # skip internal dirs (_pipeline*, .*)
+                continue
+            try:
+                yield "/".join(parts), p.read_bytes()
+            except Exception:
+                continue
+
     # ---- reading ----
     def read_file(self, rel_path: str) -> tuple[bytes, str, str]:
         p = self._abs(rel_path)

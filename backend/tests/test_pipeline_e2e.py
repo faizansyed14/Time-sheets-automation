@@ -38,6 +38,31 @@ async def test_upload_pipeline_and_tracker(client, admin_token):
     assert any(f["filename"] == "e2e.pdf" for f in page["items"])
 
 
+async def test_manual_entry_creates_record(client, admin_token):
+    import json
+    h = auth_headers(admin_token)
+    emp = await client.post("/api/v1/employee-matcher", headers=h,
+                            json={"employee_id": "MAN-1", "name": "Manual Person", "location": "DXB"})
+    assert emp.status_code == 201, emp.text
+    pk = emp.json()["id"]
+    r = await client.post(
+        "/api/v1/upload/manual", headers=h,
+        data={"employee_pk": pk, "month": "3", "year": "2026",
+              "buckets": json.dumps({"annual": ["2026-03-03"], "sick": ["2026-03-10"]}),
+              "note": "entered by HR"},
+        files={"files": ("manual.pdf", b"%PDF-1.4 manual", "application/pdf")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] in ("success", "needs_review")
+    assert body["employee_name"] == "Manual Person"
+    assert body["record_id"]
+    rec = await client.get(f"/api/v1/timesheets/{body['record_id']}", headers=h)
+    assert rec.status_code == 200, rec.text
+    assert "2026-03-03" in rec.json()["annual_leave_dates"]
+    assert "2026-03-10" in rec.json()["sick_leave_dates"]
+
+
 async def test_coverage_pagination_and_search(client, admin_token):
     h = auth_headers(admin_token)
     cov = await client.get("/api/v1/employees/coverage?year=2026&month=3&limit=5", headers=h)

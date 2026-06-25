@@ -147,12 +147,28 @@ async def get_attachment(provider_message_id: str, attachment_id: str):
         )
     except FileNotFoundError:
         raise HTTPException(404, "Attachment not found")
-    disposition = "inline" if content_type.startswith(("image/", "application/pdf")) else "attachment"
+    disposition = "inline" if content_type.startswith(("image/", "application/pdf", "message/")) else "attachment"
     return Response(
         content=data,
         media_type=content_type,
         headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
     )
+
+
+@router.get("/{provider_message_id}/attachments/{attachment_id}/eml-preview")
+async def get_attachment_eml_preview(provider_message_id: str, attachment_id: str):
+    """Parse an EML attachment and return its structured content as JSON."""
+    provider = get_email_provider()
+    try:
+        data, filename, _ct = await provider.get_attachment_bytes(
+            provider_message_id, attachment_id
+        )
+    except FileNotFoundError:
+        raise HTTPException(404, "Attachment not found")
+    if not filename.lower().endswith(".eml"):
+        raise HTTPException(400, "Not an EML file")
+    from app.services.extraction.eml_parser import parse_eml
+    return parse_eml(data)
 
 
 @router.post("/{provider_message_id}/decision")

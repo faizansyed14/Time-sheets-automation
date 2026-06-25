@@ -15,6 +15,7 @@ import { uploadTimesheets, MONTHS_LONG, type UploadResult } from "../api/client"
 import { cn, formatBytes } from "../lib/utils";
 import { Button, Card, PageHeader } from "../components/ui";
 import StoredFilesPreview from "../components/StoredFilesPreview";
+import ManualEntryForm from "../components/ManualEntryForm";
 import { FailureChip } from "../components/status";
 import { useToast } from "../components/toast";
 
@@ -27,6 +28,14 @@ export default function UploadPage() {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [results, setResults] = useState<UploadResult[]>([]);
+  const [mode, setMode] = useState<"files" | "manual">("files");
+
+  const afterChange = () => {
+    qc.invalidateQueries({ queryKey: ["pipeline"] });
+    qc.invalidateQueries({ queryKey: ["pipeline-stats"] });
+    qc.invalidateQueries({ queryKey: ["dashboard"] });
+    qc.invalidateQueries({ queryKey: ["files"] });
+  };
 
   const addFiles = useCallback((list: FileList | File[]) => {
     const files = Array.from(list).filter((f) =>
@@ -76,6 +85,29 @@ export default function UploadPage() {
         subtitle="Runs the exact same pipeline as accepting an email. Weekly or 15-day sheets for the same month merge automatically into one record."
       />
 
+      <div className="mb-5 inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
+        {([["files", "Upload files"], ["manual", "Enter manually"]] as const).map(([m, label]) => (
+          <button
+            key={m}
+            onClick={() => setMode(m)}
+            className={cn(
+              "rounded-md px-4 py-1.5 text-sm font-semibold transition-colors",
+              mode === m ? "bg-white text-brand-700 shadow-xs" : "text-slate-500 hover:text-slate-700"
+            )}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {mode === "manual" ? (
+        <ManualEntryForm
+          onResult={(r) => {
+            setResults((prev) => [r, ...prev]);
+            afterChange();
+          }}
+        />
+      ) : (
       <Card className="p-6">
         <div
           onDragOver={(e) => {
@@ -156,6 +188,7 @@ export default function UploadPage() {
           </div>
         )}
       </Card>
+      )}
 
       {results.length > 0 && (
         <Card className="mt-6">

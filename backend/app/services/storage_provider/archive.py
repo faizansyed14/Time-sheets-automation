@@ -18,20 +18,13 @@ from app.services.storage_provider import get_storage_provider
 
 
 def build_zip(manager: str | None = None) -> bytes:
+    """Build a ZIP of the vault. Uses the provider's iter_files(), which on S3
+    does a single bulk listing + parallel reads (and on local a single rglob),
+    so large archives export quickly instead of one round-trip per folder/file."""
     sp = get_storage_provider()
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
-        managers = [m.name for m in sp.list_managers()]
-        if manager:
-            managers = [m for m in managers if m == manager]
-        for mgr in managers:
-            for emp in sp.list_employees(mgr):
-                for mon in sp.list_months(mgr, emp.name):
-                    for item in sp.list_items(mgr, emp.name, mon.name):
-                        try:
-                            data, _name, _ctype = sp.read_file(item.rel_path)
-                        except Exception:
-                            continue
-                        zf.writestr(f"{mgr}/{emp.name}/{mon.name}/{item.name}", data)
+        for zip_path, data in sp.iter_files(manager):
+            zf.writestr(zip_path, data)
     buf.seek(0)
     return buf.read()

@@ -10,6 +10,7 @@ Folder model (THREE levels):   <Account Manager> / <Employee Name> / <Month-Year
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 
@@ -60,6 +61,25 @@ class StorageProvider(ABC):
     @abstractmethod
     def read_file(self, rel_path: str) -> tuple[bytes, str, str]:
         """Return (bytes, filename, content_type)."""
+
+    def iter_files(self, manager: str | None = None) -> Iterator[tuple[str, bytes]]:
+        """Yield (zip_path, data) for every file in the vault (optionally scoped
+        to one manager). Default implementation walks the 3-level listing; S3 /
+        local override this with a single bulk listing + parallel reads, which is
+        dramatically faster for large archives. zip_path is
+        '<Manager>/<Employee>/<Month-Year>/<file>'."""
+        managers = [m.name for m in self.list_managers()]
+        if manager:
+            managers = [m for m in managers if m == manager]
+        for mgr in managers:
+            for emp in self.list_employees(mgr):
+                for mon in self.list_months(mgr, emp.name):
+                    for item in self.list_items(mgr, emp.name, mon.name):
+                        try:
+                            data, _name, _ctype = self.read_file(item.rel_path)
+                        except Exception:
+                            continue
+                        yield f"{mgr}/{emp.name}/{mon.name}/{item.name}", data
 
     # ---- writing (used by the ingestion pipeline) ----
     @abstractmethod

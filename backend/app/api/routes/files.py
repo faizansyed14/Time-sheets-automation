@@ -63,9 +63,22 @@ def file_content(rel_path: str = Query(...)):
         data, name, ctype = sp.get_storage_provider().read_file(rel_path)
     except FileNotFoundError:
         raise HTTPException(404, "File not found")
-    disp = "inline" if ctype.startswith(("image/", "application/pdf", "text/", "application/json")) else "attachment"
+    disp = "inline" if ctype.startswith(("image/", "application/pdf", "text/", "application/json", "message/")) else "attachment"
     return Response(content=data, media_type=ctype,
                     headers={"Content-Disposition": f'{disp}; filename="{name}"'})
+
+
+@router.get("/eml-preview")
+def eml_preview(rel_path: str = Query(...)):
+    """Parse an EML file and return its structured content as JSON."""
+    try:
+        data, name, _ctype = sp.get_storage_provider().read_file(rel_path)
+    except FileNotFoundError:
+        raise HTTPException(404, "File not found")
+    if not name.lower().endswith(".eml"):
+        raise HTTPException(400, "Not an EML file")
+    from app.services.extraction.eml_parser import parse_eml
+    return parse_eml(data)
 
 
 # ---- ZIP download ----

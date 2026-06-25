@@ -100,9 +100,10 @@ async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_
     login_token = create_login_token(user.id, flow_id, fp)
 
     if user.auth_mode == AuthMode.CAPTCHA:
-        captcha_id, _img = await captcha_svc.generate()
+        # Don't pre-generate a captcha here — the PNG would be discarded anyway.
+        # The client calls GET /auth/captcha which returns image + id together.
         return LoginResult(status="captcha_required", login_token=login_token,
-                           captcha_id=captcha_id, user=_user_out(user),
+                           user=_user_out(user),
                            message="Solve the CAPTCHA to continue.")
 
     # OTP mode (default)
