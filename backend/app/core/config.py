@@ -89,9 +89,27 @@ class Settings(BaseSettings):
     vllm_timeout: int = 90
     # Runtime model choices (same names your project uses).
     extraction_model: str = "gpt-4o"
-    vision_image_detail: str = "high"   # low | high
+    vision_image_detail: str = "high"   # low | high — used for SCANS/photos
     validation_model: str = "gpt-4o-mini"
     enable_text_validation: bool = True
+
+    # ----- Cost / accuracy tuning (all admin-editable) -----
+    # Render PDFs at a lower DPI for the LLM: vision models gain nothing above
+    # ~150 DPI, and a smaller image = fewer tokens (esp. at high detail).
+    pdf_render_dpi: int = 150
+    # Born-digital files already provide an authoritative text layer, so the
+    # image is only layout context — send it at "low" detail (≈5–10× cheaper).
+    # Scans/photos (no text layer) keep `vision_image_detail`.
+    vision_adaptive_detail: bool = True
+    # Force valid JSON from supported OpenAI models (response_format json_object)
+    # so a stray markdown fence / trailing text can't break parsing.
+    vision_json_mode: bool = True
+    # Skip the LLM entirely for clean digital sheets whose text layer parses
+    # confidently (deterministic parser) — biggest cost saver, opt-in.
+    extraction_prefer_deterministic: bool = False
+    # Optional OCR "reader" to give scans/photos a text layer (none|tesseract).
+    # tesseract runs locally (pytesseract + tesseract-ocr) and is completely free.
+    ocr_provider: str = "none"
 
     # CORS for the Vite dev server.
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]

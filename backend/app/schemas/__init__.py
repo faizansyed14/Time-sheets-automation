@@ -211,6 +211,10 @@ class PipelineFileOut(BaseModel):
     month: int | None
     year: int | None
     record_id: str | None
+    extraction_model: str | None = None
+    extraction_method: str | None = None
+    used_ocr: bool = False
+    extraction_meta: dict | None = None
     can_retry: bool
     can_resolve_assign: bool
     resolved_at: datetime | None

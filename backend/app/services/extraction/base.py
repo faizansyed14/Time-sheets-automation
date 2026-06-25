@@ -26,6 +26,21 @@ class TimesheetExtraction:
     validation_status: str = "verified"   # verified | manual_review
     summary: str = ""
     hr_flags: list[str] = field(default_factory=list)
+    # ---- cost / provenance (surfaced on the pipeline tracker) ----
+    # Which engine path produced this result, so reviewers can see (and cost-
+    # control) what was used per file:
+    #   extraction_model  : the LLM model id (e.g. "gpt-4o", "gpt-4o-mini") or
+    #                       None when no LLM was called (deterministic / mock).
+    #   extraction_method : "vision-llm" | "deterministic-text" | "mock" |
+    #                       "unsupported"
+    #   used_ocr          : True when the local OCR reader produced the text layer.
+    extraction_model: str | None = None
+    extraction_method: str | None = None
+    used_ocr: bool = False
+    # Free-form provenance shown in the tracker's "Extraction details" dropdown:
+    # render DPI, image detail, page count, OCR provider, text-layer presence,
+    # validation model, embedded .eml attachment, etc.
+    extraction_meta: dict = field(default_factory=dict)
 
 
 @dataclass

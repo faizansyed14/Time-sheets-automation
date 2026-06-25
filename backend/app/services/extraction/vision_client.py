@@ -99,6 +99,11 @@ async def _openai_by_images(images_jpeg, prompt, system_prompt, model, image_det
     else:
         payload["max_tokens"] = 4096
         payload["temperature"] = 0.0
+        # Guarantee parseable JSON on models that support it (gpt-4o / -mini /
+        # 4.1) — no stray markdown fence or prose can break the parser. The
+        # prompt already instructs the model to return JSON.
+        if getattr(settings, "vision_json_mode", True) and model.lower().startswith(("gpt-4o", "gpt-4.1")):
+            payload["response_format"] = {"type": "json_object"}
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=httpx.Timeout(settings.openai_timeout)) as client:
         r = await client.post(f"{api_root}/v1/chat/completions", json=payload, headers=headers)

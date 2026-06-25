@@ -106,12 +106,16 @@ class MockExtractionEngine(ExtractionEngine):
         self, data: bytes, filename: str, content_type: str,
         message_id: str, attachment_id: str,
     ) -> TimesheetExtraction:
+        from app.services.extraction.file_processor import detect_file_type, extract_document_text
+        ftype = detect_file_type(filename, data)
+        meta = {"file_type": ftype, "engine": "mock", "ocr_provider": "none",
+                "has_text_layer": None, "render_dpi": None, "image_detail": None}
         case = mock_data.case_for_attachment(attachment_id)
         if not case:
             # Ad-hoc upload: parse the document text deterministically.
-            from app.services.extraction.file_processor import detect_file_type, extract_document_text
-            ftype = detect_file_type(filename, data)
             text = extract_document_text(ftype, data) if ftype != "unknown" else ""
+            meta["doc_text_chars"] = len((text or "").strip())
+            meta["has_text_layer"] = bool((text or "").strip())
             parsed = _parse_upload_text(text)
             if not parsed:
                 return TimesheetExtraction(
@@ -121,6 +125,7 @@ class MockExtractionEngine(ExtractionEngine):
                             "(mock engine reads text only — set EXTRACTION_ENGINE=vision "
                             "for scanned/image timesheets).",
                     hr_flags=["Upload not readable by the mock engine."],
+                    extraction_method="mock", extraction_meta=meta,
                 )
             case = parsed
 
@@ -170,6 +175,9 @@ class MockExtractionEngine(ExtractionEngine):
             validation_status=status,
             summary=summary,
             hr_flags=flags,
+            extraction_model=None,
+            extraction_method="mock",
+            extraction_meta=meta,
         )
 
     async def extract_approval(

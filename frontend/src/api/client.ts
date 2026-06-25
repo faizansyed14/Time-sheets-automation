@@ -188,6 +188,10 @@ export interface PipelineFile {
   month: number | null;
   year: number | null;
   record_id: string | null;
+  extraction_model: string | null;
+  extraction_method: string | null;
+  used_ocr: boolean;
+  extraction_meta: Record<string, unknown> | null;
   can_retry: boolean;
   can_resolve_assign: boolean;
   resolved_at: string | null;

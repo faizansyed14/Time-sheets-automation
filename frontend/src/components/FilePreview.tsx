@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Download, ExternalLink, FileText, Mail, Paperclip, X } from "lucide-react";
 import { cn, formatBytes } from "../lib/utils";
-import { downloadFile, isEml, isPdf, isPreviewable, type PreviewFile } from "../lib/filePreview";
+import { downloadFile, isEml, isPdf, isPreviewable, sanitizeEmailHtml, type PreviewFile } from "../lib/filePreview";
 import { fetchEmlPreview, type EmlParsed } from "../api/client";
 import { Spinner } from "./ui";
 
@@ -35,7 +35,8 @@ export function EmlPreviewPane({ fileUrl, filename }: { fileUrl: string; filenam
         // Build HTML body blob URL.
         if (data.body_html) {
           if (bodyBlobRef.current) URL.revokeObjectURL(bodyBlobRef.current);
-          const b = URL.createObjectURL(new Blob([data.body_html], { type: "text/html" }));
+          const safe = sanitizeEmailHtml(data.body_html);
+          const b = URL.createObjectURL(new Blob([safe], { type: "text/html" }));
           bodyBlobRef.current = b;
           blobsRef.current.push(b);
         }

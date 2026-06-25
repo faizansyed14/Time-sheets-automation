@@ -16,6 +16,8 @@ import {
   ExternalLink,
   Lock,
   Trash2,
+  Cpu,
+  ScanLine,
 } from "lucide-react";
 import {
   deletePipelineFile,
@@ -68,6 +70,142 @@ function StatCard({
         <p className="text-xs font-medium text-slate-500">{label}</p>
       </div>
     </button>
+  );
+}
+
+/** Per-file cost/provenance badge: which GPT model handled the file (gpt-4o vs
+ * the cheaper gpt-4o-mini), or whether a no-LLM path read it, plus an OCR chip.
+ * Lets reviewers see — and control — extraction cost at a glance. */
+function ModelBadge({ file }: { file: PipelineFile }) {
+  const method = file.extraction_method;
+  if (!method) return null;
+
+  let label: string;
+  let tone: string;
+  if (method === "vision-llm") {
+    const model = file.extraction_model ?? "vision model";
+    label = model;
+    // gpt-4o-mini (and other "mini"/"nano") = cheap → green; full gpt-4o = amber.
+    const cheap = /mini|nano|small|haiku|flash/i.test(model);
+    tone = cheap
+      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+      : "border-amber-200 bg-amber-50 text-amber-700";
+  } else if (method === "deterministic-text") {
+    label = "No LLM · text";
+    tone = "border-emerald-200 bg-emerald-50 text-emerald-700";
+  } else if (method === "mock") {
+    label = "Mock engine";
+    tone = "border-slate-200 bg-slate-50 text-slate-500";
+  } else if (method === "manual") {
+    label = "Manual entry";
+    tone = "border-slate-200 bg-slate-50 text-slate-500";
+  } else {
+    label = method;
+    tone = "border-slate-200 bg-slate-50 text-slate-500";
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span
+        title={`Extraction: ${label}${file.used_ocr ? " (OCR text layer used)" : ""}`}
+        className={cn(
+          "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-semibold",
+          tone
+        )}
+      >
+        <Cpu className="h-3 w-3" />
+        {label}
+      </span>
+      {file.used_ocr && (
+        <span
+          title="Local OCR (Tesseract) produced the text layer for this scan/photo"
+          className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-700"
+        >
+          <ScanLine className="h-3 w-3" />
+          OCR
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** Collapsible "Extraction details" panel: the full metadata for a file —
+ * GPT model, method, OCR provider/status, render DPI, image detail, pages,
+ * text-layer presence, validation model, embedded .eml attachment, etc. Lets a
+ * reviewer audit exactly how (and how expensively) each file was read. */
+function ExtractionDetails({ file }: { file: PipelineFile }) {
+  const [open, setOpen] = useState(false);
+  const meta = (file.extraction_meta ?? {}) as Record<string, unknown>;
+
+  const methodLabel: Record<string, string> = {
+    "vision-llm": "Vision LLM",
+    "deterministic-text": "Deterministic (no LLM)",
+    mock: "Mock engine",
+    manual: "Manual entry",
+    unsupported: "Unsupported file",
+  };
+  const fmt = (v: unknown): string => {
+    if (v === null || v === undefined || v === "") return "—";
+    if (typeof v === "boolean") return v ? "Yes" : "No";
+    return String(v);
+  };
+
+  // Curated, human-labelled rows (in priority order); anything we don't
+  // explicitly name is shown afterwards so nothing is hidden.
+  const known: [string, string, unknown][] = [
+    ["GPT model", "model", file.extraction_model ?? meta["model"]],
+    ["Method", "method", methodLabel[file.extraction_method ?? ""] ?? file.extraction_method ?? meta["method"]],
+    ["OCR (Tesseract) used", "used_ocr", file.used_ocr],
+    ["OCR provider", "ocr_provider", meta["ocr_provider"]],
+    ["OCR status", "ocr_status", meta["ocr_status"]],
+    ["Render DPI", "render_dpi", meta["render_dpi"]],
+    ["Image detail", "image_detail", meta["image_detail"]],
+    ["Pages rendered", "page_count", meta["page_count"]],
+    ["Has text layer", "has_text_layer", meta["has_text_layer"]],
+    ["Document text (chars)", "doc_text_chars", meta["doc_text_chars"]],
+    ["Validation model", "validation_model", meta["validation_model"]],
+    ["File type", "file_type", meta["file_type"]],
+    ["Source", "source_kind", meta["source_kind"]],
+    ["Content type", "content_type", meta["content_type"]],
+    ["Size (bytes)", "size_bytes", meta["size_bytes"]],
+    ["Embedded attachment", "embedded_attachment", meta["embedded_attachment"]],
+    ["Embedded type", "embedded_type", meta["embedded_type"]],
+  ];
+  const shownKeys = new Set(known.map(([, k]) => k));
+  const extras = Object.entries(meta).filter(([k]) => !shownKeys.has(k));
+  const rows = known.filter(([, , v]) => v !== undefined && v !== null && v !== "");
+
+  return (
+    <div className="mb-4 overflow-hidden rounded-lg border border-slate-200 bg-white">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-50"
+      >
+        {open ? <ChevronDown className="h-4 w-4 text-slate-400" /> : <ChevronRight className="h-4 w-4 text-slate-400" />}
+        <Cpu className="h-4 w-4 text-slate-400" />
+        Extraction details
+        <span className="ml-2"><ModelBadge file={file} /></span>
+      </button>
+      {open && (
+        <dl className="grid grid-cols-1 gap-x-6 gap-y-1.5 border-t border-slate-100 px-5 py-3 text-sm sm:grid-cols-2">
+          {rows.map(([label, key, value]) => (
+            <div key={key} className="flex items-baseline justify-between gap-3 border-b border-slate-50 py-1">
+              <dt className="text-slate-500">{label}</dt>
+              <dd className="text-right font-medium text-slate-800">{fmt(value)}</dd>
+            </div>
+          ))}
+          {extras.map(([key, value]) => (
+            <div key={key} className="flex items-baseline justify-between gap-3 border-b border-slate-50 py-1">
+              <dt className="text-slate-500">{key}</dt>
+              <dd className="text-right font-medium text-slate-800">{fmt(value)}</dd>
+            </div>
+          ))}
+          {rows.length === 0 && extras.length === 0 && (
+            <p className="text-slate-400">No extraction metadata recorded for this file.</p>
+          )}
+        </dl>
+      )}
+    </div>
   );
 }
 
@@ -299,6 +437,7 @@ export default function PipelinePage() {
 
                   {expanded && (
                     <div className="border-t border-slate-100 bg-slate-50/60 px-6 py-5">
+                      <ExtractionDetails file={f} />
                       {f.failure_detail && (
                         <div
                           className={cn(

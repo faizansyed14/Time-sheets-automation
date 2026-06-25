@@ -13,21 +13,25 @@ async def test_captcha_login_flow(client, admin_token):
     assert login.status_code == 200
     data = login.json()
     assert data["status"] == "captcha_required"
-    assert data["captcha_id"] and data["login_token"]
-
-    # a wrong answer is rejected
-    bad = await client.post("/api/v1/auth/verify-captcha",
-                            json={"login_token": data["login_token"],
-                                  "captcha_id": data["captcha_id"], "answer": "WRONG"})
-    assert bad.status_code == 401
-
-    # fetch a fresh captcha image + id (the "refresh" action) and solve it using
-    # the cached answer (white-box: we read it from the cache the server set)
+    assert data["login_token"]
+    # the login no longer ships a captcha image/id — the client fetches one
     img = await client.get("/api/v1/auth/captcha")
     assert img.status_code == 200
     assert img.headers["content-type"] == "image/png"
     cid = img.headers["x-captcha-id"]
     from app.core.cache import cache
+    answer = await cache.get(f"captcha:{cid}")
+    assert answer
+
+    # a wrong answer is rejected
+    bad = await client.post("/api/v1/auth/verify-captcha",
+                            json={"login_token": data["login_token"],
+                                  "captcha_id": cid, "answer": "WRONG-ANSWER"})
+    assert bad.status_code == 401
+
+    # a fresh captcha solved with the cached answer succeeds
+    img = await client.get("/api/v1/auth/captcha")
+    cid = img.headers["x-captcha-id"]
     answer = await cache.get(f"captcha:{cid}")
     assert answer
     ok = await client.post("/api/v1/auth/verify-captcha",

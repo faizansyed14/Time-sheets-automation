@@ -41,7 +41,10 @@ services:
     build: { context: ./backend }
     # Apply DB migrations (Alembic) THEN serve. A single migrating entrypoint
     # avoids races; the worker waits for this service to become healthy.
-    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"
+    # bootstrap_migrations.py = `alembic upgrade head`, but first stamps the
+    # baseline if the DB predates Alembic (tables exist, no alembic_version) so
+    # it never fails with DuplicateTable. Safe to run on every boot (idempotent).
+    command: sh -c "python bootstrap_migrations.py && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"
     env_file: [.env]
     environment:
       REDIS_URL: redis://redis:6379/0

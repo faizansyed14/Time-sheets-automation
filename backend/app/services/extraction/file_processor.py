@@ -15,10 +15,24 @@ import zipfile
 from html import unescape
 from pathlib import Path
 
-PDF_DPI = 300
+from app.core.config import settings
+
+PDF_DPI = 300          # text-extraction default; the LLM render uses settings.pdf_render_dpi
 PDF_MAX_PAGES = 10
 JPEG_QUALITY = 90
 IMAGE_MAX_SIDE = 2200
+
+
+def has_text_layer(file_type: str, data: bytes, min_chars: int = 24) -> bool:
+    """True when the file is born-digital with a usable text layer (PDF/DOCX/
+    XLSX/EML), so its text can ground the model and the image only needs LOW
+    detail. Images/scans have no text layer → False."""
+    if file_type == "image":
+        return False
+    try:
+        return len((extract_document_text(file_type, data) or "").strip()) >= min_chars
+    except Exception:
+        return False
 
 # ---------------------------------------------------------------------------
 # Shared date / attendance-grid scanning (used by the mock + vision engines)
@@ -116,10 +130,12 @@ def detect_file_type(filename: str, data: bytes) -> str:
     return "unknown"
 
 
-def pdf_to_images(pdf_bytes: bytes, dpi: int = PDF_DPI, max_pages: int = PDF_MAX_PAGES) -> list[bytes]:
+def pdf_to_images(pdf_bytes: bytes, dpi: int | None = None, max_pages: int = PDF_MAX_PAGES) -> list[bytes]:
     import fitz  # PyMuPDF
     from PIL import Image
 
+    if dpi is None:
+        dpi = int(getattr(settings, "pdf_render_dpi", 150) or 150)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     images: list[bytes] = []
     zoom = dpi / 72.0
@@ -436,8 +452,21 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
 
     found: list[tuple[str, bytes, str]] = []
     for part in msg.walk():
-        if part.get_content_maintype() == "multipart":
+        maintype = part.get_content_maintype()
+        if maintype == "multipart":
             continue
+
+        # A forwarded email (message/rfc822) carries the real timesheet inside
+        # itself ("email inside the email"). Python's walk() descends into it
+        # automatically when it's MIME-nested, but when the nested message is
+        # base64-encoded as a single leaf it is NOT descended — so pull its raw
+        # bytes and recurse to dig out the attached PDF/sheet.
+        if maintype == "message":
+            nested = _nested_message_bytes(part)
+            if nested:
+                found.extend(_eml_collect_attachments(nested))
+            continue
+
         payload = part.get_payload(decode=True)
         if not payload:
             continue
@@ -462,7 +491,38 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
         # Images without an explicit attachment disposition are skipped —
         # they are decorative graphics, not standalone timesheet files.
 
-    return found
+    # De-duplicate (a nested message can surface the same bytes twice).
+    seen: set[tuple[str, int]] = set()
+    deduped: list[tuple[str, bytes, str]] = []
+    for fn, payload, ftype in found:
+        key = (fn, len(payload))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((fn, payload, ftype))
+    return deduped
+
+
+def _nested_message_bytes(part) -> bytes | None:
+    """Raw .eml bytes of a message/rfc822 part, whether MIME-nested or a
+    base64-encoded leaf. Returns None if nothing usable is found."""
+    try:
+        payload = part.get_payload(decode=True)
+        if payload and payload.lstrip()[:1] not in (b"", None):
+            return payload
+    except Exception:
+        pass
+    try:
+        inner = part.get_payload()
+        if isinstance(inner, list) and inner:
+            return inner[0].as_bytes()
+        if hasattr(inner, "as_bytes"):
+            return inner.as_bytes()
+        if isinstance(inner, str) and inner.strip():
+            return inner.encode("utf-8", "replace")
+    except Exception:
+        pass
+    return None
 
 
 def _text_to_page_images(
@@ -647,6 +707,26 @@ def eml_best_attachment(eml_bytes: bytes) -> tuple[str, bytes, str] | None:
     if not attachments:
         return None
     return max(attachments, key=lambda t: _score_eml_attachment(t[0], t[1], t[2]))
+
+
+def eml_all_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
+    """Every real (non-decorative) document attachment inside an .eml, as
+    (save_name, payload, file_type). Used to file EACH attached sheet separately
+    in the vault alongside the original .eml — not just the single best one.
+
+    Save names are de-duplicated so two attachments that share a filename (or
+    have none) never overwrite each other on disk."""
+    raw = _eml_collect_attachments(eml_bytes)
+    out: list[tuple[str, bytes, str]] = []
+    used: set[str] = set()
+    for idx, (fname, payload, ftype) in enumerate(raw, 1):
+        name = eml_attachment_save_name(fname, ftype)
+        if name in used:
+            stem, dot, ext = name.rpartition(".")
+            name = f"{stem}_{idx}{dot}{ext}" if dot else f"{name}_{idx}"
+        used.add(name)
+        out.append((name, payload, ftype))
+    return out
 
 
 def eml_attachment_save_name(filename: str, ftype: str) -> str:

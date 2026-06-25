@@ -41,6 +41,12 @@ CONFIG_KEYS: dict[str, dict] = {
     "vision_image_detail":{"category": ConfigCategory.MODEL, "secret": False, "env": "vision_image_detail", "default": "high"},
     "validation_model":   {"category": ConfigCategory.MODEL, "secret": False, "env": "validation_model", "default": "gpt-4o-mini"},
     "enable_text_validation": {"category": ConfigCategory.MODEL, "secret": False, "env": "enable_text_validation", "default": True},
+    # cost / accuracy tuning
+    "pdf_render_dpi":         {"category": ConfigCategory.MODEL, "secret": False, "env": "pdf_render_dpi", "default": 150},
+    "vision_adaptive_detail":{"category": ConfigCategory.MODEL, "secret": False, "env": "vision_adaptive_detail", "default": True},
+    "vision_json_mode":      {"category": ConfigCategory.MODEL, "secret": False, "env": "vision_json_mode", "default": True},
+    "extraction_prefer_deterministic": {"category": ConfigCategory.MODEL, "secret": False, "env": "extraction_prefer_deterministic", "default": False},
+    "ocr_provider":          {"category": ConfigCategory.MODEL, "secret": False, "env": "ocr_provider", "default": "none"},
     # prompts (overlaid onto parser.* at read time)
     "system_prompt":      {"category": ConfigCategory.PROMPT, "secret": False, "env": None, "default": ""},
     "extraction_prompt":  {"category": ConfigCategory.PROMPT, "secret": False, "env": None, "default": ""},
