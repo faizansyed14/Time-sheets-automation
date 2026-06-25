@@ -22,7 +22,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Integer, String, Text, false, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -98,6 +98,16 @@ class PipelineFile(Base):
     month: Mapped[int | None] = mapped_column(Integer, nullable=True)
     year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     record_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+
+    # ---- extraction provenance (cost visibility on the pipeline tracker) ----
+    # Which GPT model handled this file (gpt-4o vs the cheaper gpt-4o-mini, etc.),
+    # how it was read, and whether the local OCR reader was used.
+    extraction_model: Mapped[str | None] = mapped_column(String, nullable=True)
+    extraction_method: Mapped[str | None] = mapped_column(String, nullable=True)
+    used_ocr: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
+    # render DPI, image detail, page count, OCR provider, text-layer presence,
+    # validation model, embedded .eml attachment — shown in the UI dropdown.
+    extraction_meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # copy of the original bytes (relative to storage root) so Retry works
     raw_path: Mapped[str | None] = mapped_column(String, nullable=True)

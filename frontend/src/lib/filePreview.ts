@@ -34,3 +34,11 @@ export function downloadFile(url: string, filename: string) {
   a.rel = "noreferrer";
   a.click();
 }
+
+/** Strip scripts/event handlers from email HTML before sandboxed iframe render. */
+export function sanitizeEmailHtml(html: string): string {
+  return html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<script\b[^>]*\/>/gi, "")
+    .replace(/\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+}

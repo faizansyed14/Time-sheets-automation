@@ -103,8 +103,25 @@ def _parse_dt(s: str | None) -> datetime | None:
         return datetime.now(timezone.utc)
 
 
+def _is_eml(name: str, ctype: str) -> bool:
+    """A forwarded email carried as a file — its nested PDF/sheet is the real
+    timesheet, so the whole .eml is a TIMESHEET container (never an approval)."""
+    n = (name or "").lower()
+    c = (ctype or "").lower()
+    return n.endswith(".eml") or c in ("message/rfc822", "application/eml")
+
+
+def _is_doc(name: str, ctype: str) -> bool:
+    n = (name or "").lower()
+    return (ctype in _DOC_TYPES) or n.endswith((".pdf", ".docx", ".xlsx")) or _is_eml(name, ctype)
+
+
 def _classify(name: str, ctype: str, has_doc: bool) -> str:
     n = (name or "").lower()
+    # An .eml/message is a document container — classify it first so it can
+    # never be mistaken for an approval screenshot or rendered as a flat image.
+    if _is_eml(name, ctype):
+        return "timesheet"
     if any(k in n for k in ("approv", "manager", "sign-off", "signoff")):
         return "approval_screenshot"
     if ctype in _DOC_TYPES or n.endswith((".pdf", ".docx", ".xlsx")):
@@ -120,11 +137,15 @@ def _build(msg: dict) -> ProviderMessage:
     frm = (msg.get("from") or {}).get("emailAddress") or {}
     raw = msg.get("attachments") or []
     files = [a for a in raw if str(a.get("@odata.type", "")).endswith("fileAttachment")]
-    has_doc = any(
-        (a.get("contentType") in _DOC_TYPES)
-        or str(a.get("name", "")).lower().endswith((".pdf", ".docx", ".xlsx"))
-        for a in files
-    )
+    # A forwarded email shows up as an itemAttachment (message/rfc822) whose own
+    # body carries the real timesheet (PDF/XLSX). Graph does NOT surface that
+    # nested file as a top-level attachment, so we keep the item itself and let
+    # the .eml pipeline dig the timesheet out of it.
+    items = [a for a in raw if str(a.get("@odata.type", "")).endswith("itemAttachment")]
+    # A real document present? (PDF/Office/.eml file OR a forwarded-email item.)
+    # When true, accompanying inline images are treated as approval screenshots
+    # rather than hijacking extraction as the "timesheet".
+    has_doc = any(_is_doc(a.get("name", ""), a.get("contentType", "")) for a in files) or bool(items)
     atts: list[ProviderAttachment] = []
     for a in files:
         size = a.get("size") or 0
@@ -136,6 +157,19 @@ def _build(msg: dict) -> ProviderMessage:
             content_type=a.get("contentType") or "application/octet-stream",
             size=size,
             kind=_classify(a.get("name"), a.get("contentType"), has_doc),
+        ))
+    for a in items:
+        # Treat the forwarded email as a timesheet candidate; its bytes are
+        # fetched as raw MIME (.eml) and processed by the same .eml extractor.
+        name = (a.get("name") or "forwarded-email").strip() or "forwarded-email"
+        if not name.lower().endswith(".eml"):
+            name = f"{name}.eml"
+        atts.append(ProviderAttachment(
+            attachment_id=a["id"],
+            filename=name,
+            content_type="message/rfc822",
+            size=a.get("size") or 0,
+            kind="timesheet",
         ))
 
     body = msg.get("body") or {}
@@ -211,9 +245,18 @@ class GraphEmailProvider(EmailProvider):
             if r.status_code != 200:
                 raise RuntimeError(f"Graph attachment error {r.status_code}: {r.text[:300]}")
             a = r.json()
+            odata = str(a.get("@odata.type", ""))
             content = a.get("contentBytes")
-            if not content:
-                raise FileNotFoundError(f"No contentBytes for {attachment_id}")
+            # itemAttachment (a forwarded email) has no contentBytes — its raw
+            # MIME (the .eml, with the timesheet PDF inside) is served at /$value.
+            if odata.endswith("itemAttachment") or not content:
+                rv = await c.get(f"{url}/$value", headers=await _headers())
+                if rv.status_code != 200 or not rv.content:
+                    raise FileNotFoundError(f"No content for {attachment_id}")
+                name = (a.get("name") or "forwarded-email").strip() or "forwarded-email"
+                if not name.lower().endswith(".eml"):
+                    name = f"{name}.eml"
+                return rv.content, name, "message/rfc822"
             return (base64.b64decode(content),
                     a.get("name") or "attachment",
                     a.get("contentType") or "application/octet-stream")

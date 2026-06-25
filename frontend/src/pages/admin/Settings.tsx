@@ -240,6 +240,46 @@ export default function AdminSettings() {
         </div>
       </Card>
 
+      {/* cost & accuracy tuning */}
+      <Card className="mb-5 p-5">
+        <h2 className="mb-1 flex items-center gap-2 text-sm font-bold text-slate-800"><Cpu className="h-4 w-4 text-slate-400" /> Cost &amp; accuracy</h2>
+        <p className="mb-3 text-xs text-slate-500">Born-digital sheets are read cheaply from their text layer; scans use the vision model. These knobs cut cost without losing accuracy.</p>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Adaptive image detail">
+            <label className="flex items-center gap-2 pt-2 text-sm text-slate-600">
+              <input type="checkbox" checked={form["vision_adaptive_detail"] !== false} onChange={(e) => set("vision_adaptive_detail", e.target.checked)} className="h-4 w-4 rounded border-slate-300 text-brand-600" />
+              low detail for digital (cheaper)
+            </label>
+          </Field>
+          <Field label="PDF render DPI">
+            <Select className="w-full" value={String(form["pdf_render_dpi"] ?? 150)} onChange={(e) => set("pdf_render_dpi", Number(e.target.value))}>
+              <option value="120">120 (cheapest)</option>
+              <option value="150">150 (recommended)</option>
+              <option value="200">200</option>
+              <option value="300">300 (highest)</option>
+            </Select>
+          </Field>
+          <Field label="Strict JSON output">
+            <label className="flex items-center gap-2 pt-2 text-sm text-slate-600">
+              <input type="checkbox" checked={form["vision_json_mode"] !== false} onChange={(e) => set("vision_json_mode", e.target.checked)} className="h-4 w-4 rounded border-slate-300 text-brand-600" />
+              guarantee parseable JSON
+            </label>
+          </Field>
+          <Field label="Deterministic-first">
+            <label className="flex items-center gap-2 pt-2 text-sm text-slate-600">
+              <input type="checkbox" checked={Boolean(form["extraction_prefer_deterministic"])} onChange={(e) => set("extraction_prefer_deterministic", e.target.checked)} className="h-4 w-4 rounded border-slate-300 text-brand-600" />
+              skip LLM for clean digital sheets
+            </label>
+          </Field>
+          <Field label="OCR reader (scans)">
+            <Select className="w-full" value={String(form["ocr_provider"] ?? "none")} onChange={(e) => set("ocr_provider", e.target.value)}>
+              <option value="none">none</option>
+              <option value="tesseract">Tesseract (local, free)</option>
+            </Select>
+          </Field>
+        </div>
+      </Card>
+
       {/* prompts */}
       <Card className="p-5">
         <div className="mb-3 flex items-center justify-between">

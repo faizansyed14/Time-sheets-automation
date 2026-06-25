@@ -17,6 +17,7 @@ note, and a machine code the pipeline tracker uses.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from rapidfuzz import fuzz
@@ -50,6 +51,81 @@ def _is_placeholder_name(name: str) -> bool:
     # all non-letters (e.g. "----", "n/a.") or a single short token like "x"
     letters = [c for c in n if c.isalpha()]
     return len(letters) < 2
+
+
+# --------------------------------------------------------------------------- #
+# Name agreement
+#
+# Real timesheets carry short forms of the matcher's full name: dropped middle
+# names ("Abdul Ghani" for "Abdul Syed Ghani"), initials ("A. Ghani"), and
+# abbreviations ("Mohd Ali" for "Mohammed Ali"). A confident match is accepted
+# when EITHER:
+#   (a) the classic fuzzy path passes (handles abbreviations / typos), OR
+#   (b) the sheet name is an abbreviation-aware token SUBSET of the full name
+#       (handles dropped middle names + initials).
+# The subset path requires the surname (or ≥2 tokens) to line up, so a shared
+# first name alone ("Abdul" → "Abdul Syed Ghani") is NOT accepted.
+# --------------------------------------------------------------------------- #
+def _tokens(name: str) -> list[str]:
+    return [t for t in re.split(r"[^a-z0-9]+", (name or "").lower()) if t]
+
+
+def _token_match(a: str, b: str) -> bool:
+    """Do two name tokens plausibly refer to the same name part?"""
+    if a == b:
+        return True
+    # abbreviation by prefix: "abd"→"abdul", "ghani"→"ghanim" (len>=3 both sides)
+    if len(a) >= 3 and len(b) >= 3 and (a.startswith(b) or b.startswith(a)):
+        return True
+    # initial: "a"→"abdul"
+    if len(a) == 1 and b[:1] == a:
+        return True
+    if len(b) == 1 and a[:1] == b:
+        return True
+    return False
+
+
+def _subset_compatible(e_tokens: list[str], c_tokens: list[str]) -> bool:
+    """True when the shorter name's tokens are all present (abbrev/initial aware)
+    in the longer name — i.e. one is a short form of the other."""
+    short, long = (e_tokens, c_tokens) if len(e_tokens) <= len(c_tokens) else (c_tokens, e_tokens)
+    if not short or not long:
+        return False
+    used = [False] * len(long)
+    matched = 0
+    for ta in short:
+        for j, tb in enumerate(long):
+            if not used[j] and _token_match(ta, tb):
+                used[j] = True
+                matched += 1
+                break
+    if matched != len(short):
+        return False                       # a token in the shorter name isn't in the longer one
+    if len(short) == 1:
+        return _token_match(short[0], long[-1])   # one token => must be the surname
+    return True                            # 2+ tokens fully contained => same person
+
+
+def _name_agrees(extracted: str, candidate: str) -> bool:
+    a, b = extracted.strip().lower(), candidate.strip().lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # (a) classic fuzzy path — handles abbreviations / OCR typos
+    if fuzz.WRatio(a, b) >= FUZZY_THRESHOLD and fuzz.token_sort_ratio(a, b) >= FUZZY_TOKEN_FLOOR:
+        return True
+    # (b) abbreviation-aware token subset — handles dropped names + initials
+    return _subset_compatible(_tokens(a), _tokens(b))
+
+
+def _name_score(extracted: str, candidate: str) -> float:
+    """Confidence used to rank candidates of a SHARED id."""
+    a, b = extracted.strip().lower(), candidate.strip().lower()
+    score = float(fuzz.WRatio(a, b))
+    if _subset_compatible(_tokens(a), _tokens(b)):
+        score = max(score, 93.0)
+    return score
 
 
 class MatchCode:
@@ -111,44 +187,49 @@ async def match_employee(
             MatchCode.NO_MATCH,
         )
 
-    # ---- the name must agree with exactly one candidate (exact, else strong fuzzy) ----
-    exact = [c for c in candidates if c.name.strip().lower() == name_norm]
-    if len(exact) == 1:
-        emp = exact[0]
+    # ---- single candidate: confirm the name agrees (short forms allowed) ----
+    if len(candidates) == 1:
+        emp = candidates[0]
+        if _name_agrees(name_norm, emp.name):
+            return MatchResult(
+                emp, f"Matched by employee ID ({id_norm}) + name "
+                     f'("{extracted_name}" → "{emp.name}"{_loc(emp)}).',
+                MatchCode.ID_AND_NAME,
+            )
         return MatchResult(
-            emp, f"Matched by employee ID ({id_norm}) + name ({emp.name}{_loc(emp)}).",
-            MatchCode.ID_AND_NAME,
-        )
-    if len(exact) > 1:
-        return MatchResult(
-            None, f'Employee ID {id_norm} + name "{extracted_name}" matches multiple rows — ambiguous.',
-            MatchCode.AMBIGUOUS_ID,
-        )
-
-    # fuzzy ONLY against the ID's own candidate rows (tolerate OCR / abbreviations)
-    scored = sorted(
-        ((fuzz.WRatio(name_norm, c.name.strip().lower()),
-          fuzz.token_sort_ratio(name_norm, c.name.strip().lower()), c) for c in candidates),
-        key=lambda t: t[0], reverse=True,
-    )
-    best_score, best_token, best = scored[0]
-    second_score = scored[1][0] if len(scored) > 1 else 0
-    if (best_score >= FUZZY_THRESHOLD and best_token >= FUZZY_TOKEN_FLOOR
-            and (len(candidates) == 1 or best_score - second_score >= 5)):
-        return MatchResult(
-            best,
-            f'Matched by employee ID ({id_norm}) + name "{extracted_name}" → '
-            f'"{best.name}"{_loc(best)} ({int(best_score)}% confidence).',
-            MatchCode.ID_AND_NAME,
+            None,
+            f'Employee ID {id_norm} belongs to "{emp.name}"{_loc(emp)}, but the sheet name '
+            f'"{extracted_name}" does not match it — not matched. Please assign the correct employee.',
+            MatchCode.NO_MATCH,
         )
 
-    # ID exists but the name does NOT agree with it -> NOT matched, flag for assignment.
+    # ---- shared ID: the name must single out exactly one person ----
+    agreeing = [c for c in candidates if _name_agrees(name_norm, c.name)]
+    if len(agreeing) == 1:
+        emp = agreeing[0]
+        return MatchResult(
+            emp, f"Matched by employee ID ({id_norm}) + name "
+                 f'("{extracted_name}" → "{emp.name}"{_loc(emp)}) — ID is shared across teams.',
+            MatchCode.ID_AND_NAME,
+        )
+    if len(agreeing) > 1:
+        # multiple plausibly agree — take a clear winner only if it dominates
+        ranked = sorted(((_name_score(name_norm, c), c) for c in agreeing),
+                        key=lambda t: t[0], reverse=True)
+        best_score, best = ranked[0]
+        second = ranked[1][0]
+        if best_score - second >= 8:
+            return MatchResult(
+                best, f"Matched by employee ID ({id_norm}) + name "
+                      f'("{extracted_name}" → "{best.name}"{_loc(best)}, {int(best_score)}% confidence).',
+                MatchCode.ID_AND_NAME,
+            )
+
     who = ", ".join(f"{c.name}{_loc(c)}" for c in candidates)
-    code = MatchCode.AMBIGUOUS_ID if len(candidates) > 1 else MatchCode.NO_MATCH
     return MatchResult(
         None,
-        f'Employee ID {id_norm} belongs to {who}, but the sheet name "{extracted_name}" '
-        "does not match — not matched. Please assign the correct employee.",
-        code,
+        f'Employee ID {id_norm} is shared by {who}, and the sheet name "{extracted_name}" '
+        "does not clearly identify one of them — not matched. Please assign the correct employee.",
+        MatchCode.AMBIGUOUS_ID,
     )
 

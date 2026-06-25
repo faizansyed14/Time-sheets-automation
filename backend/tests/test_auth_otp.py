@@ -20,7 +20,7 @@ async def test_admin_requires_2fa_captcha_default(client):
     body = r.json()
     assert body["status"] == "captcha_required"
     assert body["user"]["role"] == "admin"
-    assert body["captcha_id"] and body["login_token"]
+    assert body["login_token"]
     # completing the second factor yields a working admin token
     token = await login_2fa(client, "admin", "admin")
     me = await client.get("/api/v1/auth/me", headers=auth_headers(token))

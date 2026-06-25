@@ -49,21 +49,90 @@ class VisionExtractionEngine(ExtractionEngine):
             return TimesheetExtraction(
                 employee_id=None, employee_name=None, month=0, year=0,
                 validation_status="manual_review", summary="Unsupported file type.",
-                hr_flags=["Unsupported file type."])
+                hr_flags=["Unsupported file type."],
+                extraction_method="unsupported")
 
-        images = fp.to_images(ftype, data)
         model = settings.extraction_model
         # Authoritative cell/text content (for .eml this reads the embedded
         # attachment) — handed to the model so a poor image render can't make
         # it hallucinate names/IDs/dates.
         doc_text = fp.extract_document_text(ftype, data)
+        has_text = len((doc_text or "").strip()) >= 24
+
+        # The bytes/type/name the LLM should treat as THE document. For an .eml
+        # carrying a real PDF/Office sheet ("email inside the email"), point the
+        # model at that attachment directly — far more reliable and cheaper than
+        # rendering the whole email to many images.
+        llm_bytes, llm_ftype, llm_name = data, ftype, filename
+        embedded_meta: dict = {}
+        if ftype == "eml":
+            best = fp.eml_best_attachment(data)
+            if best:
+                emb_name, emb_payload, emb_ftype = best
+                llm_bytes, llm_ftype, llm_name = emb_payload, emb_ftype, (emb_name or filename)
+                embedded_meta = {"embedded_attachment": emb_name, "embedded_type": emb_ftype}
+
+        # Render: digital PDFs are grounded by their text layer, so a low DPI is
+        # plenty (cheaper); scanned PDFs (no text layer) need more resolution.
+        render_dpi: int | None = None
+        if llm_ftype == "pdf":
+            base_dpi = int(getattr(settings, "pdf_render_dpi", 150) or 150)
+            render_dpi = base_dpi if has_text else max(base_dpi, 220)
+            images = fp.pdf_to_images(llm_bytes, dpi=render_dpi)
+        else:
+            images = fp.to_images(llm_ftype, llm_bytes)
+
+        # OCR reader (optional): give scans/photos a text layer so they get the
+        # same grounding as digital sheets. No-op unless OCR_PROVIDER is set.
+        used_ocr = False
+        ocr_provider = (settings.ocr_provider or "none").strip().lower()
+        ocr_status = "disabled"
+        if not has_text and ocr_provider != "none":
+            from app.services.extraction import ocr
+            ocr_status = ocr.ocr_status()  # ready | not_installed | unknown_provider
+            if ocr_status == "ready":
+                try:
+                    ocr_txt = ocr.ocr_text(images, llm_bytes, llm_ftype)
+                    if ocr_txt.strip():
+                        doc_text, has_text = ocr_txt, len(ocr_txt.strip()) >= 24
+                        used_ocr = True
+                except Exception:
+                    ocr_status = "error"
+
+        # Build the provenance shown in the tracker's "Extraction details" panel.
+        meta = {
+            "file_type": ftype,
+            "page_count": len(images),
+            "render_dpi": render_dpi,
+            "has_text_layer": bool(has_text),
+            "doc_text_chars": len((doc_text or "").strip()),
+            "ocr_provider": ocr_provider,
+            "ocr_status": ocr_status,
+            "validation_model": settings.validation_model if settings.enable_text_validation else None,
+            **embedded_meta,
+        }
+
+        # Deterministic-first (opt-in): a clean digital text layer that parses
+        # confidently skips the LLM entirely — the biggest cost saver.
+        if settings.extraction_prefer_deterministic and has_text:
+            det = self._deterministic_from_text(doc_text)
+            if det is not None:
+                det.used_ocr = used_ocr
+                det.extraction_meta = {**meta, "image_detail": None}
+                return det
+
+        # Adaptive image detail: born-digital sheets are grounded by their text
+        # layer, so the image only needs LOW detail (≈5–10× cheaper); scans keep
+        # the configured (high) detail.
+        detail = "low" if (settings.vision_adaptive_detail and has_text) else settings.vision_image_detail
+        meta["image_detail"] = detail
         raw = await vision_client.extract_timesheet(
             images_jpeg=images,
             prompt=parser.get_prompt("extraction"),
             system_prompt=parser.get_prompt("system"),
             model=model,
-            image_detail=settings.vision_image_detail,
-            file_bytes=data, file_type=ftype, filename=filename,
+            image_detail=detail,
+            file_bytes=llm_bytes, file_type=llm_ftype, filename=llm_name,
             aux_text=doc_text,
         )
         parsed = parser.parse_extraction(parser.extract_json_from_vllm_response(raw))
@@ -133,6 +202,55 @@ class VisionExtractionEngine(ExtractionEngine):
             absent_dates=cleaned["absent"],
             public_holiday_dates=cleaned["public_holiday"],
             validation_status=status, summary=summary, hr_flags=flags,
+            extraction_model=model, extraction_method="vision-llm", used_ocr=used_ocr,
+            extraction_meta=meta,
+        )
+
+    def _deterministic_from_text(self, doc_text: str) -> TimesheetExtraction | None:
+        """Extract WITHOUT an LLM from a clean text layer. Returns a result only
+        when identity (id + name) and period are confidently present; otherwise
+        None so the caller falls back to the vision model."""
+        from app.services.extraction.mock_engine import _parse_upload_text
+        from app.services.pipeline.matching import _is_placeholder_name
+
+        parsed = _parse_upload_text(doc_text)
+        if not parsed:
+            return None
+        emp_id = (parsed.get("emp_id") or "").strip()
+        emp_name = (parsed.get("emp_name") or "").strip()
+        month = parsed.get("month") or 0
+        year = parsed.get("year") or 0
+        if not emp_id or not emp_name or _is_placeholder_name(emp_name):
+            return None
+        if not (1 <= month <= 12 and year >= 2000):
+            return None
+
+        raw = {b: parsed.get(b, []) for b in
+               ("annual", "remote", "sick", "unpaid", "absent", "public_holiday")}
+        cleaned, flags = validate(raw, month, year)
+        try:
+            present = set(parsed.get("_present") or [])
+            if len(present) >= 5:
+                accounted = {d for v in cleaned.values() for d in v}
+                gaps = unaccounted_working_days(
+                    month, year, present, set(parsed.get("_weekend") or []), accounted)
+                uf = unaccounted_flag(gaps)
+                if uf:
+                    flags = flags + [uf]
+        except Exception:
+            pass
+        status = "manual_review" if flags else "verified"
+        total = sum(len(v) for v in cleaned.values())
+        mname = calendar.month_name[month]
+        summary = ("Needs review: " + " ".join(flags[:4])) if flags else (
+            f"Clean extraction (no-LLM, digital text) — {total} leave/holiday day(s) for {mname} {year}.")
+        return TimesheetExtraction(
+            employee_id=emp_id, employee_name=emp_name, month=month, year=year,
+            annual_leave_dates=cleaned["annual"], remote_work_dates=cleaned["remote"],
+            sick_leave_dates=cleaned["sick"], unpaid_leave_dates=cleaned["unpaid"],
+            absent_dates=cleaned["absent"], public_holiday_dates=cleaned["public_holiday"],
+            validation_status=status, summary=summary, hr_flags=flags,
+            extraction_model=None, extraction_method="deterministic-text",
         )
 
     async def _text_crosscheck(self, doc_text, cleaned, month, year) -> tuple[str | None, list[str]]:

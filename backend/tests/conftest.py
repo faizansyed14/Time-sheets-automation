@@ -87,10 +87,14 @@ async def login_2fa(client, username: str, password: str) -> str:
         v = await client.post("/api/v1/auth/verify-otp",
                               json={"login_token": data["login_token"], "code": data["debug_otp"]})
     elif data["status"] == "captcha_required":
-        answer = await cache.get(f"captcha:{data['captcha_id']}")
+        # The login no longer returns a captcha; the client fetches a fresh one
+        # (image + id) from GET /auth/captcha, then solves it.
+        cap = await client.get("/api/v1/auth/captcha")
+        cid = cap.headers["x-captcha-id"]
+        answer = await cache.get(f"captcha:{cid}")
         v = await client.post("/api/v1/auth/verify-captcha",
                               json={"login_token": data["login_token"],
-                                    "captcha_id": data["captcha_id"], "answer": answer})
+                                    "captcha_id": cid, "answer": answer})
     else:
         raise AssertionError(f"unexpected login status: {data}")
     assert v.status_code == 200, v.text

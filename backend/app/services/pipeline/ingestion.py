@@ -48,8 +48,7 @@ from app.services.extraction import get_extraction_engine
 from app.services.extraction.base import ApprovalExtraction
 from app.services.extraction.file_processor import (
     detect_file_type,
-    eml_attachment_save_name,
-    eml_best_attachment,
+    eml_all_attachments,
     eml_body_to_images,
 )
 from app.services.extraction.validation import summarize as summarize_record
@@ -279,8 +278,30 @@ async def ingest_timesheet_bytes(
         _fail(tracker, PipelineStage.EXTRACTION, FailureCode.LLM_FAILED,
               f"The extraction model failed on this file: {str(e)[:300]}")
         return None, tracker
+    # Record how this file was read so the tracker can show cost/provenance
+    # (which GPT model, deterministic-no-LLM, or local OCR) per file.
+    tracker.extraction_model = getattr(ext, "extraction_model", None)
+    tracker.extraction_method = getattr(ext, "extraction_method", None)
+    tracker.used_ocr = bool(getattr(ext, "used_ocr", False))
+    tracker.extraction_meta = {
+        **(getattr(ext, "extraction_meta", None) or {}),
+        "source_kind": source_kind,
+        "content_type": content_type,
+        "size_bytes": len(data or b""),
+        "model": tracker.extraction_model,
+        "method": tracker.extraction_method,
+        "used_ocr": tracker.used_ocr,
+    }
+    _method_label = {
+        "vision-llm": f"{tracker.extraction_model or 'vision model'}",
+        "deterministic-text": "deterministic text parser (no LLM)",
+        "mock": "mock engine (no LLM)",
+        "unsupported": "unsupported file",
+    }.get(tracker.extraction_method or "", tracker.extraction_method or "engine")
+    _ocr_note = " · OCR text layer used" if tracker.used_ocr else ""
     _event(tracker, PipelineStage.EXTRACTION, "ok",
-           f"LLM extraction returned (name='{ext.employee_name or '—'}', "
+           f"Read with {_method_label}{_ocr_note} "
+           f"(name='{ext.employee_name or '—'}', "
            f"id='{ext.employee_id or '—'}', period={ext.month}/{ext.year}).")
 
     # ---- stage: identification (did the sheet contain usable identity/period?) ----
@@ -402,17 +423,24 @@ async def ingest_timesheet_bytes(
     folder_rel = None
     storage_warn = None
     eml_extracted_name: str | None = None
+    eml_extracted_names: list[str] = []
     try:
+        # Always keep the ORIGINAL incoming file in the vault (the .eml itself,
+        # the PDF, the image, …) so the source of every record is preserved.
         sp.save_file(account_manager, employee_name, period_month, period_year, filename, data)
         if ftype == "eml":
-            best = eml_best_attachment(data)
-            if best:
-                raw_name, att_payload, att_ftype = best
-                eml_extracted_name = eml_attachment_save_name(raw_name, att_ftype)
-                sp.save_file(
-                    account_manager, employee_name, period_month, period_year,
-                    eml_extracted_name, att_payload,
-                )
+            # Store EACH attached sheet separately next to the original .eml
+            # (e.g. Sri_Timesheet_May2026.pdf), so the vault holds the mail AND
+            # every attachment AND the .json result — not just the mail.
+            attachments = eml_all_attachments(data)
+            if attachments:
+                for save_name, att_payload, _att_ftype in attachments:
+                    sp.save_file(
+                        account_manager, employee_name, period_month, period_year,
+                        save_name, att_payload,
+                    )
+                    eml_extracted_names.append(save_name)
+                eml_extracted_name = eml_extracted_names[0]
             else:
                 # Inline timesheet (no attachment): save the rendered image of
                 # the email (Subject + body) — the same image sent to the model.
@@ -421,6 +449,7 @@ async def ingest_timesheet_bytes(
                     for idx, img in enumerate(imgs[:8], 1):
                         nm = "email_view.jpg" if len(imgs) == 1 else f"email_view_p{idx}.jpg"
                         sp.save_file(account_manager, employee_name, period_month, period_year, nm, img)
+                        eml_extracted_names.append(nm)
                     if imgs:
                         eml_extracted_name = "email_view.jpg"
                 except Exception:
@@ -434,7 +463,11 @@ async def ingest_timesheet_bytes(
                          "account_manager": account_manager, "match_note": m.note},
             "period": {"month": period_month, "year": period_year},
             "source_files": [{"filename": e["filename"], "ingested_at": e["ingested_at"]} for e in entries],
-            "eml": {"original": filename, "extracted_attachment": eml_extracted_name} if ftype == "eml" else None,
+            "eml": {"original": filename, "extracted_attachment": eml_extracted_name,
+                    "extracted_attachments": eml_extracted_names} if ftype == "eml" else None,
+            "extraction": tracker.extraction_meta or {
+                "model": tracker.extraction_model, "method": tracker.extraction_method,
+                "used_ocr": bool(tracker.used_ocr)},
             "leaves": {k: cleaned[k] for k in BUCKET_FIELDS},
             "validation": {"status": validation_status, "summary": summary, "flags": flags},
             "approval": {"detected": approval_detected, "detail": approval_detail},
@@ -442,8 +475,12 @@ async def ingest_timesheet_bytes(
         }, indent=2, default=str))
         folder_rel = sp.folder_rel(account_manager, employee_name, period_month, period_year)
         filed = f"Filed under {folder_rel}."
-        if eml_extracted_name:
-            filed += f" Extracted attachment saved as {eml_extracted_name}."
+        if eml_extracted_names:
+            if len(eml_extracted_names) == 1:
+                filed += f" Original email kept; attached sheet saved as {eml_extracted_names[0]}."
+            else:
+                filed += (f" Original email kept; {len(eml_extracted_names)} attached file(s) saved "
+                          f"({', '.join(eml_extracted_names)}).")
         _event(tracker, PipelineStage.FILING, "ok", filed)
     except Exception as e:
         storage_warn = f"Could not file on disk: {str(e)[:200]}"
@@ -618,6 +655,11 @@ async def ingest_manual_entry(
     tracker.employee_name = employee_name
     tracker.employee_id = matched.employee_id
     tracker.month, tracker.year = month, year
+    tracker.extraction_model = None
+    tracker.extraction_method = "manual"
+    tracker.used_ocr = False
+    tracker.extraction_meta = {"method": "manual", "model": None, "used_ocr": False,
+                               "source_kind": "manual"}
     _event(tracker, PipelineStage.MATCHING, "ok",
            f"Manually assigned to {employee_name} ({matched.employee_id}).")
 

@@ -49,6 +49,8 @@ def _out(t: PipelineFile) -> PipelineFileOut:
         failure_detail=t.failure_detail, events=t.events or [],
         employee_id=t.employee_id, employee_name=t.employee_name,
         month=t.month, year=t.year, record_id=t.record_id,
+        extraction_model=t.extraction_model, extraction_method=t.extraction_method,
+        used_ocr=bool(t.used_ocr), extraction_meta=t.extraction_meta,
         can_retry=bool(t.raw_path or (t.source_kind == "email" and t.attachment_id)),
         can_resolve_assign=can_resolve_assign(t),
         resolved_at=t.resolved_at, resolution_note=t.resolution_note,
