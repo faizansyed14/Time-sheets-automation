@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     # file can be retried. This lives OUTSIDE storage_root so it never shows up
     # in the File Vault browser. (Local-disk providers only.)
     pipeline_raw_root: str = str(BACKEND_ROOT / "data" / "pipeline_raw")
+    # Retry copies are normally deleted as soon as a file succeeds; this caps how
+    # long a STILL-failed file's original is kept before it is purged, so the
+    # raw store can never grow without bound. 0 disables the age purge.
+    pipeline_raw_retention_days: int = 60
 
     # Which email provider to use: "mock" now, "graph" later.
     email_provider: str = "mock"
@@ -159,10 +163,20 @@ class Settings(BaseSettings):
     login_rate_window_seconds: int = 300          # per 5 min
     otp_verify_rate_max: int = 20
     otp_verify_rate_window_seconds: int = 300
+    # CAPTCHA issuance throttle: at most N fresh/refreshed captchas per IP per
+    # window; the (N+1)th is blocked until the window slides (≈ a 300s lockout).
+    captcha_rate_max: int = 10
+    captcha_rate_window_seconds: int = 300
+    # CAPTCHA answer-verification throttle (brute-force guard on the answer).
+    captcha_verify_rate_max: int = 20
+    captcha_verify_rate_window_seconds: int = 300
 
     # CAPTCHA
     captcha_length: int = 6
     captcha_ttl_seconds: int = 180
+    totp_issuer: str = "TimeSight"
+    totp_verify_rate_max: int = 20
+    totp_verify_rate_window_seconds: int = 300
 
     # Device fingerprint must stay consistent through a login flow
     fingerprint_required: bool = True

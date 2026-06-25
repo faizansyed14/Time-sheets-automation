@@ -61,6 +61,13 @@ async def lifespan(app: FastAPI):
         relocate_legacy_pipeline_raw()
     except Exception:
         pass
+    # Safety net for the daily beat job: purge over-retention pipeline retry
+    # copies on boot (queued to the worker; runs inline in eager/dev mode).
+    try:
+        from app.services.tasks import purge_pipeline_raw_task
+        purge_pipeline_raw_task.delay()
+    except Exception:
+        pass
     async with SessionLocal() as db:
         # default admin + apply any saved AI config to the live process
         try:

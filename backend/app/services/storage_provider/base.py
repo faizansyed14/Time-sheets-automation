@@ -81,6 +81,21 @@ class StorageProvider(ABC):
                             continue
                         yield f"{mgr}/{emp.name}/{mon.name}/{item.name}", data
 
+    def iter_file_meta(self, manager: str | None = None) -> Iterator[tuple[str, int]]:
+        """Yield (zip_path, size_bytes) for every vault file WITHOUT downloading
+        it — metadata only. Used to compute available years and the total size of
+        a download up front (so the UI can show an accurate progress bar). Local
+        and S3 override this with a single cheap listing; this default falls back
+        to the 3-level walk."""
+        managers = [m.name for m in self.list_managers()]
+        if manager:
+            managers = [m for m in managers if m == manager]
+        for mgr in managers:
+            for emp in self.list_employees(mgr):
+                for mon in self.list_months(mgr, emp.name):
+                    for item in self.list_items(mgr, emp.name, mon.name):
+                        yield f"{mgr}/{emp.name}/{mon.name}/{item.name}", int(item.size or 0)
+
     # ---- writing (used by the ingestion pipeline) ----
     @abstractmethod
     def save_file(self, manager: str, employee: str, month_label: str, filename: str, data: bytes) -> str: ...

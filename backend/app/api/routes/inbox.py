@@ -17,9 +17,10 @@ from app.schemas import (
     EmailDetail,
     EmailListItem,
     Page,
+    RerunExtractionIn,
 )
 from app.services.email_provider import get_email_provider
-from app.services.pipeline.ingestion import ingest_email
+from app.services.pipeline.ingestion import IngestSelectionError, ingest_email
 
 router = APIRouter(prefix="/inbox", tags=["inbox"])
 
@@ -192,7 +193,14 @@ async def decide(provider_message_id: str, body: DecisionIn, db: AsyncSession = 
         await db.commit()
         return {"status": "archived", "records_created": 0}
 
-    records = await ingest_email(db, row)
+    try:
+        records = await ingest_email(
+            db, row,
+            attachment_ids=body.attachment_ids,
+            approval_attachment_id=body.approval_attachment_id,
+        )
+    except IngestSelectionError as e:
+        raise HTTPException(400, str(e)) from e
     await datacache.bust_pipeline()
     return {"status": "ingested", "records_created": len(records),
             "record_ids": [r.id for r in records]}
@@ -228,27 +236,35 @@ async def restore_email(provider_message_id: str, db: AsyncSession = Depends(get
 
 
 @router.post("/{provider_message_id}/rerun")
-async def rerun_extraction(provider_message_id: str, db: AsyncSession = Depends(get_db)):
-    """Wipe existing month folders for related records and run ingestion again."""
+async def rerun_extraction(
+    provider_message_id: str,
+    body: RerunExtractionIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """Wipe existing month folders for related records and re-run selected attachments."""
     row = (await db.execute(select(EmailMessage).where(EmailMessage.provider_message_id == provider_message_id))).scalar_one_or_none()
     if not row:
         raise HTTPException(404, "Email session not found")
     if row.status != EmailStatus.INGESTED:
         raise HTTPException(400, "Only accepted emails can be re-run")
 
-    # Find affected records to find storage paths
     recs = (await db.execute(select(TimesheetRecord).where(TimesheetRecord.source_email_id == provider_message_id))).scalars().all()
-    
+
     from app.services import storage_provider as sp
     for r in recs:
         if r.storage_folder:
-            # Delete the specific month folder
             try:
                 sp.get_storage_provider().delete_folder(r.storage_folder)
             except Exception:
-                pass # Already gone or permission error
+                pass
 
-    # Re-trigger ingestion (which will upsert and overwrite database rows)
-    records = await ingest_email(db, row)
+    try:
+        records = await ingest_email(
+            db, row,
+            attachment_ids=body.attachment_ids,
+            approval_attachment_id=body.approval_attachment_id,
+        )
+    except IngestSelectionError as e:
+        raise HTTPException(400, str(e)) from e
     await datacache.bust_pipeline()
     return {"status": "re-ingested", "records_count": len(records)}

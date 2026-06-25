@@ -45,6 +45,16 @@ class EmailDetail(EmailListItem):
 
 class DecisionIn(BaseModel):
     accepted: bool
+    # Timesheet attachment IDs to send through extraction. When omitted on accept,
+    # all attachments classified as timesheet are processed (legacy behaviour).
+    attachment_ids: list[str] | None = None
+    # Optional manager-approval screenshot — only processed when explicitly set.
+    approval_attachment_id: str | None = None
+
+
+class RerunExtractionIn(BaseModel):
+    attachment_ids: list[str]
+    approval_attachment_id: str | None = None
 
 
 class SourceFileEntry(BaseModel):

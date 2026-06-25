@@ -1,14 +1,16 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { UserPlus, Shield, Eye, User as UserIcon, Mail, KeyRound, Trash2, Power, Pencil } from "lucide-react";
+import { UserPlus, Shield, Eye, User as UserIcon, Mail, KeyRound, Trash2, Power, Pencil, Smartphone } from "lucide-react";
 import {
   adminCreateUser,
   adminDeleteUser,
   adminListUsers,
+  adminTotpSetup,
   adminUpdateUser,
   type AuthModeT,
   type AuthRole,
   type AuthUser,
+  type TotpSetupResult,
 } from "../../api/client";
 import { avatarColor, cn, initials } from "../../lib/utils";
 import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton } from "../../components/ui";
@@ -17,6 +19,12 @@ import { useAuth } from "../../lib/auth";
 
 type Form = { username: string; password: string; email: string; role: AuthRole; auth_mode: AuthModeT };
 const EMPTY: Form = { username: "", password: "", email: "", role: "user", auth_mode: "otp" };
+
+function authModeLabel(mode: AuthModeT) {
+  if (mode === "totp") return "Authenticator";
+  if (mode === "captcha") return "CAPTCHA (legacy)";
+  return "OTP (email)";
+}
 
 function RoleBadge({ role }: { role: AuthRole }) {
   if (role === "admin") return <Badge tone="violet"><Shield className="h-3 w-3" /> admin</Badge>;
@@ -31,6 +39,7 @@ export default function AdminUsers() {
   const { data: users, isLoading } = useQuery({ queryKey: ["admin-users"], queryFn: adminListUsers });
   const [modal, setModal] = useState<{ mode: "create" } | { mode: "edit"; user: AuthUser } | null>(null);
   const [form, setForm] = useState<Form>(EMPTY);
+  const [totpSetup, setTotpSetup] = useState<{ user: AuthUser; data: TotpSetupResult } | null>(null);
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ["admin-users"] });
 
@@ -43,7 +52,14 @@ export default function AdminUsers() {
         role: form.role,
         auth_mode: form.auth_mode,
       }),
-    onSuccess: () => { toast("success", "User created"); setModal(null); invalidate(); },
+    onSuccess: (user) => {
+      toast("success", "User created");
+      setModal(null);
+      invalidate();
+      if (user.auth_mode === "totp") {
+        adminTotpSetup(user.id).then((data) => setTotpSetup({ user, data })).catch(() => {});
+      }
+    },
     onError: (e: any) => toast("error", "Could not create user", e?.response?.data?.detail ?? String(e)),
   });
 
@@ -57,6 +73,12 @@ export default function AdminUsers() {
       }),
     onSuccess: () => { toast("success", "User updated"); setModal(null); invalidate(); },
     onError: (e: any) => toast("error", "Could not update user", e?.response?.data?.detail ?? String(e)),
+  });
+
+  const totpSetupMut = useMutation({
+    mutationFn: (u: AuthUser) => adminTotpSetup(u.id),
+    onSuccess: (data, user) => setTotpSetup({ user, data }),
+    onError: (e: any) => toast("error", "Could not generate QR", e?.response?.data?.detail ?? String(e)),
   });
 
   const toggleActive = useMutation({
@@ -82,7 +104,7 @@ export default function AdminUsers() {
     <div className="animate-fade-up">
       <PageHeader
         title="Users & access"
-        subtitle="Create users and edit their role, email and 2-factor method. Every role (incl. admin) signs in with 2FA."
+        subtitle="Create users and choose OTP (email) or Authenticator (TOTP). Every role signs in with CAPTCHA + 2FA."
         actions={<Button onClick={openCreate}><UserPlus className="h-4 w-4" /> Add user</Button>}
       />
 
@@ -119,13 +141,18 @@ export default function AdminUsers() {
                     <span className="flex items-center gap-1 text-xs"><Mail className="h-3 w-3 text-slate-400" />{u.email ?? "—"}</span>
                   </td>
                   <td className="px-3 py-2.5">
-                    <span className="text-xs font-medium uppercase text-slate-600">{u.auth_mode}</span>
+                    <span className="text-xs font-medium text-slate-600">{authModeLabel(u.auth_mode)}</span>
                   </td>
                   <td className="px-3 py-2.5">
                     {u.is_active ? <Badge tone="green">active</Badge> : <Badge tone="rose">disabled</Badge>}
                   </td>
                   <td className="px-3 py-2.5">
                     <div className="flex justify-end gap-1">
+                      {u.auth_mode === "totp" && (
+                        <button onClick={() => totpSetupMut.mutate(u)} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-brand-600" title="Authenticator QR">
+                          <Smartphone className="h-4 w-4" />
+                        </button>
+                      )}
                       <button onClick={() => openEdit(u)} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-brand-600" title="Edit">
                         <Pencil className="h-4 w-4" />
                       </button>
@@ -152,7 +179,7 @@ export default function AdminUsers() {
         title={isEdit ? `Edit ${modal && "user" in modal ? modal.user.username : ""}` : "Add user"}
         subtitle={isEdit
           ? "Update role, email, 2-factor method, or set a new password."
-          : "OTP users need an email for code delivery; admins default to CAPTCHA."}
+          : "OTP users need an email. Authenticator users scan a QR code on first login."}
       >
         <div className="grid grid-cols-2 gap-3">
           <Field label="Username">
@@ -177,10 +204,17 @@ export default function AdminUsers() {
           <Field label="2-factor mode">
             <Select className="w-full" value={form.auth_mode} onChange={(e) => setForm({ ...form, auth_mode: e.target.value as AuthModeT })}>
               <option value="otp">OTP (email)</option>
-              <option value="captcha">CAPTCHA</option>
+              <option value="totp">Authenticator (Microsoft / Google)</option>
             </Select>
           </Field>
         </div>
+        {isEdit && modal && "user" in modal && modal.user.auth_mode === "totp" && (
+          <div className="mt-3">
+            <Button variant="secondary" onClick={() => totpSetupMut.mutate(modal.user)} disabled={totpSetupMut.isPending}>
+              <Smartphone className="h-4 w-4" /> Reset authenticator QR
+            </Button>
+          </div>
+        )}
         <div className="mt-5 flex justify-end gap-2">
           <Button variant="secondary" onClick={() => setModal(null)}>Cancel</Button>
           <Button
@@ -194,6 +228,25 @@ export default function AdminUsers() {
             <KeyRound className="h-4 w-4" /> {isEdit ? "Save changes" : "Create user"}
           </Button>
         </div>
+      </Modal>
+
+      <Modal
+        open={!!totpSetup}
+        onClose={() => setTotpSetup(null)}
+        title={totpSetup ? `Authenticator setup — ${totpSetup.user.username}` : "Authenticator setup"}
+        subtitle="Scan the QR code in Microsoft Authenticator or Google Authenticator. Shown once — save it securely."
+      >
+        {totpSetup && (
+          <div className="space-y-3 text-center">
+            <img
+              src={`data:image/png;base64,${totpSetup.data.qr_png}`}
+              alt="Authenticator QR"
+              className="mx-auto h-48 w-48 rounded-lg border border-slate-200 bg-white p-2"
+            />
+            <p className="text-xs text-slate-500">Manual key (if QR scan fails):</p>
+            <p className="break-all font-mono text-xs text-slate-700">{totpSetup.data.manual_secret}</p>
+          </div>
+        )}
       </Modal>
     </div>
   );

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import shutil
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
 from app.core.config import settings
@@ -123,3 +124,65 @@ def delete_raw(rel_path: str | None) -> None:
                 shutil.rmtree(folder, ignore_errors=True)
         except Exception:
             pass
+
+
+# ------------------------------------------------------------- retention purge
+def purge_old(max_age_days: int | None = None) -> int:
+    """Delete retry copies older than `max_age_days` (default
+    settings.pipeline_raw_retention_days). Returns how many originals were
+    removed. Best-effort and idempotent — safe to run on a schedule.
+
+    A copy is normally deleted the instant its file succeeds; this is the safety
+    net that bounds the store for files that stay failed/needs-review forever."""
+    days = settings.pipeline_raw_retention_days if max_age_days is None else max_age_days
+    if not days or days <= 0:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    return _purge_old_s3(cutoff) if _use_s3() else _purge_old_local(cutoff)
+
+
+def _purge_old_local(cutoff: datetime) -> int:
+    removed = 0
+    # Current layout (data/pipeline_raw/<id>/) plus the legacy storage/_pipeline/.
+    for root in (settings.pipeline_raw_path, settings.storage_path / "_pipeline"):
+        if not root.is_dir():
+            continue
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            try:
+                mtime = datetime.fromtimestamp(child.stat().st_mtime, tz=timezone.utc)
+            except Exception:
+                continue
+            if mtime < cutoff:
+                shutil.rmtree(child, ignore_errors=True)
+                removed += 1
+    return removed
+
+
+def _purge_old_s3(cutoff: datetime) -> int:
+    removed = 0
+    prefix = _s3_key("").rstrip("/") + "/"
+    client = _s3_client()
+    try:
+        paginator = client.get_paginator("list_objects_v2")
+        batch: list[dict] = []
+        for page in paginator.paginate(Bucket=settings.s3_bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                lm = obj.get("LastModified")
+                if lm is None:
+                    continue
+                if lm.tzinfo is None:
+                    lm = lm.replace(tzinfo=timezone.utc)
+                if lm < cutoff:
+                    batch.append({"Key": obj["Key"]})
+                    if len(batch) == 1000:  # delete_objects caps at 1000 keys
+                        client.delete_objects(Bucket=settings.s3_bucket, Delete={"Objects": batch})
+                        removed += len(batch)
+                        batch = []
+        if batch:
+            client.delete_objects(Bucket=settings.s3_bucket, Delete={"Objects": batch})
+            removed += len(batch)
+    except Exception:
+        pass
+    return removed

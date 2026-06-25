@@ -48,6 +48,16 @@ def _run_coro(coro_factory):
     return box["value"]
 
 
+@celery_app.task(name="maintenance.purge_pipeline_raw")
+def purge_pipeline_raw_task():
+    """Scheduled cleanup: delete pipeline retry copies older than the retention
+    window (settings.pipeline_raw_retention_days). Runs daily via Celery beat;
+    also invoked once on app startup as a safety net."""
+    from app.services.pipeline import raw_store
+    removed = raw_store.purge_old()
+    return {"removed": removed}
+
+
 @celery_app.task(name="ingestion.process_upload")
 def process_upload_task(filename: str, content_type: str, data_b64: str):
     """Run the upload pipeline in a worker. Bytes are passed base64-encoded."""

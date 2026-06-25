@@ -32,4 +32,13 @@ celery_app.conf.update(
     task_acks_late=True,
     worker_max_tasks_per_child=200,
     broker_connection_retry_on_startup=True,
+    # Periodic maintenance (runs under `celery worker -B` or a dedicated beat).
+    # Daily purge of pipeline retry copies past their retention window so the
+    # raw store stays bounded as data grows.
+    beat_schedule={
+        "purge-pipeline-raw-daily": {
+            "task": "maintenance.purge_pipeline_raw",
+            "schedule": 24 * 60 * 60,  # seconds — once a day
+        },
+    },
 )

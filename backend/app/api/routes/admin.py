@@ -32,8 +32,10 @@ from app.schemas.auth import (
     ConfigUpdate,
     ProviderTestIn,
     ProviderTestResult,
+    TotpSetupOut,
     UserOut,
 )
+from app.services.auth import totp as totp_svc
 from app.services.config import service as config_service
 from app.services.llm import provider as llm_provider
 
@@ -51,6 +53,27 @@ def _check_password(pw: str) -> None:
 def _user_out(u: User) -> UserOut:
     return UserOut(id=u.id, username=u.username, email=u.email, role=u.role,
                    auth_mode=u.auth_mode, is_active=u.is_active, last_login_at=u.last_login_at)
+
+
+def _provision_totp(u: User, *, reset: bool = False) -> TotpSetupOut:
+    if reset or not u.totp_secret_enc:
+        secret = totp_svc.generate_secret()
+        u.totp_secret_enc = totp_svc.encrypt_secret(secret)
+        u.totp_enrolled = False
+    else:
+        secret = totp_svc.decrypt_secret(u.totp_secret_enc)
+    uri = totp_svc.provisioning_uri(secret, u.username)
+    return TotpSetupOut(
+        uri=uri,
+        qr_png=totp_svc.qr_png_base64(uri),
+        manual_secret=secret,
+        enrolled=u.totp_enrolled,
+    )
+
+
+def _clear_totp(u: User) -> None:
+    u.totp_secret_enc = None
+    u.totp_enrolled = False
 
 
 # ----------------------------- users -----------------------------
@@ -75,6 +98,8 @@ async def create_user(body: AdminUserCreate, db: AsyncSession = Depends(get_db))
         raise HTTPException(400, "An email is required for OTP delivery")
     u = User(username=body.username, email=str(body.email) if body.email else None,
              password_hash=hash_password(body.password), role=body.role, auth_mode=body.auth_mode)
+    if body.auth_mode == AuthMode.TOTP:
+        _provision_totp(u)
     db.add(u)
     await db.commit()
     await db.refresh(u)
@@ -93,6 +118,10 @@ async def update_user(user_id: str, body: AdminUserUpdate, db: AsyncSession = De
     if body.auth_mode is not None:
         if body.auth_mode not in AuthMode.ALL:
             raise HTTPException(400, f"auth_mode must be one of {AuthMode.ALL}")
+        if body.auth_mode != AuthMode.TOTP and u.auth_mode == AuthMode.TOTP:
+            _clear_totp(u)
+        if body.auth_mode == AuthMode.TOTP and u.auth_mode != AuthMode.TOTP:
+            _provision_totp(u)
         u.auth_mode = body.auth_mode
     if body.email is not None:
         u.email = str(body.email)
@@ -118,10 +147,27 @@ async def switch_auth_mode(user_id: str, mode: str, db: AsyncSession = Depends(g
         raise HTTPException(404, "User not found")
     if mode == AuthMode.OTP and not u.email:
         raise HTTPException(400, "Assign an email before switching this user to OTP")
+    if mode != AuthMode.TOTP and u.auth_mode == AuthMode.TOTP:
+        _clear_totp(u)
+    if mode == AuthMode.TOTP and u.auth_mode != AuthMode.TOTP:
+        _provision_totp(u)
     u.auth_mode = mode
     await db.commit()
     await db.refresh(u)
     return _user_out(u)
+
+
+@router.post("/users/{user_id}/totp-setup", response_model=TotpSetupOut)
+async def totp_setup(user_id: str, db: AsyncSession = Depends(get_db)):
+    """Generate or reset authenticator secret and return a one-time QR setup payload."""
+    u = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not u:
+        raise HTTPException(404, "User not found")
+    if u.auth_mode != AuthMode.TOTP:
+        raise HTTPException(400, "User is not on authenticator mode")
+    out = _provision_totp(u, reset=True)
+    await db.commit()
+    return out
 
 
 @router.delete("/users/{user_id}")

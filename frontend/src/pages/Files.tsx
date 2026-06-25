@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   FolderOpen,
@@ -11,22 +11,26 @@ import {
   ChevronRight,
   Briefcase,
   User,
+  Upload,
 } from "lucide-react";
 import {
   createFileEmployee,
   createFileManager,
   createFileMonth,
   deleteFolder,
-  downloadZipUrl,
+  deleteVaultFile,
+  downloadScopedZipUrl,
   fileContentUrl,
   listFileEmployees,
   listFileItems,
   listFileManagers,
   listFileMonths,
   renameFolder,
+  uploadFilesToMonth,
 } from "../api/client";
 import { cn, formatBytes } from "../lib/utils";
 import { FilePreviewModal, PreviewableFileRow } from "../components/FilePreview";
+import { VaultDownload } from "../components/VaultDownload";
 import { Button, Card, EmptyState, Input, Modal, PageHeader, Skeleton } from "../components/ui";
 import { useToast } from "../components/toast";
 import type { PreviewFile } from "../lib/filePreview";
@@ -108,6 +112,27 @@ export default function FilesPage() {
     onError: (e: any) => toast("error", "Delete failed", e?.response?.data?.detail ?? String(e)),
   });
 
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const uploadMut = useMutation({
+    mutationFn: (chosen: File[]) =>
+      uploadFilesToMonth(manager!, employee!, month!, chosen),
+    onSuccess: (res: any) => {
+      toast("success", `Uploaded ${res?.saved?.length ?? 0} file(s)`);
+      invalidate();
+    },
+    onError: (e: any) => toast("error", "Upload failed", e?.response?.data?.detail ?? String(e)),
+  });
+
+  const deleteFileMut = useMutation({
+    mutationFn: (relPath: string) => deleteVaultFile(relPath),
+    onSuccess: () => {
+      toast("info", "File deleted");
+      invalidate();
+    },
+    onError: (e: any) => toast("error", "Delete failed", e?.response?.data?.detail ?? String(e)),
+  });
+
   const crumb = (label: string, onClick?: () => void, active?: boolean) => (
     <button
       onClick={onClick}
@@ -126,14 +151,7 @@ export default function FilesPage() {
       <PageHeader
         title="File vault"
         subtitle="Everything the pipeline files on disk — Account Manager → Employee → Month."
-        actions={
-          <a href={downloadZipUrl(manager ?? undefined)}>
-            <Button variant="secondary">
-              <Download className="h-4 w-4" />
-              Download {manager ? `"${manager}"` : "all"} as ZIP
-            </Button>
-          </a>
-        }
+        actions={<VaultDownload manager={manager} />}
       />
 
       <div className="mb-4 flex flex-wrap items-center gap-1">
@@ -259,6 +277,35 @@ export default function FilesPage() {
                 <Plus className="h-4 w-4" />
               </Button>
             )}
+            {employee && month && (
+              <div className="flex items-center gap-1">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  className="hidden"
+                  onChange={(e) => {
+                    const chosen = Array.from(e.target.files ?? []);
+                    if (chosen.length) uploadMut.mutate(chosen);
+                    e.target.value = "";
+                  }}
+                />
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  title="Upload file(s) into this month"
+                  disabled={uploadMut.isPending}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <Upload className="h-4 w-4" /> Upload
+                </Button>
+                <a href={downloadScopedZipUrl(`${manager}/${employee}/${month}`)}>
+                  <Button size="sm" variant="ghost" title="Download this month as ZIP">
+                    <Download className="h-4 w-4" />
+                  </Button>
+                </a>
+              </div>
+            )}
           </div>
           <div className="flex-1 overflow-y-auto p-2">
             {!employee ? (
@@ -277,14 +324,29 @@ export default function FilesPage() {
                       contentType: f.content_type,
                     };
                     return (
-                      <PreviewableFileRow
-                        key={f.rel_path}
-                        file={file}
-                        onPreview={setPreview}
-                        icon={<FileText className="h-4 w-4 shrink-0 text-slate-400" />}
-                        meta={<span className="text-[11px] text-slate-400">{formatBytes(f.size)}</span>}
-                        className="border-transparent px-3 py-2 hover:border-transparent"
-                      />
+                      <div key={f.rel_path} className="flex items-center gap-1">
+                        <div className="min-w-0 flex-1">
+                          <PreviewableFileRow
+                            file={file}
+                            onPreview={setPreview}
+                            icon={<FileText className="h-4 w-4 shrink-0 text-slate-400" />}
+                            meta={<span className="text-[11px] text-slate-400">{formatBytes(f.size)}</span>}
+                            className="border-transparent px-3 py-2 hover:border-transparent"
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          title="Delete this file"
+                          disabled={deleteFileMut.isPending}
+                          onClick={() => {
+                            if (confirm(`Delete "${f.name}"? This cannot be undone.`))
+                              deleteFileMut.mutate(f.rel_path);
+                          }}
+                          className="shrink-0 rounded-lg p-2 text-slate-400 transition-colors hover:bg-rose-50 hover:text-rose-500"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
                     );
                   })}
                 </>
