@@ -679,6 +679,34 @@ def eml_body_to_images(eml_bytes: bytes) -> list[bytes]:
     return [_stitch_text_images(text)]
 
 
+def email_body_to_images(subject: str | None, body_text: str | None) -> list[bytes]:
+    """Render a Graph/inbox plain-text email (subject + body) to JPEG — same
+    pipeline path as inline EML timesheets."""
+    from html import escape as _esc
+
+    focused = _focus_timesheet_text(body_text or "")
+    header = (
+        f"<p style='font-family:sans-serif'><b>Subject:</b> "
+        f"{_esc(subject or '')}</p><hr/>"
+    )
+    doc = (
+        "<html><head><meta charset='utf-8'>"
+        "<style>body{font-family:Arial,Helvetica,sans-serif;font-size:11pt;} "
+        "pre{white-space:pre-wrap;word-wrap:break-word;font-family:monospace;font-size:10pt;} "
+        "table{border-collapse:collapse;} "
+        "tr,td,th{break-inside:avoid;page-break-inside:avoid;}</style>"
+        f"</head><body>{header}<pre>{_esc(focused)}</pre></body></html>"
+    )
+    pdf = _html_to_pdf_bytes(doc)
+    if pdf:
+        try:
+            return [pdf_to_single_image(pdf)]
+        except Exception:
+            pass
+    text = f"Subject: {subject or ''}\n\n{focused}"
+    return [_stitch_text_images(text)]
+
+
 def _stitch_text_images(text: str) -> bytes:
     """Stitch the multi-page TrueType text render into one tall image."""
     from PIL import Image

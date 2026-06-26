@@ -26,6 +26,33 @@ class AttachmentOut(BaseModel):
     kind: str
 
 
+class MatchedEmployeeOut(BaseModel):
+    employee_pk: str
+    employee_id: str
+    employee_name: str
+    account_manager: str | None = None
+    location: str | None = None
+    matched_email: str | None = None
+    is_sender: bool = False
+    source: str | None = None
+
+
+class EmailAiCheckOut(BaseModel):
+    summary: str
+    model: str | None = None
+    used_llm: bool = False
+    checked_at: str | None = None
+    attachments: list[dict] = []
+    body_category: str = "other"
+    body_reason: str = ""
+    recommended_timesheet_ids: list[str] = []
+    recommended_approval_id: str | None = None
+    extract_body: bool = False
+    matched_employee: MatchedEmployeeOut | None = None
+    missing: list[str] = []
+    found: list[str] = []
+
+
 class EmailListItem(BaseModel):
     id: str
     provider_message_id: str
@@ -41,6 +68,8 @@ class EmailListItem(BaseModel):
 class EmailDetail(EmailListItem):
     body_text: str | None
     attachments: list[AttachmentOut]
+    ai_check: EmailAiCheckOut | None = None
+    ai_check_running: bool = False
 
 
 class DecisionIn(BaseModel):
@@ -50,11 +79,14 @@ class DecisionIn(BaseModel):
     attachment_ids: list[str] | None = None
     # Optional manager-approval screenshot — only processed when explicitly set.
     approval_attachment_id: str | None = None
+    # Render email body as image and extract (inline timesheet in message text).
+    extract_body: bool = False
 
 
 class RerunExtractionIn(BaseModel):
     attachment_ids: list[str]
     approval_attachment_id: str | None = None
+    extract_body: bool = False
 
 
 class SourceFileEntry(BaseModel):

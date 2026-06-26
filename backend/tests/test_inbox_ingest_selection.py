@@ -35,6 +35,13 @@ def test_rejects_non_timesheet_in_attachment_ids():
         resolve_ingest_attachments(_ATTS, attachment_ids=["logo"], approval_attachment_id=None)
 
 
-def test_rejects_empty_selection():
+def test_extract_body_allows_empty_attachment_ids():
+    ts, ap = resolve_ingest_attachments(
+        _ATTS, attachment_ids=[], approval_attachment_id=None, extract_body=True)
+    assert ts == []
+    assert ap is None
+
+
+def test_rejects_empty_selection_without_body():
     with pytest.raises(IngestSelectionError, match="at least one"):
         resolve_ingest_attachments(_ATTS, attachment_ids=[], approval_attachment_id=None)

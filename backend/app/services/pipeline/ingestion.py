@@ -48,6 +48,7 @@ from app.services.extraction import get_extraction_engine
 from app.services.extraction.base import ApprovalExtraction
 from app.services.extraction.file_processor import (
     detect_file_type,
+    email_body_to_images,
     eml_all_attachments,
     eml_body_to_images,
 )
@@ -224,6 +225,7 @@ async def ingest_timesheet_bytes(
     approval_name: str, source_id: str | None, attachment_id: str | None = None,
     source_kind: str = "upload", tracker: PipelineFile | None = None,
     manual_employee_pk: str | None = None,
+    email_employee_pk: str | None = None,
     manual_month: int | None = None,
     manual_year: int | None = None,
     resolution_note: str | None = None,
@@ -355,7 +357,13 @@ async def ingest_timesheet_bytes(
         _event(tracker, PipelineStage.MATCHING, "ok", m_note)
         m = matching.MatchResult(matched, m_note, MatchCode.ID_AND_NAME)
     else:
-        m = await matching.match_employee(db, ext.employee_id, ext.employee_name)
+        email_hint = None
+        if email_employee_pk:
+            email_hint = (
+                await db.execute(select(Employee).where(Employee.id == email_employee_pk))
+            ).scalar_one_or_none()
+        m = await matching.match_employee(
+            db, ext.employee_id, ext.employee_name, email_hint=email_hint)
         if m.employee is None:
             code = FailureCode.AMBIGUOUS_ID if m.code == MatchCode.AMBIGUOUS_ID \
                 else FailureCode.EMPLOYEE_NOT_MATCHED
@@ -565,6 +573,7 @@ def resolve_ingest_attachments(
     *,
     attachment_ids: list[str] | None,
     approval_attachment_id: str | None,
+    extract_body: bool = False,
 ) -> tuple[list[dict], dict | None]:
     """Pick timesheet + optional approval attachments for extraction."""
     by_id = {a["attachment_id"]: a for a in attachments if a.get("attachment_id")}
@@ -582,6 +591,13 @@ def resolve_ingest_attachments(
         return timesheet_atts, approval_att
 
     if not attachment_ids:
+        if extract_body:
+            approval_att = None
+            if approval_attachment_id:
+                approval_att = by_id.get(approval_attachment_id)
+                if not approval_att:
+                    raise IngestSelectionError("Unknown approval attachment.")
+            return [], approval_att
         raise IngestSelectionError("Select at least one timesheet attachment to extract.")
 
     timesheet_atts: list[dict] = []
@@ -589,9 +605,8 @@ def resolve_ingest_attachments(
         att = by_id.get(aid)
         if not att:
             raise IngestSelectionError(f"Unknown attachment id: {aid}")
-        if att.get("kind") != "timesheet":
-            label = att.get("filename") or aid
-            raise IngestSelectionError(f"'{label}' is not a timesheet attachment.")
+        if aid == approval_attachment_id:
+            raise IngestSelectionError("Same attachment cannot be timesheet and approval.")
         timesheet_atts.append(att)
 
     approval_att = None
@@ -599,8 +614,8 @@ def resolve_ingest_attachments(
         approval_att = by_id.get(approval_attachment_id)
         if not approval_att:
             raise IngestSelectionError("Unknown approval attachment.")
-        if approval_att.get("kind") != "approval_screenshot":
-            raise IngestSelectionError("Approval selection must be a screenshot attachment.")
+        if approval_attachment_id in attachment_ids:
+            raise IngestSelectionError("Same attachment cannot be timesheet and approval.")
 
     return timesheet_atts, approval_att
 
@@ -611,6 +626,7 @@ async def ingest_email(
     *,
     attachment_ids: list[str] | None = None,
     approval_attachment_id: str | None = None,
+    extract_body: bool = False,
 ) -> list[TimesheetRecord]:
     provider = get_email_provider()
     engine = get_extraction_engine()
@@ -619,7 +635,11 @@ async def ingest_email(
         attachments,
         attachment_ids=attachment_ids,
         approval_attachment_id=approval_attachment_id,
+        extract_body=extract_body,
     )
+
+    if not extract_body and not timesheet_atts:
+        raise IngestSelectionError("Select at least one timesheet attachment to extract.")
 
     approval_detected, approval_detail = False, "No approval screenshot provided."
     approval_bytes, approval_name = None, "manager_approval.png"
@@ -633,7 +653,29 @@ async def ingest_email(
         except Exception:
             approval_bytes = None
 
+    inbox_employee_pk: str | None = None
+    if email.ai_check:
+        me = email.ai_check.get("matched_employee") or {}
+        inbox_employee_pk = me.get("employee_pk")
+
     created: list[TimesheetRecord] = []
+
+    if extract_body:
+        try:
+            imgs = email_body_to_images(email.subject, email.body_text)
+        except Exception as e:
+            raise IngestSelectionError(f"Could not render email body as image: {str(e)[:120]}") from e
+        if not imgs:
+            raise IngestSelectionError("Could not render email body as image.")
+        rec, _t = await ingest_timesheet_bytes(
+            db, data=imgs[0], filename="email_body.jpg", content_type="image/jpeg",
+            approval_detected=approval_detected, approval_detail=approval_detail,
+            approval_bytes=approval_bytes, approval_name=approval_name,
+            source_id=email.provider_message_id, attachment_id="__body__",
+            source_kind="email", email_employee_pk=inbox_employee_pk)
+        if rec is not None:
+            created.append(rec)
+
     for a in timesheet_atts:
         try:
             data, filename, content_type = await provider.get_attachment_bytes(
@@ -652,7 +694,7 @@ async def ingest_email(
             approval_detected=approval_detected, approval_detail=approval_detail,
             approval_bytes=approval_bytes, approval_name=approval_name,
             source_id=email.provider_message_id, attachment_id=a["attachment_id"],
-            source_kind="email")
+            source_kind="email", email_employee_pk=inbox_employee_pk)
         if rec is not None:
             created.append(rec)
 
