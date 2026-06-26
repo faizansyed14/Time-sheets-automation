@@ -63,7 +63,10 @@ services:
 
   worker:
     build: { context: ./backend }
-    command: celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=4
+    # -B runs an embedded beat scheduler for periodic maintenance (daily
+    # pipeline-raw retention purge). Keep this to a SINGLE worker replica; if you
+    # scale workers, move beat to its own one-replica service instead.
+    command: celery -A app.core.celery_app.celery_app worker -B --loglevel=info --concurrency=4
     env_file: [.env]
     environment:
       REDIS_URL: redis://redis:6379/0

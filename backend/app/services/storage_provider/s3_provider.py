@@ -150,6 +150,25 @@ class S3StorageProvider(StorageProvider):
                 if data is not None:
                     yield rel, data
 
+    def iter_file_meta(self, manager: str | None = None):
+        """(zip_path, size) from a SINGLE paginated listing — Size comes back in
+        the listing, so no get_object calls. Cheap even for huge vaults."""
+        base = (self.prefix + "/") if self.prefix else ""
+        mgr_safe = _safe(manager) if manager else None
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=base):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                rel = key[len(base):] if base else key
+                if not rel or rel.endswith("/"):
+                    continue
+                parts = rel.split("/")
+                if parts[0].startswith(("_", ".")) or parts[-1] == _KEEP:
+                    continue
+                if mgr_safe and parts[0] != mgr_safe:
+                    continue
+                yield rel, int(obj.get("Size") or 0)
+
     # ---- reading ----
     def read_file(self, rel_path: str) -> tuple[bytes, str, str]:
         key = self._key(*[_safe(p) for p in rel_path.split("/")[:-1]] + [rel_path.split("/")[-1]])

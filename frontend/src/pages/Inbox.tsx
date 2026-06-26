@@ -20,6 +20,7 @@ import {
   rerunExtraction,
   restoreEmail,
   type EmailListItem,
+  type IngestSelection,
 } from "../api/client";
 import { cn, formatDateTime, initials, avatarColor } from "../lib/utils";
 import { FilePreviewModal, PreviewableFileRow } from "../components/FilePreview";
@@ -51,8 +52,17 @@ export default function InboxPage() {
   const [status, setStatus] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [preview, setPreview] = useState<PreviewFile | null>(null);
+  const [selectedTimesheetIds, setSelectedTimesheetIds] = useState<Set<string>>(new Set());
+  const [approvalAttachmentId, setApprovalAttachmentId] = useState<string | null>(null);
 
   useEffect(() => setPreview(null), [selected]);
+
+  const buildSelection = (): IngestSelection => ({
+    attachment_ids: [...selectedTimesheetIds],
+    approval_attachment_id: approvalAttachmentId,
+  });
+
+  const canExtract = selectedTimesheetIds.size > 0;
 
   const dq = useDebounced(q, 350);
   const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
@@ -78,6 +88,15 @@ export default function InboxPage() {
     enabled: !!selected,
   });
 
+  useEffect(() => {
+    if (!detail) return;
+    const timesheetIds = detail.attachments
+      .filter((a) => a.kind === "timesheet")
+      .map((a) => a.attachment_id);
+    setSelectedTimesheetIds(new Set(timesheetIds));
+    setApprovalAttachmentId(null);
+  }, [detail?.provider_message_id]);
+
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["inbox"] });
     qc.invalidateQueries({ queryKey: ["email", selected] });
@@ -87,7 +106,8 @@ export default function InboxPage() {
   };
 
   const decide = useMutation({
-    mutationFn: ({ id, accepted }: { id: string; accepted: boolean }) => decideEmail(id, accepted),
+    mutationFn: ({ id, accepted, selection }: { id: string; accepted: boolean; selection?: IngestSelection }) =>
+      decideEmail(id, accepted, selection),
     onSuccess: (res: any, { accepted }) => {
       if (accepted)
         toast(
@@ -114,7 +134,8 @@ export default function InboxPage() {
   });
 
   const rerun = useMutation({
-    mutationFn: rerunExtraction,
+    mutationFn: ({ id, selection }: { id: string; selection: IngestSelection }) =>
+      rerunExtraction(id, selection),
     onSuccess: (res: any) => {
       toast("success", "Re-ran extraction", `${res.records_count} record(s) refreshed.`);
       invalidate();
@@ -126,7 +147,7 @@ export default function InboxPage() {
     <div className="flex h-full animate-fade-up flex-col">
       <PageHeader
         title="Email Inbox"
-        subtitle="Review each timesheet email — Accept runs the extraction pipeline, Reject archives it."
+        subtitle="Accept runs extraction on the attachments you select — logos and extras can be left out."
       />
 
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 xl:grid-cols-[400px_1fr]">
@@ -246,13 +267,17 @@ export default function InboxPage() {
                     <>
                       <Button
                         variant="success"
-                        disabled={decide.isPending}
+                        disabled={decide.isPending || !canExtract}
                         onClick={() =>
-                          decide.mutate({ id: detail.provider_message_id, accepted: true })
+                          decide.mutate({
+                            id: detail.provider_message_id,
+                            accepted: true,
+                            selection: buildSelection(),
+                          })
                         }
                       >
                         {decide.isPending ? <Spinner className="border-white/40 border-t-white" /> : <CheckCircle2 className="h-4 w-4" />}
-                        Accept · Run extraction
+                        Accept · Run extraction ({selectedTimesheetIds.size})
                       </Button>
                       <Button
                         variant="secondary"
@@ -276,8 +301,13 @@ export default function InboxPage() {
                   {detail.status === "ingested" && (
                     <Button
                       variant="secondary"
-                      disabled={rerun.isPending}
-                      onClick={() => rerun.mutate(detail.provider_message_id)}
+                      disabled={rerun.isPending || !canExtract}
+                      onClick={() =>
+                        rerun.mutate({
+                          id: detail.provider_message_id,
+                          selection: buildSelection(),
+                        })
+                      }
                     >
                       <RotateCcw className={cn("h-4 w-4", rerun.isPending && "animate-spin")} />
                       Re-run extraction
@@ -291,9 +321,40 @@ export default function InboxPage() {
                   {detail.body_text}
                 </pre>
 
-                <h3 className="mb-2 mt-5 text-xs font-bold uppercase tracking-wide text-slate-500">
-                  Attachments ({detail.attachments.length})
-                </h3>
+                <div className="mb-2 mt-5 flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                    Attachments ({detail.attachments.length})
+                  </h3>
+                  {(detail.status === "new" || detail.status === "ingested") && (
+                    <div className="flex gap-2 text-[11px]">
+                      <button
+                        type="button"
+                        className="font-medium text-brand-600 hover:text-brand-700"
+                        onClick={() =>
+                          setSelectedTimesheetIds(
+                            new Set(detail.attachments.filter((a) => a.kind === "timesheet").map((a) => a.attachment_id))
+                          )
+                        }
+                      >
+                        Select all timesheets
+                      </button>
+                      <span className="text-slate-300">·</span>
+                      <button
+                        type="button"
+                        className="text-slate-500 hover:text-slate-700"
+                        onClick={() => {
+                          setSelectedTimesheetIds(new Set());
+                          setApprovalAttachmentId(null);
+                        }}
+                      >
+                        Clear selection
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <p className="mb-3 text-[11px] text-slate-500">
+                  Check timesheets to extract. Optionally pick one screenshot as manager approval — skip logos.
+                </p>
                 <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
                   {detail.attachments.map((a) => {
                     const file: PreviewFile = {
@@ -301,20 +362,82 @@ export default function InboxPage() {
                       filename: a.filename,
                       contentType: a.content_type,
                     };
+                    const isTimesheet = a.kind === "timesheet";
+                    const isApproval = a.kind === "approval_screenshot";
+                    const extractable = isTimesheet || isApproval;
+                    const timesheetChecked = selectedTimesheetIds.has(a.attachment_id);
+                    const approvalChecked = approvalAttachmentId === a.attachment_id;
                     return (
-                      <PreviewableFileRow
+                      <div
                         key={a.attachment_id}
-                        file={file}
-                        onPreview={setPreview}
-                        icon={
-                          a.kind === "approval_screenshot" ? (
-                            <ImageIcon className="h-5 w-5 shrink-0 text-emerald-500" />
-                          ) : (
-                            <FileText className="h-5 w-5 shrink-0 text-brand-500" />
-                          )
-                        }
-                        subtitle={a.kind === "approval_screenshot" ? "Manager approval" : "Timesheet"}
-                      />
+                        className={cn(
+                          "flex items-stretch gap-2 rounded-lg border border-slate-200 bg-white",
+                          extractable && (timesheetChecked || approvalChecked) && "border-brand-300 ring-1 ring-brand-100"
+                        )}
+                      >
+                        {extractable && (detail.status === "new" || detail.status === "ingested") && (
+                          <div className="flex shrink-0 flex-col justify-center gap-2 border-r border-slate-100 px-2 py-2">
+                            {isTimesheet && (
+                              <label className="flex cursor-pointer items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                                <input
+                                  type="checkbox"
+                                  checked={timesheetChecked}
+                                  onChange={(e) => {
+                                    setSelectedTimesheetIds((prev) => {
+                                      const next = new Set(prev);
+                                      if (e.target.checked) next.add(a.attachment_id);
+                                      else next.delete(a.attachment_id);
+                                      return next;
+                                    });
+                                  }}
+                                  className="rounded border-slate-300 text-brand-600"
+                                />
+                                Extract
+                              </label>
+                            )}
+                            {isApproval && (
+                              <label className="flex cursor-pointer items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-600">
+                                <input
+                                  type="checkbox"
+                                  checked={approvalChecked}
+                                  onChange={(e) => {
+                                    if (e.target.checked) {
+                                      setApprovalAttachmentId(a.attachment_id);
+                                    } else {
+                                      setApprovalAttachmentId((cur) => (cur === a.attachment_id ? null : cur));
+                                    }
+                                  }}
+                                  className="rounded border-slate-300 text-emerald-600"
+                                />
+                                Approval
+                              </label>
+                            )}
+                          </div>
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <PreviewableFileRow
+                            file={file}
+                            onPreview={setPreview}
+                            className="border-0 hover:border-0"
+                            icon={
+                              a.kind === "approval_screenshot" ? (
+                                <ImageIcon className="h-5 w-5 shrink-0 text-emerald-500" />
+                              ) : a.kind === "other" ? (
+                                <Paperclip className="h-5 w-5 shrink-0 text-slate-400" />
+                              ) : (
+                                <FileText className="h-5 w-5 shrink-0 text-brand-500" />
+                              )
+                            }
+                            subtitle={
+                              a.kind === "approval_screenshot"
+                                ? "Screenshot / possible approval"
+                                : a.kind === "other"
+                                  ? "Not classified — preview only"
+                                  : "Timesheet document"
+                            }
+                          />
+                        </div>
+                      </div>
                     );
                   })}
                 </div>

@@ -29,9 +29,10 @@ class Role:
 
 
 class AuthMode:
-    OTP = "otp"          # email one-time code (Graph)
-    CAPTCHA = "captcha"  # word CAPTCHA challenge
-    ALL = (OTP, CAPTCHA)
+    OTP = "otp"              # email one-time code (Graph)
+    TOTP = "totp"            # authenticator app (Microsoft / Google / Authy)
+    CAPTCHA = "captcha"      # legacy: login-page CAPTCHA is the only 2FA step
+    ALL = (OTP, TOTP, CAPTCHA)
 
 
 class User(Base):
@@ -46,6 +47,9 @@ class User(Base):
     # role, including admins.
     auth_mode: Mapped[str] = mapped_column(String, default=AuthMode.OTP)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # TOTP authenticator — secret encrypted at rest; enrolled after first successful verify.
+    totp_secret_enc: Mapped[str | None] = mapped_column(String, nullable=True)
+    totp_enrolled: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -238,14 +238,24 @@ export const fetchInbox = (
     })
     .then((r) => r.data);
 
+export interface IngestSelection {
+  attachment_ids: string[];
+  approval_attachment_id?: string | null;
+}
+
 export const fetchEmail = (id: string) => api.get<EmailDetail>(`/inbox/${id}`).then((r) => r.data);
 
-export const decideEmail = (id: string, accepted: boolean) =>
-  api.post(`/inbox/${id}/decision`, { accepted }).then((r) => r.data);
+export const decideEmail = (id: string, accepted: boolean, selection?: IngestSelection) =>
+  api.post(`/inbox/${id}/decision`, {
+    accepted,
+    attachment_ids: selection?.attachment_ids,
+    approval_attachment_id: selection?.approval_attachment_id ?? null,
+  }).then((r) => r.data);
 
 export const restoreEmail = (id: string) => api.post(`/inbox/${id}/restore`).then((r) => r.data);
 
-export const rerunExtraction = (id: string) => api.post(`/inbox/${id}/rerun`).then((r) => r.data);
+export const rerunExtraction = (id: string, selection: IngestSelection) =>
+  api.post(`/inbox/${id}/rerun`, selection).then((r) => r.data);
 
 export const attachmentUrl = (msgId: string, attId: string) =>
   withAuthParam(`/api/v1/inbox/${msgId}/attachments/${encodeURIComponent(attId)}`);
@@ -396,6 +406,49 @@ export const fileContentUrl = (relPath: string) =>
   withAuthParam(`/api/v1/files/content?rel_path=${encodeURIComponent(relPath)}`);
 export const downloadZipUrl = (manager?: string) =>
   withAuthParam(`/api/v1/files/download-zip${manager ? `?manager=${encodeURIComponent(manager)}` : ""}`);
+// Scoped ZIP of any subtree (one employee or one month) by vault-relative path.
+export const downloadScopedZipUrl = (relPath: string) =>
+  withAuthParam(`/api/v1/files/download-zip?rel_path=${encodeURIComponent(relPath)}`);
+
+export type VaultYear = { year: number; files: number; bytes: number };
+export const fetchVaultYears = () =>
+  api.get<VaultYear[]>("/files/years").then((r) => r.data);
+
+type ZipScope = { manager?: string; relPath?: string; year?: number };
+function zipScopeQuery(scope: ZipScope): string {
+  const p = new URLSearchParams();
+  if (scope.manager) p.set("manager", scope.manager);
+  if (scope.relPath) p.set("rel_path", scope.relPath);
+  if (scope.year) p.set("year", String(scope.year));
+  const q = p.toString();
+  return q ? `?${q}` : "";
+}
+// Total {files, bytes} of a download scope — drives the progress bar.
+export const fetchDownloadSize = (scope: ZipScope) =>
+  api.get<{ files: number; bytes: number }>(`/files/download-size${zipScopeQuery(scope)}`)
+    .then((r) => r.data);
+// Authed URL for a scoped ZIP (year / manager / subtree), for native downloads.
+export const scopedZipUrl = (scope: ZipScope) =>
+  withAuthParam(`/api/v1/files/download-zip${zipScopeQuery(scope)}`);
+
+// Delete a single file from the vault.
+export const deleteVaultFile = (relPath: string) =>
+  api.delete("/files/file", { params: { rel_path: relPath } }).then((r) => r.data);
+
+// Upload one or more files straight into an employee's month folder.
+export const uploadFilesToMonth = (
+  manager: string, emp: string, month: string, files: File[],
+) => {
+  const form = new FormData();
+  files.forEach((f) => form.append("files", f, f.name));
+  return api
+    .post(
+      `/files/managers/${encodeURIComponent(manager)}/employees/${encodeURIComponent(emp)}/months/${encodeURIComponent(month)}/files`,
+      form,
+      { headers: { "Content-Type": "multipart/form-data" } },
+    )
+    .then((r) => r.data);
+};
 
 export type EmlParsed = {
   subject: string;
@@ -585,7 +638,7 @@ export const MONTHS_LONG = ["", "January", "February", "March", "April", "May", 
 // Auth
 // ===========================================================================
 export type AuthRole = "admin" | "user" | "viewer";
-export type AuthModeT = "otp" | "captcha";
+export type AuthModeT = "otp" | "totp" | "captcha";
 
 export interface AuthUser {
   id: string;
@@ -598,13 +651,15 @@ export interface AuthUser {
 }
 
 export interface LoginResult {
-  status: "authenticated" | "otp_required" | "captcha_required";
+  status: "authenticated" | "otp_required" | "totp_required" | "totp_enrollment_required";
   access_token?: string | null;
   login_token?: string | null;
   captcha_id?: string | null;
   user?: AuthUser | null;
   message?: string | null;
   debug_otp?: string | null;
+  totp_uri?: string | null;
+  totp_qr_png?: string | null;
 }
 export interface TokenResult {
   status: string;
@@ -612,13 +667,23 @@ export interface TokenResult {
   user: AuthUser;
 }
 
+export interface TotpSetupResult {
+  uri: string;
+  qr_png: string;
+  manual_secret: string;
+  enrolled: boolean;
+}
+
 const fp = () => deviceFingerprint();
 
-export const authLogin = (username: string, password: string) =>
-  api.post<LoginResult>("/auth/login", { username, password, fingerprint: fp() }).then((r) => r.data);
+export const authLogin = (username: string, password: string, captcha_id: string, captcha_answer: string) =>
+  api.post<LoginResult>("/auth/login", { username, password, captcha_id, captcha_answer, fingerprint: fp() }).then((r) => r.data);
 
 export const authVerifyOtp = (login_token: string, code: string) =>
   api.post<TokenResult>("/auth/verify-otp", { login_token, code, fingerprint: fp() }).then((r) => r.data);
+
+export const authVerifyTotp = (login_token: string, code: string) =>
+  api.post<TokenResult>("/auth/verify-totp", { login_token, code, fingerprint: fp() }).then((r) => r.data);
 
 export const authResendOtp = (login_token: string) =>
   api.post<LoginResult>("/auth/resend-otp", { login_token, fingerprint: fp() }).then((r) => r.data);
@@ -642,6 +707,8 @@ export const adminUpdateUser = (id: string, body: Partial<{
 }>) => api.patch<AuthUser>(`/admin/users/${id}`, body).then((r) => r.data);
 export const adminSwitchAuthMode = (id: string, mode: AuthModeT) =>
   api.post<AuthUser>(`/admin/users/${id}/auth-mode`, null, { params: { mode } }).then((r) => r.data);
+export const adminTotpSetup = (id: string) =>
+  api.post<TotpSetupResult>(`/admin/users/${id}/totp-setup`).then((r) => r.data);
 export const adminDeleteUser = (id: string) => api.delete(`/admin/users/${id}`).then((r) => r.data);
 
 // ===========================================================================

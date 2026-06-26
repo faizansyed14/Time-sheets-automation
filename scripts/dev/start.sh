@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the full DEV stack (backend + worker + redis + frontend) via Docker.
+# Start the full DEV stack (nginx + backend + worker + redis + frontend) via Docker.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 if [ ! -f .env ]; then
@@ -9,6 +9,7 @@ if [ ! -f .env ]; then
 fi
 echo "▶ Starting dev stack (Docker)…"
 docker compose -f docker-compose.dev.yml --env-file .env up --build -d
-echo "✓ Backend:  http://localhost:8000  (docs: /docs)"
-echo "✓ Frontend: http://localhost:5173"
+echo "✓ App (via nginx):  http://localhost:8080   ← single entry (API + SPA + HMR)"
+echo "✓ Frontend direct:  http://localhost:5173"
+echo "✓ Backend direct:   http://localhost:8000   (docs: /docs)"
 echo "  Logs: docker compose -f docker-compose.dev.yml logs -f"

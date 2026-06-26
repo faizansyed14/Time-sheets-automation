@@ -556,21 +556,79 @@ async def _safe_approval(engine, data, source_id, attachment_id) -> ApprovalExtr
         return ApprovalExtraction(detected=False, detail=f"Could not read approval ({str(e)[:120]}).")
 
 
-async def ingest_email(db: AsyncSession, email: EmailMessage) -> list[TimesheetRecord]:
+class IngestSelectionError(ValueError):
+    """Invalid attachment selection for email ingestion."""
+
+
+def resolve_ingest_attachments(
+    attachments: list[dict],
+    *,
+    attachment_ids: list[str] | None,
+    approval_attachment_id: str | None,
+) -> tuple[list[dict], dict | None]:
+    """Pick timesheet + optional approval attachments for extraction."""
+    by_id = {a["attachment_id"]: a for a in attachments if a.get("attachment_id")}
+
+    if attachment_ids is None:
+        timesheet_atts = [a for a in attachments if a.get("kind") == "timesheet"]
+        if approval_attachment_id:
+            approval_att = by_id.get(approval_attachment_id)
+            if not approval_att:
+                raise IngestSelectionError("Unknown approval attachment.")
+            if approval_att.get("kind") != "approval_screenshot":
+                raise IngestSelectionError("Approval selection must be a screenshot attachment.")
+        else:
+            approval_att = next((a for a in attachments if a.get("kind") == "approval_screenshot"), None)
+        return timesheet_atts, approval_att
+
+    if not attachment_ids:
+        raise IngestSelectionError("Select at least one timesheet attachment to extract.")
+
+    timesheet_atts: list[dict] = []
+    for aid in attachment_ids:
+        att = by_id.get(aid)
+        if not att:
+            raise IngestSelectionError(f"Unknown attachment id: {aid}")
+        if att.get("kind") != "timesheet":
+            label = att.get("filename") or aid
+            raise IngestSelectionError(f"'{label}' is not a timesheet attachment.")
+        timesheet_atts.append(att)
+
+    approval_att = None
+    if approval_attachment_id:
+        approval_att = by_id.get(approval_attachment_id)
+        if not approval_att:
+            raise IngestSelectionError("Unknown approval attachment.")
+        if approval_att.get("kind") != "approval_screenshot":
+            raise IngestSelectionError("Approval selection must be a screenshot attachment.")
+
+    return timesheet_atts, approval_att
+
+
+async def ingest_email(
+    db: AsyncSession,
+    email: EmailMessage,
+    *,
+    attachment_ids: list[str] | None = None,
+    approval_attachment_id: str | None = None,
+) -> list[TimesheetRecord]:
     provider = get_email_provider()
     engine = get_extraction_engine()
     attachments = email.attachments or []
-    approval_atts = [a for a in attachments if a.get("kind") == "approval_screenshot"]
-    timesheet_atts = [a for a in attachments if a.get("kind") == "timesheet"]
+    timesheet_atts, approval_att = resolve_ingest_attachments(
+        attachments,
+        attachment_ids=attachment_ids,
+        approval_attachment_id=approval_attachment_id,
+    )
 
     approval_detected, approval_detail = False, "No approval screenshot provided."
     approval_bytes, approval_name = None, "manager_approval.png"
-    if approval_atts:
-        a = approval_atts[0]
+    if approval_att:
         try:
             approval_bytes, approval_name, _ = await provider.get_attachment_bytes(
-                email.provider_message_id, a["attachment_id"])
-            ap = await _safe_approval(engine, approval_bytes, email.provider_message_id, a["attachment_id"])
+                email.provider_message_id, approval_att["attachment_id"])
+            ap = await _safe_approval(
+                engine, approval_bytes, email.provider_message_id, approval_att["attachment_id"])
             approval_detected, approval_detail = ap.detected, ap.detail
         except Exception:
             approval_bytes = None

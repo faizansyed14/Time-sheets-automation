@@ -10,6 +10,8 @@ from pydantic import BaseModel, EmailStr, Field
 class LoginIn(BaseModel):
     username: str
     password: str
+    captcha_id: str
+    captcha_answer: str
     fingerprint: str | None = None  # opaque client device id (hashed server-side)
 
 
@@ -31,6 +33,12 @@ class VerifyCaptchaIn(BaseModel):
     fingerprint: str | None = None
 
 
+class VerifyTotpIn(BaseModel):
+    login_token: str
+    code: str
+    fingerprint: str | None = None
+
+
 class UserOut(BaseModel):
     id: str
     username: str
@@ -42,7 +50,7 @@ class UserOut(BaseModel):
 
 
 class LoginResult(BaseModel):
-    # status: authenticated | otp_required | captcha_required
+    # status: authenticated | otp_required | totp_required | totp_enrollment_required
     status: str
     access_token: str | None = None
     login_token: str | None = None
@@ -50,6 +58,8 @@ class LoginResult(BaseModel):
     user: UserOut | None = None
     message: str | None = None
     debug_otp: str | None = None  # populated only when not running in prod
+    totp_uri: str | None = None
+    totp_qr_png: str | None = None  # base64 PNG for authenticator enrollment
 
 
 class TokenResult(BaseModel):
@@ -73,6 +83,13 @@ class AdminUserUpdate(BaseModel):
     auth_mode: str | None = None
     is_active: bool | None = None
     password: str | None = None
+
+
+class TotpSetupOut(BaseModel):
+    uri: str
+    qr_png: str  # base64 PNG
+    manual_secret: str
+    enrolled: bool
 
 
 # ---------------- admin: config ----------------

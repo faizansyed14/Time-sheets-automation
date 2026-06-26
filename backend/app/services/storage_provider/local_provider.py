@@ -111,6 +111,25 @@ class LocalStorageProvider(StorageProvider):
             except Exception:
                 continue
 
+    def iter_file_meta(self, manager: str | None = None):
+        """(zip_path, size) for every file — one rglob + stat, no file reads."""
+        root = self.root
+        if not root.exists():
+            return
+        base = self._abs(_safe(manager)) if manager else root
+        if not base.exists():
+            return
+        for p in sorted(base.rglob("*")):
+            if not p.is_file():
+                continue
+            parts = p.relative_to(root).parts
+            if parts and _is_hidden(parts[0]):
+                continue
+            try:
+                yield "/".join(parts), p.stat().st_size
+            except Exception:
+                continue
+
     # ---- reading ----
     def read_file(self, rel_path: str) -> tuple[bytes, str, str]:
         p = self._abs(rel_path)
