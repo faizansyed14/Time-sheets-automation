@@ -129,8 +129,9 @@ def _name_score(extracted: str, candidate: str) -> float:
 
 
 class MatchCode:
-    ID_AND_NAME = "id_and_name"        # id + name both agree on one row (the ONLY match)
-    AMBIGUOUS_ID = "ambiguous_id"      # shared AUH/DXB id, name can't disambiguate
+    ID_AND_NAME = "id_and_name"
+    EMAIL_AND_NAME = "email_and_name"  # sender / AI employee + sheet name, no id on PDF
+    AMBIGUOUS_ID = "ambiguous_id"
     NO_MATCH = "no_match"              # id or name missing / not found / disagree
     NO_IDENTITY = "no_identity"        # nothing extracted to match on
 
@@ -147,7 +148,11 @@ def _loc(e: Employee) -> str:
 
 
 async def match_employee(
-    db: AsyncSession, extracted_id: str | None, extracted_name: str | None
+    db: AsyncSession,
+    extracted_id: str | None,
+    extracted_name: str | None,
+    *,
+    email_hint: Employee | None = None,
 ) -> MatchResult:
     name_norm = (extracted_name or "").strip().lower()
     name_is_placeholder = bool(name_norm) and _is_placeholder_name(name_norm)
@@ -160,6 +165,13 @@ async def match_employee(
         return MatchResult(None, "No employee ID or name found on the sheet to match.",
                            MatchCode.NO_IDENTITY)
     if not id_norm:
+        if name_norm and email_hint and _name_agrees(name_norm, email_hint.name):
+            return MatchResult(
+                email_hint,
+                f'Matched inbox employee + sheet name ("{extracted_name}" → '
+                f'"{email_hint.name}" · {email_hint.employee_id}{_loc(email_hint)}).',
+                MatchCode.EMAIL_AND_NAME,
+            )
         return MatchResult(
             None,
             f'Only a name ("{extracted_name}") was found — an employee ID is also required '

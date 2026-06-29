@@ -49,6 +49,10 @@ class EmailMessage(Base):
 
     has_approval_screenshot: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # Inbox AI check (gpt-4.1-nano): attachment triage + recommended employee.
+    ai_check: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    ai_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     status: Mapped[str] = mapped_column(String, default=EmailStatus.NEW, index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

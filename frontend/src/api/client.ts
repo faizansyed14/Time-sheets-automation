@@ -81,6 +81,44 @@ export interface Attachment {
 export interface EmailDetail extends EmailListItem {
   body_text: string | null;
   attachments: Attachment[];
+  ai_check: EmailAiCheck | null;
+  ai_check_running: boolean;
+}
+
+export interface MatchedEmployee {
+  employee_pk: string;
+  employee_id: string;
+  employee_name: string;
+  account_manager: string | null;
+  location: string | null;
+  matched_email: string | null;
+  is_sender: boolean;
+  source: string | null;
+}
+
+export interface EmailAiCheck {
+  summary: string;
+  model: string | null;
+  used_llm: boolean;
+  checked_at: string | null;
+  attachments: {
+    attachment_id: string;
+    filename: string;
+    category: string;
+    reason: string;
+    source_kind?: string;
+    used_ocr?: boolean;
+    text_chars?: number;
+    nested?: { filename?: string; file_type?: string; text_chars?: number; used_ocr?: boolean }[];
+  }[];
+  body_category: string;
+  body_reason: string;
+  recommended_timesheet_ids: string[];
+  recommended_approval_id: string | null;
+  extract_body: boolean;
+  matched_employee: MatchedEmployee | null;
+  missing: string[];
+  found: string[];
 }
 
 export interface SourceFileEntry {
@@ -241,21 +279,29 @@ export const fetchInbox = (
 export interface IngestSelection {
   attachment_ids: string[];
   approval_attachment_id?: string | null;
+  extract_body?: boolean;
 }
 
-export const fetchEmail = (id: string) => api.get<EmailDetail>(`/inbox/${id}`).then((r) => r.data);
+export const fetchEmail = (id: string, refreshAi = false) =>
+  api
+    .get<EmailDetail>(`/inbox/${id}`, { params: refreshAi ? { refresh_ai: true } : undefined })
+    .then((r) => r.data);
 
 export const decideEmail = (id: string, accepted: boolean, selection?: IngestSelection) =>
   api.post(`/inbox/${id}/decision`, {
     accepted,
     attachment_ids: selection?.attachment_ids,
     approval_attachment_id: selection?.approval_attachment_id ?? null,
+    extract_body: selection?.extract_body ?? false,
   }).then((r) => r.data);
 
 export const restoreEmail = (id: string) => api.post(`/inbox/${id}/restore`).then((r) => r.data);
 
 export const rerunExtraction = (id: string, selection: IngestSelection) =>
   api.post(`/inbox/${id}/rerun`, selection).then((r) => r.data);
+
+export const bodyImagePreviewUrl = (msgId: string) =>
+  withAuthParam(`/api/v1/inbox/${msgId}/body-image-preview`);
 
 export const attachmentUrl = (msgId: string, attId: string) =>
   withAuthParam(`/api/v1/inbox/${msgId}/attachments/${encodeURIComponent(attId)}`);

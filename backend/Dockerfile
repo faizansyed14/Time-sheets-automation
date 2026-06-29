@@ -8,11 +8,13 @@ ENV PYTHONUNBUFFERED=1 \
 # System libs:
 #  - WeasyPrint: pango / cairo / gdk-pixbuf / ffi  (+ fonts for crisp render)
 #  - LibreOffice (writer+calc): docx/xlsx -> pdf fallback
+#  - Tesseract: local OCR for inbox AI check + pipeline scans (OCR_PROVIDER=tesseract)
 #  - curl: container healthcheck
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 libffi8 \
         fonts-dejavu-core fonts-liberation \
         libreoffice-writer libreoffice-calc \
+        tesseract-ocr \
         curl \
     && rm -rf /var/lib/apt/lists/*
 

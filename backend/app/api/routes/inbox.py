@@ -14,8 +14,10 @@ from app.models.timesheet_record import TimesheetRecord
 from app.schemas import (
     AttachmentOut,
     DecisionIn,
+    EmailAiCheckOut,
     EmailDetail,
     EmailListItem,
+    MatchedEmployeeOut,
     Page,
     RerunExtractionIn,
 )
@@ -117,7 +119,11 @@ async def list_inbox(
 
 
 @router.get("/{provider_message_id}", response_model=EmailDetail)
-async def get_email(provider_message_id: str, db: AsyncSession = Depends(get_db)):
+async def get_email(
+    provider_message_id: str,
+    refresh_ai: bool = Query(default=False, description="Re-run inbox AI check"),
+    db: AsyncSession = Depends(get_db),
+):
     provider = get_email_provider()
     msg = await provider.get_message(provider_message_id)
     if not msg:
@@ -125,6 +131,21 @@ async def get_email(provider_message_id: str, db: AsyncSession = Depends(get_db)
     row = await _sync_message(db, msg)
     await db.commit()
     await db.refresh(row)
+
+    ai_out: EmailAiCheckOut | None = None
+    if row.ai_check:
+        ai_out = EmailAiCheckOut(**row.ai_check)
+    if refresh_ai:
+        from app.services.inbox.ai_check import ensure_ai_check
+        try:
+            result = await ensure_ai_check(db, row, force=True)
+            await db.commit()
+            await db.refresh(row)
+            ai_out = EmailAiCheckOut(**result)
+        except Exception:
+            if row.ai_check:
+                ai_out = EmailAiCheckOut(**row.ai_check)
+
     base = _to_list_item(row)
     return EmailDetail(
         **base.model_dump(),
@@ -136,7 +157,27 @@ async def get_email(provider_message_id: str, db: AsyncSession = Depends(get_db)
             )
             for a in (row.attachments or [])
         ],
+        ai_check=ai_out,
+        ai_check_running=False,
     )
+
+
+@router.get("/{provider_message_id}/body-image-preview")
+async def body_image_preview(provider_message_id: str, db: AsyncSession = Depends(get_db)):
+    """Preview the rendered email-body image (inline timesheet in message text)."""
+    from app.services.extraction.file_processor import email_body_to_images
+
+    row = (
+        await db.execute(
+            select(EmailMessage).where(EmailMessage.provider_message_id == provider_message_id)
+        )
+    ).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "Email not found")
+    imgs = email_body_to_images(row.subject, row.body_text)
+    if not imgs:
+        raise HTTPException(400, "Could not render email body")
+    return Response(content=imgs[0], media_type="image/jpeg")
 
 
 @router.get("/{provider_message_id}/attachments/{attachment_id}")
@@ -198,6 +239,7 @@ async def decide(provider_message_id: str, body: DecisionIn, db: AsyncSession = 
             db, row,
             attachment_ids=body.attachment_ids,
             approval_attachment_id=body.approval_attachment_id,
+            extract_body=body.extract_body,
         )
     except IngestSelectionError as e:
         raise HTTPException(400, str(e)) from e
@@ -263,6 +305,7 @@ async def rerun_extraction(
             db, row,
             attachment_ids=body.attachment_ids,
             approval_attachment_id=body.approval_attachment_id,
+            extract_body=body.extract_body,
         )
     except IngestSelectionError as e:
         raise HTTPException(400, str(e)) from e

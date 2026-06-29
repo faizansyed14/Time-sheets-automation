@@ -11,9 +11,14 @@ import {
   FileText,
   Search,
   Undo2,
+  UserCheck,
+  AlertCircle,
+  Check,
+  Brain,
 } from "lucide-react";
 import {
   attachmentUrl,
+  bodyImagePreviewUrl,
   decideEmail,
   fetchEmail,
   fetchInbox,
@@ -45,6 +50,15 @@ function StatusBadge({ status }: { status: EmailListItem["status"] }) {
   return <Badge tone="indigo">New</Badge>;
 }
 
+function applyAiSelection(detail: { ai_check?: { recommended_timesheet_ids: string[]; recommended_approval_id: string | null } | null }) {
+  const ai = detail.ai_check;
+  if (!ai) return { timesheets: new Set<string>(), approval: null as string | null };
+  return {
+    timesheets: new Set(ai.recommended_timesheet_ids || []),
+    approval: ai.recommended_approval_id,
+  };
+}
+
 export default function InboxPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
@@ -54,15 +68,24 @@ export default function InboxPage() {
   const [preview, setPreview] = useState<PreviewFile | null>(null);
   const [selectedTimesheetIds, setSelectedTimesheetIds] = useState<Set<string>>(new Set());
   const [approvalAttachmentId, setApprovalAttachmentId] = useState<string | null>(null);
+  const [extractBodyEnabled, setExtractBodyEnabled] = useState(false);
+  const [aiRunning, setAiRunning] = useState(false);
 
   useEffect(() => setPreview(null), [selected]);
+  useEffect(() => {
+    setExtractBodyEnabled(false);
+    setSelectedTimesheetIds(new Set());
+    setApprovalAttachmentId(null);
+  }, [selected]);
 
   const buildSelection = (): IngestSelection => ({
     attachment_ids: [...selectedTimesheetIds],
     approval_attachment_id: approvalAttachmentId,
+    extract_body: extractBodyEnabled,
   });
 
-  const canExtract = selectedTimesheetIds.size > 0;
+  const extractCount = selectedTimesheetIds.size + (extractBodyEnabled ? 1 : 0);
+  const canExtract = extractCount > 0;
 
   const dq = useDebounced(q, 350);
   const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
@@ -73,8 +96,6 @@ export default function InboxPage() {
   });
   const emails = data?.pages.flatMap((p) => p.items) ?? [];
   const total = data?.pages[0]?.total ?? 0;
-  // The list scrolls inside its own panel, so the sentinel must observe that
-  // container (not the viewport) for auto-loading to fire as you scroll.
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useSentinel(
     () => hasNextPage && !isFetchingNextPage && fetchNextPage(),
@@ -82,7 +103,7 @@ export default function InboxPage() {
     scrollRef
   );
 
-  const { data: detail, isLoading: loadingDetail } = useQuery({
+  const { data: detail, isLoading: loadingDetail, isFetching: fetchingDetail } = useQuery({
     queryKey: ["email", selected],
     queryFn: () => fetchEmail(selected!),
     enabled: !!selected,
@@ -90,12 +111,20 @@ export default function InboxPage() {
 
   useEffect(() => {
     if (!detail) return;
-    const timesheetIds = detail.attachments
-      .filter((a) => a.kind === "timesheet")
-      .map((a) => a.attachment_id);
-    setSelectedTimesheetIds(new Set(timesheetIds));
-    setApprovalAttachmentId(null);
-  }, [detail?.provider_message_id]);
+    const sel = applyAiSelection(detail);
+    if (detail.ai_check) {
+      setSelectedTimesheetIds(sel.timesheets);
+      setApprovalAttachmentId(sel.approval);
+      setExtractBodyEnabled(!!detail.ai_check.extract_body);
+    } else {
+      const timesheetIds = detail.attachments
+        .filter((a) => a.kind === "timesheet")
+        .map((a) => a.attachment_id);
+      setSelectedTimesheetIds(new Set(timesheetIds));
+      setApprovalAttachmentId(null);
+      setExtractBodyEnabled(false);
+    }
+  }, [detail?.provider_message_id, detail?.ai_check?.checked_at]);
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["inbox"] });
@@ -143,15 +172,28 @@ export default function InboxPage() {
     onError: (e: any) => toast("error", "Re-run failed", e?.response?.data?.detail ?? String(e)),
   });
 
+  const runAiCheck = async () => {
+    if (!selected) return;
+    setAiRunning(true);
+    try {
+      const data = await fetchEmail(selected, true);
+      qc.setQueryData(["email", selected], data);
+    } finally {
+      setAiRunning(false);
+    }
+  };
+
+  const ai = detail?.ai_check;
+  const aiAtt = (id: string) => ai?.attachments.find((a) => a.attachment_id === id);
+
   return (
     <div className="flex h-full animate-fade-up flex-col">
       <PageHeader
         title="Email Inbox"
-        subtitle="Accept runs extraction on the attachments you select — logos and extras can be left out."
+        subtitle="Select an email, run AI Check, then Accept to extract."
       />
 
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 xl:grid-cols-[400px_1fr]">
-        {/* ---------------- list ---------------- */}
         <Card className="flex min-h-0 flex-col">
           <div className="flex items-center gap-2 border-b border-slate-100 p-3">
             <div className="relative flex-1">
@@ -186,9 +228,7 @@ export default function InboxPage() {
                   onClick={() => setSelected(m.provider_message_id)}
                   className={cn(
                     "flex w-full items-start gap-3 border-b border-slate-100 px-4 py-3 text-left transition-colors",
-                    selected === m.provider_message_id
-                      ? "bg-brand-50/70"
-                      : "hover:bg-slate-50"
+                    selected === m.provider_message_id ? "bg-brand-50/70" : "hover:bg-slate-50"
                   )}
                 >
                   <span
@@ -201,9 +241,7 @@ export default function InboxPage() {
                   </span>
                   <span className="min-w-0 flex-1">
                     <span className="flex items-baseline justify-between gap-2">
-                      <span className="truncate text-sm font-semibold text-slate-800">
-                        {m.sender_name}
-                      </span>
+                      <span className="truncate text-sm font-semibold text-slate-800">{m.sender_name}</span>
                       <span className="shrink-0 text-[11px] text-slate-400">
                         {formatDateTime(m.received_at).split(",")[0]}
                       </span>
@@ -215,9 +253,7 @@ export default function InboxPage() {
                         <Paperclip className="h-3 w-3" />
                         {m.attachment_count}
                       </span>
-                      {m.has_approval_screenshot && (
-                        <BadgeCheck className="h-3.5 w-3.5 text-emerald-500" />
-                      )}
+                      {m.has_approval_screenshot && <BadgeCheck className="h-3.5 w-3.5 text-emerald-500" />}
                     </span>
                   </span>
                 </button>
@@ -229,25 +265,20 @@ export default function InboxPage() {
                 <Spinner className="h-4 w-4" /> Loading more…
               </div>
             )}
-            {!isLoading && emails.length > 0 && (
-              <p className="px-4 py-2 text-center text-[11px] text-slate-400">
-                Showing {emails.length} of {total}
-              </p>
-            )}
           </div>
         </Card>
 
-        {/* ---------------- detail ---------------- */}
         <Card className="flex min-h-0 flex-col">
           {!selected ? (
             <EmptyState
               icon={<Mail className="h-6 w-6" />}
               title="Select an email"
-              detail="Pick a message on the left to preview its body and attachments."
+              detail="Click AI Check to classify attachments and detect inline timesheets."
             />
           ) : loadingDetail || !detail ? (
-            <div className="flex flex-1 items-center justify-center">
+            <div className="flex flex-1 flex-col items-center justify-center gap-3">
               <Spinner className="h-6 w-6" />
+              <p className="text-sm text-slate-500">Loading email…</p>
             </div>
           ) : (
             <>
@@ -256,13 +287,26 @@ export default function InboxPage() {
                   <div className="min-w-0">
                     <h2 className="text-base font-bold text-slate-900">{detail.subject}</h2>
                     <p className="mt-0.5 text-xs text-slate-500">
-                      {detail.sender_name} &lt;{detail.sender_email}&gt; ·{" "}
-                      {formatDateTime(detail.received_at)}
+                      {detail.sender_name} &lt;{detail.sender_email}&gt; · {formatDateTime(detail.received_at)}
                     </p>
+                    {ai?.matched_employee && (
+                      <span className="mt-1.5 inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
+                        <UserCheck className="h-3 w-3" />
+                        {ai.matched_employee.employee_name} · {ai.matched_employee.employee_id}
+                        {ai.matched_employee.location ? ` · ${ai.matched_employee.location}` : ""}
+                      </span>
+                    )}
                   </div>
-                  <StatusBadge status={detail.status} />
+                  <div className="flex items-center gap-2">
+                    {fetchingDetail && <Spinner className="h-4 w-4" />}
+                    <StatusBadge status={detail.status} />
+                  </div>
                 </div>
                 <div className="mt-4 flex flex-wrap gap-2">
+                  <Button variant="secondary" disabled={aiRunning || loadingDetail} onClick={runAiCheck} title="Run AI check">
+                    {aiRunning ? <Spinner className="h-4 w-4" /> : <Brain className="h-4 w-4" />}
+                    AI Check
+                  </Button>
                   {detail.status === "new" && (
                     <>
                       <Button
@@ -277,25 +321,20 @@ export default function InboxPage() {
                         }
                       >
                         {decide.isPending ? <Spinner className="border-white/40 border-t-white" /> : <CheckCircle2 className="h-4 w-4" />}
-                        Accept · Run extraction ({selectedTimesheetIds.size})
+                        Accept · Extract ({extractCount})
                       </Button>
                       <Button
                         variant="secondary"
                         disabled={decide.isPending}
-                        onClick={() =>
-                          decide.mutate({ id: detail.provider_message_id, accepted: false })
-                        }
+                        onClick={() => decide.mutate({ id: detail.provider_message_id, accepted: false })}
                       >
-                        <Archive className="h-4 w-4" /> Reject · Archive
+                        <Archive className="h-4 w-4" /> Archive
                       </Button>
                     </>
                   )}
                   {detail.status === "archived" && (
-                    <Button
-                      variant="secondary"
-                      onClick={() => restore.mutate(detail.provider_message_id)}
-                    >
-                      <Undo2 className="h-4 w-4" /> Restore to New
+                    <Button variant="secondary" onClick={() => restore.mutate(detail.provider_message_id)}>
+                      <Undo2 className="h-4 w-4" /> Restore
                     </Button>
                   )}
                   {detail.status === "ingested" && (
@@ -303,10 +342,7 @@ export default function InboxPage() {
                       variant="secondary"
                       disabled={rerun.isPending || !canExtract}
                       onClick={() =>
-                        rerun.mutate({
-                          id: detail.provider_message_id,
-                          selection: buildSelection(),
-                        })
+                        rerun.mutate({ id: detail.provider_message_id, selection: buildSelection() })
                       }
                     >
                       <RotateCcw className={cn("h-4 w-4", rerun.isPending && "animate-spin")} />
@@ -316,55 +352,101 @@ export default function InboxPage() {
                 </div>
               </div>
 
+              {(ai || aiRunning) && (
+                <div className="border-b border-slate-100 bg-slate-50/80 px-5 py-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Brain className="h-4 w-4 text-brand-600" />
+                    <span className="text-sm font-semibold text-slate-800">AI analysis</span>
+                    {aiRunning && <Spinner className="h-4 w-4" />}
+                    {ai?.used_llm && ai.model && <Badge tone="slate">{ai.model}</Badge>}
+                    {ai && !ai.used_llm && <Badge tone="slate">Rules only</Badge>}
+                  </div>
+                  {ai && (
+                    <>
+                      <p className="mt-1 text-sm text-slate-600">{ai.summary}</p>
+                      <div className="mt-3 grid gap-3 md:grid-cols-2">
+                        {ai.found.length > 0 && (
+                          <div>
+                            <p className="text-[10px] font-bold uppercase tracking-wide text-emerald-600">Found</p>
+                            <ul className="mt-1 space-y-1">
+                              {ai.found.map((line) => (
+                                <li key={line} className="flex items-start gap-1.5 text-xs text-slate-700">
+                                  <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-500" />
+                                  {line}
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {ai.missing.length > 0 && (
+                          <div>
+                            <p className="text-[10px] font-bold uppercase tracking-wide text-amber-600">Notes</p>
+                            <ul className="mt-1 space-y-1">
+                              {ai.missing.map((line) => (
+                                <li key={line} className="flex items-start gap-1.5 text-xs text-slate-700">
+                                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
+                                  {line}
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
               <div className="min-h-0 flex-1 overflow-y-auto p-5">
+                {ai?.extract_body && (detail.status === "new" || detail.status === "ingested") && (
+                  <div className="mb-4 rounded-lg border border-brand-200 bg-brand-50/70 p-4">
+                    <label className="flex cursor-pointer items-start gap-3">
+                      <input
+                        type="checkbox"
+                        checked={extractBodyEnabled}
+                        onChange={(e) => setExtractBodyEnabled(e.target.checked)}
+                        className="mt-1 rounded border-slate-300 text-brand-600"
+                      />
+                      <span className="min-w-0 flex-1">
+                        <span className="text-sm font-semibold text-slate-800">Convert email to image</span>
+                        <p className="mt-0.5 text-xs text-slate-600">
+                          Timesheet table is in the message body — renders subject + body to JPEG for pipeline extraction.
+                        </p>
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          className="mt-2"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            setPreview({
+                              url: bodyImagePreviewUrl(detail.provider_message_id),
+                              filename: "email_body.jpg",
+                              contentType: "image/jpeg",
+                            });
+                          }}
+                        >
+                          <ImageIcon className="h-4 w-4" /> Preview image
+                        </Button>
+                      </span>
+                    </label>
+                  </div>
+                )}
+
                 <pre className="whitespace-pre-wrap rounded-lg bg-slate-50 p-4 font-sans text-sm leading-6 text-slate-700">
                   {detail.body_text}
                 </pre>
 
-                <div className="mb-2 mt-5 flex flex-wrap items-center justify-between gap-2">
+                <div className="mb-2 mt-5">
                   <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500">
                     Attachments ({detail.attachments.length})
                   </h3>
-                  {(detail.status === "new" || detail.status === "ingested") && (
-                    <div className="flex gap-2 text-[11px]">
-                      <button
-                        type="button"
-                        className="font-medium text-brand-600 hover:text-brand-700"
-                        onClick={() =>
-                          setSelectedTimesheetIds(
-                            new Set(detail.attachments.filter((a) => a.kind === "timesheet").map((a) => a.attachment_id))
-                          )
-                        }
-                      >
-                        Select all timesheets
-                      </button>
-                      <span className="text-slate-300">·</span>
-                      <button
-                        type="button"
-                        className="text-slate-500 hover:text-slate-700"
-                        onClick={() => {
-                          setSelectedTimesheetIds(new Set());
-                          setApprovalAttachmentId(null);
-                        }}
-                      >
-                        Clear selection
-                      </button>
-                    </div>
-                  )}
                 </div>
-                <p className="mb-3 text-[11px] text-slate-500">
-                  Check timesheets to extract. Optionally pick one screenshot as manager approval — skip logos.
-                </p>
                 <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
                   {detail.attachments.map((a) => {
-                    const file: PreviewFile = {
-                      url: attachmentUrl(detail.provider_message_id, a.attachment_id),
-                      filename: a.filename,
-                      contentType: a.content_type,
-                    };
-                    const isTimesheet = a.kind === "timesheet";
-                    const isApproval = a.kind === "approval_screenshot";
-                    const extractable = isTimesheet || isApproval;
+                    const analysis = aiAtt(a.attachment_id);
+                    const isTimesheet = a.kind === "timesheet" || analysis?.category === "timesheet";
+                    const isApproval = a.kind === "approval_screenshot" || analysis?.category === "approval";
+                    const extractable = isTimesheet || isApproval || !!analysis;
                     const timesheetChecked = selectedTimesheetIds.has(a.attachment_id);
                     const approvalChecked = approvalAttachmentId === a.attachment_id;
                     return (
@@ -401,11 +483,8 @@ export default function InboxPage() {
                                   type="checkbox"
                                   checked={approvalChecked}
                                   onChange={(e) => {
-                                    if (e.target.checked) {
-                                      setApprovalAttachmentId(a.attachment_id);
-                                    } else {
-                                      setApprovalAttachmentId((cur) => (cur === a.attachment_id ? null : cur));
-                                    }
+                                    if (e.target.checked) setApprovalAttachmentId(a.attachment_id);
+                                    else setApprovalAttachmentId((c) => (c === a.attachment_id ? null : c));
                                   }}
                                   className="rounded border-slate-300 text-emerald-600"
                                 />
@@ -416,24 +495,36 @@ export default function InboxPage() {
                         )}
                         <div className="min-w-0 flex-1">
                           <PreviewableFileRow
-                            file={file}
+                            file={{
+                              url: attachmentUrl(detail.provider_message_id, a.attachment_id),
+                              filename: a.filename,
+                              contentType: a.content_type,
+                            }}
                             onPreview={setPreview}
                             className="border-0 hover:border-0"
                             icon={
-                              a.kind === "approval_screenshot" ? (
+                              isApproval ? (
                                 <ImageIcon className="h-5 w-5 shrink-0 text-emerald-500" />
-                              ) : a.kind === "other" ? (
-                                <Paperclip className="h-5 w-5 shrink-0 text-slate-400" />
-                              ) : (
+                              ) : isTimesheet ? (
                                 <FileText className="h-5 w-5 shrink-0 text-brand-500" />
+                              ) : (
+                                <Paperclip className="h-5 w-5 shrink-0 text-slate-400" />
                               )
                             }
                             subtitle={
-                              a.kind === "approval_screenshot"
-                                ? "Screenshot / possible approval"
-                                : a.kind === "other"
-                                  ? "Not classified — preview only"
-                                  : "Timesheet document"
+                              analysis
+                                ? `${analysis.category} — ${analysis.reason}${
+                                    analysis.used_ocr ? " · OCR" : ""
+                                  }${
+                                    analysis.text_chars != null && analysis.text_chars > 0
+                                      ? ` · ${analysis.text_chars} chars`
+                                      : ""
+                                  }`
+                                : isTimesheet
+                                  ? "Timesheet document"
+                                  : isApproval
+                                    ? "Approval screenshot"
+                                    : "Waiting for AI check"
                             }
                           />
                         </div>

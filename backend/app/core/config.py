@@ -114,6 +114,8 @@ class Settings(BaseSettings):
     # Optional OCR "reader" to give scans/photos a text layer (none|tesseract).
     # tesseract runs locally (pytesseract + tesseract-ocr) and is completely free.
     ocr_provider: str = "none"
+    # Cheap model for inbox AI check (classify attachments + body in one call).
+    ai_check_model: str = "gpt-4.1-nano"
 
     # CORS for the Vite dev server.
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
