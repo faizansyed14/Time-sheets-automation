@@ -5,7 +5,12 @@ export type PreviewFile = {
 };
 
 const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"]);
-const PREVIEW_EXTS = new Set([...IMAGE_EXTS, "pdf", "eml"]);
+const PREVIEW_EXTS = new Set([...IMAGE_EXTS, "pdf", "eml", "docx"]);
+
+const DOCX_CTS = new Set([
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/docx",
+]);
 
 function ext(filename: string) {
   return filename.split(".").pop()?.toLowerCase() ?? "";
@@ -21,9 +26,15 @@ export function isEml(filename: string, contentType?: string | null) {
   return ext(filename) === "eml" || ct === "message/rfc822";
 }
 
+export function isDocx(filename: string, contentType?: string | null) {
+  const ct = contentType?.toLowerCase() ?? "";
+  return ext(filename) === "docx" || DOCX_CTS.has(ct);
+}
+
 export function isPreviewable(filename: string, contentType?: string | null) {
   const ct = contentType?.toLowerCase() ?? "";
   if (ct.startsWith("image/") || ct === "application/pdf" || ct === "message/rfc822") return true;
+  if (DOCX_CTS.has(ct)) return true;
   return PREVIEW_EXTS.has(ext(filename));
 }
 

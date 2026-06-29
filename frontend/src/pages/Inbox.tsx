@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Mail,
@@ -15,6 +15,10 @@ import {
   AlertCircle,
   Check,
   Brain,
+  ChevronDown,
+  ChevronRight,
+  Forward,
+  Maximize2,
 } from "lucide-react";
 import {
   attachmentUrl,
@@ -24,15 +28,22 @@ import {
   fetchInbox,
   rerunExtraction,
   restoreEmail,
+  type Attachment,
+  type EmailAiCheck,
   type EmailListItem,
   type IngestSelection,
 } from "../api/client";
 import { cn, formatDateTime, initials, avatarColor } from "../lib/utils";
-import { FilePreviewModal, PreviewableFileRow } from "../components/FilePreview";
+import { FilePreviewModal } from "../components/FilePreview";
+import { sanitizeEmailHtml } from "../lib/filePreview";
 import { Badge, Button, Card, EmptyState, PageHeader, Select, Skeleton, Spinner } from "../components/ui";
 import { useToast } from "../components/toast";
 import { useDebounced, useSentinel } from "../lib/useInfinite";
 import type { PreviewFile } from "../lib/filePreview";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function StatusBadge({ status }: { status: EmailListItem["status"] }) {
   if (status === "ingested")
@@ -58,6 +69,558 @@ function applyAiSelection(detail: { ai_check?: { recommended_timesheet_ids: stri
     approval: ai.recommended_approval_id,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Forwarded-email body parser
+// Detects common divider patterns used by Outlook / Gmail / mobile clients.
+// ---------------------------------------------------------------------------
+
+const FWD_DIVIDERS = [
+  // Outlook Windows / Mac
+  /^_{3,}[\r\n]+From:/m,
+  // Outlook web "Original Message"
+  /^-{3,}\s*Original Message\s*-{3,}/im,
+  // Gmail
+  /^-{5,}\s*Forwarded message\s*-{5,}/im,
+  // Generic dash line followed by From:
+  /^-{3,}[\r\n]+From:/m,
+];
+
+interface EmailParts {
+  outer: string;      // text written by the forwarder
+  forwarded: string;  // the nested original message
+  isForwarded: boolean;
+}
+
+function splitForwardedBody(body: string): EmailParts {
+  for (const re of FWD_DIVIDERS) {
+    const match = body.match(re);
+    if (match && match.index !== undefined) {
+      return {
+        outer: body.slice(0, match.index).trim(),
+        forwarded: body.slice(match.index).trim(),
+        isForwarded: true,
+      };
+    }
+  }
+  return { outer: body, forwarded: "", isForwarded: false };
+}
+
+function isForwardedSubject(subject: string | null): boolean {
+  if (!subject) return false;
+  return /^(fw|fwd):/i.test(subject.trim());
+}
+
+// ---------------------------------------------------------------------------
+// CID (inline image) helpers
+// Matches [cid:filename@domain] or [cid:content-id] references in plain-text
+// bodies and maps them to their attachment download URLs.
+// ---------------------------------------------------------------------------
+
+const CID_RE = /\[cid:([^\]]+)\]/g;
+// Matches src="cid:..." and src='cid:...' inside HTML bodies
+const HTML_CID_RE = /src\s*=\s*["']cid:([^"']+)["']/gi;
+
+/**
+ * Returns a map of raw CID token (e.g. "[cid:image001.jpg@xxx]") → attachment URL.
+ * Uses filename match (case-insensitive, part before the first "@").
+ */
+function buildCidMap(
+  bodyText: string,
+  attachments: Attachment[],
+  providerId: string,
+): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const match of bodyText.matchAll(CID_RE)) {
+    const att = findByCid(match[1], attachments);
+    if (att) map.set(match[0], attachmentUrl(providerId, att.attachment_id));
+  }
+  return map;
+}
+
+/**
+ * Returns the set of attachment IDs that are referenced inline via:
+ *   [cid:...] in plain-text bodies, or
+ *   src="cid:..." in HTML bodies.
+ * These are rendered in the body and hidden from the chip list.
+ */
+/** Find attachment by CID ref: match on attachment.cid first, then filename fallback. */
+function findByCid(cidRef: string, attachments: Attachment[]): Attachment | undefined {
+  const cidLower = cidRef.toLowerCase();
+  const cidName = cidRef.split("@")[0].toLowerCase();
+  // Exact cid match (strip angle brackets Graph sometimes adds)
+  let att = attachments.find((a) => {
+    const ac = (a.cid ?? "").replace(/^<|>$/g, "").toLowerCase();
+    return ac === cidLower || ac === cidName;
+  });
+  // Filename fallback
+  if (!att) att = attachments.find((a) => a.filename.toLowerCase() === cidName);
+  return att;
+}
+
+function inlineAttachmentIds(
+  bodyText: string,
+  bodyHtml: string | null,
+  attachments: Attachment[],
+): Set<string> {
+  const ids = new Set<string>();
+
+  // Plain-text [cid:...] references
+  for (const match of bodyText.matchAll(CID_RE)) {
+    const att = findByCid(match[1], attachments);
+    if (att) ids.add(att.attachment_id);
+  }
+
+  // HTML src="cid:..." references (Graph emails)
+  if (bodyHtml) {
+    for (const match of bodyHtml.matchAll(HTML_CID_RE)) {
+      const att = findByCid(match[1], attachments);
+      if (att) ids.add(att.attachment_id);
+    }
+  }
+
+  return ids;
+}
+
+// ---------------------------------------------------------------------------
+// Plain-text segment renderer — replaces [cid:...] with <img> tags inline
+// ---------------------------------------------------------------------------
+
+function TextWithInlineImages({
+  text,
+  cidMap,
+  className,
+}: {
+  text: string;
+  cidMap: Map<string, string>;
+  className?: string;
+}) {
+  if (cidMap.size === 0) {
+    return <pre className={cn("whitespace-pre-wrap font-sans text-sm leading-6 text-slate-700", className)}>{text}</pre>;
+  }
+
+  // Split on every [cid:...] token and interleave <img> elements.
+  const parts: ReactNode[] = [];
+  let last = 0;
+  for (const match of text.matchAll(CID_RE)) {
+    const token = match[0];
+    const url = cidMap.get(token);
+    if (match.index !== undefined && match.index > last) {
+      parts.push(
+        <span key={`t-${last}`} className="whitespace-pre-wrap">
+          {text.slice(last, match.index)}
+        </span>
+      );
+    }
+    if (url) {
+      parts.push(
+        <img
+          key={`img-${match.index}`}
+          src={url}
+          alt={match[1].split("@")[0]}
+          className="my-1 inline-block max-h-20 max-w-full object-contain align-middle"
+        />
+      );
+    } else if (match.index !== undefined) {
+      // Unknown CID — keep the token as text (hidden to reduce noise)
+      parts.push(
+        <span key={`cid-${match.index}`} className="hidden">
+          {token}
+        </span>
+      );
+    }
+    if (match.index !== undefined) last = match.index + token.length;
+  }
+  if (last < text.length) {
+    parts.push(
+      <span key={`t-end`} className="whitespace-pre-wrap">
+        {text.slice(last)}
+      </span>
+    );
+  }
+
+  return (
+    <p className={cn("font-sans text-sm leading-6 text-slate-700", className)}>
+      {parts}
+    </p>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Email body renderer — HTML iframe when body_html available, text fallback
+// ---------------------------------------------------------------------------
+
+/**
+ * Replaces `cid:filename@...` in an HTML string with actual attachment URLs
+ * so inline images (logos, signatures, tables) render correctly in the iframe.
+ */
+function resolveCidsInHtml(html: string, attachments: Attachment[], providerId: string): string {
+  return html.replace(/cid:([^"'\s>)]+)/gi, (_, cidRef: string) => {
+    const att = findByCid(cidRef, attachments);
+    return att ? attachmentUrl(providerId, att.attachment_id) : "#";
+  });
+}
+
+function EmailBodyRenderer({
+  bodyText,
+  bodyHtml,
+  subject,
+  attachments,
+  providerId,
+}: {
+  bodyText: string | null;
+  bodyHtml: string | null;
+  subject: string | null;
+  attachments: Attachment[];
+  providerId: string;
+}) {
+  // -- HTML path: resolve CIDs, sanitize, render in sandboxed iframe ----------
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!bodyHtml) return;
+    const resolved = resolveCidsInHtml(bodyHtml, attachments, providerId);
+    const safe = sanitizeEmailHtml(resolved);
+    const blob = URL.createObjectURL(new Blob([safe], { type: "text/html" }));
+    setBlobUrl(blob);
+    return () => URL.revokeObjectURL(blob);
+  }, [bodyHtml, attachments, providerId]);
+
+  if (bodyHtml) {
+    if (!blobUrl) return null;
+    return (
+      <iframe
+        key={blobUrl}
+        src={blobUrl}
+        title="Email body"
+        sandbox="allow-same-origin"
+        className="h-full w-full min-h-[300px] border-0"
+      />
+    );
+  }
+
+  // -- Plain-text fallback (mock emails or providers without HTML) -----------
+  const text = bodyText ?? "";
+  const cidMap = useMemo(() => buildCidMap(text, attachments, providerId), [text, attachments, providerId]);
+  const { outer, forwarded, isForwarded } = useMemo(() => splitForwardedBody(text), [text]);
+  const detectedFwd = isForwarded || isForwardedSubject(subject);
+
+  if (!text.trim()) {
+    return (
+      <p className="py-6 text-center text-sm italic text-slate-400">(no message body)</p>
+    );
+  }
+
+  if (detectedFwd && forwarded) {
+    return (
+      <div className="space-y-3">
+        {outer && <TextWithInlineImages text={outer} cidMap={cidMap} />}
+        <div className="rounded-lg border border-slate-200 bg-slate-50/60">
+          <div className="flex items-center gap-1.5 border-b border-slate-200 px-3 py-2">
+            <Forward className="h-3.5 w-3.5 text-slate-400" />
+            <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+              Forwarded message
+            </span>
+          </div>
+          <div className="p-3">
+            <TextWithInlineImages text={forwarded} cidMap={cidMap} className="text-slate-600" />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return <TextWithInlineImages text={text} cidMap={cidMap} />;
+}
+
+// ---------------------------------------------------------------------------
+// AI analysis panel — collapsible, collapsed by default
+// ---------------------------------------------------------------------------
+
+function AiAnalysisPanel({
+  ai,
+  aiRunning,
+}: {
+  ai: EmailAiCheck | null;
+  aiRunning: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+
+  // Auto-expand while running so user sees the spinner
+  useEffect(() => {
+    if (aiRunning) setOpen(true);
+  }, [aiRunning]);
+
+  if (!ai && !aiRunning) return null;
+
+  return (
+    <div className="border-b border-slate-100 bg-slate-50/80">
+      {/* Collapsible header */}
+      <button
+        type="button"
+        onClick={() => setOpen((v: boolean) => !v)}
+        className="flex w-full items-center gap-2 px-5 py-2.5 text-left"
+      >
+        <Brain className="h-4 w-4 shrink-0 text-brand-600" />
+        <span className="flex-1 text-sm font-semibold text-slate-800">AI analysis</span>
+        {aiRunning && <Spinner className="h-4 w-4" />}
+        {ai?.used_llm && ai.model && <Badge tone="slate">{ai.model}</Badge>}
+        {ai && !ai.used_llm && <Badge tone="slate">Rules only</Badge>}
+        {open ? (
+          <ChevronDown className="h-4 w-4 shrink-0 text-slate-400" />
+        ) : (
+          <ChevronRight className="h-4 w-4 shrink-0 text-slate-400" />
+        )}
+      </button>
+
+      {/* Expandable body */}
+      {open && ai && (
+        <div className="px-5 pb-4">
+          <p className="text-sm text-slate-600">{ai.summary}</p>
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            {ai.found.length > 0 && (
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-wide text-emerald-600">Found</p>
+                <ul className="mt-1 space-y-1">
+                  {ai.found.map((line) => (
+                    <li key={line} className="flex items-start gap-1.5 text-xs text-slate-700">
+                      <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-500" />
+                      {line}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {ai.missing.length > 0 && (
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-wide text-amber-600">Notes</p>
+                <ul className="mt-1 space-y-1">
+                  {ai.missing.map((line) => (
+                    <li key={line} className="flex items-start gap-1.5 text-xs text-slate-700">
+                      <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
+                      {line}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Outlook-style attachment chips rendered at the top of the email
+// ---------------------------------------------------------------------------
+
+// Detect document vs image attachments.
+// Documents (pdf / docx / xlsx / eml) go in the top chip strip.
+// Images (png / jpg / gif / etc.) that are NOT inline go in a separate section with approval checkbox.
+const DOC_TYPES = new Set(["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "message/rfc822"]);
+const DOC_EXTS = new Set(["pdf", "docx", "xlsx", "eml"]);
+
+function isDocAttachment(a: Attachment): boolean {
+  if (DOC_TYPES.has(a.content_type)) return true;
+  const ext = a.filename.split(".").pop()?.toLowerCase() ?? "";
+  return DOC_EXTS.has(ext);
+}
+
+function isImageAttachment(a: Attachment): boolean {
+  return a.content_type.startsWith("image/") || /\.(png|jpg|jpeg|gif|webp|bmp)$/i.test(a.filename);
+}
+
+function AttachmentChip({
+  a,
+  providerId,
+  ai,
+  selectedTimesheetIds,
+  setSelectedTimesheetIds,
+  status,
+  setPreview,
+  aiAtt,
+}: {
+  a: Attachment;
+  providerId: string;
+  ai: any;
+  selectedTimesheetIds: Set<string>;
+  setSelectedTimesheetIds: Dispatch<SetStateAction<Set<string>>>;
+  status: string;
+  setPreview: (f: PreviewFile) => void;
+  aiAtt: (id: string) => any;
+}) {
+  const analysis = aiAtt(a.attachment_id);
+  const isTimesheet = a.kind === "timesheet" || analysis?.category === "timesheet";
+  const timesheetChecked = selectedTimesheetIds.has(a.attachment_id);
+  const canExtract = isTimesheet && (status === "new" || status === "ingested");
+
+  const chipColor = timesheetChecked
+    ? "border-brand-300 bg-brand-50 ring-1 ring-brand-100"
+    : "border-slate-200 bg-white hover:border-brand-200";
+
+  return (
+    <div className={cn("flex items-center gap-2 rounded-lg border px-2.5 py-2 text-xs transition-colors", chipColor)}>
+      <FileText className="h-4 w-4 shrink-0 text-brand-500" />
+      <span className="min-w-0">
+        <span className="block max-w-[200px] truncate font-medium text-slate-700">{a.filename}</span>
+        {analysis && (
+          <span className="block text-[10px] text-slate-400">
+            {analysis.category}{analysis.used_ocr ? " · OCR" : ""}
+          </span>
+        )}
+      </span>
+      {canExtract && (
+        <label className="flex cursor-pointer items-center gap-1 text-[10px] font-semibold text-slate-500">
+          <input
+            type="checkbox"
+            checked={timesheetChecked}
+            onChange={(e) => {
+              setSelectedTimesheetIds((prev) => {
+                const next = new Set(prev);
+                if (e.target.checked) next.add(a.attachment_id);
+                else next.delete(a.attachment_id);
+                return next;
+              });
+            }}
+            className="rounded border-slate-300 text-brand-600"
+          />
+          Extract
+        </label>
+      )}
+      <button
+        type="button"
+        onClick={() => setPreview({ url: attachmentUrl(providerId, a.attachment_id), filename: a.filename, contentType: a.content_type })}
+        className="ml-1 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-brand-500 hover:text-brand-700"
+      >
+        Preview
+      </button>
+    </div>
+  );
+}
+
+function AttachmentChips({
+  attachments,
+  providerId,
+  ai,
+  selectedTimesheetIds,
+  setSelectedTimesheetIds,
+  approvalAttachmentId,
+  setApprovalAttachmentId,
+  status,
+  setPreview,
+  aiAtt,
+  inlineIds,
+}: {
+  attachments: Attachment[];
+  providerId: string;
+  ai: any;
+  selectedTimesheetIds: Set<string>;
+  setSelectedTimesheetIds: Dispatch<SetStateAction<Set<string>>>;
+  approvalAttachmentId: string | null;
+  setApprovalAttachmentId: Dispatch<SetStateAction<string | null>>;
+  status: string;
+  setPreview: (f: PreviewFile) => void;
+  aiAtt: (id: string) => any;
+  inlineIds: Set<string>;
+}) {
+  // Documents (PDF/DOCX/EML) → top chip strip
+  const docs = attachments.filter((a) => !inlineIds.has(a.attachment_id) && isDocAttachment(a));
+  // Images that are NOT inline CID (approval screenshots, non-logo images)
+  const images = attachments.filter((a) => !inlineIds.has(a.attachment_id) && isImageAttachment(a));
+
+  if (!docs.length && !images.length) return null;
+
+  return (
+    <div className="border-b border-slate-100 px-5 py-3 space-y-3">
+      {docs.length > 0 && (
+        <div>
+          <p className="mb-2 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400">
+            <Paperclip className="h-3 w-3" />
+            {docs.length} attachment{docs.length !== 1 ? "s" : ""}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {docs.map((a) => (
+              <div key={a.attachment_id}>
+                <AttachmentChip
+                  a={a}
+                  providerId={providerId}
+                  ai={ai}
+                  selectedTimesheetIds={selectedTimesheetIds}
+                  setSelectedTimesheetIds={setSelectedTimesheetIds}
+                  status={status}
+                  setPreview={setPreview}
+                  aiAtt={aiAtt}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {images.length > 0 && (
+        <div>
+          <p className="mb-2 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400">
+            <ImageIcon className="h-3 w-3" />
+            {images.length} image{images.length !== 1 ? "s" : ""}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {images.map((a) => {
+              const analysis = aiAtt(a.attachment_id);
+              const isApproval = a.kind === "approval_screenshot" || analysis?.category === "approval";
+              const approvalChecked = approvalAttachmentId === a.attachment_id;
+              const canDecide = status === "new" || status === "ingested";
+              return (
+                <div
+                  key={a.attachment_id}
+                  className={cn(
+                    "flex items-center gap-2 rounded-lg border px-2.5 py-2 text-xs transition-colors",
+                    approvalChecked
+                      ? "border-emerald-300 bg-emerald-50 ring-1 ring-emerald-100"
+                      : "border-slate-200 bg-white hover:border-emerald-200",
+                  )}
+                >
+                  <ImageIcon className="h-4 w-4 shrink-0 text-emerald-500" />
+                  <span className="min-w-0">
+                    <span className="block max-w-[160px] truncate font-medium text-slate-700">{a.filename}</span>
+                    {analysis && (
+                      <span className="block text-[10px] text-slate-400">{analysis.category}</span>
+                    )}
+                  </span>
+                  {(isApproval || !analysis) && canDecide && (
+                    <label className="flex cursor-pointer items-center gap-1 text-[10px] font-semibold text-emerald-600">
+                      <input
+                        type="checkbox"
+                        checked={approvalChecked}
+                        onChange={(e) => {
+                          if (e.target.checked) setApprovalAttachmentId(a.attachment_id);
+                          else setApprovalAttachmentId((c) => (c === a.attachment_id ? null : c));
+                        }}
+                        className="rounded border-slate-300 text-emerald-600"
+                      />
+                      Approval
+                    </label>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setPreview({ url: attachmentUrl(providerId, a.attachment_id), filename: a.filename, contentType: a.content_type })}
+                    className="ml-1 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-brand-500 hover:text-brand-700"
+                  >
+                    Preview
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main page
+// ---------------------------------------------------------------------------
 
 export default function InboxPage() {
   const qc = useQueryClient();
@@ -95,7 +658,6 @@ export default function InboxPage() {
     getNextPageParam: (last) => (last.has_more ? last.offset + last.items.length : undefined),
   });
   const emails = data?.pages.flatMap((p) => p.items) ?? [];
-  const total = data?.pages[0]?.total ?? 0;
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useSentinel(
     () => hasNextPage && !isFetchingNextPage && fetchNextPage(),
@@ -185,16 +747,32 @@ export default function InboxPage() {
 
   const ai = detail?.ai_check;
   const aiAtt = (id: string) => ai?.attachments.find((a) => a.attachment_id === id);
+  const isForwarded = isForwardedSubject(detail?.subject ?? null);
+
+  // Inline-image attachments referenced via [cid:...] (text) or src="cid:..." (HTML)
+  const inlineIds = useMemo(
+    () =>
+      detail
+        ? inlineAttachmentIds(detail.body_text ?? "", detail.body_html ?? null, detail.attachments)
+        : new Set<string>(),
+    [detail?.body_text, detail?.body_html, detail?.attachments],
+  );
+
+  // Full-screen email detail mode
+  const [fullscreen, setFullscreen] = useState(false);
 
   return (
     <div className="flex h-full animate-fade-up flex-col">
-      <PageHeader
-        title="Email Inbox"
-        subtitle="Select an email, run AI Check, then Accept to extract."
-      />
+     
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 xl:grid-cols-[400px_1fr]">
-        <Card className="flex min-h-0 flex-col">
+      <div className={cn(
+        "grid min-h-0 flex-1 gap-5",
+        fullscreen
+          ? "grid-cols-1"
+          : "grid-cols-1 xl:grid-cols-[300px_1fr]",
+      )}>
+        {/* ── Left: email list (hidden in fullscreen) ───────────── */}
+        <Card className={cn("flex min-h-0 flex-col", fullscreen && "hidden xl:hidden")}>
           <div className="flex items-center gap-2 border-b border-slate-100 p-3">
             <div className="relative flex-1">
               <Search className="absolute left-2.5 top-2 h-4 w-4 text-slate-400" />
@@ -268,6 +846,7 @@ export default function InboxPage() {
           </div>
         </Card>
 
+        {/* ── Right: email detail ───────────────────────────────── */}
         <Card className="flex min-h-0 flex-col">
           {!selected ? (
             <EmptyState
@@ -282,122 +861,171 @@ export default function InboxPage() {
             </div>
           ) : (
             <>
-              <div className="border-b border-slate-100 p-5">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <h2 className="text-base font-bold text-slate-900">{detail.subject}</h2>
-                    <p className="mt-0.5 text-xs text-slate-500">
-                      {detail.sender_name} &lt;{detail.sender_email}&gt; · {formatDateTime(detail.received_at)}
-                    </p>
-                    {ai?.matched_employee && (
-                      <span className="mt-1.5 inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
-                        <UserCheck className="h-3 w-3" />
-                        {ai.matched_employee.employee_name} · {ai.matched_employee.employee_id}
-                        {ai.matched_employee.location ? ` · ${ai.matched_employee.location}` : ""}
-                      </span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {fetchingDetail && <Spinner className="h-4 w-4" />}
-                    <StatusBadge status={detail.status} />
-                  </div>
+              {fullscreen ? (
+                /* ── Fullscreen: minimal collapse bar only ─────── */
+                <div className="flex shrink-0 items-center justify-between border-b border-slate-100 px-4 py-2">
+                  <span className="truncate text-xs font-semibold text-slate-500">{detail.subject || "(no subject)"}</span>
+                  <button
+                    type="button"
+                    title="Collapse"
+                    onClick={() => setFullscreen(false)}
+                    className="ml-3 flex shrink-0 items-center gap-1 rounded px-2 py-1 text-xs text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                  >
+                    <ChevronRight className="h-3.5 w-3.5 rotate-180" /> Collapse
+                  </button>
                 </div>
-                <div className="mt-4 flex flex-wrap gap-2">
-                  <Button variant="secondary" disabled={aiRunning || loadingDetail} onClick={runAiCheck} title="Run AI check">
-                    {aiRunning ? <Spinner className="h-4 w-4" /> : <Brain className="h-4 w-4" />}
-                    AI Check
-                  </Button>
-                  {detail.status === "new" && (
-                    <>
-                      <Button
-                        variant="success"
-                        disabled={decide.isPending || !canExtract}
-                        onClick={() =>
-                          decide.mutate({
-                            id: detail.provider_message_id,
-                            accepted: true,
-                            selection: buildSelection(),
-                          })
-                        }
-                      >
-                        {decide.isPending ? <Spinner className="border-white/40 border-t-white" /> : <CheckCircle2 className="h-4 w-4" />}
-                        Accept · Extract ({extractCount})
-                      </Button>
-                      <Button
-                        variant="secondary"
-                        disabled={decide.isPending}
-                        onClick={() => decide.mutate({ id: detail.provider_message_id, accepted: false })}
-                      >
-                        <Archive className="h-4 w-4" /> Archive
-                      </Button>
-                    </>
-                  )}
-                  {detail.status === "archived" && (
-                    <Button variant="secondary" onClick={() => restore.mutate(detail.provider_message_id)}>
-                      <Undo2 className="h-4 w-4" /> Restore
-                    </Button>
-                  )}
-                  {detail.status === "ingested" && (
-                    <Button
-                      variant="secondary"
-                      disabled={rerun.isPending || !canExtract}
-                      onClick={() =>
-                        rerun.mutate({ id: detail.provider_message_id, selection: buildSelection() })
-                      }
-                    >
-                      <RotateCcw className={cn("h-4 w-4", rerun.isPending && "animate-spin")} />
-                      Re-run extraction
-                    </Button>
-                  )}
-                </div>
-              </div>
+              ) : (
+                <>
+                  {/* ── Email header — Outlook style ─────────────── */}
+                  <div className="shrink-0 border-b border-slate-100 px-5 py-3">
+                    <div className="flex items-start gap-3">
+                      {/* Left: subject + meta */}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <h2 className="text-sm font-bold leading-snug text-slate-900">
+                            {detail.subject || "(no subject)"}
+                          </h2>
+                          {isForwarded && (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-violet-50 px-2 py-0.5 text-[10px] font-semibold text-violet-600">
+                              <Forward className="h-3 w-3" /> Forwarded
+                            </span>
+                          )}
+                        </div>
 
-              {(ai || aiRunning) && (
-                <div className="border-b border-slate-100 bg-slate-50/80 px-5 py-4">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Brain className="h-4 w-4 text-brand-600" />
-                    <span className="text-sm font-semibold text-slate-800">AI analysis</span>
-                    {aiRunning && <Spinner className="h-4 w-4" />}
-                    {ai?.used_llm && ai.model && <Badge tone="slate">{ai.model}</Badge>}
-                    {ai && !ai.used_llm && <Badge tone="slate">Rules only</Badge>}
-                  </div>
-                  {ai && (
-                    <>
-                      <p className="mt-1 text-sm text-slate-600">{ai.summary}</p>
-                      <div className="mt-3 grid gap-3 md:grid-cols-2">
-                        {ai.found.length > 0 && (
-                          <div>
-                            <p className="text-[10px] font-bold uppercase tracking-wide text-emerald-600">Found</p>
-                            <ul className="mt-1 space-y-1">
-                              {ai.found.map((line) => (
-                                <li key={line} className="flex items-start gap-1.5 text-xs text-slate-700">
-                                  <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-500" />
-                                  {line}
-                                </li>
-                              ))}
-                            </ul>
+                        {/* From / Date metadata */}
+                        <div className="mt-1.5 space-y-0.5 text-xs text-slate-600">
+                          <div className="flex gap-2">
+                            <span className="w-10 shrink-0 font-semibold text-slate-400">From</span>
+                            <span className="flex min-w-0 flex-wrap items-center gap-1.5">
+                              <span
+                                className={cn(
+                                  "flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[8px] font-bold",
+                                  avatarColor(detail.sender_name)
+                                )}
+                              >
+                                {initials(detail.sender_name)}
+                              </span>
+                              <span className="font-medium text-slate-800">{detail.sender_name}</span>
+                              {detail.sender_email && (
+                                <span className="text-slate-400 truncate">&lt;{detail.sender_email}&gt;</span>
+                              )}
+                            </span>
                           </div>
-                        )}
-                        {ai.missing.length > 0 && (
-                          <div>
-                            <p className="text-[10px] font-bold uppercase tracking-wide text-amber-600">Notes</p>
-                            <ul className="mt-1 space-y-1">
-                              {ai.missing.map((line) => (
-                                <li key={line} className="flex items-start gap-1.5 text-xs text-slate-700">
-                                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
-                                  {line}
-                                </li>
-                              ))}
-                            </ul>
+                          <div className="flex gap-2">
+                            <span className="w-10 shrink-0 font-semibold text-slate-400">Date</span>
+                            <span>{formatDateTime(detail.received_at)}</span>
                           </div>
-                        )}
+                          {ai?.matched_employee && (
+                            <div className="flex gap-2">
+                              <span className="w-10 shrink-0 font-semibold text-slate-400">Match</span>
+                              <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
+                                <UserCheck className="h-3 w-3" />
+                                {ai.matched_employee.employee_name} · {ai.matched_employee.employee_id}
+                                {ai.matched_employee.location ? ` · ${ai.matched_employee.location}` : ""}
+                              </span>
+                            </div>
+                          )}
+                        </div>
                       </div>
-                    </>
-                  )}
-                </div>
+
+                      {/* Right: status badge + expand + action buttons */}
+                      <div className="flex shrink-0 flex-col items-end gap-2">
+                        <div className="flex items-center gap-1.5">
+                          {fetchingDetail && <Spinner className="h-3.5 w-3.5" />}
+                          <StatusBadge status={detail.status} />
+                          <button
+                            type="button"
+                            title="Expand to full screen"
+                            onClick={() => setFullscreen(true)}
+                            className="rounded p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                          >
+                            <Maximize2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+
+                        {/* Action buttons */}
+                        <div className="flex flex-wrap justify-end gap-1.5">
+                          <Button size="sm" variant="secondary" disabled={aiRunning || loadingDetail} onClick={runAiCheck}>
+                            {aiRunning ? <Spinner className="h-3 w-3" /> : <Brain className="h-3 w-3" />}
+                            AI Check
+                          </Button>
+                          {detail.status === "new" && (
+                            <>
+                              <Button
+                                size="sm"
+                                variant="success"
+                                disabled={decide.isPending || !canExtract}
+                                onClick={() =>
+                                  decide.mutate({
+                                    id: detail.provider_message_id,
+                                    accepted: true,
+                                    selection: buildSelection(),
+                                  })
+                                }
+                              >
+                                {decide.isPending ? (
+                                  <Spinner className="border-white/40 border-t-white h-3 w-3" />
+                                ) : (
+                                  <CheckCircle2 className="h-3 w-3" />
+                                )}
+                                Accept ({extractCount})
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                disabled={decide.isPending}
+                                onClick={() => decide.mutate({ id: detail.provider_message_id, accepted: false })}
+                              >
+                                <Archive className="h-3 w-3" /> Archive
+                              </Button>
+                            </>
+                          )}
+                          {detail.status === "archived" && (
+                            <Button size="sm" variant="secondary" onClick={() => restore.mutate(detail.provider_message_id)}>
+                              <Undo2 className="h-3 w-3" /> Restore
+                            </Button>
+                          )}
+                          {detail.status === "ingested" && (
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              disabled={rerun.isPending || !canExtract}
+                              onClick={() =>
+                                rerun.mutate({ id: detail.provider_message_id, selection: buildSelection() })
+                              }
+                            >
+                              <RotateCcw className={cn("h-3 w-3", rerun.isPending && "animate-spin")} />
+                              Re-run
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* ── Attachments — Outlook chips, above body ──── */}
+                  <AttachmentChips
+                    attachments={detail.attachments}
+                    providerId={detail.provider_message_id}
+                    ai={ai}
+                    selectedTimesheetIds={selectedTimesheetIds}
+                    setSelectedTimesheetIds={setSelectedTimesheetIds}
+                    approvalAttachmentId={approvalAttachmentId}
+                    setApprovalAttachmentId={setApprovalAttachmentId}
+                    status={detail.status}
+                    setPreview={setPreview}
+                    aiAtt={aiAtt}
+                    inlineIds={inlineIds}
+                  />
+
+                  {/* ── AI analysis — collapsed by default ────────── */}
+                  <AiAnalysisPanel ai={ai} aiRunning={aiRunning} />
+                </>
               )}
 
-              <div className="min-h-0 flex-1 overflow-y-auto p-5">
+              {/* ── Body ─────────────────────────────────────────── */}
+              <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+                {/* Convert-body-to-image option (AI suggestion) */}
                 {ai?.extract_body && (detail.status === "new" || detail.status === "ingested") && (
                   <div className="mb-4 rounded-lg border border-brand-200 bg-brand-50/70 p-4">
                     <label className="flex cursor-pointer items-start gap-3">
@@ -410,7 +1038,8 @@ export default function InboxPage() {
                       <span className="min-w-0 flex-1">
                         <span className="text-sm font-semibold text-slate-800">Convert email to image</span>
                         <p className="mt-0.5 text-xs text-slate-600">
-                          Timesheet table is in the message body — renders subject + body to JPEG for pipeline extraction.
+                          Timesheet table is in the message body — renders subject + body to JPEG for pipeline
+                          extraction.
                         </p>
                         <Button
                           type="button"
@@ -432,106 +1061,14 @@ export default function InboxPage() {
                   </div>
                 )}
 
-                <pre className="whitespace-pre-wrap rounded-lg bg-slate-50 p-4 font-sans text-sm leading-6 text-slate-700">
-                  {detail.body_text}
-                </pre>
-
-                <div className="mb-2 mt-5">
-                  <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500">
-                    Attachments ({detail.attachments.length})
-                  </h3>
-                </div>
-                <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-                  {detail.attachments.map((a) => {
-                    const analysis = aiAtt(a.attachment_id);
-                    const isTimesheet = a.kind === "timesheet" || analysis?.category === "timesheet";
-                    const isApproval = a.kind === "approval_screenshot" || analysis?.category === "approval";
-                    const extractable = isTimesheet || isApproval || !!analysis;
-                    const timesheetChecked = selectedTimesheetIds.has(a.attachment_id);
-                    const approvalChecked = approvalAttachmentId === a.attachment_id;
-                    return (
-                      <div
-                        key={a.attachment_id}
-                        className={cn(
-                          "flex items-stretch gap-2 rounded-lg border border-slate-200 bg-white",
-                          extractable && (timesheetChecked || approvalChecked) && "border-brand-300 ring-1 ring-brand-100"
-                        )}
-                      >
-                        {extractable && (detail.status === "new" || detail.status === "ingested") && (
-                          <div className="flex shrink-0 flex-col justify-center gap-2 border-r border-slate-100 px-2 py-2">
-                            {isTimesheet && (
-                              <label className="flex cursor-pointer items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
-                                <input
-                                  type="checkbox"
-                                  checked={timesheetChecked}
-                                  onChange={(e) => {
-                                    setSelectedTimesheetIds((prev) => {
-                                      const next = new Set(prev);
-                                      if (e.target.checked) next.add(a.attachment_id);
-                                      else next.delete(a.attachment_id);
-                                      return next;
-                                    });
-                                  }}
-                                  className="rounded border-slate-300 text-brand-600"
-                                />
-                                Extract
-                              </label>
-                            )}
-                            {isApproval && (
-                              <label className="flex cursor-pointer items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-600">
-                                <input
-                                  type="checkbox"
-                                  checked={approvalChecked}
-                                  onChange={(e) => {
-                                    if (e.target.checked) setApprovalAttachmentId(a.attachment_id);
-                                    else setApprovalAttachmentId((c) => (c === a.attachment_id ? null : c));
-                                  }}
-                                  className="rounded border-slate-300 text-emerald-600"
-                                />
-                                Approval
-                              </label>
-                            )}
-                          </div>
-                        )}
-                        <div className="min-w-0 flex-1">
-                          <PreviewableFileRow
-                            file={{
-                              url: attachmentUrl(detail.provider_message_id, a.attachment_id),
-                              filename: a.filename,
-                              contentType: a.content_type,
-                            }}
-                            onPreview={setPreview}
-                            className="border-0 hover:border-0"
-                            icon={
-                              isApproval ? (
-                                <ImageIcon className="h-5 w-5 shrink-0 text-emerald-500" />
-                              ) : isTimesheet ? (
-                                <FileText className="h-5 w-5 shrink-0 text-brand-500" />
-                              ) : (
-                                <Paperclip className="h-5 w-5 shrink-0 text-slate-400" />
-                              )
-                            }
-                            subtitle={
-                              analysis
-                                ? `${analysis.category} — ${analysis.reason}${
-                                    analysis.used_ocr ? " · OCR" : ""
-                                  }${
-                                    analysis.text_chars != null && analysis.text_chars > 0
-                                      ? ` · ${analysis.text_chars} chars`
-                                      : ""
-                                  }`
-                                : isTimesheet
-                                  ? "Timesheet document"
-                                  : isApproval
-                                    ? "Approval screenshot"
-                                    : "Waiting for AI check"
-                            }
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                {/* Email body — HTML iframe when available, plain-text fallback */}
+                <EmailBodyRenderer
+                  bodyText={detail.body_text}
+                  bodyHtml={detail.body_html}
+                  subject={detail.subject}
+                  attachments={detail.attachments}
+                  providerId={detail.provider_message_id}
+                />
               </div>
             </>
           )}

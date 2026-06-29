@@ -49,6 +49,11 @@ class EmailMessage(Base):
 
     has_approval_screenshot: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # HTML body — populated when the email provider returns HTML (e.g. Graph).
+    # Used for rich rendering in the UI; body_text is the plain-text fallback and
+    # is used for search and AI check (smaller, no markup noise).
+    body_html: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Inbox AI check (gpt-4.1-nano): attachment triage + recommended employee.
     ai_check: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     ai_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

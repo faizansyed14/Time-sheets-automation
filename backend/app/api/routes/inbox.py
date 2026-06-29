@@ -36,7 +36,7 @@ async def _sync_message(db: AsyncSession, msg) -> EmailMessage:
     ).scalar_one_or_none()
     atts = [
         {"attachment_id": a.attachment_id, "filename": a.filename,
-         "content_type": a.content_type, "size": a.size, "kind": a.kind}
+         "content_type": a.content_type, "size": a.size, "kind": a.kind, "cid": a.cid}
         for a in msg.attachments
     ]
     has_approval = any(a["kind"] == "approval_screenshot" for a in atts)
@@ -46,6 +46,7 @@ async def _sync_message(db: AsyncSession, msg) -> EmailMessage:
         existing.subject = msg.subject
         existing.received_at = msg.received_at
         existing.body_text = msg.body_text
+        existing.body_html = msg.body_html
         existing.attachments = atts
         existing.has_approval_screenshot = has_approval
         return existing
@@ -56,6 +57,7 @@ async def _sync_message(db: AsyncSession, msg) -> EmailMessage:
         subject=msg.subject,
         received_at=msg.received_at,
         body_text=msg.body_text,
+        body_html=msg.body_html,
         attachments=atts,
         has_approval_screenshot=has_approval,
         status=EmailStatus.NEW,
@@ -150,10 +152,12 @@ async def get_email(
     return EmailDetail(
         **base.model_dump(),
         body_text=row.body_text,
+        body_html=row.body_html,
         attachments=[
             AttachmentOut(
                 attachment_id=a["attachment_id"], filename=a["filename"],
                 content_type=a["content_type"], kind=a["kind"],
+                cid=a.get("cid"),
             )
             for a in (row.attachments or [])
         ],

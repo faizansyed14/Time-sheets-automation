@@ -19,6 +19,7 @@ class ProviderAttachment:
     content_type: str
     size: int
     kind: str  # "timesheet" | "approval_screenshot" | "other"
+    cid: str | None = None  # MIME Content-ID for inline CID resolution
 
 
 @dataclass
@@ -29,6 +30,7 @@ class ProviderMessage:
     subject: str
     received_at: datetime
     body_text: str
+    body_html: str | None = None
     attachments: list[ProviderAttachment] = field(default_factory=list)
 
 

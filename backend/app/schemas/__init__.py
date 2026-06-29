@@ -24,6 +24,7 @@ class AttachmentOut(BaseModel):
     filename: str
     content_type: str
     kind: str
+    cid: str | None = None
 
 
 class MatchedEmployeeOut(BaseModel):
@@ -67,6 +68,7 @@ class EmailListItem(BaseModel):
 
 class EmailDetail(EmailListItem):
     body_text: str | None
+    body_html: str | None = None
     attachments: list[AttachmentOut]
     ai_check: EmailAiCheckOut | None = None
     ai_check_running: bool = False

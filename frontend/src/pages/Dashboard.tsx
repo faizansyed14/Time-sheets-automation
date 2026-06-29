@@ -193,7 +193,6 @@ export default function Dashboard() {
     <div className="animate-fade-up">
       <PageHeader
         title="Dashboard"
-        subtitle="Who has submitted, who is missing, and what still needs review — at a glance."
         actions={
           <div className="flex items-center gap-2">
             <Select value={month} onChange={(e) => setMonth(Number(e.target.value))}>
