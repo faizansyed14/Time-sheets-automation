@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   LayoutDashboard,
   Mail,
+  MessagesSquare,
   UploadCloud,
   Activity,
   Users,
@@ -24,6 +25,7 @@ import { useAuth } from "../lib/auth";
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/inbox", label: "Email Inbox", icon: Mail },
+  { to: "/chat", label: "Agentic Chat", icon: MessagesSquare },
   { to: "/upload", label: "Upload", icon: UploadCloud },
   { to: "/pipeline", label: "Pipeline", icon: Activity },
   { to: "/employees", label: "Employees", icon: Users },
@@ -38,6 +40,7 @@ const ADMIN_NAV = [
 const TITLES: Record<string, string> = {
   "/": "Dashboard",
   "/inbox": "Email Inbox",
+  "/chat": "Agentic Chat",
   "/upload": "Upload timesheets",
   "/pipeline": "Pipeline tracker",
   "/employees": "Employee matcher",

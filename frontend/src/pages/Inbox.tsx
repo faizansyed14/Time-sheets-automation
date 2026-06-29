@@ -28,15 +28,18 @@ import {
   fetchInbox,
   rerunExtraction,
   restoreEmail,
+  stageExtraction,
   type Attachment,
   type EmailAiCheck,
   type EmailListItem,
   type IngestSelection,
+  type PipelineFile,
 } from "../api/client";
 import { cn, formatDateTime, initials, avatarColor } from "../lib/utils";
 import { FilePreviewModal } from "../components/FilePreview";
+import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
 import { sanitizeEmailHtml } from "../lib/filePreview";
-import { Badge, Button, Card, EmptyState, PageHeader, Select, Skeleton, Spinner } from "../components/ui";
+import { Badge, Button, Card, EmptyState, Select, Skeleton, Spinner } from "../components/ui";
 import { useToast } from "../components/toast";
 import { useDebounced, useSentinel } from "../lib/useInfinite";
 import type { PreviewFile } from "../lib/filePreview";
@@ -276,15 +279,36 @@ function EmailBodyRenderer({
 }) {
   // -- HTML path: resolve CIDs, sanitize, render in sandboxed iframe ----------
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [frameHeight, setFrameHeight] = useState(320);
 
   useEffect(() => {
     if (!bodyHtml) return;
+    // Most cid: images are already inlined as data URIs by the backend; this
+    // resolves any that weren't, then we sandbox the result in an iframe.
     const resolved = resolveCidsInHtml(bodyHtml, attachments, providerId);
     const safe = sanitizeEmailHtml(resolved);
-    const blob = URL.createObjectURL(new Blob([safe], { type: "text/html" }));
+    const doc =
+      `<!doctype html><html><head><meta charset="utf-8">` +
+      `<base target="_blank">` +
+      `<style>html,body{margin:0;padding:12px;font-family:Calibri,Segoe UI,Arial,sans-serif;` +
+      `color:#1f2937;font-size:14px;line-height:1.5;word-wrap:break-word}` +
+      `img{max-width:100%;height:auto}table{max-width:100%}</style></head>` +
+      `<body>${safe}</body></html>`;
+    const blob = URL.createObjectURL(new Blob([doc], { type: "text/html" }));
     setBlobUrl(blob);
     return () => URL.revokeObjectURL(blob);
   }, [bodyHtml, attachments, providerId]);
+
+  // The blob is same-origin (allow-same-origin), so we can measure its content
+  // and grow the iframe to fit — no inner scrollbar, renders like Outlook.
+  const sizeToContent = (e: React.SyntheticEvent<HTMLIFrameElement>) => {
+    try {
+      const body = e.currentTarget.contentWindow?.document?.body;
+      if (body) setFrameHeight(Math.max(120, body.scrollHeight + 24));
+    } catch {
+      /* cross-origin guard — keep default height */
+    }
+  };
 
   if (bodyHtml) {
     if (!blobUrl) return null;
@@ -293,8 +317,10 @@ function EmailBodyRenderer({
         key={blobUrl}
         src={blobUrl}
         title="Email body"
-        sandbox="allow-same-origin"
-        className="h-full w-full min-h-[300px] border-0"
+        onLoad={sizeToContent}
+        sandbox="allow-same-origin allow-popups"
+        style={{ height: frameHeight }}
+        className="w-full border-0"
       />
     );
   }
@@ -434,7 +460,6 @@ function isImageAttachment(a: Attachment): boolean {
 function AttachmentChip({
   a,
   providerId,
-  ai,
   selectedTimesheetIds,
   setSelectedTimesheetIds,
   status,
@@ -443,7 +468,7 @@ function AttachmentChip({
 }: {
   a: Attachment;
   providerId: string;
-  ai: any;
+  ai?: any;
   selectedTimesheetIds: Set<string>;
   setSelectedTimesheetIds: Dispatch<SetStateAction<Set<string>>>;
   status: string;
@@ -633,6 +658,8 @@ export default function InboxPage() {
   const [approvalAttachmentId, setApprovalAttachmentId] = useState<string | null>(null);
   const [extractBodyEnabled, setExtractBodyEnabled] = useState(false);
   const [aiRunning, setAiRunning] = useState(false);
+  // Staged pipeline files awaiting review in the Compare & Fix overlay (queue).
+  const [stagedQueue, setStagedQueue] = useState<PipelineFile[]>([]);
 
   useEffect(() => setPreview(null), [selected]);
   useEffect(() => {
@@ -658,6 +685,7 @@ export default function InboxPage() {
     getNextPageParam: (last) => (last.has_more ? last.offset + last.items.length : undefined),
   });
   const emails = data?.pages.flatMap((p) => p.items) ?? [];
+
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useSentinel(
     () => hasNextPage && !isFetchingNextPage && fetchNextPage(),
@@ -673,14 +701,17 @@ export default function InboxPage() {
 
   useEffect(() => {
     if (!detail) return;
+    // Only real documents (pdf/docx/xlsx/eml) are ever auto-selected for
+    // extraction — images, logos and approval screenshots never are.
+    const docIds = new Set(detail.attachments.filter(isDocAttachment).map((a) => a.attachment_id));
     const sel = applyAiSelection(detail);
     if (detail.ai_check) {
-      setSelectedTimesheetIds(sel.timesheets);
+      setSelectedTimesheetIds(new Set([...sel.timesheets].filter((id) => docIds.has(id))));
       setApprovalAttachmentId(sel.approval);
       setExtractBodyEnabled(!!detail.ai_check.extract_body);
     } else {
       const timesheetIds = detail.attachments
-        .filter((a) => a.kind === "timesheet")
+        .filter((a) => a.kind === "timesheet" && docIds.has(a.attachment_id))
         .map((a) => a.attachment_id);
       setSelectedTimesheetIds(new Set(timesheetIds));
       setApprovalAttachmentId(null);
@@ -716,6 +747,31 @@ export default function InboxPage() {
     onError: (e: any) => toast("error", "Action failed", e?.response?.data?.detail ?? String(e)),
   });
 
+  // Run Extraction → stage selected sources into the pipeline, then review &
+  // accept each via the Compare & Fix overlay.
+  const stage = useMutation({
+    mutationFn: ({ id, selection }: { id: string; selection: IngestSelection }) =>
+      stageExtraction(id, { attachment_ids: selection.attachment_ids, extract_body: selection.extract_body }),
+    onSuccess: (files: PipelineFile[]) => {
+      qc.invalidateQueries({ queryKey: ["pipeline"] });
+      qc.invalidateQueries({ queryKey: ["pipeline-stats"] });
+      if (!files.length) {
+        toast("warning", "Nothing to extract", "No timesheet could be extracted from the selection.");
+        return;
+      }
+      setStagedQueue(files);
+    },
+    onError: (e: any) => toast("error", "Extraction failed", e?.response?.data?.detail ?? String(e)),
+  });
+
+  // Advance the review queue (after Accept/file or Reject/cancel).
+  const advanceQueue = () => setStagedQueue((q) => q.slice(1));
+  const onStagedSaved = () => {
+    toast("success", "Record filed", "Saved to the pipeline and File Vault.");
+    invalidate();
+    advanceQueue();
+  };
+
   const restore = useMutation({
     mutationFn: restoreEmail,
     onSuccess: () => {
@@ -749,14 +805,15 @@ export default function InboxPage() {
   const aiAtt = (id: string) => ai?.attachments.find((a) => a.attachment_id === id);
   const isForwarded = isForwardedSubject(detail?.subject ?? null);
 
-  // Inline-image attachments referenced via [cid:...] (text) or src="cid:..." (HTML)
-  const inlineIds = useMemo(
-    () =>
-      detail
-        ? inlineAttachmentIds(detail.body_text ?? "", detail.body_html ?? null, detail.attachments)
-        : new Set<string>(),
-    [detail?.body_text, detail?.body_html, detail?.attachments],
-  );
+  // Inline-image attachments to hide from the chip list. The backend already
+  // resolves cid: images to data URIs and reports which attachments it inlined;
+  // we union that with a client-side scan as a fallback for any unresolved cids.
+  const inlineIds = useMemo(() => {
+    if (!detail) return new Set<string>();
+    const ids = inlineAttachmentIds(detail.body_text ?? "", detail.body_html ?? null, detail.attachments);
+    for (const id of detail.inline_attachment_ids ?? []) ids.add(id);
+    return ids;
+  }, [detail?.body_text, detail?.body_html, detail?.attachments, detail?.inline_attachment_ids]);
 
   // Full-screen email detail mode
   const [fullscreen, setFullscreen] = useState(false);
@@ -825,7 +882,7 @@ export default function InboxPage() {
                       </span>
                     </span>
                     <span className="block truncate text-xs text-slate-500">{m.subject}</span>
-                    <span className="mt-1 flex items-center gap-2">
+                    <span className="mt-1 flex flex-wrap items-center gap-2">
                       <StatusBadge status={m.status} />
                       <span className="flex items-center gap-0.5 text-[11px] text-slate-400">
                         <Paperclip className="h-3 w-3" />
@@ -954,21 +1011,16 @@ export default function InboxPage() {
                               <Button
                                 size="sm"
                                 variant="success"
-                                disabled={decide.isPending || !canExtract}
-                                onClick={() =>
-                                  decide.mutate({
-                                    id: detail.provider_message_id,
-                                    accepted: true,
-                                    selection: buildSelection(),
-                                  })
-                                }
+                                disabled={stage.isPending || !canExtract}
+                                onClick={() => stage.mutate({ id: detail.provider_message_id, selection: buildSelection() })}
+                                title="Extract and review before filing"
                               >
-                                {decide.isPending ? (
+                                {stage.isPending ? (
                                   <Spinner className="border-white/40 border-t-white h-3 w-3" />
                                 ) : (
                                   <CheckCircle2 className="h-3 w-3" />
                                 )}
-                                Accept ({extractCount})
+                                Run Extraction ({extractCount})
                               </Button>
                               <Button
                                 size="sm"
@@ -1019,7 +1071,7 @@ export default function InboxPage() {
                   />
 
                   {/* ── AI analysis — collapsed by default ────────── */}
-                  <AiAnalysisPanel ai={ai} aiRunning={aiRunning} />
+                  <AiAnalysisPanel ai={ai ?? null} aiRunning={aiRunning} />
                 </>
               )}
 
@@ -1076,6 +1128,15 @@ export default function InboxPage() {
       </div>
 
       <FilePreviewModal file={preview} onClose={() => setPreview(null)} />
+
+      {/* Run Extraction → review each staged file in the Compare & Fix overlay:
+          edit the extracted leaves, Accept (file record + vault) or Reject
+          (leave it in the pipeline). */}
+      <PipelineCompareFixModal
+        file={stagedQueue[0] ?? null}
+        onClose={advanceQueue}
+        onSaved={onStagedSaved}
+      />
     </div>
   );
 }

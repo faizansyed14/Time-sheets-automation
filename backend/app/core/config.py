@@ -92,9 +92,9 @@ class Settings(BaseSettings):
     vllm_temperature: float = 0.0
     vllm_timeout: int = 90
     # Runtime model choices (same names your project uses).
-    extraction_model: str = "gpt-4o"
-    vision_image_detail: str = "high"   # low | high — used for SCANS/photos
-    validation_model: str = "gpt-4o-mini"
+    extraction_model: str = "gpt-4o"        # override via EXTRACTION_MODEL in .env
+    vision_image_detail: str = "high"       # low | high — override via VISION_IMAGE_DETAIL
+    validation_model: str = "gpt-4o-mini"  # override via VALIDATION_MODEL in .env
     enable_text_validation: bool = True
 
     # ----- Cost / accuracy tuning (all admin-editable) -----
@@ -115,7 +115,9 @@ class Settings(BaseSettings):
     # tesseract runs locally (pytesseract + tesseract-ocr) and is completely free.
     ocr_provider: str = "none"
     # Cheap model for inbox AI check (classify attachments + body in one call).
-    ai_check_model: str = "gpt-4.1-nano"
+    ai_check_model: str = "gpt-4o-mini"
+    # Model for the Agentic Chat assistant (text → safe DB actions).
+    agent_chat_model: str = "gpt-4o"
 
     # CORS for the Vite dev server.
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]

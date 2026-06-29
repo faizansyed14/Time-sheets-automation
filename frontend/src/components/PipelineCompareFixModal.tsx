@@ -33,8 +33,8 @@ import {
   type Employee,
   type PipelineFile,
 } from "../api/client";
-import { isEml, isPdf, isPreviewable } from "../lib/filePreview";
-import { EmlPreviewPane } from "./FilePreview";
+import { isDocx, isEml, isPdf, isPreviewable } from "../lib/filePreview";
+import { DocxPreviewPane, EmlPreviewPane } from "./FilePreview";
 import { Button, Input, Select, Spinner } from "./ui";
 import { cn, formatBytes } from "../lib/utils";
 import { useToast } from "./toast";
@@ -52,6 +52,92 @@ const BUCKETS = [
 ] as const;
 
 const FILE_RE = /\.(pdf|docx|xlsx|png|jpe?g|eml)$/i;
+
+// ---------------------------------------------------------------------------
+// Month day-picker — a calendar that shows ONLY the record's month, so a date
+// from another month can never be added by mistake. Click a day to toggle it.
+// ---------------------------------------------------------------------------
+const WEEKDAYS = ["S", "M", "T", "W", "T", "F", "S"] as const;
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+function MonthDayPicker({
+  year,
+  month,
+  selected,
+  tone,
+  onToggle,
+}: {
+  year: number;
+  month: number; // 1-12
+  selected: string[];
+  tone: string;
+  onToggle: (iso: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const firstDow = new Date(year, month - 1, 1).getDay(); // 0 = Sunday
+  const iso = (d: number) => `${year}-${pad2(month)}-${pad2(d)}`;
+  const selSet = new Set(selected);
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="inline-flex items-center gap-1 rounded-md bg-brand-600 px-2 py-1 text-[11px] font-semibold text-white hover:bg-brand-700"
+      >
+        <Plus className="h-3.5 w-3.5" /> Add day
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full z-30 mt-1 w-[230px] rounded-lg border border-slate-200 bg-white p-2.5 shadow-pop">
+          <p className="mb-1.5 text-center text-[11px] font-semibold text-slate-600">
+            {MONTHS_LONG[month]} {year}
+          </p>
+          <div className="grid grid-cols-7 gap-0.5 text-center text-[9px] font-bold uppercase text-slate-400">
+            {WEEKDAYS.map((d, i) => (
+              <div key={i}>{d}</div>
+            ))}
+          </div>
+          <div className="mt-0.5 grid grid-cols-7 gap-0.5">
+            {Array.from({ length: firstDow }).map((_, i) => (
+              <div key={`blank-${i}`} />
+            ))}
+            {Array.from({ length: daysInMonth }).map((_, i) => {
+              const day = i + 1;
+              const on = selSet.has(iso(day));
+              return (
+                <button
+                  key={day}
+                  type="button"
+                  onClick={() => onToggle(iso(day))}
+                  className={cn(
+                    "flex h-7 items-center justify-center rounded text-[11px] font-medium transition-colors",
+                    on
+                      ? cn("ring-1 ring-inset", tone)
+                      : "text-slate-700 hover:bg-slate-100"
+                  )}
+                >
+                  {day}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Employee search (inline, no modal wrapper)
@@ -152,6 +238,14 @@ function RawFilePreview({ file }: { file: PipelineFile }) {
   if (isPdf(name, ct)) {
     return <iframe src={url} title={name} className="h-full w-full rounded-lg bg-white" />;
   }
+  if (isDocx(name, ct)) {
+    // Same DOCX renderer used by the email inbox preview.
+    return (
+      <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
+        <DocxPreviewPane fileUrl={url} />
+      </div>
+    );
+  }
   if (isPreviewable(name, ct)) {
     return (
       <img
@@ -198,7 +292,6 @@ export default function PipelineCompareFixModal({
   const [month, setMonth] = useState(new Date().getMonth() + 1);
   const [year, setYear] = useState(new Date().getFullYear());
   const [dates, setDates] = useState<Record<string, string[]>>({});
-  const [newDate, setNewDate] = useState<Record<string, string>>({});
   const [attachments, setAttachments] = useState<File[]>([]);
   const [note, setNote] = useState("");
   const [pending, setPending] = useState(false);
@@ -209,20 +302,32 @@ export default function PipelineCompareFixModal({
     enabled: !!file,
   });
 
-  // Reset when a new file is opened.
+  // Reset when a new file is opened. Pre-fill from the AI-staged extraction
+  // (extraction_meta.staged) so a "Run Extraction" review starts populated.
   useEffect(() => {
     if (!file || file.id === prevFileId.current) return;
     prevFileId.current = file.id;
-    setEmployeeQ(file.employee_id ?? file.employee_name ?? "");
-    setEmployeePk("");
-    setMonth(file.month ?? new Date().getMonth() + 1);
-    setYear(file.year ?? new Date().getFullYear());
-    setDates({});
-    setNewDate({});
+    const staged = (file.extraction_meta?.staged ?? null) as {
+      employee_pk?: string | null; matched_name?: string | null;
+      matched_employee_id?: string | null; month?: number | null; year?: number | null;
+      buckets?: Record<string, string[]>;
+    } | null;
+    if (staged?.employee_pk) {
+      setEmployeePk(staged.employee_pk);
+      setEmployeeQ(`${staged.matched_employee_id ?? ""} · ${staged.matched_name ?? ""}`.trim());
+    } else {
+      setEmployeePk("");
+      setEmployeeQ(file.employee_id ?? file.employee_name ?? "");
+    }
+    setMonth(staged?.month ?? file.month ?? new Date().getMonth() + 1);
+    setYear(staged?.year ?? file.year ?? new Date().getFullYear());
+    setDates(staged?.buckets ?? {});
     setAttachments([]);
     setNote("");
     setPending(false);
   }, [file]);
+
+  const isStaged = file?.failure_code === "pending_review";
 
   // Lock scroll + Escape key.
   useEffect(() => {
@@ -242,11 +347,16 @@ export default function PipelineCompareFixModal({
     [employees, employeePk]
   );
 
-  const addDate = (key: string) => {
-    const v = newDate[key];
-    if (!v) return;
-    setDates((d) => ({ ...d, [key]: [...new Set([...(d[key] ?? []), v])].sort() }));
-    setNewDate((n) => ({ ...n, [key]: "" }));
+  // Toggle a day in a bucket. The picker only offers days inside the record's
+  // month, so out-of-month dates can't be entered.
+  const toggleDate = (key: string, iso: string) => {
+    setDates((d) => {
+      const cur = d[key] ?? [];
+      const next = cur.includes(iso)
+        ? cur.filter((x) => x !== iso)
+        : [...cur, iso].sort();
+      return { ...d, [key]: next };
+    });
   };
 
   const addFiles = (list: FileList | null) => {
@@ -303,7 +413,7 @@ export default function PipelineCompareFixModal({
         <div className="flex shrink-0 items-center gap-2 border-b border-slate-100 bg-slate-50 px-4 py-3">
           <Columns2 className="h-4 w-4 text-slate-400" />
           <span className="min-w-0 flex-1 truncate text-sm font-semibold text-slate-700">
-            Compare &amp; Fix — {file.filename}
+            {isStaged ? "Review extraction" : "Compare & Fix"} — {file.filename}
           </span>
           {file.failure_detail && (
             <span className="hidden truncate text-xs text-rose-500 sm:block max-w-sm">
@@ -328,11 +438,21 @@ export default function PipelineCompareFixModal({
               Manual entry
             </h3>
 
-            {/* Error banner */}
-            <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm leading-5 text-rose-800">
-              <p className="font-semibold">{file.failure_label ?? "Failed"}</p>
-              <p className="mt-0.5">{file.failure_detail}</p>
-            </div>
+            {/* Banner — info for AI-staged review, error for a real failure */}
+            {isStaged ? (
+              <div className="mb-3 rounded-lg border border-brand-200 bg-brand-50 p-3 text-sm leading-5 text-brand-800">
+                <p className="font-semibold">AI-extracted — review &amp; accept</p>
+                <p className="mt-0.5 text-slate-600">
+                  The leaves below were read from the document. Check them against the preview, edit if
+                  needed, then Accept to file the record. Closing leaves it in the pipeline.
+                </p>
+              </div>
+            ) : (
+              <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm leading-5 text-rose-800">
+                <p className="font-semibold">{file.failure_label ?? "Failed"}</p>
+                <p className="mt-0.5">{file.failure_detail}</p>
+              </div>
+            )}
 
             {/* Employee */}
             <label className="mb-3 block">
@@ -408,21 +528,13 @@ export default function PipelineCompareFixModal({
                         </button>
                       </span>
                     ))}
-                    <span className="inline-flex items-center gap-1">
-                      <input
-                        type="date"
-                        value={newDate[b.key] ?? ""}
-                        onChange={(e) => setNewDate((n) => ({ ...n, [b.key]: e.target.value }))}
-                        className="rounded-md border border-slate-300 px-2 py-1 text-[11px] focus:border-brand-500 focus:outline-none"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => addDate(b.key)}
-                        className="rounded-md bg-brand-600 p-1 text-white hover:bg-brand-700"
-                      >
-                        <Plus className="h-3.5 w-3.5" />
-                      </button>
-                    </span>
+                    <MonthDayPicker
+                      year={year}
+                      month={month}
+                      selected={dates[b.key] ?? []}
+                      tone={b.tone}
+                      onToggle={(iso) => toggleDate(b.key, iso)}
+                    />
                   </div>
                 </div>
               ))}
@@ -481,7 +593,7 @@ export default function PipelineCompareFixModal({
             <div className="flex items-center gap-3 border-t border-slate-100 pt-4">
               <span className="flex-1 text-xs text-slate-400">{totalDays} day(s) entered</span>
               <Button variant="secondary" onClick={onClose} disabled={pending}>
-                Cancel
+                {isStaged ? "Reject" : "Cancel"}
               </Button>
               <Button disabled={!canSave} onClick={handleSave}>
                 {pending ? (
@@ -489,7 +601,7 @@ export default function PipelineCompareFixModal({
                 ) : (
                   <PencilLine className="h-4 w-4" />
                 )}
-                Save &amp; file record
+                {isStaged ? "Accept & file record" : "Save & file record"}
               </Button>
             </div>
           </div>

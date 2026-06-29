@@ -83,6 +83,7 @@ export interface EmailDetail extends EmailListItem {
   body_text: string | null;
   body_html: string | null;
   attachments: Attachment[];
+  inline_attachment_ids: string[];
   ai_check: EmailAiCheck | null;
   ai_check_running: boolean;
 }
@@ -289,6 +290,20 @@ export const fetchEmail = (id: string, refreshAi = false) =>
     .get<EmailDetail>(`/inbox/${id}`, { params: refreshAi ? { refresh_ai: true } : undefined })
     .then((r) => r.data);
 
+// Run Extraction → stage the selected attachments/body into the pipeline as
+// needs-review items (no record yet); the returned PipelineFiles are reviewed
+// and accepted via the Compare & Fix overlay.
+export const stageExtraction = (
+  id: string,
+  selection: { attachment_ids: string[]; extract_body?: boolean },
+) =>
+  api
+    .post<PipelineFile[]>(`/inbox/${id}/stage-extraction`, {
+      attachment_ids: selection.attachment_ids,
+      extract_body: selection.extract_body ?? false,
+    })
+    .then((r) => r.data);
+
 export const decideEmail = (id: string, accepted: boolean, selection?: IngestSelection) =>
   api.post(`/inbox/${id}/decision`, {
     accepted,
@@ -307,6 +322,92 @@ export const bodyImagePreviewUrl = (msgId: string) =>
 
 export const attachmentUrl = (msgId: string, attId: string) =>
   withAuthParam(`/api/v1/inbox/${msgId}/attachments/${encodeURIComponent(attId)}`);
+
+// ---------------------------------------------------------------------------
+// Agentic chat (timesheet assistant)
+// ---------------------------------------------------------------------------
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface ChatChange {
+  record_id: string;
+  employee_name: string | null;
+  month: number;
+  year: number;
+  month_name: string | null;
+  leave_type: string;
+  action: "add" | "set" | "clear";
+  before: string[];
+  after: string[];
+  added: string[];
+  removed: string[];
+}
+
+export interface ChatResponse {
+  answer: string;
+  changes: ChatChange[];
+  tools_used: string[];
+  error: string | null;
+}
+
+export interface ChatPromptGroup {
+  group: string;
+  prompts: string[];
+}
+
+export interface ChatSuggestions {
+  suggestions: string[];
+  prompt_book: ChatPromptGroup[];
+  enabled: boolean;
+  model: string | null;
+}
+
+export interface MatchedChatEmployee {
+  employee_pk: string;
+  employee_id: string;
+  name: string;
+  email: string | null;
+  location: string | null;
+}
+
+export interface ChatExtraction {
+  status: string;                // "ok" | "unsupported_type" | "extraction_failed" | ...
+  filename: string;
+  token?: string;                // ephemeral preview token (only when ok)
+  content_type?: string;
+  extracted_employee_name?: string | null;
+  extracted_employee_id?: string | null;
+  matched_employee?: MatchedChatEmployee | null;
+  match_note?: string | null;
+  month?: number | null;
+  year?: number | null;
+  month_name?: string | null;
+  leaves?: Record<string, string[]>;
+  counts?: Record<string, number>;
+  total_leaves?: number;
+  validation_status?: string;
+  flags?: string[];
+  summary?: string;
+  message?: string;
+  error?: string;
+}
+
+export const fetchChatSuggestions = () =>
+  api.get<ChatSuggestions>("/agentic-chat/suggestions").then((r) => r.data);
+
+export const sendChat = (messages: ChatMessage[], extractions: ChatExtraction[] = []) =>
+  api.post<ChatResponse>("/agentic-chat", { messages, extractions }).then((r) => r.data);
+
+export const extractChatSheet = (file: File) => {
+  const form = new FormData();
+  form.append("file", file);
+  return api.post<ChatExtraction>("/agentic-chat/extract", form).then((r) => r.data);
+};
+
+export const chatAttachmentUrl = (token: string) =>
+  withAuthParam(`/api/v1/agentic-chat/attachments/${encodeURIComponent(token)}`);
 
 // ---------------------------------------------------------------------------
 // Dashboard / employees
@@ -526,6 +627,9 @@ export function fetchEmlPreview(fileUrl: string): Promise<EmlParsed> {
     // Pipeline raw copy: /api/v1/pipeline/{id}/raw-preview
     const pip = u.pathname.match(/\/pipeline\/([^/]+)\/raw-preview$/);
     if (pip) return api.get<EmlParsed>(`/pipeline/${pip[1]}/raw-eml-preview`).then((r) => r.data);
+    // Agentic-chat ephemeral upload: /api/v1/agentic-chat/attachments/{token}
+    const chat = u.pathname.match(/\/agentic-chat\/attachments\/([^/]+)$/);
+    if (chat) return api.get<EmlParsed>(`/agentic-chat/attachments/${encodeURIComponent(chat[1])}/eml-preview`).then((r) => r.data);
   } catch { /* fall through */ }
   return Promise.reject(new Error("Cannot derive EML preview URL from: " + fileUrl));
 }
@@ -790,8 +894,8 @@ export const AI_PROVIDERS = {
     label: "OpenAI",
     keyField: "openai_api_key",
     baseField: "openai_base_url",
-    extractionModels: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"],
-    validationModels: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
+    extractionModels: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano"],
+    validationModels: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1-nano"],
   },
   deepseek: {
     label: "DeepSeek",

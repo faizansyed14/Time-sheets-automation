@@ -68,6 +68,7 @@ class FailureCode:
     VALIDATION_MISMATCH = "validation_mismatch"  # duplicate/out-of-month/header mismatch flags
     STORAGE_ERROR = "storage_error"
     DUPLICATE_FILE = "duplicate_file"          # identical file already processed (no-op)
+    PENDING_REVIEW = "pending_review"          # AI-extracted, awaiting human accept (not a failure)
     UNKNOWN = "unknown"
 
 

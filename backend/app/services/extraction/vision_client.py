@@ -171,7 +171,9 @@ async def _extract_vllm(images_jpeg, prompt, system_prompt, model, image_detail)
         return r.json()
 
 
-async def validate_extraction(prompt: str, system_prompt: str | None, model: str = "gpt-4o-mini") -> dict:
+async def validate_extraction(prompt: str, system_prompt: str | None, model: str | None = None) -> dict:
+    from app.core.config import settings as _s
+    model = (model or _s.validation_model).strip()
     api_key = (settings.openai_api_key or "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY required for text validation.")
