@@ -76,10 +76,12 @@ export interface Attachment {
   filename: string;
   content_type: string;
   kind: "timesheet" | "approval_screenshot" | "other";
+  cid?: string | null;
 }
 
 export interface EmailDetail extends EmailListItem {
   body_text: string | null;
+  body_html: string | null;
   attachments: Attachment[];
   ai_check: EmailAiCheck | null;
   ai_check_running: boolean;

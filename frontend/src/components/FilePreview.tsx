@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Download, ExternalLink, FileText, Mail, Paperclip, X } from "lucide-react";
 import { cn, formatBytes } from "../lib/utils";
-import { downloadFile, isEml, isPdf, isPreviewable, sanitizeEmailHtml, type PreviewFile } from "../lib/filePreview";
+import { downloadFile, isDocx, isEml, isPdf, isPreviewable, sanitizeEmailHtml, type PreviewFile } from "../lib/filePreview";
 import { fetchEmlPreview, type EmlParsed } from "../api/client";
 import { Spinner } from "./ui";
 
@@ -163,7 +163,66 @@ export function EmlPreviewPane({ fileUrl, filename }: { fileUrl: string; filenam
 }
 
 // ---------------------------------------------------------------------------
-// Generic file preview modal (PDF / image / EML)
+// DOCX viewer — renders .docx in-browser via docx-preview
+// ---------------------------------------------------------------------------
+
+function DocxPreviewPane({ fileUrl }: { fileUrl: string }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    setErr(null);
+    setLoading(true);
+    if (!containerRef.current) return;
+    const target = containerRef.current;
+
+    Promise.all([
+      import("docx-preview"),
+      fetch(fileUrl).then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.blob();
+      }),
+    ])
+      .then(([{ renderAsync }, blob]) => {
+        if (!alive) return;
+        return renderAsync(blob, target, undefined, {
+          inWrapper: true,
+          ignoreWidth: false,
+          ignoreHeight: false,
+          useBase64URL: true,
+        });
+      })
+      .then(() => { if (alive) setLoading(false); })
+      .catch(() => { if (alive) setErr("Could not render DOCX file."); });
+
+    return () => { alive = false; };
+  }, [fileUrl]);
+
+  if (err) {
+    return (
+      <div className="flex h-full items-center justify-center text-sm text-rose-500">{err}</div>
+    );
+  }
+
+  return (
+    <div className="relative h-full overflow-auto bg-slate-100">
+      {loading && (
+        <div className="absolute inset-0 flex items-center justify-center bg-slate-100">
+          <Spinner className="h-6 w-6" />
+        </div>
+      )}
+      <div
+        ref={containerRef}
+        className="docx-preview-container mx-auto max-w-4xl bg-white shadow-sm"
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Generic file preview modal (PDF / image / EML / DOCX)
 // ---------------------------------------------------------------------------
 
 export function FilePreviewModal({
@@ -189,6 +248,7 @@ export function FilePreviewModal({
 
   const pdf = isPdf(file.filename, file.contentType);
   const eml = isEml(file.filename, file.contentType);
+  const docx = isDocx(file.filename, file.contentType);
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex flex-col p-3 sm:p-5">
@@ -223,9 +283,14 @@ export function FilePreviewModal({
         </div>
 
         {/* Body */}
-        <div className={cn("min-h-0 flex-1 overflow-auto", eml ? "bg-white" : "bg-slate-100 p-2")}>
+        <div className={cn(
+          "min-h-0 flex-1 overflow-auto",
+          eml || docx ? "bg-white" : "bg-slate-100 p-2",
+        )}>
           {eml ? (
             <EmlPreviewPane fileUrl={file.url} filename={file.filename} />
+          ) : docx ? (
+            <DocxPreviewPane fileUrl={file.url} />
           ) : pdf ? (
             <iframe
               src={file.url}

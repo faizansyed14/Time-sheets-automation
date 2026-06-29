@@ -157,6 +157,7 @@ def _build(msg: dict) -> ProviderMessage:
             content_type=a.get("contentType") or "application/octet-stream",
             size=size,
             kind=_classify(a.get("name"), a.get("contentType"), has_doc),
+            cid=a.get("contentId") or None,
         ))
     for a in items:
         # Treat the forwarded email as a timesheet candidate; its bytes are
@@ -173,9 +174,13 @@ def _build(msg: dict) -> ProviderMessage:
         ))
 
     body = msg.get("body") or {}
-    body_text = body.get("content") or msg.get("bodyPreview") or ""
+    body_content = body.get("content") or msg.get("bodyPreview") or ""
+    body_html: str | None = None
     if body.get("contentType") == "html":
-        body_text = _strip_html(body_text)
+        body_html = body_content          # keep raw HTML for rich rendering
+        body_text = _strip_html(body_content)  # plain text for search / AI check
+    else:
+        body_text = body_content
 
     return ProviderMessage(
         message_id=msg["id"],
@@ -184,12 +189,16 @@ def _build(msg: dict) -> ProviderMessage:
         subject=msg.get("subject") or "(no subject)",
         received_at=_parse_dt(msg.get("receivedDateTime")),
         body_text=body_text,
+        body_html=body_html,
         attachments=atts,
     )
 
 
 _SELECT = "id,subject,from,receivedDateTime,bodyPreview,body,hasAttachments"
+# List view: base attachment type supports these fields in $select
 _EXPAND = "attachments($select=id,name,contentType,size,isInline)"
+# Detail view: no $select → Graph returns all fields including contentId on fileAttachment subtype
+_EXPAND_DETAIL = "attachments"
 
 
 class GraphEmailProvider(EmailProvider):
@@ -227,9 +236,11 @@ class GraphEmailProvider(EmailProvider):
 
     async def get_message(self, message_id: str) -> ProviderMessage | None:
         url = f"{GRAPH}/users/{settings.graph_mailbox}/messages/{message_id}"
-        params = {"$select": _SELECT, "$expand": _EXPAND}
+        params = {"$select": _SELECT, "$expand": _EXPAND_DETAIL}
         async with httpx.AsyncClient(timeout=60) as c:
-            r = await c.get(url, params=params, headers=await _headers(text_body=True))
+            # text_body=False → Graph returns native HTML body so we can store
+            # body_html for rich rendering. body_text is derived via _strip_html.
+            r = await c.get(url, params=params, headers=await _headers(text_body=False))
             if r.status_code == 404:
                 return None
             if r.status_code != 200:
