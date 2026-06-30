@@ -70,8 +70,58 @@ class EmailDetail(EmailListItem):
     body_text: str | None
     body_html: str | None = None
     attachments: list[AttachmentOut]
+    # Attachment ids embedded inline in body_html (resolved to data URIs) —
+    # hidden from the separate attachment list, as Outlook does.
+    inline_attachment_ids: list[str] = []
     ai_check: EmailAiCheckOut | None = None
     ai_check_running: bool = False
+
+
+# ---- agentic chat ----
+class ChatMessageIn(BaseModel):
+    role: str            # "user" | "assistant"
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessageIn]
+    # Structured results of any sheets the user uploaded into the chat this
+    # session (from POST /agentic-chat/extract). Passed back so the assistant
+    # has the grounded extraction to answer about and act on.
+    extractions: list[dict] = []
+
+
+class ChatChange(BaseModel):
+    record_id: str
+    employee_name: str | None = None
+    month: int
+    year: int
+    month_name: str | None = None
+    leave_type: str
+    action: str          # add | set | clear
+    before: list[str] = []
+    after: list[str] = []
+    added: list[str] = []
+    removed: list[str] = []
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    changes: list[ChatChange] = []
+    tools_used: list[str] = []
+    error: str | None = None
+
+
+class ChatPromptGroup(BaseModel):
+    group: str
+    prompts: list[str]
+
+
+class ChatSuggestions(BaseModel):
+    suggestions: list[str]
+    prompt_book: list[ChatPromptGroup]
+    enabled: bool          # whether an AI provider is configured
+    model: str | None = None
 
 
 class DecisionIn(BaseModel):
@@ -88,6 +138,12 @@ class DecisionIn(BaseModel):
 class RerunExtractionIn(BaseModel):
     attachment_ids: list[str]
     approval_attachment_id: str | None = None
+    extract_body: bool = False
+
+
+class ExtractionPreviewIn(BaseModel):
+    """Run-extraction request — extract selected sources (attachments / body)."""
+    attachment_ids: list[str] = []
     extract_body: bool = False
 
 

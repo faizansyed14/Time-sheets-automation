@@ -54,6 +54,24 @@ MESSAGES = [
         "received_at": _dt("2026-02-02T09:14:00"),
         "body_text": "Hi HR,\n\nPlease find attached my timesheet for January 2026 along "
                      "with the manager approval screenshot.\n\nThanks,\nMohammed",
+        # Outlook-style HTML body with an inline signature logo (cid:). The
+        # backend resolves cid: → data URI so it renders like Outlook.
+        "body_html": (
+            "<div style=\"font-family:Calibri,Arial,sans-serif;font-size:14px;color:#1f2937\">"
+            "<p>Hi HR,</p>"
+            "<p>Please find attached my timesheet for <b>January 2026</b> along with the "
+            "manager approval screenshot.</p>"
+            "<p>Thanks,<br>Mohammed Ali</p>"
+            "<table style=\"margin-top:16px;border-top:1px solid #e5e7eb;padding-top:8px\"><tr>"
+            "<td><img src=\"cid:alphalogo\" alt=\"Alpha Data\" width=\"180\"></td>"
+            "</tr></table>"
+            "<p style=\"color:#16a34a;font-style:italic;font-size:12px\">"
+            "Please consider your environmental responsibility before printing this e-mail.</p>"
+            "</div>"
+        ),
+        "inline_images": [
+            {"slot": "logo", "cid": "alphalogo", "filename": "alpha_data_footer_gradient1.png"},
+        ],
         "cases": [
             {
                 "slot": "ts",

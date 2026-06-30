@@ -54,7 +54,7 @@ class EmailMessage(Base):
     # is used for search and AI check (smaller, no markup noise).
     body_html: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # Inbox AI check (gpt-4.1-nano): attachment triage + recommended employee.
+    # Inbox AI check (gpt-4o-mini): attachment triage + recommended employee.
     ai_check: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     ai_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

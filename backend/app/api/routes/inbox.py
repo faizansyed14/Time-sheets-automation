@@ -17,12 +17,14 @@ from app.schemas import (
     EmailAiCheckOut,
     EmailDetail,
     EmailListItem,
+    ExtractionPreviewIn,
     MatchedEmployeeOut,
     Page,
+    PipelineFileOut,
     RerunExtractionIn,
 )
 from app.services.email_provider import get_email_provider
-from app.services.pipeline.ingestion import IngestSelectionError, ingest_email
+from app.services.pipeline.ingestion import IngestSelectionError, ingest_email, stage_email_extraction
 
 router = APIRouter(prefix="/inbox", tags=["inbox"])
 
@@ -66,6 +68,35 @@ async def _sync_message(db: AsyncSession, msg) -> EmailMessage:
     return row
 
 
+# Document attachments that go through extraction. Images/logos/screenshots are
+# excluded from the inbox attachment count (the user wants only real files).
+_DOC_CONTENT_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/msword",
+    "application/vnd.ms-excel",
+    "message/rfc822",
+    "application/eml",
+}
+_DOC_EXTS = (".pdf", ".docx", ".xlsx", ".doc", ".xls", ".eml")
+
+
+def is_doc_attachment(a) -> bool:
+    """A real document (pdf/docx/xlsx/eml) — not an inline image, logo, or screenshot."""
+    if not isinstance(a, dict):
+        return False
+    ct = (a.get("content_type") or "").lower()
+    fn = (a.get("filename") or "").lower()
+    if ct.startswith("image/"):
+        return False
+    return ct in _DOC_CONTENT_TYPES or fn.endswith(_DOC_EXTS)
+
+
+def _doc_count(attachments) -> int:
+    return sum(1 for a in (attachments or []) if is_doc_attachment(a))
+
+
 def _to_list_item(row: EmailMessage) -> EmailListItem:
     return EmailListItem(
         id=row.id,
@@ -75,7 +106,7 @@ def _to_list_item(row: EmailMessage) -> EmailListItem:
         subject=row.subject,
         received_at=row.received_at,
         status=row.status,
-        attachment_count=len(row.attachments or []),
+        attachment_count=_doc_count(row.attachments),
         has_approval_screenshot=row.has_approval_screenshot,
     )
 
@@ -137,10 +168,15 @@ async def get_email(
     ai_out: EmailAiCheckOut | None = None
     if row.ai_check:
         ai_out = EmailAiCheckOut(**row.ai_check)
-    if refresh_ai:
+    # Auto-run the AI check when opening an email that has real document
+    # attachments (pdf/docx/xlsx/eml) and hasn't been checked yet — or whenever
+    # an explicit refresh is requested. Emails without documents are never
+    # checked (nothing to extract).
+    needs_check = (refresh_ai or row.ai_check is None) and _doc_count(row.attachments) > 0
+    if needs_check:
         from app.services.inbox.ai_check import ensure_ai_check
         try:
-            result = await ensure_ai_check(db, row, force=True)
+            result = await ensure_ai_check(db, row, force=refresh_ai)
             await db.commit()
             await db.refresh(row)
             ai_out = EmailAiCheckOut(**result)
@@ -148,11 +184,18 @@ async def get_email(
             if row.ai_check:
                 ai_out = EmailAiCheckOut(**row.ai_check)
 
+    # Resolve inline cid: images (logos, signatures, pasted screenshots) to
+    # self-contained data URIs so the HTML body renders exactly like Outlook.
+    from app.services.inbox.inline_images import inline_cid_images
+    body_html, inline_ids = await inline_cid_images(
+        provider, row.provider_message_id, row.body_html, row.attachments or [])
+
     base = _to_list_item(row)
     return EmailDetail(
         **base.model_dump(),
         body_text=row.body_text,
-        body_html=row.body_html,
+        body_html=body_html,
+        inline_attachment_ids=inline_ids,
         attachments=[
             AttachmentOut(
                 attachment_id=a["attachment_id"], filename=a["filename"],
@@ -215,6 +258,33 @@ async def get_attachment_eml_preview(provider_message_id: str, attachment_id: st
         raise HTTPException(400, "Not an EML file")
     from app.services.extraction.eml_parser import parse_eml
     return parse_eml(data)
+
+
+@router.post("/{provider_message_id}/stage-extraction", response_model=list[PipelineFileOut])
+async def stage_extraction(
+    provider_message_id: str,
+    body: ExtractionPreviewIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """Run Extraction: extract the selected attachments (and optionally the
+    email body) and STAGE them in the pipeline as needs-review items carrying
+    the AI-extracted leaves — without filing a record yet. The frontend then
+    opens the existing Compare & Fix overlay to review/edit and Accept (file)
+    or Reject (leave staged in the pipeline)."""
+    from app.api.routes.pipeline import _out as _pipeline_out
+
+    provider = get_email_provider()
+    msg = await provider.get_message(provider_message_id)
+    if not msg:
+        raise HTTPException(404, "Email not found")
+    row = await _sync_message(db, msg)
+    await db.commit()
+    await db.refresh(row)
+
+    staged = await stage_email_extraction(
+        db, row, attachment_ids=body.attachment_ids, extract_body=body.extract_body)
+    await datacache.bust_pipeline()
+    return [_pipeline_out(t) for t in staged]
 
 
 @router.post("/{provider_message_id}/decision")

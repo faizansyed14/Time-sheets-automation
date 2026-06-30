@@ -36,6 +36,7 @@ FAILURE_LABELS: dict[str, str] = {
     FailureCode.VALIDATION_MISMATCH: "Validation mismatch",
     FailureCode.STORAGE_ERROR: "Storage error",
     FailureCode.DUPLICATE_FILE: "Duplicate file",
+    FailureCode.PENDING_REVIEW: "Awaiting review",
     FailureCode.UNKNOWN: "Unknown error",
 }
 

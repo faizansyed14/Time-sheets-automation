@@ -125,7 +125,7 @@ async def _llm_classify(
     if not api_key or api_key.lower() == "change-me":
         return None
 
-    model = (settings.ai_check_model or "gpt-4.1-nano").strip()
+    model = (settings.ai_check_model or settings.validation_model).strip()
     lines = [
         f"SUBJECT: {email.subject or ''}",
         f"FROM: {email.sender_name or ''} <{email.sender_email or ''}>",

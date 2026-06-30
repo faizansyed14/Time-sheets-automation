@@ -1,0 +1,93 @@
+"""
+Inline `cid:` images in an email's HTML body as self-contained data URIs.
+
+Outlook / Microsoft Graph HTML bodies reference embedded images (logos,
+signatures, pasted screenshots) by their MIME Content-ID, e.g.
+``<img src="cid:image001.png@01DA...">``. A browser cannot resolve a `cid:`
+URL, so those images render empty.
+
+Rather than depend on fragile client-side cid→attachment matching plus
+authenticated image sub-requests from a sandboxed iframe, we resolve each
+referenced image to a base64 ``data:`` URI on the server (the same approach the
+.eml parser already uses). The body then renders exactly like Outlook with no
+extra network requests.
+"""
+from __future__ import annotations
+
+import base64
+import re
+
+# Matches the cid token inside src="cid:..." / src='cid:...' / url(cid:...).
+_CID_REF_RE = re.compile(r"cid:([^\"'\s>)]+)", re.IGNORECASE)
+
+
+def _norm_cid(value: str | None) -> str:
+    """Normalise a Content-ID for comparison: drop <> wrappers and case."""
+    return (value or "").strip().strip("<>").lower()
+
+
+def _find_attachment(ref: str, attachments: list[dict]) -> dict | None:
+    """Resolve a `cid:` reference to its attachment.
+
+    Match on the attachment's Content-ID first (Graph/EML populate this), then
+    fall back to the filename — Outlook often names the part `cid:image001.png`
+    where the attachment filename is `image001.png`.
+    """
+    ref_full = _norm_cid(ref)
+    ref_name = ref_full.split("@")[0]
+    for a in attachments:
+        ac = _norm_cid(a.get("cid"))
+        if ac and ac in (ref_full, ref_name):
+            return a
+    for a in attachments:
+        if (a.get("filename") or "").lower() == ref_name:
+            return a
+    return None
+
+
+async def inline_cid_images(
+    provider,
+    message_id: str,
+    body_html: str | None,
+    attachments: list[dict],
+) -> tuple[str | None, list[str]]:
+    """Return (html_with_data_uris, inlined_attachment_ids).
+
+    `inlined_attachment_ids` are the attachments that were embedded in the body
+    — the caller hides these from the separate attachment list so an inline
+    logo is not also shown as a downloadable file (Outlook behaviour).
+    """
+    if not body_html or "cid:" not in body_html.lower():
+        return body_html, []
+
+    refs = {m.group(1) for m in _CID_REF_RE.finditer(body_html)}
+    if not refs:
+        return body_html, []
+
+    data_uris: dict[str, str] = {}     # cid ref -> data: URI
+    inlined_ids: set[str] = set()
+    for ref in refs:
+        att = _find_attachment(ref, attachments)
+        if not att:
+            continue
+        try:
+            data, _fn, ctype = await provider.get_attachment_bytes(
+                message_id, att["attachment_id"])
+        except Exception:
+            continue
+        if not data:
+            continue
+        ctype = (ctype or att.get("content_type") or "image/png").split(";")[0]
+        if not ctype.startswith("image/"):
+            continue
+        b64 = base64.b64encode(data).decode()
+        data_uris[ref] = f"data:{ctype};base64,{b64}"
+        inlined_ids.add(att["attachment_id"])
+
+    if not data_uris:
+        return body_html, []
+
+    def _sub(m: re.Match) -> str:
+        return data_uris.get(m.group(1), m.group(0))
+
+    return _CID_REF_RE.sub(_sub, body_html), sorted(inlined_ids)

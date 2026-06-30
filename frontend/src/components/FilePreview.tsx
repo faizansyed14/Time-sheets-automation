@@ -166,7 +166,7 @@ export function EmlPreviewPane({ fileUrl, filename }: { fileUrl: string; filenam
 // DOCX viewer — renders .docx in-browser via docx-preview
 // ---------------------------------------------------------------------------
 
-function DocxPreviewPane({ fileUrl }: { fileUrl: string }) {
+export function DocxPreviewPane({ fileUrl }: { fileUrl: string }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);

@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.deps import require_write
 from app.api.routes import (
     admin,
+    agentic_chat,
     auth,
     employee_matcher,
     employees,
@@ -139,6 +140,7 @@ app.include_router(employee_matcher.router, prefix=settings.api_prefix, dependen
 app.include_router(upload.router, prefix=settings.api_prefix, dependencies=_protected)
 app.include_router(files.router, prefix=settings.api_prefix, dependencies=_protected)
 app.include_router(pipeline.router, prefix=settings.api_prefix, dependencies=_protected)
+app.include_router(agentic_chat.router, prefix=settings.api_prefix, dependencies=_protected)
 
 
 @app.get("/health")

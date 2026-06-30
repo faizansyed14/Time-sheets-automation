@@ -132,6 +132,24 @@ def _render_approval_png(detail: str, emp_name: str) -> bytes:
     return bio.getvalue()
 
 
+def _render_logo_png() -> bytes:
+    """A small brand-style logo, stand-in for an Outlook inline signature image."""
+    from PIL import Image, ImageDraw
+
+    w, h = 360, 90
+    img = Image.new("RGB", (w, h), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    # gradient bar
+    for x in range(w):
+        t = x / w
+        d.line([(x, 60), (x, h)], fill=(int(37 + t * 60), int(99 + t * 40), int(235 - t * 80)))
+    d.text((14, 18), "ALPHA DATA", fill=(20, 40, 90))
+    d.text((14, 40), "RECRUITMENT", fill=(90, 110, 150))
+    bio = io.BytesIO()
+    img.save(bio, format="PNG")
+    return bio.getvalue()
+
+
 def _case_filename(c: dict, ext: str) -> str:
     """Unique per attachment — weekly sheets for the same person/month must
     not collide (the period label keeps Week 1-2 and Week 3-4 apart)."""
@@ -165,6 +183,16 @@ def _build_attachments(msg: dict) -> list[ProviderAttachment]:
             size=0,
             kind="approval_screenshot",
         ))
+    # Inline signature/logo images referenced by cid: in body_html.
+    for im in msg.get("inline_images", []):
+        atts.append(ProviderAttachment(
+            attachment_id=mock_data.attachment_id(msg["message_id"], im["slot"]),
+            filename=im["filename"],
+            content_type="image/png",
+            size=0,
+            kind="other",
+            cid=im["cid"],
+        ))
     return atts
 
 
@@ -176,6 +204,7 @@ def _to_provider_message(msg: dict) -> ProviderMessage:
         subject=msg["subject"],
         received_at=msg["received_at"],
         body_text=msg["body_text"],
+        body_html=msg.get("body_html"),
         attachments=_build_attachments(msg),
     )
 
@@ -208,6 +237,11 @@ class MockEmailProvider(EmailProvider):
         if ap and mock_data.attachment_id(message_id, ap["slot"]) == attachment_id:
             data = _render_approval_png(ap["detail"], msg["cases"][0]["emp_name"])
             return data, "manager_approval.png", "image/png"
+
+        # inline signature/logo image?
+        for im in msg.get("inline_images", []):
+            if mock_data.attachment_id(message_id, im["slot"]) == attachment_id:
+                return _render_logo_png(), im["filename"], "image/png"
 
         # otherwise a timesheet case
         case = mock_data.case_for_attachment(attachment_id)
