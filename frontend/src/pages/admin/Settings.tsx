@@ -231,8 +231,6 @@ export default function AdminSettings() {
             </Select>
           </Field>
           {modelField("validation_model", "Validation model", pmeta.validationModels)}
-          {modelField("ai_check_model", "AI Check model (inbox triage)", pmeta.validationModels)}
-          {modelField("agent_chat_model", "Agent Chat model", pmeta.extractionModels)}
           <Field label="Text cross-validation">
             <label className="flex items-center gap-2 pt-2 text-sm text-slate-600">
               <input type="checkbox" checked={Boolean(form["enable_text_validation"])} onChange={(e) => set("enable_text_validation", e.target.checked)} className="h-4 w-4 rounded border-slate-300 text-brand-600" />

@@ -37,11 +37,11 @@ CONFIG_KEYS: dict[str, dict] = {
     "deepseek_base_url":  {"category": ConfigCategory.PROVIDER, "secret": False, "env": None, "default": "https://api.deepseek.com/v1"},
     # model controls
     "extraction_engine":  {"category": ConfigCategory.MODEL, "secret": False, "env": "extraction_engine", "default": "mock"},
-    "extraction_model":   {"category": ConfigCategory.MODEL, "secret": False, "env": "extraction_model", "default": None},
-    "vision_image_detail":{"category": ConfigCategory.MODEL, "secret": False, "env": "vision_image_detail", "default": None},
-    "validation_model":   {"category": ConfigCategory.MODEL, "secret": False, "env": "validation_model", "default": None},
-    "ai_check_model":     {"category": ConfigCategory.MODEL, "secret": False, "env": "ai_check_model", "default": None},
-    "agent_chat_model":   {"category": ConfigCategory.MODEL, "secret": False, "env": "agent_chat_model", "default": None},
+    "extraction_model":   {"category": ConfigCategory.MODEL, "secret": False, "env": "extraction_model", "default": "gpt-4o"},
+    "vision_image_detail":{"category": ConfigCategory.MODEL, "secret": False, "env": "vision_image_detail", "default": "high"},
+    "validation_model":   {"category": ConfigCategory.MODEL, "secret": False, "env": "validation_model", "default": "gpt-4o-mini"},
+    "ai_check_model":     {"category": ConfigCategory.MODEL, "secret": False, "env": "ai_check_model", "default": "gpt-4o-mini"},
+    "agent_chat_model":   {"category": ConfigCategory.MODEL, "secret": False, "env": "agent_chat_model", "default": "gpt-4o-mini"},
     "enable_text_validation": {"category": ConfigCategory.MODEL, "secret": False, "env": "enable_text_validation", "default": True},
     # cost / accuracy tuning
     "pdf_render_dpi":         {"category": ConfigCategory.MODEL, "secret": False, "env": "pdf_render_dpi", "default": 150},

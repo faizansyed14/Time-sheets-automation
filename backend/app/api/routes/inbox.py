@@ -5,10 +5,12 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import datacache
 from app.core.database import get_db
+from app.core.cache import cache
 from app.models.email_message import EmailMessage, EmailStatus
 from app.models.timesheet_record import TimesheetRecord
 from app.schemas import (
@@ -30,41 +32,55 @@ router = APIRouter(prefix="/inbox", tags=["inbox"])
 
 
 async def _sync_message(db: AsyncSession, msg) -> EmailMessage:
-    """Upsert a provider message into our EmailMessage table (preserving status)."""
-    existing = (
-        await db.execute(
-            select(EmailMessage).where(EmailMessage.provider_message_id == msg.message_id)
-        )
-    ).scalar_one_or_none()
+    """Upsert a provider message into EmailMessage.
+
+    Must be concurrency-safe: multiple requests may sync the same provider id at
+    the same time (open inbox, click AI check, ai-check-all, etc.). Use a single
+    INSERT .. ON CONFLICT .. DO UPDATE to avoid unique violations.
+    """
     atts = [
         {"attachment_id": a.attachment_id, "filename": a.filename,
          "content_type": a.content_type, "size": a.size, "kind": a.kind, "cid": a.cid}
         for a in msg.attachments
     ]
     has_approval = any(a["kind"] == "approval_screenshot" for a in atts)
-    if existing:
-        existing.sender_name = msg.sender_name
-        existing.sender_email = msg.sender_email
-        existing.subject = msg.subject
-        existing.received_at = msg.received_at
-        existing.body_text = msg.body_text
-        existing.body_html = msg.body_html
-        existing.attachments = atts
-        existing.has_approval_screenshot = has_approval
-        return existing
-    row = EmailMessage(
-        provider_message_id=msg.message_id,
-        sender_name=msg.sender_name,
-        sender_email=msg.sender_email,
-        subject=msg.subject,
-        received_at=msg.received_at,
-        body_text=msg.body_text,
-        body_html=msg.body_html,
-        attachments=atts,
-        has_approval_screenshot=has_approval,
-        status=EmailStatus.NEW,
+
+    stmt = (
+        pg_insert(EmailMessage)
+        .values(
+            provider_message_id=msg.message_id,
+            sender_name=msg.sender_name,
+            sender_email=msg.sender_email,
+            subject=msg.subject,
+            received_at=msg.received_at,
+            body_text=msg.body_text,
+            body_html=msg.body_html,
+            attachments=atts,
+            has_approval_screenshot=has_approval,
+            status=EmailStatus.NEW,
+        )
+        .on_conflict_do_update(
+            index_elements=["provider_message_id"],
+            set_={
+                # Preserve workflow fields (status/decided_at/ai_check/etc.). Only refresh message data.
+                "sender_name": msg.sender_name,
+                "sender_email": msg.sender_email,
+                "subject": msg.subject,
+                "received_at": msg.received_at,
+                "body_text": msg.body_text,
+                "body_html": msg.body_html,
+                "attachments": atts,
+                "has_approval_screenshot": has_approval,
+            },
+        )
+        .returning(EmailMessage.id)
     )
-    db.add(row)
+    await db.execute(stmt)
+    row = (
+        await db.execute(
+            select(EmailMessage).where(EmailMessage.provider_message_id == msg.message_id)
+        )
+    ).scalar_one()
     return row
 
 
@@ -97,6 +113,31 @@ def _doc_count(attachments) -> int:
     return sum(1 for a in (attachments or []) if is_doc_attachment(a))
 
 
+def _should_run_ai_check(row: EmailMessage, *, refresh_ai: bool = False) -> bool:
+    """Run AI check when never checked, or when user explicitly requests a rerun."""
+    if refresh_ai:
+        return True
+    return row.ai_check is None
+
+
+def _queue_inbox_ai_check(limit: int | None = None) -> None:
+    """Queue a background pass over unchecked emails (skips already-checked)."""
+    from app.core.config import settings
+    from app.services.tasks import ai_check_inbox_task
+
+    batch = max(1, int(limit or settings.inbox_ai_check_batch))
+    try:
+        if settings.celery_task_always_eager:
+            import threading
+            threading.Thread(
+                target=lambda: ai_check_inbox_task.run(batch), daemon=True
+            ).start()
+        else:
+            ai_check_inbox_task.delay(batch)
+    except Exception:
+        pass
+
+
 def _to_list_item(row: EmailMessage) -> EmailListItem:
     return EmailListItem(
         id=row.id,
@@ -108,6 +149,7 @@ def _to_list_item(row: EmailMessage) -> EmailListItem:
         status=row.status,
         attachment_count=_doc_count(row.attachments),
         has_approval_screenshot=row.has_approval_screenshot,
+        ai_checked=bool(row.ai_check),
     )
 
 
@@ -121,14 +163,28 @@ async def list_inbox(
 ):
     """Paginated, server-side searched inbox. The search hits the whole table
     (subject / sender / body) in SQL, not just the current page."""
-    provider = get_email_provider()
-    # Discover any new provider messages so the table is current, then page
-    # from the DB. (Sync runs once per request; only on the first page to keep
-    # scrolling cheap.)
+    # Best-effort provider sync. Must never block the UI: when a background
+    # scan/worker is already syncing the inbox, skip syncing here to avoid Graph
+    # throttling + DB contention that would stall this endpoint.
     if offset == 0:
-        for m in await provider.list_messages(None):
-            await _sync_message(db, m)
-        await db.commit()
+        lock_key = "inbox:sync:lock"
+        try:
+            if not await cache.exists(lock_key):
+                await cache.set(lock_key, True, ttl=30)
+                try:
+                    provider = get_email_provider()
+                    for m in await provider.list_messages(None):
+                        await _sync_message(db, m)
+                    await db.commit()
+                    _queue_inbox_ai_check()
+                except Exception:
+                    # Any provider error should not break listing existing rows.
+                    await db.rollback()
+                finally:
+                    await cache.delete(lock_key)
+        except Exception:
+            # Cache unavailable → just skip provider sync and serve DB results.
+            pass
 
     base = select(EmailMessage)
     if status:
@@ -151,6 +207,15 @@ async def list_inbox(
                 has_more=offset + len(items) < total)
 
 
+@router.post("/background-scan")
+async def background_scan(limit: int | None = Query(default=None, ge=1, le=500)):
+    """Queue a background AI-check pass over unchecked inbox emails.
+    Already-checked emails are skipped (no reprocess)."""
+    from app.core.config import settings
+    _queue_inbox_ai_check(limit or settings.inbox_ai_check_batch)
+    return {"queued": True}
+
+
 @router.get("/{provider_message_id}", response_model=EmailDetail)
 async def get_email(
     provider_message_id: str,
@@ -168,19 +233,22 @@ async def get_email(
     ai_out: EmailAiCheckOut | None = None
     if row.ai_check:
         ai_out = EmailAiCheckOut(**row.ai_check)
-    # Auto-run the AI check when opening an email that has real document
-    # attachments (pdf/docx/xlsx/eml) and hasn't been checked yet — or whenever
-    # an explicit refresh is requested. Emails without documents are never
-    # checked (nothing to extract).
-    needs_check = (refresh_ai or row.ai_check is None) and _doc_count(row.attachments) > 0
+    needs_check = _should_run_ai_check(row, refresh_ai=refresh_ai)
     if needs_check:
+        import logging
+
         from app.services.inbox.ai_check import ensure_ai_check
+
+        log = logging.getLogger(__name__)
         try:
             result = await ensure_ai_check(db, row, force=refresh_ai)
             await db.commit()
             await db.refresh(row)
             ai_out = EmailAiCheckOut(**result)
-        except Exception:
+        except Exception as exc:
+            log.exception("AI check failed for %s", provider_message_id)
+            if refresh_ai:
+                raise HTTPException(502, f"AI check failed: {str(exc)[:240]}") from exc
             if row.ai_check:
                 ai_out = EmailAiCheckOut(**row.ai_check)
 

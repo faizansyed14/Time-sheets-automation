@@ -48,8 +48,37 @@ export function downloadFile(url: string, filename: string) {
 
 /** Strip scripts/event handlers from email HTML before sandboxed iframe render. */
 export function sanitizeEmailHtml(html: string): string {
-  return html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
-    .replace(/<script\b[^>]*\/>/gi, "")
-    .replace(/\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+  // Fast path for non-browser contexts (shouldn't happen in this app, but safe).
+  if (typeof window === "undefined" || typeof DOMParser === "undefined") {
+    return html
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<script\b[^>]*\/>/gi, "")
+      .replace(/\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+  }
+
+  try {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+
+    // Remove script-like / active content nodes completely.
+    doc.querySelectorAll("script,noscript,iframe,object,embed,link[rel='preload'][as='script']").forEach((n) => n.remove());
+
+    // Strip inline event handlers + javascript: URLs.
+    doc.querySelectorAll("*").forEach((el) => {
+      // Clone list because we'll mutate attributes while iterating.
+      Array.from(el.attributes).forEach((a) => {
+        const name = a.name.toLowerCase();
+        const value = (a.value || "").trim();
+        if (name.startsWith("on")) el.removeAttribute(a.name);
+        if ((name === "href" || name === "src") && /^javascript:/i.test(value)) el.removeAttribute(a.name);
+      });
+    });
+
+    return doc.documentElement.outerHTML;
+  } catch {
+    // Fallback to regex if parsing fails.
+    return html
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<script\b[^>]*\/>/gi, "")
+      .replace(/\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+  }
 }

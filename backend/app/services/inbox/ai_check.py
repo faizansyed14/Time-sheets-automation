@@ -32,6 +32,7 @@ from app.services.pipeline import matching as employee_matching
 
 _VALID = {"timesheet", "approval", "other"}
 _TEXT_CAP = 4_500
+_BODY_CAP = 12_000  # full email body for LLM (inline timesheet grids can be long)
 _MIN_TEXT = 24
 
 
@@ -125,11 +126,15 @@ async def _llm_classify(
     if not api_key or api_key.lower() == "change-me":
         return None
 
-    model = (settings.ai_check_model or settings.validation_model).strip()
+    model = (settings.ai_check_model or "gpt-4o-mini").strip()
+    from app.services.inbox.timesheet_detect import plain_email_body
+
+    body_for_llm = plain_email_body(
+        subject=email.subject, body_text=email.body_text, body_html=email.body_html)
     lines = [
         f"SUBJECT: {email.subject or ''}",
         f"FROM: {email.sender_name or ''} <{email.sender_email or ''}>",
-        f"BODY:\n{(email.body_text or '')[:_TEXT_CAP]}",
+        f"BODY:\n{body_for_llm[:_BODY_CAP]}",
         "",
         "ATTACHMENTS:",
     ]
@@ -161,7 +166,14 @@ async def _llm_classify(
         "- Filenames with ATTENDANCE/TIMESHEET/TIME_SHEET are almost always timesheet unless they are "
         "clearly an Adobe audit trail (…audit.pdf, not signed).\n"
         "- Prefer the signed attendance PDF for recommended_timesheet_ids, not the audit copy.\n"
-        "- Body text from Adobe Sign notification emails is NOT a timesheet.\n\n"
+        "- Body text from Adobe Sign notification emails is NOT a timesheet.\n"
+        "- Short emails that only ask someone to approve a timesheet (no pasted grid) are NOT "
+        "timesheets — body_category=other, extract_body=false.\n\n"
+        "extract_body rules (your decision from the full BODY text):\n"
+        "- extract_body=true: the attendance table itself is pasted in the email body (rows of "
+        "dates with hours, leave, IN/OUT, EMP NO, MONTH/YEAR) AND no attachment is a timesheet.\n"
+        "- extract_body=false: timesheet is only in an attachment, or the body is a short note, "
+        "forward, approval request, or merely mentions timesheets/dates without a grid.\n\n"
         "Return ONLY JSON:\n"
         "{\n"
         '  "attachments": [{"attachment_id": "<id>", "category": "timesheet|approval|other", "reason": "<short>"}],\n'
@@ -173,7 +185,6 @@ async def _llm_classify(
         '  "employee_name_on_sheet": "<name from timesheet text or null>",\n'
         '  "employee_id_on_sheet": "<id from timesheet text or null>"\n'
         "}\n"
-        "extract_body=true ONLY when the timesheet table is in the email body and no attachment is a timesheet."
     )
     try:
         from app.services.extraction import vision_client
@@ -324,16 +335,20 @@ async def run_ai_check(db: AsyncSession, email: EmailMessage) -> dict[str, Any]:
     att_out, timesheet_ids, approval_id, sheet_name, sheet_id = _reconcile_classification(
         blocks, llm)
 
+    from app.services.inbox.timesheet_detect import plain_email_body
+
+    body_probe = plain_email_body(
+        subject=email.subject, body_text=email.body_text, body_html=email.body_html)
     if llm:
         body_cat = str(llm.get("body_category", "other")).strip().lower()
         if body_cat not in _VALID:
             body_cat = "other"
         body_reason = str(llm.get("body_reason") or "").strip()
+        # Trust the LLM — it sees the full body text and decides extract_body.
         extract_body = bool(llm.get("extract_body")) and not timesheet_ids
     else:
-        body_text = f"Subject: {email.subject or ''}\n\n{email.body_text or ''}"
-        body_cat, body_reason = _coded_category(body_text)
-        extract_body = body_cat == "timesheet" and not timesheet_ids
+        body_cat, body_reason = _coded_category(body_probe)
+        extract_body = False
         combined = "\n\n".join(b.get("text") or "" for b in blocks)
         if combined.strip() and not sheet_id and not sheet_name:
             from app.services.inbox.timesheet_detect import extract_identity_from_text

@@ -13,7 +13,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
-  Send, Sparkles, BookOpen, Bot, User, Loader2, AlertTriangle, Paperclip,
+  Send, Sparkles, BookOpen, User, Loader2, AlertTriangle, Paperclip,
   ArrowRight, Plus, Minus, RotateCcw, Trash2, FileText, Eye, UserCheck, CalendarDays,
 } from "lucide-react";
 import {
@@ -128,21 +128,56 @@ function ExtractionCard({ e, onPreview }: { e: ChatExtraction; onPreview: () => 
   );
 }
 
-function Bubble({ turn, onPreview }: { turn: Turn; onPreview: (e: ChatExtraction) => void }) {
+// Typewriter reveal — types out assistant text on first mount with a blinking
+// caret. History bubbles don't re-mount (stable keys) so they never re-type.
+function Typewriter({ text, onTick }: { text: string; onTick?: () => void }) {
+  const [shown, setShown] = useState(0);
+  useEffect(() => {
+    setShown(0);
+    if (!text) return;
+    let i = 0;
+    const step = Math.max(1, Math.round(text.length / 220)); // ~quick even for long replies
+    const id = setInterval(() => {
+      i += step;
+      setShown(Math.min(i, text.length));
+      onTick?.();
+      if (i >= text.length) clearInterval(id);
+    }, 16);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [text]);
+  const done = shown >= text.length;
+  return (
+    <p className="whitespace-pre-wrap">
+      {text.slice(0, shown)}
+      {!done && <span className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] animate-blink rounded-full bg-brand-500 align-middle" />}
+    </p>
+  );
+}
+
+function Bubble({ turn, onPreview, onTick }: { turn: Turn; onPreview: (e: ChatExtraction) => void; onTick?: () => void }) {
   const isUser = turn.role === "user";
   return (
-    <div className={cn("flex gap-3", isUser && "flex-row-reverse")}>
+    <div className={cn("flex animate-bubble-in gap-3", isUser && "flex-row-reverse")}>
       <span className={cn(
-        "mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full",
-        isUser ? "bg-slate-200 text-slate-600" : "bg-brand-100 text-brand-700")}>
-        {isUser ? <User className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
+        "mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full shadow-sm",
+        isUser
+          ? "bg-slate-200 text-slate-600"
+          : "bg-gradient-to-br from-brand-500 to-violet-600 text-white ring-2 ring-white")}>
+        {isUser ? <User className="h-4 w-4" /> : <Sparkles className="h-4 w-4" />}
       </span>
       <div className={cn("flex min-w-0 max-w-[82%] flex-col", isUser && "items-end")}>
         {turn.content && (
           <div className={cn(
-            "rounded-2xl px-4 py-2.5 text-sm leading-6",
-            isUser ? "bg-brand-600 text-white" : "bg-slate-50 text-slate-800 ring-1 ring-slate-100")}>
-            <p className="whitespace-pre-wrap">{turn.content}</p>
+            "rounded-2xl px-4 py-2.5 text-sm leading-6 shadow-xs",
+            isUser
+              ? "rounded-tr-sm bg-gradient-to-br from-brand-600 to-brand-700 text-white"
+              : "rounded-tl-sm bg-white text-slate-800 ring-1 ring-slate-200/80")}>
+            {isUser ? (
+              <p className="whitespace-pre-wrap">{turn.content}</p>
+            ) : (
+              <Typewriter text={turn.content} onTick={onTick} />
+            )}
           </div>
         )}
         {turn.extraction && <ExtractionCard e={turn.extraction} onPreview={() => onPreview(turn.extraction!)} />}
@@ -166,8 +201,11 @@ export default function AgenticChatPage() {
 
   const { data: suggest } = useQuery({ queryKey: ["chat-suggestions"], queryFn: fetchChatSuggestions });
 
-  useEffect(() => {
+  const scrollToBottom = () =>
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+
+  useEffect(() => {
+    scrollToBottom();
   }, [turns, sending, uploading]);
 
   const send = async (text: string) => {
@@ -259,38 +297,44 @@ export default function AgenticChatPage() {
       <Card className="flex min-h-0 flex-1 flex-col">
         <div ref={scrollRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
           {empty ? (
-            <div className="mx-auto max-w-xl py-6 text-center">
-              <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-brand-100 text-brand-700">
-                <Bot className="h-6 w-6" />
+            <div className="mx-auto max-w-xl py-8 text-center">
+              <div className="mx-auto mb-4 flex h-14 w-14 animate-pop-in items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-violet-600 text-white shadow-[0_8px_24px_-8px_rgb(99_102_241/0.7)]">
+                <Sparkles className="h-7 w-7" />
               </div>
-              <h3 className="text-base font-semibold text-slate-800">How can I help with timesheets?</h3>
-              <p className="mt-1 text-sm text-slate-500">
+              <h3 className="text-xl font-bold">
+                <span className="text-gradient">How can I help with timesheets?</span>
+              </h3>
+              <p className="mx-auto mt-2 max-w-md text-sm text-slate-500">
                 Check submissions, count leaves, find who's missing, add / clear leave dates — or
                 <span className="font-medium text-slate-600"> attach a sheet</span> to extract it.
               </p>
-              <div className="mt-5 grid gap-2 sm:grid-cols-2">
-                {(suggest?.suggestions ?? []).map((s) => (
+              <div className="mt-6 grid gap-2.5 sm:grid-cols-2">
+                {(suggest?.suggestions ?? []).map((s, i) => (
                   <button
                     key={s}
                     onClick={() => send(s)}
-                    className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-left text-sm text-slate-700 shadow-xs transition-colors hover:border-brand-300 hover:bg-brand-50/40"
+                    style={{ animationDelay: `${i * 70}ms` }}
+                    className="group animate-fade-up rounded-xl border border-slate-200 bg-white px-3.5 py-3 text-left text-sm text-slate-700 shadow-xs transition-all hover:-translate-y-0.5 hover:border-brand-300 hover:shadow-card-hover"
                   >
-                    <Sparkles className="mr-1.5 inline h-3.5 w-3.5 text-brand-500" />
+                    <Sparkles className="mr-1.5 inline h-3.5 w-3.5 text-brand-500 transition-transform group-hover:scale-110" />
                     {s}
                   </button>
                 ))}
               </div>
             </div>
           ) : (
-            turns.map((t, i) => <Bubble key={i} turn={t} onPreview={openPreview} />)
+            turns.map((t, i) => <Bubble key={i} turn={t} onPreview={openPreview} onTick={scrollToBottom} />)
           )}
           {(sending || uploading) && (
-            <div className="flex items-center gap-3 text-sm text-slate-400">
-              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-brand-100 text-brand-700">
-                <Bot className="h-4 w-4" />
+            <div className="flex animate-bubble-in items-center gap-3 text-sm text-slate-400">
+              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-brand-500 to-violet-600 text-white shadow-sm ring-2 ring-white">
+                <Sparkles className="h-4 w-4" />
               </span>
-              <span className="flex items-center gap-1.5 rounded-2xl bg-slate-50 px-4 py-2.5 ring-1 ring-slate-100">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" /> {uploading ? "Extracting sheet…" : "Thinking…"}
+              <span className="flex items-center gap-2 rounded-2xl rounded-tl-sm bg-white px-4 py-3 shadow-xs ring-1 ring-slate-200/80">
+                <span className="typing-dots flex items-center gap-1">
+                  <span /><span /><span />
+                </span>
+                <span className="text-xs font-medium text-slate-400">{uploading ? "Extracting sheet…" : "Thinking…"}</span>
               </span>
             </div>
           )}

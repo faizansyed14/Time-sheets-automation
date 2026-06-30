@@ -21,12 +21,12 @@ function fieldSlug(label: string) {
 type Variant = "primary" | "secondary" | "ghost" | "danger" | "success";
 const VARIANTS: Record<Variant, string> = {
   primary:
-    "bg-brand-600 text-white hover:bg-brand-700 shadow-xs disabled:bg-brand-300 disabled:shadow-none",
+    "bg-gradient-to-b from-brand-500 to-brand-600 text-white shadow-[0_2px_8px_-2px_rgb(79_70_229/0.5)] hover:from-brand-500 hover:to-brand-700 disabled:from-brand-300 disabled:to-brand-300 disabled:shadow-none",
   secondary:
     "bg-white text-slate-700 ring-1 ring-inset ring-slate-200 hover:bg-slate-50 hover:ring-slate-300 shadow-xs disabled:text-slate-400 disabled:shadow-none",
   ghost: "text-slate-600 hover:bg-slate-100 disabled:text-slate-300",
-  danger: "bg-rose-600 text-white hover:bg-rose-700 shadow-xs disabled:bg-rose-300",
-  success: "bg-emerald-600 text-white hover:bg-emerald-700 shadow-xs disabled:bg-emerald-300",
+  danger: "bg-gradient-to-b from-rose-500 to-rose-600 text-white shadow-[0_2px_8px_-2px_rgb(225_29_72/0.5)] hover:to-rose-700 disabled:from-rose-300 disabled:to-rose-300",
+  success: "bg-gradient-to-b from-emerald-500 to-emerald-600 text-white shadow-[0_2px_8px_-2px_rgb(16_185_129/0.5)] hover:to-emerald-700 disabled:from-emerald-300 disabled:to-emerald-300",
 };
 
 export function Button({
@@ -51,7 +51,7 @@ export function Button({
 /* ----------------------------- Card ----------------------------- */
 export function Card({ className, children }: { className?: string; children: ReactNode }) {
   return (
-    <div className={cn("rounded-xl border border-slate-200/80 bg-white shadow-card", className)}>
+    <div className={cn("rounded-2xl border border-slate-200/70 bg-white shadow-card", className)}>
       {children}
     </div>
   );
@@ -293,10 +293,13 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   return (
-    <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
-      <div>
-        <h1 className="text-[22px] font-semibold leading-tight tracking-tight text-slate-900">{title}</h1>
-        {subtitle && <p className="mt-1 text-sm leading-relaxed text-slate-500">{subtitle}</p>}
+    <div className="mb-6 flex flex-wrap items-end justify-between gap-3 animate-fade-up">
+      <div className="flex items-start gap-3">
+        <span className="mt-1 h-7 w-1.5 rounded-full bg-gradient-to-b from-brand-500 to-violet-600" />
+        <div>
+          <h1 className="text-[22px] font-bold leading-tight tracking-tight text-slate-900">{title}</h1>
+          {subtitle && <p className="mt-1 text-sm leading-relaxed text-slate-500">{subtitle}</p>}
+        </div>
       </div>
       {actions && <div className="flex items-center gap-2">{actions}</div>}
     </div>

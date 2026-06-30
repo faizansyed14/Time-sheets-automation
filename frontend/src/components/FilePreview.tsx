@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Download, ExternalLink, FileText, Mail, Paperclip, X } from "lucide-react";
+import { Download, ExternalLink, FileText, Mail, Maximize2, Minimize2, Paperclip, X } from "lucide-react";
 import { cn, formatBytes } from "../lib/utils";
 import { downloadFile, isDocx, isEml, isPdf, isPreviewable, sanitizeEmailHtml, type PreviewFile } from "../lib/filePreview";
 import { fetchEmlPreview, type EmlParsed } from "../api/client";
@@ -222,6 +222,75 @@ export function DocxPreviewPane({ fileUrl }: { fileUrl: string }) {
 }
 
 // ---------------------------------------------------------------------------
+// Image lightbox — true full-screen viewer (Outlook style). Dark backdrop,
+// centered image, click to toggle fit ↔ actual size, Esc / click-out to close.
+// ---------------------------------------------------------------------------
+
+function ImageLightbox({ file, onClose }: { file: PreviewFile; onClose: () => void }) {
+  const [zoomed, setZoomed] = useState(false);
+
+  return createPortal(
+    <div className="fixed inset-0 z-[60] flex flex-col bg-slate-950/95 animate-overlay-in">
+      {/* Floating top bar */}
+      <div className="absolute inset-x-0 top-0 z-10 flex items-center gap-2 bg-gradient-to-b from-black/60 to-transparent px-5 py-3">
+        <span className="min-w-0 flex-1 truncate text-sm font-medium text-white/90">
+          {file.filename}
+        </span>
+        <button
+          type="button"
+          onClick={() => setZoomed((z) => !z)}
+          className="rounded-lg p-2 text-white/70 transition-colors hover:bg-white/10 hover:text-white"
+          title={zoomed ? "Fit to screen" : "Actual size"}
+        >
+          {zoomed ? <Minimize2 className="h-5 w-5" /> : <Maximize2 className="h-5 w-5" />}
+        </button>
+        <a
+          href={file.url}
+          download={file.filename}
+          className="rounded-lg p-2 text-white/70 transition-colors hover:bg-white/10 hover:text-white"
+          title="Download"
+        >
+          <Download className="h-5 w-5" />
+        </a>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close"
+          className="rounded-lg p-2 text-white/70 transition-colors hover:bg-white/10 hover:text-white"
+        >
+          <X className="h-5 w-5" />
+        </button>
+      </div>
+
+      {/* Image stage — click backdrop closes; click image toggles zoom */}
+      <div
+        className={cn(
+          "flex min-h-0 flex-1 items-center justify-center p-6",
+          zoomed ? "overflow-auto" : "overflow-hidden"
+        )}
+        onClick={onClose}
+      >
+        <img
+          src={file.url}
+          alt={file.filename}
+          onClick={(e) => {
+            e.stopPropagation();
+            setZoomed((z) => !z);
+          }}
+          className={cn(
+            "animate-scale-in select-none rounded-lg shadow-2xl transition-transform duration-200",
+            zoomed
+              ? "max-w-none cursor-zoom-out"
+              : "max-h-full max-w-full cursor-zoom-in object-contain"
+          )}
+        />
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Generic file preview modal (PDF / image / EML / DOCX)
 // ---------------------------------------------------------------------------
 
@@ -249,6 +318,10 @@ export function FilePreviewModal({
   const pdf = isPdf(file.filename, file.contentType);
   const eml = isEml(file.filename, file.contentType);
   const docx = isDocx(file.filename, file.contentType);
+  const image = !pdf && !eml && !docx && isPreviewable(file.filename, file.contentType);
+
+  // Images get a dedicated full-screen lightbox instead of the framed card.
+  if (image) return <ImageLightbox file={file} onClose={onClose} />;
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex flex-col p-3 sm:p-5">

@@ -47,13 +47,18 @@ function Kpi({
   accent?: string;
 }) {
   return (
-    <Card className={cn("flex items-center gap-3.5 p-4", accent)}>
-      <div className={cn("flex h-11 w-11 shrink-0 items-center justify-center rounded-xl", tone)}>
+    <Card
+      className={cn(
+        "group relative flex items-center gap-3.5 overflow-hidden p-4 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-card-hover",
+        accent
+      )}
+    >
+      <div className={cn("flex h-12 w-12 shrink-0 items-center justify-center rounded-xl ring-1 ring-inset ring-black/[0.03] transition-transform duration-200 group-hover:scale-105", tone)}>
         {icon}
       </div>
       <div className="min-w-0">
-        <p className="text-2xl font-bold leading-7 text-slate-900">{value}</p>
-        <p className="truncate text-xs font-medium text-slate-500">{label}</p>
+        <p className="text-[26px] font-bold leading-7 tracking-tight text-slate-900">{value}</p>
+        <p className="truncate text-xs font-semibold text-slate-500">{label}</p>
         {hint && <p className="truncate text-[11px] text-slate-400">{hint}</p>}
       </div>
     </Card>
