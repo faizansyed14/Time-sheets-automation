@@ -11,6 +11,7 @@ production a real worker is started by `scripts/prod/start.sh`.
 from __future__ import annotations
 
 from celery import Celery
+from celery.signals import worker_process_init
 
 from app.core.config import settings
 
@@ -48,3 +49,11 @@ celery_app.conf.update(
         },
     },
 )
+
+
+@worker_process_init.connect
+def _celery_worker_process_init(**_kwargs) -> None:
+    """After prefork, discard async clients inherited from the parent process."""
+    from app.services.tasks import _reset_async_clients
+
+    _reset_async_clients()

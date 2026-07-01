@@ -1,22 +1,24 @@
 ==========================================================================
  DEVELOPMENT — Docker commands
- Stack: Postgres + Redis + backend (1 reload worker) + Celery worker
-        (concurrency 1) + Vite frontend. Same as prod, fewer resources.
+ Stack: Redis + backend (uvicorn --workers 3) + Celery worker (concurrency 3)
+        + built frontend/nginx. Same build as prod. Uses AWS RDS (Postgres)
+        + AWS S3 (files) via .env — no local db / storage container.
  File:  docker-compose.dev.yml      Env: .env  (copy from .env.dev)
 ==========================================================================
 with start script
 ./scripts/dev/start.sh
 
 to delete data(pipelinefiles,timesheet_records,email_messages,employe matcher)
-docker compose -f "c:\Users\FAIZAN\Downloads\timesheet-portal\docker-compose.dev.yml" exec backend python -m app.seed.clear_business_data 2>&1
+docker compose -f docker-compose.dev.yml exec backend python -m app.seed.clear_business_data 2>&1
 # ---- setup (once) ----
-cp .env.dev .env    # then edit .env
+cp .env.dev .env    # then edit .env — DATABASE_URL -> your RDS endpoint,
+                    # STORAGE_PROVIDER=s3 + S3_BUCKET/S3_REGION -> your bucket
 
 # ---- start / stop (or use scripts/dev/start.sh | stop.sh) ----
 docker compose -f docker-compose.dev.yml --env-file .env up --build
 docker compose -f docker-compose.dev.yml --env-file .env up --build -d   # detached
 docker compose -f docker-compose.dev.yml down                                # stop
-docker compose -f docker-compose.dev.yml down --volumes                      # stop + wipe db/storage
+docker compose -f docker-compose.dev.yml down --volumes                      # stop + wipe local redis
 
 # ---- logs ----
 docker compose -f docker-compose.dev.yml logs -f
@@ -30,7 +32,7 @@ docker compose -f docker-compose.dev.yml build backend
 
 # ---- shells ----
 docker compose -f docker-compose.dev.yml exec backend bash
-docker compose -f docker-compose.dev.yml exec db psql -U timesheet -d timesheet
+psql "$DATABASE_URL"   # connect to RDS directly (db is no longer a compose service)
 
 # ---- run the test suite inside the backend container ----
 docker compose -f docker-compose.dev.yml exec backend python -m pytest
@@ -40,5 +42,8 @@ docker compose -f docker-compose.dev.yml exec backend \
   celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=1
 
 # ---- URLs ----
-# Frontend:  http://localhost:5173        Backend API: http://localhost:8000
-# API docs:  http://localhost:8000/docs   Login:       admin / admin
+# App (SPA + API via nginx):  http://localhost:8080   Login: admin / admin
+# On EC2: host nginx + certbot terminate HTTPS in front of :8080 (docs/DEPLOYMENT.md)
+# API docs: not proxied by nginx (same as prod). To reach /docs locally:
+#   docker compose -f docker-compose.dev.yml exec backend curl -s localhost:8000/docs -o /dev/null -w '%{http_code}\n'
+#   (or temporarily add `ports: ["8000:8000"]` under the backend service)

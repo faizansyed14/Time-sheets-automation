@@ -1,114 +1,93 @@
-# DEVELOPMENT stack — structurally IDENTICAL to production (Postgres + Redis +
-# backend + Celery worker + auth + real task queue), only with fewer workers and
-# smaller resource limits, plus hot-reload + source mounts for fast iteration.
+# DEV/STAGING stack — production-style build (built SPA served by nginx,
+# multi-worker uvicorn) that talks to EXTERNAL AWS RDS (Postgres) and S3 (files).
+# No local Postgres and no local file-storage volume: RDS holds all data, S3
+# holds all files, so those Docker volumes are intentionally absent.
 #
-#   docker compose -f docker-compose.dev.yml --env-file .env up --build
-# or: bash scripts/dev/start.sh        (see commands/dev.txt for all commands)
+# The ONLY local stateful piece is Redis (Celery broker + cache + rate-limit
+# windows). It keeps a small appendonly volume so queued background jobs survive
+# a restart — that is a broker concern, not application data.
+#
+# Same file runs on your laptop and on the shared dev/staging EC2. On EC2 a
+# host-level nginx + certbot terminates HTTPS and proxies to 127.0.0.1:8080
+# (see docs/DEPLOYMENT.md). Locally just open http://localhost:8080.
+#
+#   docker compose -f docker-compose.dev.yml --env-file .env up -d --build
+# or: bash scripts/dev/start.sh
+#
+# Required in .env:
+#   DATABASE_URL      postgresql+asyncpg://USER:PASS@<rds-endpoint>:5432/timesheet
+#   STORAGE_PROVIDER  s3
+#   S3_BUCKET/S3_REGION   your bucket
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY   BLANK on EC2 (instance IAM role);
+#     set them only when running outside AWS (e.g. laptop) without a role.
+# Optional tuning (defaults shown):
+#   UVICORN_WORKERS=4       CELERY_CONCURRENCY=3
 
 services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-timesheet}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-timesheet}
-      POSTGRES_DB: ${POSTGRES_DB:-timesheet}
-    ports: ["5432:5432"]                # exposed in dev for psql/debugging
-    volumes: [pg_data_dev:/var/lib/postgresql/data]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-timesheet}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    deploy:
-      resources:
-        limits: { cpus: "0.50", memory: 256M }
-
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis_data:/data]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
     deploy:
       resources:
-        limits: { cpus: "0.25", memory: 128M }
+        limits: { cpus: "0.50", memory: 256M }
 
   backend:
     build: { context: ./backend }
-    # Apply DB migrations (Alembic is the single source of truth) THEN start the
-    # single hot-reloading process (prod runs --workers 4).
-    command: sh -c "python bootstrap_migrations.py && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    # Apply Alembic migrations against the RDS in DATABASE_URL, THEN serve.
+    # Workers are tunable from .env (UVICORN_WORKERS) without editing this file.
+    command: sh -c "python bootstrap_migrations.py && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-4}"
     env_file: [.env]
     environment:
       REDIS_URL: redis://redis:6379/0
-      CELERY_TASK_ALWAYS_EAGER: "false"   # real queue, same as prod
-      AUTO_CREATE_TABLES: "false"         # Alembic owns the schema (see command)
-      # DATABASE_URL comes from .env only (local @db or AWS RDS — do not override here)
-    volumes:
-      - ./backend:/app                    # hot reload
-      - backend_storage_dev:/app/storage
-    ports: ["8000:8000"]
+      CELERY_TASK_ALWAYS_EAGER: "false"
+      AUTO_CREATE_TABLES: "false"        # Alembic (against RDS) owns the schema
+      # DATABASE_URL / STORAGE_PROVIDER / S3_* come from .env only
+    expose: ["8000"]
+    restart: unless-stopped
     depends_on:
-      db: { condition: service_healthy }
       redis: { condition: service_healthy }
     deploy:
       resources:
-        limits: { cpus: "1.00", memory: 1024M }
+        limits: { cpus: "2.00", memory: 2048M }
 
   worker:
     build: { context: ./backend }
-    # dev: concurrency 1 (prod runs 4). -B = embedded beat for periodic
-    # maintenance (daily pipeline-raw retention purge).
-    command: celery -A app.core.celery_app.celery_app worker -B --loglevel=info --concurrency=1
+    # -B = embedded beat scheduler (AI-check + pipeline-raw purge on the
+    # INBOX_AI_CHECK_INTERVAL_HOURS / PIPELINE_RAW_PURGE_INTERVAL_HOURS cadence
+    # from .env). Keep this a SINGLE replica — beat must not run twice.
+    command: celery -A app.core.celery_app.celery_app worker -B --loglevel=info --concurrency=${CELERY_CONCURRENCY:-3}
     env_file: [.env]
     environment:
       REDIS_URL: redis://redis:6379/0
       CELERY_TASK_ALWAYS_EAGER: "false"
       AUTO_CREATE_TABLES: "false"
-      # DATABASE_URL from .env only
-    volumes:
-      - ./backend:/app
-      - backend_storage_dev:/app/storage
+      DB_NULLPOOL: "true"
+    restart: unless-stopped
     depends_on:
       redis: { condition: service_healthy }
-      db: { condition: service_healthy }
-      # wait for the backend to finish `alembic upgrade head` before consuming tasks
-      backend: { condition: service_healthy }
+      backend: { condition: service_healthy }   # wait for migrations to finish
     deploy:
       resources:
-        limits: { cpus: "0.50", memory: 512M }
+        limits: { cpus: "1.00", memory: 1024M }
 
-  frontend:
-    build: { context: ./frontend, target: dev }
-    command: npm run dev -- --host 0.0.0.0
-    environment:
-      VITE_PROXY_TARGET: http://backend:8000   # reach the backend service
-      VITE_HMR_CLIENT_PORT: "8080"             # HMR socket comes back via nginx
+  # Single public nginx container (SPA + API reverse proxy).
+  nginx:
+    build: { context: ./frontend, target: prod }
+    ports: ["127.0.0.1:8080:80"]
     volumes:
-      - ./frontend:/app
-      - /app/node_modules
-    ports: ["5173:5173"]
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
     depends_on: [backend]
     deploy:
       resources:
-        limits: { cpus: "0.50", memory: 512M }
-
-  # Single entry point in front of the dev stack (mirrors prod's nginx) while
-  # preserving Vite hot-reload. App + API are served at http://localhost:8080;
-  # 5173/8000 stay exposed for direct debugging.
-  nginx:
-    image: nginx:1.27-alpine
-    volumes:
-      - ./frontend/nginx.dev.conf:/etc/nginx/conf.d/default.conf:ro
-    ports: ["8080:80"]
-    depends_on: [backend, frontend]
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits: { cpus: "0.25", memory: 128M }
+        limits: { cpus: "0.50", memory: 256M }
 
 volumes:
-  pg_data_dev:
-  backend_storage_dev:
+  redis_data:

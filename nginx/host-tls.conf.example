@@ -1,0 +1,45 @@
+# Host-level nginx site for the shared dev/staging EC2 (and prod, same pattern).
+# Terminates HTTPS with a Let's Encrypt cert and reverse-proxies to the Docker
+# frontend container published on 127.0.0.1:8080 (which itself serves the SPA
+# and proxies /api|/auth|/health to the backend container).
+#
+# Install:
+#   sudo apt-get update && sudo apt-get install -y nginx
+#   sudo cp nginx/host-tls.conf.example /etc/nginx/sites-available/timesheets
+#   # edit server_name below to your domain
+#   sudo ln -s /etc/nginx/sites-available/timesheets /etc/nginx/sites-enabled/timesheets
+#   sudo rm -f /etc/nginx/sites-enabled/default
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# Then obtain + auto-configure TLS (edits this file in place, adds the 443
+# block + redirect, and installs a renewal timer):
+#   sudo apt-get install -y certbot python3-certbot-nginx
+#   sudo certbot --nginx -d dev.yourdomain.com --redirect --agree-tos -m you@yourcompany.com
+#   # renewal is automatic via the certbot systemd timer; test with:
+#   sudo certbot renew --dry-run
+
+server {
+    listen 80;
+    server_name dev.yourdomain.com;   # <-- change me
+
+    # Large timesheet / vault uploads + downloads.
+    client_max_body_size 100m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_http_version 1.1;
+        # Stream large exports straight through (no disk buffering).
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_max_temp_file_size 0;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+}
+# After `certbot --nginx` runs, it appends a `listen 443 ssl` server block with
+# the certificate paths and rewrites this port-80 block to redirect to HTTPS.
