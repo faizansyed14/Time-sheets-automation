@@ -159,32 +159,17 @@ async def get_employee_timesheets(
 
 
 async def count_leaves(
-    db: AsyncSession, employee: str, leave_type: str | None = None,
+    db: AsyncSession, employee: str, leave_type: str,
     month: int | None = None, year: int | None = None,
 ) -> dict[str, Any]:
-    """Count an employee's leaves. If leave_type is None/'all', returns all types."""
-    ts = await get_employee_timesheets(db, employee, month, year)
-    if ts["status"] != "ok":
-        return ts
-
-    # No specific type requested → return full breakdown of all leave types
-    if not leave_type or leave_type.strip().lower() in ("all", ""):
-        summary: dict[str, Any] = {}
-        for field, label in _FIELD_LABELS.items():
-            total = sum(r["leaves"].get(label, 0) for r in ts["records"])
-            per_record = [
-                {"month": r["month"], "year": r["year"],
-                 "month_name": r["month_name"], "count": r["leaves"].get(label, 0),
-                 "dates": r["leave_dates"].get(label, [])}
-                for r in ts["records"]
-            ]
-            summary[label] = {"total": total, "per_record": per_record}
-        return {"status": "ok", "employee": ts["employee"], "all_leave_types": summary}
-
+    """Count an employee's leaves of a given type, optionally scoped to a month/year."""
     field = _resolve_leave_field(leave_type)
     if not field:
         return {"status": "unknown_leave_type", "leave_type": leave_type,
                 "valid_types": sorted(set(_FIELD_LABELS.values()))}
+    ts = await get_employee_timesheets(db, employee, month, year)
+    if ts["status"] != "ok":
+        return ts
     label = _FIELD_LABELS[field]
     total = 0
     per_record = []

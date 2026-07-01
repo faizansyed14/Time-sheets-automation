@@ -33,12 +33,18 @@ celery_app.conf.update(
     worker_max_tasks_per_child=200,
     broker_connection_retry_on_startup=True,
     # Periodic maintenance (runs under `celery worker -B` or a dedicated beat).
-    # Daily purge of pipeline retry copies past their retention window so the
-    # raw store stays bounded as data grows.
+    # Intervals are configurable from .env (see config.Settings):
+    #   PIPELINE_RAW_PURGE_INTERVAL_HOURS  — purge S3/disk retry copies (default daily)
+    #   INBOX_AI_CHECK_INTERVAL_HOURS      — AI-check inbox sheets (default every 5h)
     beat_schedule={
-        "purge-pipeline-raw-daily": {
+        "purge-pipeline-raw": {
             "task": "maintenance.purge_pipeline_raw",
-            "schedule": 24 * 60 * 60,  # seconds — once a day
+            "schedule": max(60.0, settings.pipeline_raw_purge_interval_hours * 3600.0),
+        },
+        "inbox-ai-check": {
+            "task": "inbox.ai_check_scan",
+            "schedule": max(60.0, settings.inbox_ai_check_interval_hours * 3600.0),
+            "args": (settings.inbox_ai_check_batch,),
         },
     },
 )

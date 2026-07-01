@@ -64,6 +64,9 @@ class EmailListItem(BaseModel):
     status: str
     attachment_count: int
     has_approval_screenshot: bool
+    # Whether the inbox AI check has already run (drives the "calling AI…" hint
+    # so an already-checked email never shows it / implies a re-check).
+    ai_checked: bool = False
 
 
 class EmailDetail(EmailListItem):

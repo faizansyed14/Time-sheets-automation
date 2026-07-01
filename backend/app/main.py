@@ -69,6 +69,16 @@ async def lifespan(app: FastAPI):
         purge_pipeline_raw_task.delay()
     except Exception:
         pass
+    # Pre-warm inbox AI checks in the background so sheets are classified before
+    # the user opens them. Only queued when a real Celery worker is present
+    # (non-eager); in eager/dev mode this would run inline and block startup, so
+    # we skip it there — the frontend's background-scan call covers dev.
+    if not settings.celery_task_always_eager:
+        try:
+            from app.services.tasks import ai_check_inbox_task
+            ai_check_inbox_task.delay(100)
+        except Exception:
+            pass
     async with SessionLocal() as db:
         # default admin + apply any saved AI config to the live process
         try:

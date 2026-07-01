@@ -204,7 +204,7 @@ export default function FilesPage() {
                 <FolderRow
                   key={m.rel_path}
                   active={manager === m.name}
-                  icon={<Briefcase className="h-4 w-4" />}
+                  icon={<Folder className="h-4 w-4" />}
                   label={m.name}
                   meta={`${m.employee_count} employee${m.employee_count !== 1 ? "s" : ""}`}
                   onClick={() => {
@@ -427,11 +427,11 @@ function FolderRow({
     <div
       className={cn(
         "group flex items-center gap-2.5 rounded-lg px-3 py-2 transition-colors",
-        active ? "bg-brand-50 text-brand-700" : "text-slate-600 hover:bg-slate-50"
+        active ? "bg-amber-50 text-amber-800" : "text-slate-600 hover:bg-slate-50"
       )}
     >
       <button onClick={onClick} className="flex min-w-0 flex-1 items-center gap-2.5 text-left">
-        <span className={cn("shrink-0", active ? "text-brand-500" : "text-slate-400")}>{icon}</span>
+        <span className={cn("shrink-0", active ? "text-amber-500" : "text-amber-400")}>{icon}</span>
         <span className="min-w-0 flex-1">
           <span className="block truncate text-sm font-medium">{label}</span>
           <span className="block text-[11px] text-slate-400">{meta}</span>

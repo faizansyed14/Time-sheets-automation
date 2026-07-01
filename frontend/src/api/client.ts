@@ -69,6 +69,7 @@ export interface EmailListItem {
   status: "new" | "archived" | "ingested";
   attachment_count: number;
   has_approval_screenshot: boolean;
+  ai_checked: boolean;
 }
 
 export interface Attachment {
@@ -303,6 +304,11 @@ export const stageExtraction = (
       extract_body: selection.extract_body ?? false,
     })
     .then((r) => r.data);
+
+// Fire-and-forget: ask the backend to AI-check inbox sheets in the background
+// (Celery). Called once on app open; skips already-checked emails server-side.
+export const triggerBackgroundScan = () =>
+  api.post<{ queued: boolean }>(`/inbox/background-scan`).then((r) => r.data).catch(() => ({ queued: false }));
 
 export const decideEmail = (id: string, accepted: boolean, selection?: IngestSelection) =>
   api.post(`/inbox/${id}/decision`, {
@@ -894,8 +900,8 @@ export const AI_PROVIDERS = {
     label: "OpenAI",
     keyField: "openai_api_key",
     baseField: "openai_base_url",
-    extractionModels: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano"],
-    validationModels: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1-nano"],
+    extractionModels: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"],
+    validationModels: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
   },
   deepseek: {
     label: "DeepSeek",

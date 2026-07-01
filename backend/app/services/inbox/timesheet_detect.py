@@ -28,6 +28,25 @@ _MONTHS = (
 )
 
 
+def plain_email_body(
+    *,
+    subject: str | None = None,
+    body_text: str | None = None,
+    body_html: str | None = None,
+) -> str:
+    """Plain text for detection / LLM — body_text first, HTML table flatten as fallback."""
+    text = (body_text or "").strip()
+    if len(text) >= 40:
+        return f"{subject or ''}\n\n{text}".strip()
+    html = (body_html or "").strip()
+    if html:
+        from app.services.extraction.file_processor import _html_to_text
+        html_plain = _html_to_text(html).strip()
+        if html_plain:
+            return f"{subject or ''}\n\n{html_plain}".strip()
+    return f"{subject or ''}\n\n{text}".strip()
+
+
 def looks_like_timesheet(text: str) -> tuple[bool, str]:
     t = (text or "").lower()
     if len(t.strip()) < 20:
@@ -37,11 +56,11 @@ def looks_like_timesheet(text: str) -> tuple[bool, str]:
         score += 2
     if any(m in t for m in _MONTHS):
         score += 1
-    if len(find_dates_in_text(text)) >= 3:
+    if len(find_dates_in_text(text)) >= 5:
         score += 1
     if any(n in t for n in _NEG_KEYWORDS):
         score -= 3
-    if score >= 2:
+    if score >= 3:
         return True, "timesheet signals in text"
     return False, "not a timesheet"
 

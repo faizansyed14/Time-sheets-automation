@@ -221,7 +221,7 @@ function TextWithInlineImages({
           key={`img-${match.index}`}
           src={url}
           alt={match[1].split("@")[0]}
-          className="my-1 inline-block max-h-20 max-w-full object-contain align-middle"
+          className="my-1 inline-block max-h-12 max-w-[120px] object-contain align-middle"
         />
       );
     } else if (match.index !== undefined) {
@@ -277,14 +277,19 @@ function EmailBodyRenderer({
   attachments: Attachment[];
   providerId: string;
 }) {
-  // -- HTML path: resolve CIDs, sanitize, render in sandboxed iframe ----------
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const [frameHeight, setFrameHeight] = useState(320);
 
+  const text = bodyText ?? "";
+  const cidMap = useMemo(() => buildCidMap(text, attachments, providerId), [text, attachments, providerId]);
+  const { outer, forwarded, isForwarded } = useMemo(() => splitForwardedBody(text), [text]);
+  const detectedFwd = isForwarded || isForwardedSubject(subject);
+
   useEffect(() => {
-    if (!bodyHtml) return;
-    // Most cid: images are already inlined as data URIs by the backend; this
-    // resolves any that weren't, then we sandbox the result in an iframe.
+    if (!bodyHtml) {
+      setBlobUrl(null);
+      return;
+    }
     const resolved = resolveCidsInHtml(bodyHtml, attachments, providerId);
     const safe = sanitizeEmailHtml(resolved);
     const doc =
@@ -292,15 +297,14 @@ function EmailBodyRenderer({
       `<base target="_blank">` +
       `<style>html,body{margin:0;padding:12px;font-family:Calibri,Segoe UI,Arial,sans-serif;` +
       `color:#1f2937;font-size:14px;line-height:1.5;word-wrap:break-word}` +
-      `img{max-width:100%;height:auto}table{max-width:100%}</style></head>` +
+      `img{max-width:min(100%,220px);max-height:96px;height:auto;object-fit:contain;display:block;margin:4px 0}` +
+      `table{max-width:100%}</style></head>` +
       `<body>${safe}</body></html>`;
     const blob = URL.createObjectURL(new Blob([doc], { type: "text/html" }));
     setBlobUrl(blob);
     return () => URL.revokeObjectURL(blob);
   }, [bodyHtml, attachments, providerId]);
 
-  // The blob is same-origin (allow-same-origin), so we can measure its content
-  // and grow the iframe to fit — no inner scrollbar, renders like Outlook.
   const sizeToContent = (e: React.SyntheticEvent<HTMLIFrameElement>) => {
     try {
       const body = e.currentTarget.contentWindow?.document?.body;
@@ -324,12 +328,6 @@ function EmailBodyRenderer({
       />
     );
   }
-
-  // -- Plain-text fallback (mock emails or providers without HTML) -----------
-  const text = bodyText ?? "";
-  const cidMap = useMemo(() => buildCidMap(text, attachments, providerId), [text, attachments, providerId]);
-  const { outer, forwarded, isForwarded } = useMemo(() => splitForwardedBody(text), [text]);
-  const detectedFwd = isForwarded || isForwardedSubject(subject);
 
   if (!text.trim()) {
     return (
@@ -370,12 +368,15 @@ function AiAnalysisPanel({
   ai: EmailAiCheck | null;
   aiRunning: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
 
-  // Auto-expand while running so user sees the spinner
+  // Auto-expand while the backend runs the first-time AI check on open.
   useEffect(() => {
     if (aiRunning) setOpen(true);
   }, [aiRunning]);
+  useEffect(() => {
+    if (ai?.checked_at) setOpen(true);
+  }, [ai?.checked_at]);
 
   if (!ai && !aiRunning) return null;
 
@@ -524,6 +525,134 @@ function AttachmentChip({
   );
 }
 
+// Collapsible block — images default closed so the email body stays visible.
+function CollapsibleAttachmentSection({
+  title,
+  icon,
+  defaultOpen = false,
+  hint,
+  children,
+}: {
+  title: string;
+  icon: ReactNode;
+  defaultOpen?: boolean;
+  hint?: string;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+
+  return (
+    <div className="rounded-lg border border-slate-100 bg-slate-50/50">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-[11px] font-bold uppercase tracking-wide text-slate-500 hover:bg-slate-50"
+      >
+        {open ? (
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+        ) : (
+          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+        )}
+        {icon}
+        <span className="flex-1">{title}</span>
+      </button>
+      {open && (
+        <div className="border-t border-slate-100 px-3 pb-3 pt-2">
+          {children}
+          {hint && <p className="mt-2 text-[11px] text-slate-400">{hint}</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Image card — compact thumbnail; click → lightbox. Extract / Approval checkboxes.
+function ImageCard({
+  a, providerId, selectedTimesheetIds, setSelectedTimesheetIds,
+  approvalAttachmentId, setApprovalAttachmentId, status, setPreview, aiAtt,
+}: {
+  a: Attachment;
+  providerId: string;
+  selectedTimesheetIds: Set<string>;
+  setSelectedTimesheetIds: Dispatch<SetStateAction<Set<string>>>;
+  approvalAttachmentId: string | null;
+  setApprovalAttachmentId: Dispatch<SetStateAction<string | null>>;
+  status: string;
+  setPreview: (f: PreviewFile) => void;
+  aiAtt: (id: string) => any;
+}) {
+  const url = attachmentUrl(providerId, a.attachment_id);
+  const analysis = aiAtt(a.attachment_id);
+  const approvalChecked = approvalAttachmentId === a.attachment_id;
+  const extractChecked = selectedTimesheetIds.has(a.attachment_id);
+  const canDecide = status === "new" || status === "ingested";
+
+  return (
+    <div
+      className={cn(
+        "group flex w-[108px] flex-col overflow-hidden rounded-lg border text-[10px] transition-colors",
+        extractChecked
+          ? "border-brand-300 ring-1 ring-brand-100"
+          : approvalChecked
+            ? "border-emerald-300 ring-1 ring-emerald-100"
+            : "border-slate-200 hover:border-brand-200",
+      )}
+    >
+      <button
+        type="button"
+        title="Click to enlarge"
+        onClick={() => setPreview({ url, filename: a.filename, contentType: a.content_type })}
+        className="relative block h-14 w-full overflow-hidden bg-slate-100"
+      >
+        <img src={url} alt={a.filename} className="h-full w-full object-contain p-0.5" />
+        <span className="absolute inset-0 flex items-center justify-center bg-slate-900/0 opacity-0 transition-all group-hover:bg-slate-900/20 group-hover:opacity-100">
+          <span className="inline-flex items-center gap-0.5 rounded bg-white/90 px-1.5 py-0.5 text-[9px] font-semibold text-slate-700">
+            <Maximize2 className="h-2.5 w-2.5" />
+          </span>
+        </span>
+      </button>
+      <div className="flex flex-col gap-1 p-1.5">
+        <span className="truncate font-medium text-slate-700" title={a.filename}>{a.filename}</span>
+        {analysis?.category && (
+          <span className="text-[9px] text-slate-400">{analysis.category}{analysis.used_ocr ? " · OCR" : ""}</span>
+        )}
+        {canDecide && (
+          <div className="flex flex-wrap gap-1.5">
+            <label className="flex cursor-pointer items-center gap-0.5 text-[9px] font-semibold text-brand-600">
+              <input
+                type="checkbox"
+                checked={extractChecked}
+                onChange={(e) =>
+                  setSelectedTimesheetIds((prev) => {
+                    const next = new Set(prev);
+                    if (e.target.checked) next.add(a.attachment_id);
+                    else next.delete(a.attachment_id);
+                    return next;
+                  })
+                }
+                className="rounded border-slate-300 text-brand-600"
+              />
+              Extract
+            </label>
+            <label className="flex cursor-pointer items-center gap-0.5 text-[9px] font-semibold text-emerald-600">
+              <input
+                type="checkbox"
+                checked={approvalChecked}
+                onChange={(e) => {
+                  if (e.target.checked) setApprovalAttachmentId(a.attachment_id);
+                  else setApprovalAttachmentId((c) => (c === a.attachment_id ? null : c));
+                }}
+                className="rounded border-slate-300 text-emerald-600"
+              />
+              Approval
+            </label>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function AttachmentChips({
   attachments,
   providerId,
@@ -551,10 +680,31 @@ function AttachmentChips({
 }) {
   // Documents (PDF/DOCX/EML) → top chip strip
   const docs = attachments.filter((a) => !inlineIds.has(a.attachment_id) && isDocAttachment(a));
-  // Images that are NOT inline CID (approval screenshots, non-logo images)
-  const images = attachments.filter((a) => !inlineIds.has(a.attachment_id) && isImageAttachment(a));
+  // Images attached normally (approval screenshots, standalone pictures).
+  const attachedImages = attachments.filter((a) => !inlineIds.has(a.attachment_id) && isImageAttachment(a));
+  const inlineImages = attachments.filter((a) => inlineIds.has(a.attachment_id) && isImageAttachment(a));
 
-  if (!docs.length && !images.length) return null;
+  // Dedupe — same file must not appear twice (attached + inline).
+  const imageById = new Map<string, Attachment>();
+  for (const a of [...attachedImages, ...inlineImages]) {
+    imageById.set(a.attachment_id, a);
+  }
+  const allImages = [...imageById.values()];
+  const inlineIdSet = new Set(inlineImages.map((a) => a.attachment_id));
+
+  if (!docs.length && !allImages.length) return null;
+
+  const imageProps = {
+    providerId, selectedTimesheetIds, setSelectedTimesheetIds,
+    approvalAttachmentId, setApprovalAttachmentId, status, setPreview, aiAtt,
+  };
+
+  const imageHint = (
+    <>
+      Tick <span className="font-semibold text-brand-600">Extract</span> on a pasted timesheet image to run it
+      through extraction.
+    </>
+  );
 
   return (
     <div className="border-b border-slate-100 px-5 py-3 space-y-3">
@@ -583,61 +733,40 @@ function AttachmentChips({
         </div>
       )}
 
-      {images.length > 0 && (
-        <div>
-          <p className="mb-2 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400">
-            <ImageIcon className="h-3 w-3" />
-            {images.length} image{images.length !== 1 ? "s" : ""}
-          </p>
-          <div className="flex flex-wrap gap-2">
-            {images.map((a) => {
-              const analysis = aiAtt(a.attachment_id);
-              const isApproval = a.kind === "approval_screenshot" || analysis?.category === "approval";
-              const approvalChecked = approvalAttachmentId === a.attachment_id;
-              const canDecide = status === "new" || status === "ingested";
-              return (
-                <div
-                  key={a.attachment_id}
-                  className={cn(
-                    "flex items-center gap-2 rounded-lg border px-2.5 py-2 text-xs transition-colors",
-                    approvalChecked
-                      ? "border-emerald-300 bg-emerald-50 ring-1 ring-emerald-100"
-                      : "border-slate-200 bg-white hover:border-emerald-200",
-                  )}
-                >
-                  <ImageIcon className="h-4 w-4 shrink-0 text-emerald-500" />
-                  <span className="min-w-0">
-                    <span className="block max-w-[160px] truncate font-medium text-slate-700">{a.filename}</span>
-                    {analysis && (
-                      <span className="block text-[10px] text-slate-400">{analysis.category}</span>
-                    )}
-                  </span>
-                  {(isApproval || !analysis) && canDecide && (
-                    <label className="flex cursor-pointer items-center gap-1 text-[10px] font-semibold text-emerald-600">
-                      <input
-                        type="checkbox"
-                        checked={approvalChecked}
-                        onChange={(e) => {
-                          if (e.target.checked) setApprovalAttachmentId(a.attachment_id);
-                          else setApprovalAttachmentId((c) => (c === a.attachment_id ? null : c));
-                        }}
-                        className="rounded border-slate-300 text-emerald-600"
-                      />
-                      Approval
-                    </label>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => setPreview({ url: attachmentUrl(providerId, a.attachment_id), filename: a.filename, contentType: a.content_type })}
-                    className="ml-1 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-brand-500 hover:text-brand-700"
-                  >
-                    Preview
-                  </button>
+      {allImages.length > 0 && (
+        <CollapsibleAttachmentSection
+          key={providerId}
+          title={`${allImages.length} image${allImages.length !== 1 ? "s" : ""}`}
+          icon={<ImageIcon className="h-3 w-3" />}
+          defaultOpen={false}
+          hint={inlineIdSet.size > 0 ? imageHint : undefined}
+        >
+          <div className="space-y-2">
+            {attachedImages.length > 0 && inlineImages.length > 0 && (
+              <>
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Attached</p>
+                <div className="flex flex-wrap gap-2">
+                  {attachedImages.map((a) => (
+                    <ImageCard key={a.attachment_id} a={a} {...imageProps} />
+                  ))}
                 </div>
-              );
-            })}
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">In email body</p>
+                <div className="flex flex-wrap gap-2">
+                  {inlineImages.map((a) => (
+                    <ImageCard key={a.attachment_id} a={a} {...imageProps} />
+                  ))}
+                </div>
+              </>
+            )}
+            {(attachedImages.length === 0 || inlineImages.length === 0) && (
+              <div className="flex flex-wrap gap-2">
+                {allImages.map((a) => (
+                  <ImageCard key={a.attachment_id} a={a} {...imageProps} />
+                ))}
+              </div>
+            )}
           </div>
-        </div>
+        </CollapsibleAttachmentSection>
       )}
     </div>
   );
@@ -657,8 +786,7 @@ export default function InboxPage() {
   const [selectedTimesheetIds, setSelectedTimesheetIds] = useState<Set<string>>(new Set());
   const [approvalAttachmentId, setApprovalAttachmentId] = useState<string | null>(null);
   const [extractBodyEnabled, setExtractBodyEnabled] = useState(false);
-  const [aiRunning, setAiRunning] = useState(false);
-  // Staged pipeline files awaiting review in the Compare & Fix overlay (queue).
+  const [aiRerunning, setAiRerunning] = useState(false);
   const [stagedQueue, setStagedQueue] = useState<PipelineFile[]>([]);
 
   useEffect(() => setPreview(null), [selected]);
@@ -698,6 +826,15 @@ export default function InboxPage() {
     queryFn: () => fetchEmail(selected!),
     enabled: !!selected,
   });
+
+  const selectedItem = emails.find((e) => e.provider_message_id === selected);
+  const aiRunning = (!!selected && loadingDetail && !selectedItem?.ai_checked) || aiRerunning;
+
+  useEffect(() => {
+    if (detail?.ai_check?.checked_at) {
+      qc.invalidateQueries({ queryKey: ["inbox"] });
+    }
+  }, [detail?.ai_check?.checked_at, qc]);
 
   useEffect(() => {
     if (!detail) return;
@@ -790,14 +927,17 @@ export default function InboxPage() {
     onError: (e: any) => toast("error", "Re-run failed", e?.response?.data?.detail ?? String(e)),
   });
 
-  const runAiCheck = async () => {
+  const rerunAi = async () => {
     if (!selected) return;
-    setAiRunning(true);
+    setAiRerunning(true);
     try {
       const data = await fetchEmail(selected, true);
       qc.setQueryData(["email", selected], data);
+      qc.invalidateQueries({ queryKey: ["inbox"] });
+    } catch (e: any) {
+      toast("error", "AI rerun failed", e?.response?.data?.detail ?? String(e));
     } finally {
-      setAiRunning(false);
+      setAiRerunning(false);
     }
   };
 
@@ -909,13 +1049,32 @@ export default function InboxPage() {
             <EmptyState
               icon={<Mail className="h-6 w-6" />}
               title="Select an email"
-              detail="Click AI Check to classify attachments and detect inline timesheets."
+              detail="AI analysis runs automatically when emails arrive."
             />
           ) : loadingDetail || !detail ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-3">
-              <Spinner className="h-6 w-6" />
-              <p className="text-sm text-slate-500">Loading email…</p>
-            </div>
+            (() => {
+              // While the email loads, the backend auto-runs the AI check for
+              // sheets — surface that so the few-second wait is understood.
+              const selItem = emails.find((e) => e.provider_message_id === selected);
+              const needsAi = selItem && !selItem.ai_checked;
+              return (
+                <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+                  <Spinner className="h-6 w-6" />
+                  {needsAi ? (
+                    <div className="flex flex-col items-center gap-1.5 animate-fade-up">
+                      <span className="inline-flex items-center gap-1.5 rounded-full bg-brand-50 px-3 py-1 text-xs font-semibold text-brand-700 ring-1 ring-inset ring-brand-200">
+                        <Brain className="h-3.5 w-3.5" /> AI analysis
+                      </span>
+                      <p className="text-sm font-medium text-slate-600">
+                        Running first-time check — this might take a few seconds…
+                      </p>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-slate-500">Loading email…</p>
+                  )}
+                </div>
+              );
+            })()
           ) : (
             <>
               {fullscreen ? (
@@ -1002,9 +1161,15 @@ export default function InboxPage() {
 
                         {/* Action buttons */}
                         <div className="flex flex-wrap justify-end gap-1.5">
-                          <Button size="sm" variant="secondary" disabled={aiRunning || loadingDetail} onClick={runAiCheck}>
-                            {aiRunning ? <Spinner className="h-3 w-3" /> : <Brain className="h-3 w-3" />}
-                            AI Check
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            disabled={aiRerunning || loadingDetail}
+                            onClick={rerunAi}
+                            title="Re-run AI analysis on this email"
+                          >
+                            {aiRerunning ? <Spinner className="h-3 w-3" /> : <Brain className="h-3 w-3" />}
+                            Rerun AI
                           </Button>
                           {detail.status === "new" && (
                             <>

@@ -92,9 +92,9 @@ class Settings(BaseSettings):
     vllm_temperature: float = 0.0
     vllm_timeout: int = 90
     # Runtime model choices (same names your project uses).
-    extraction_model: str = "gpt-4o"        # override via EXTRACTION_MODEL in .env
-    vision_image_detail: str = "high"       # low | high — override via VISION_IMAGE_DETAIL
-    validation_model: str = "gpt-4o-mini"  # override via VALIDATION_MODEL in .env
+    extraction_model: str = "gpt-4o"
+    vision_image_detail: str = "high"   # low | high — used for SCANS/photos
+    validation_model: str = "gpt-4o-mini"
     enable_text_validation: bool = True
 
     # ----- Cost / accuracy tuning (all admin-editable) -----
@@ -117,7 +117,7 @@ class Settings(BaseSettings):
     # Cheap model for inbox AI check (classify attachments + body in one call).
     ai_check_model: str = "gpt-4o-mini"
     # Model for the Agentic Chat assistant (text → safe DB actions).
-    agent_chat_model: str = "gpt-4o"
+    agent_chat_model: str = "gpt-4o-mini"
 
     # CORS for the Vite dev server.
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
@@ -142,6 +142,15 @@ class Settings(BaseSettings):
     celery_broker_url: str = ""      # defaults to redis_url
     celery_result_backend: str = ""  # defaults to redis_url
     celery_task_always_eager: bool = True
+
+    # ---- Scheduled background jobs (Celery beat) — intervals configurable ----
+    # How often the S3 / disk pipeline-raw retry copies are purged. Default once
+    # a day. Set in hours; e.g. 24 = daily, 12 = twice a day, 168 = weekly.
+    pipeline_raw_purge_interval_hours: float = 24.0
+    # How often the inbox AI-check pass runs over unchecked emails.
+    inbox_ai_check_interval_hours: float = 5.0
+    # How many unchecked emails each scheduled AI-check pass processes (cost cap).
+    inbox_ai_check_batch: int = 100
 
     # ===================== Auth / Security =====================
     auth_enabled: bool = True

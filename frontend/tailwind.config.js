@@ -46,12 +46,41 @@ export default {
           "0%": { opacity: "0" },
           "100%": { opacity: "1" },
         },
+        // Premium / chat motion
+        "blink": {
+          "0%, 100%": { opacity: "1" },
+          "50%": { opacity: "0" },
+        },
+        "typing-dot": {
+          "0%, 60%, 100%": { transform: "translateY(0)", opacity: ".4" },
+          "30%": { transform: "translateY(-4px)", opacity: "1" },
+        },
+        "shimmer": {
+          "100%": { transform: "translateX(100%)" },
+        },
+        "gradient-pan": {
+          "0%, 100%": { backgroundPosition: "0% 50%" },
+          "50%": { backgroundPosition: "100% 50%" },
+        },
+        "pop-in": {
+          "0%": { opacity: "0", transform: "scale(.92)" },
+          "100%": { opacity: "1", transform: "scale(1)" },
+        },
+        "bubble-in": {
+          "0%": { opacity: "0", transform: "translateY(8px) scale(.98)" },
+          "100%": { opacity: "1", transform: "translateY(0) scale(1)" },
+        },
       },
       animation: {
         "fade-up": "fade-up .25s ease-out both",
         "slide-in": "slide-in .25s cubic-bezier(.32,.72,.35,1) both",
         "scale-in": "scale-in .2s cubic-bezier(.16,1,.3,1) both",
         "overlay-in": "overlay-in .2s ease-out both",
+        "blink": "blink 1s step-end infinite",
+        "shimmer": "shimmer 1.6s infinite",
+        "gradient-pan": "gradient-pan 6s ease infinite",
+        "pop-in": "pop-in .22s cubic-bezier(.16,1,.3,1) both",
+        "bubble-in": "bubble-in .28s cubic-bezier(.16,1,.3,1) both",
       },
     },
   },

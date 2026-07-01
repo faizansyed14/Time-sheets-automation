@@ -21,13 +21,12 @@ from functools import lru_cache
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.openai_url import openai_urls
 from app.services.config.service import get_overlay
 
-# Per-provider fallback metadata — openai model resolved from settings at runtime
+# Per-provider defaults: (base_url_key, api_key_key, default_model)
 PROVIDERS = {
-    "openai":   {"base": "openai_base_url",   "key": "openai_api_key",   "model_setting": "extraction_model"},
+    "openai": {"base": "openai_base_url", "key": "openai_api_key", "model": "gpt-4o"},
     "deepseek": {"base": "deepseek_base_url", "key": "deepseek_api_key", "model": "deepseek-chat"},
 }
 
@@ -56,13 +55,11 @@ async def _resolve(db: AsyncSession, kind: str, provider_override: str | None = 
     base_url = cfg.get(meta["base"]) or ""
     api_key = cfg.get(meta["key"]) or ""
     if kind == "validation":
-        model = cfg.get("validation_model") or settings.validation_model
+        model = cfg.get("validation_model") or "gpt-4o-mini"
     elif kind == "agent":
-        model = cfg.get("agent_chat_model") or settings.agent_chat_model
+        model = cfg.get("agent_chat_model") or "gpt-4o-mini"
     else:
-        # For openai provider fall back to settings.extraction_model; for others use their built-in default
-        fallback = getattr(settings, meta.get("model_setting", ""), None) or meta.get("model", settings.extraction_model)
-        model = cfg.get("extraction_model") or fallback
+        model = cfg.get("extraction_model") or meta["model"]
     return provider, model, base_url, api_key
 
 
@@ -97,8 +94,8 @@ async def test_provider(db: AsyncSession, provider: str | None, prompt: str) -> 
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.prompts import ChatPromptTemplate
 
-    p, _, base_url, api_key = await _resolve(db, "validation", provider)
-    _, model, _, _ = await _resolve(db, "validation", provider)
+    p, _, base_url, api_key = await _resolve(db, "extraction", provider)
+    model = "gpt-4o-mini" if p == "openai" else (PROVIDERS.get(p) or PROVIDERS["openai"])["model"]
     if not api_key:
         return {"ok": False, "provider": p, "model": model, "error": "No API key configured for this provider."}
     t0 = time.time()

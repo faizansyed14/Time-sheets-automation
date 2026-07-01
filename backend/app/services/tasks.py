@@ -58,6 +58,60 @@ def purge_pipeline_raw_task():
     return {"removed": removed}
 
 
+@celery_app.task(name="inbox.ai_check_scan")
+def ai_check_inbox_task(limit: int = 100):
+    """Background pass: AI-check every inbox email not yet checked.
+
+    Runs off-request (inbox sync, app open, Celery beat). Already-checked
+    emails (ai_check is not None) are never reprocessed."""
+    from sqlalchemy import select
+
+    from app.core.cache import cache
+    from app.core.config import settings
+    from app.core.database import SessionLocal
+    from app.models.email_message import EmailMessage
+    from app.services.email_provider import get_email_provider
+    from app.services.inbox.ai_check import ensure_ai_check
+
+    async def _run():
+        limit_eff = max(1, int(limit or settings.inbox_ai_check_batch))
+        async with SessionLocal() as db:
+            try:
+                lock_key = "inbox:sync:lock"
+                if not await cache.exists(lock_key):
+                    await cache.set(lock_key, True, ttl=30)
+                    try:
+                        provider = get_email_provider()
+                        from app.api.routes.inbox import _sync_message
+                        for m in await provider.list_messages(None):
+                            await _sync_message(db, m)
+                        await db.commit()
+                    finally:
+                        await cache.delete(lock_key)
+            except Exception:
+                pass
+
+            rows = (await db.execute(
+                select(EmailMessage)
+                .where(EmailMessage.ai_check.is_(None))
+                .order_by(EmailMessage.received_at.desc())
+                .limit(limit_eff)
+            )).scalars().all()
+
+            checked = 0
+            for row in rows:
+                try:
+                    await ensure_ai_check(db, row, force=False)
+                    await db.commit()
+                    checked += 1
+                except Exception:
+                    await db.rollback()
+                    continue
+            return {"checked": checked, "scanned": len(rows)}
+
+    return _run_coro(_run)
+
+
 @celery_app.task(name="ingestion.process_upload")
 def process_upload_task(filename: str, content_type: str, data_b64: str):
     """Run the upload pipeline in a worker. Bytes are passed base64-encoded."""
