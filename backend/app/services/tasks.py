@@ -23,29 +23,51 @@ def send_otp_email_task(self, email: str, code: str):
         raise self.retry(exc=exc)
 
 
-def _run_coro(coro_factory):
-    """Run an async coroutine to completion in its own event loop, in a dedicated
-    thread. Works whether or not the caller already has a running loop (so the
-    task behaves the same in a real worker and in eager mode inside async tests)."""
-    import threading
+def _reset_async_clients() -> None:
+    """Dispose async clients bound to the wrong/closed event loop.
 
-    box: dict = {}
+    Celery prefork workers inherit module-level objects from the parent process.
+    asyncpg/sqlalchemy connections and redis asyncio clients are tied to a loop;
+    reusing them across task loops causes:
+      - RuntimeError: Event loop is closed
+      - RuntimeError: Future attached to a different loop
+    """
 
-    def runner():
-        loop = asyncio.new_event_loop()
+    async def _cleanup() -> None:
+        from app.core.cache import cache
+        from app.core.database import engine
+
+        # Reset redis client (if it was created) so next use re-inits cleanly.
+        if getattr(cache, "_redis", None) is not None:
+            try:
+                await cache._redis.aclose()
+            except Exception:
+                pass
+            cache._redis = None
+            cache._checked = False
+
+        # Drop all pooled DB connections (if any) so none cross loop boundaries.
+        await engine.dispose()
+
+    try:
+        asyncio.run(_cleanup())
+    except Exception:
+        # Best-effort. Even if cleanup fails, ensure we don't keep a stale redis handle.
         try:
-            box["value"] = loop.run_until_complete(coro_factory())
-        except Exception as e:  # surface inside the calling thread
-            box["error"] = e
-        finally:
-            loop.close()
+            from app.core.cache import cache
 
-    t = threading.Thread(target=runner)
-    t.start()
-    t.join()
-    if "error" in box:
-        raise box["error"]
-    return box["value"]
+            cache._redis = None
+            cache._checked = False
+        except Exception:
+            pass
+
+
+def _run_coro(coro_factory):
+    """Run async work to completion in a fresh event loop."""
+    try:
+        return asyncio.run(coro_factory())
+    finally:
+        _reset_async_clients()
 
 
 @celery_app.task(name="maintenance.purge_pipeline_raw")

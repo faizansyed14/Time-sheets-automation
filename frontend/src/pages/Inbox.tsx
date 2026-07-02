@@ -536,7 +536,7 @@ function CollapsibleAttachmentSection({
   title: string;
   icon: ReactNode;
   defaultOpen?: boolean;
-  hint?: string;
+  hint?: ReactNode;
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
