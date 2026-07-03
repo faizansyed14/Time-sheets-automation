@@ -114,8 +114,6 @@ class Settings(BaseSettings):
     # Optional OCR "reader" to give scans/photos a text layer (none|tesseract).
     # tesseract runs locally (pytesseract + tesseract-ocr) and is completely free.
     ocr_provider: str = "none"
-    # Cheap model for inbox AI check (classify attachments + body in one call).
-    ai_check_model: str = "gpt-4o-mini"
     # Model for the Agentic Chat assistant (text → safe DB actions).
     agent_chat_model: str = "gpt-4o-mini"
 
@@ -147,10 +145,6 @@ class Settings(BaseSettings):
     # How often the S3 / disk pipeline-raw retry copies are purged. Default once
     # a day. Set in hours; e.g. 24 = daily, 12 = twice a day, 168 = weekly.
     pipeline_raw_purge_interval_hours: float = 24.0
-    # How often the inbox AI-check pass runs over unchecked emails.
-    inbox_ai_check_interval_hours: float = 5.0
-    # How many unchecked emails each scheduled AI-check pass processes (cost cap).
-    inbox_ai_check_batch: int = 100
 
     # ===================== Auth / Security =====================
     auth_enabled: bool = True

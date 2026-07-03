@@ -15,7 +15,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -63,7 +63,6 @@ class TimesheetRecord(Base):
     unpaid_leave_dates: Mapped[list] = mapped_column(JSON, default=list)
     absent_dates: Mapped[list] = mapped_column(JSON, default=list)
     public_holiday_dates: Mapped[list] = mapped_column(JSON, default=list)
-    total_working_hours: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # ---- machine validation ----
     validation_status: Mapped[str] = mapped_column(

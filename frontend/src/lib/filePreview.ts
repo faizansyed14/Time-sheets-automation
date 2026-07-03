@@ -2,18 +2,31 @@ export type PreviewFile = {
   url: string;
   filename: string;
   contentType?: string | null;
+  /** Server render-to-image endpoint (DOCX/XLSX) — the preview works in any
+   *  browser while `url` stays the downloadable original. */
+  renderUrl?: string | null;
 };
 
 const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"]);
-const PREVIEW_EXTS = new Set([...IMAGE_EXTS, "pdf", "eml", "docx"]);
+const PREVIEW_EXTS = new Set([...IMAGE_EXTS, "pdf", "eml", "docx", "xlsx"]);
 
 const DOCX_CTS = new Set([
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   "application/docx",
 ]);
 
+const XLSX_CTS = new Set([
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-excel",
+]);
+
 function ext(filename: string) {
   return filename.split(".").pop()?.toLowerCase() ?? "";
+}
+
+export function isXlsx(filename: string, contentType?: string | null) {
+  const ct = contentType?.toLowerCase() ?? "";
+  return ext(filename) === "xlsx" || XLSX_CTS.has(ct);
 }
 
 export function isPdf(filename: string, contentType?: string | null) {

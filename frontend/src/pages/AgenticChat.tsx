@@ -275,7 +275,7 @@ export default function AgenticChatPage() {
   return (
     <div className="flex h-full animate-fade-up flex-col">
       <PageHeader
-        title="Agentic Chat"
+        title="Ask AI"
         subtitle="Ask about timesheets and leaves, upload a sheet to extract it, or make edits — the assistant only works on this database."
         actions={
           <div className="flex items-center gap-2">

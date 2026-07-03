@@ -15,6 +15,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
+  CheckCircle2,
   Columns2,
   Download,
   FileText,
@@ -22,19 +23,25 @@ import {
   PencilLine,
   Plus,
   Search,
+  Trash2,
   User,
   X,
 } from "lucide-react";
 import {
+  attachmentRenderUrl,
+  attachmentUrl,
+  fetchEmail,
   fetchEmployeeMatcher,
+  deletePipelineFile,
   pipelineManualFix,
+  pipelineRawRenderUrl,
   pipelineRawUrl,
   MONTHS_LONG,
   type Employee,
   type PipelineFile,
 } from "../api/client";
-import { isDocx, isEml, isPdf, isPreviewable } from "../lib/filePreview";
-import { DocxPreviewPane, EmlPreviewPane } from "./FilePreview";
+import { isDocx, isEml, isPdf, isPreviewable, isXlsx } from "../lib/filePreview";
+import { DocxPreviewPane, EmlPreviewPane, ServerRenderPane } from "./FilePreview";
 import { Button, Input, Select, Spinner } from "./ui";
 import { cn, formatBytes } from "../lib/utils";
 import { useToast } from "./toast";
@@ -221,13 +228,13 @@ function EmployeePicker({
 }
 
 // ---------------------------------------------------------------------------
-// Raw file preview pane (right side)
+// Right-side preview panes
 // ---------------------------------------------------------------------------
-function RawFilePreview({ file }: { file: PipelineFile }) {
-  const url = pipelineRawUrl(file.id);
-  const name = file.filename ?? "file";
-  const ct = file.content_type ?? "";
-
+// Generic preview by type: EML pane, PDF iframe, DOCX/XLSX server-rendered
+// page images, plain <img> for pictures, download card otherwise.
+function SourcePreview({ url, renderUrl, name, ct }: {
+  url: string; renderUrl?: string | null; name: string; ct: string;
+}) {
   if (isEml(name, ct)) {
     return (
       <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
@@ -238,8 +245,15 @@ function RawFilePreview({ file }: { file: PipelineFile }) {
   if (isPdf(name, ct)) {
     return <iframe src={url} title={name} className="h-full w-full rounded-lg bg-white" />;
   }
+  if ((isDocx(name, ct) || isXlsx(name, ct)) && renderUrl) {
+    // Server render-to-image — same preview path for DOCX and XLSX.
+    return (
+      <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
+        <ServerRenderPane renderUrl={renderUrl} />
+      </div>
+    );
+  }
   if (isDocx(name, ct)) {
-    // Same DOCX renderer used by the email inbox preview.
     return (
       <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
         <DocxPreviewPane fileUrl={url} />
@@ -270,6 +284,17 @@ function RawFilePreview({ file }: { file: PipelineFile }) {
   );
 }
 
+function RawFilePreview({ file }: { file: PipelineFile }) {
+  return (
+    <SourcePreview
+      url={pipelineRawUrl(file.id)}
+      renderUrl={pipelineRawRenderUrl(file.id)}
+      name={file.filename ?? "file"}
+      ct={file.content_type ?? ""}
+    />
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Main modal
 // ---------------------------------------------------------------------------
@@ -277,10 +302,12 @@ export default function PipelineCompareFixModal({
   file,
   onClose,
   onSaved,
+  onDiscarded,
 }: {
   file: PipelineFile | null;
   onClose: () => void;
   onSaved: () => void;
+  onDiscarded?: () => void;
 }) {
   const { toast } = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -294,6 +321,8 @@ export default function PipelineCompareFixModal({
   const [dates, setDates] = useState<Record<string, string[]>>({});
   const [attachments, setAttachments] = useState<File[]>([]);
   const [note, setNote] = useState("");
+  const [approved, setApproved] = useState(false);
+  const [approvalDetail, setApprovalDetail] = useState("");
   const [pending, setPending] = useState(false);
 
   const { data: employees, isLoading } = useQuery({
@@ -301,6 +330,33 @@ export default function PipelineCompareFixModal({
     queryFn: fetchEmployeeMatcher,
     enabled: !!file,
   });
+
+  // Related sources: the OTHER attachments of the same email (approval
+  // screenshots, extra timesheets) — switchable in the right panel so the
+  // reviewer can cross-check without leaving Compare & Fix.
+  const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
+  const emailSourceId = file?.source_kind === "email" ? file.source_id : null;
+  const { data: sourceEmail } = useQuery({
+    queryKey: ["email", emailSourceId],
+    queryFn: () => fetchEmail(emailSourceId!),
+    enabled: !!emailSourceId,
+    staleTime: 60_000,
+  });
+  const relatedSources = useMemo(() => {
+    if (!sourceEmail || !emailSourceId) return [] as {
+      id: string; filename: string; ct: string; url: string; renderUrl: string;
+    }[];
+    return (sourceEmail.attachments ?? [])
+      .filter((a) => a.attachment_id !== file?.attachment_id)   // skip the staged file itself
+      .map((a) => ({
+        id: a.attachment_id,
+        filename: a.filename,
+        ct: a.content_type,
+        url: attachmentUrl(emailSourceId, a.attachment_id),
+        renderUrl: attachmentRenderUrl(emailSourceId, a.attachment_id),
+      }));
+  }, [sourceEmail, emailSourceId, file?.attachment_id]);
+  const activeSource = relatedSources.find((s) => s.id === activeSourceId) ?? null;
 
   // Reset when a new file is opened. Pre-fill from the AI-staged extraction
   // (extraction_meta.staged) so a "Run Extraction" review starts populated.
@@ -324,10 +380,26 @@ export default function PipelineCompareFixModal({
     setDates(staged?.buckets ?? {});
     setAttachments([]);
     setNote("");
+    // Manager approval — pre-filled from what Extract Email found (signature
+    // on a sheet, approval screenshot, approval wording); reviewer can flip it.
+    const foundApproval = (file.extraction_meta?.full_email_extract ?? null) as {
+      approval?: { detected: boolean; detail: string };
+    } | null;
+    setApproved(!!foundApproval?.approval?.detected);
+    setApprovalDetail(foundApproval?.approval?.detected ? (foundApproval.approval?.detail ?? "") : "");
     setPending(false);
+    setActiveSourceId(null);
   }, [file]);
 
   const isStaged = file?.failure_code === "pending_review";
+  // Present only on items staged by the one-button "Extract Email" flow.
+  const fullEmail = (file?.extraction_meta?.full_email_extract ?? null) as {
+    sheets?: {
+      filename: string; kind: string; leave_days?: number;
+      manager_signature?: boolean;
+    }[];
+    approval?: { detected: boolean; detail: string };
+  } | null;
 
   // Lock scroll + Escape key.
   useEffect(() => {
@@ -376,6 +448,24 @@ export default function PipelineCompareFixModal({
     (v, i, a) => a.indexOf(v) === i
   );
 
+  const handleDiscard = async () => {
+    if (!file || pending) return;
+    if (!isStaged) {
+      onClose();
+      return;
+    }
+    setPending(true);
+    try {
+      await deletePipelineFile(file.id);
+      toast("info", "Review item removed");
+      onDiscarded?.();
+      onClose();
+    } catch (e: any) {
+      toast("error", "Delete failed", e?.response?.data?.detail ?? String(e));
+      setPending(false);
+    }
+  };
+
   const handleSave = async () => {
     if (!file || !canSave) return;
     setPending(true);
@@ -386,6 +476,8 @@ export default function PipelineCompareFixModal({
         year,
         buckets: dates,
         note: note || undefined,
+        approval_status: approved ? "approved" : "not_approved",
+        approval_detail: approvalDetail || undefined,
         files: attachments,
       });
       const ok = result.status === "success";
@@ -451,6 +543,36 @@ export default function PipelineCompareFixModal({
               <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm leading-5 text-rose-800">
                 <p className="font-semibold">{file.failure_label ?? "Failed"}</p>
                 <p className="mt-0.5">{file.failure_detail}</p>
+              </div>
+            )}
+
+            {/* Extract Email breakdown — which sheets inside the email were
+                read, their kind, and where the approval evidence came from. */}
+            {fullEmail && (
+              <div className="mb-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-700">
+                <p className="font-bold uppercase tracking-wide text-slate-500">
+                  Read from this email
+                </p>
+                <ul className="mt-1 space-y-0.5">
+                  {(fullEmail.sheets ?? []).map((s, i) => (
+                    <li key={i} className="flex items-start gap-1.5">
+                      <FileText className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
+                      <span className="min-w-0">
+                        <span className="font-semibold text-slate-800">{s.filename}</span>
+                        {" — "}
+                        {s.kind === "leave_certificate" ? "leave certificate" : s.kind}
+                        {s.leave_days ? `, ${s.leave_days} leave day(s)` : ""}
+                        {s.manager_signature ? " · manager signature ✓" : ""}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                {fullEmail.approval && (
+                  <p className={cn("mt-1.5 font-semibold",
+                    fullEmail.approval.detected ? "text-emerald-700" : "text-amber-700")}>
+                    {fullEmail.approval.detail}
+                  </p>
+                )}
               </div>
             )}
 
@@ -540,6 +662,48 @@ export default function PipelineCompareFixModal({
               ))}
             </div>
 
+            {/* Manager approval — the reviewer's explicit verdict, filed on
+                the record on Accept. Pre-filled from what Extract Email found. */}
+            <div className="mb-3">
+              <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Manager approval
+              </p>
+              <div className="inline-flex rounded-lg border border-slate-300 p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setApproved(true)}
+                  className={cn(
+                    "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors",
+                    approved
+                      ? "bg-emerald-600 text-white shadow-sm"
+                      : "text-slate-600 hover:bg-slate-100"
+                  )}
+                >
+                  <CheckCircle2 className="h-3.5 w-3.5" /> Approved
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setApproved(false)}
+                  className={cn(
+                    "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors",
+                    !approved
+                      ? "bg-slate-700 text-white shadow-sm"
+                      : "text-slate-600 hover:bg-slate-100"
+                  )}
+                >
+                  <X className="h-3.5 w-3.5" /> Not approved
+                </button>
+              </div>
+              <input
+                value={approvalDetail}
+                onChange={(e) => setApprovalDetail(e.target.value)}
+                placeholder={approved
+                  ? 'Evidence, e.g. "Approved — Sylvia Noronha, 2 Jul 2026"'
+                  : "Why not approved (optional)"}
+                className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10"
+              />
+            </div>
+
             {/* File attachments */}
             <div className="mb-3">
               <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
@@ -592,8 +756,15 @@ export default function PipelineCompareFixModal({
             {/* Actions */}
             <div className="flex items-center gap-3 border-t border-slate-100 pt-4">
               <span className="flex-1 text-xs text-slate-400">{totalDays} day(s) entered</span>
-              <Button variant="secondary" onClick={onClose} disabled={pending}>
-                {isStaged ? "Reject" : "Cancel"}
+              <Button variant="secondary" onClick={handleDiscard} disabled={pending}>
+                {isStaged ? (
+                  <>
+                    <Trash2 className="h-4 w-4" />
+                    Delete
+                  </>
+                ) : (
+                  "Cancel"
+                )}
               </Button>
               <Button disabled={!canSave} onClick={handleSave}>
                 {pending ? (
@@ -606,24 +777,67 @@ export default function PipelineCompareFixModal({
             </div>
           </div>
 
-          {/* RIGHT — original file preview */}
+          {/* RIGHT — source preview, switchable between the staged file and
+              the other attachments of the same email (approvals, extra
+              timesheets) so everything can be cross-checked in one place. */}
           <div className="flex min-h-0 flex-col bg-slate-100">
             <div className="flex shrink-0 items-center gap-2 border-b border-slate-200 bg-white px-3 py-2">
               <FileText className="h-3.5 w-3.5 text-slate-400" />
               <span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-600">
-                {file.filename}
+                {activeSource ? activeSource.filename : file.filename}
               </span>
               <a
-                href={pipelineRawUrl(file.id)}
-                download={file.filename ?? "file"}
+                href={activeSource ? activeSource.url : pipelineRawUrl(file.id)}
+                download={(activeSource ? activeSource.filename : file.filename) ?? "file"}
                 className="rounded p-1 text-slate-400 hover:text-brand-600"
                 title="Download original"
               >
                 <Download className="h-3.5 w-3.5" />
               </a>
             </div>
+            {relatedSources.length > 0 && (
+              <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-slate-200 bg-white/70 px-3 py-2">
+                <button
+                  type="button"
+                  onClick={() => setActiveSourceId(null)}
+                  className={cn(
+                    "rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 ring-inset transition-colors",
+                    activeSourceId === null
+                      ? "bg-brand-600 text-white ring-brand-600"
+                      : "bg-white text-slate-600 ring-slate-200 hover:bg-brand-50"
+                  )}
+                >
+                  Staged file
+                </button>
+                {relatedSources.map((s) => (
+                  <button
+                    key={s.id}
+                    type="button"
+                    onClick={() => setActiveSourceId(s.id)}
+                    title={s.filename}
+                    className={cn(
+                      "max-w-[180px] truncate rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 ring-inset transition-colors",
+                      activeSourceId === s.id
+                        ? "bg-brand-600 text-white ring-brand-600"
+                        : "bg-white text-slate-600 ring-slate-200 hover:bg-brand-50"
+                    )}
+                  >
+                    {s.filename}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="min-h-0 flex-1 overflow-auto p-2">
-              <RawFilePreview file={file} />
+              {activeSource ? (
+                <SourcePreview
+                  url={activeSource.url}
+                  renderUrl={activeSource.renderUrl}
+                  name={activeSource.filename}
+                  ct={activeSource.ct}
+                />
+              ) : (
+                <RawFilePreview file={file} />
+              )}
             </div>
           </div>
 

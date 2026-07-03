@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Download, ExternalLink, FileText, Mail, Maximize2, Minimize2, Paperclip, X } from "lucide-react";
+import {
+  ChevronLeft, ChevronRight, Download, ExternalLink, FileText, Mail,
+  Maximize2, Minimize2, Paperclip, X,
+} from "lucide-react";
 import { cn, formatBytes } from "../lib/utils";
-import { downloadFile, isDocx, isEml, isPdf, isPreviewable, sanitizeEmailHtml, type PreviewFile } from "../lib/filePreview";
+import { downloadFile, isDocx, isEml, isPdf, isPreviewable, isXlsx, sanitizeEmailHtml, type PreviewFile } from "../lib/filePreview";
 import { fetchEmlPreview, type EmlParsed } from "../api/client";
 import { Spinner } from "./ui";
 
@@ -222,6 +225,81 @@ export function DocxPreviewPane({ fileUrl }: { fileUrl: string }) {
 }
 
 // ---------------------------------------------------------------------------
+// Server render pane — DOCX/XLSX rendered to page images on the backend.
+// Works in every browser; the original file stays downloadable. Pages via
+// ?page=N with the total in the X-Page-Count response header.
+// ---------------------------------------------------------------------------
+
+export function ServerRenderPane({ renderUrl }: { renderUrl: string }) {
+  const [page, setPage] = useState(1);
+  const [pages, setPages] = useState(1);
+  const [img, setImg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => { setPage(1); }, [renderUrl]);
+
+  useEffect(() => {
+    let alive = true;
+    let blobUrl: string | null = null;
+    setImg(null);
+    setErr(null);
+    const sep = renderUrl.includes("?") ? "&" : "?";
+    fetch(`${renderUrl}${sep}page=${page}`)
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const count = Number(r.headers.get("X-Page-Count") || "1");
+        const blob = await r.blob();
+        if (!alive) return;
+        setPages(Number.isFinite(count) && count > 0 ? count : 1);
+        blobUrl = URL.createObjectURL(blob);
+        setImg(blobUrl);
+      })
+      .catch(() => alive && setErr("Could not render this file. Use Download to open the original."));
+    return () => {
+      alive = false;
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    };
+  }, [renderUrl, page]);
+
+  if (err) {
+    return <div className="flex h-full items-center justify-center px-6 text-center text-sm text-rose-500">{err}</div>;
+  }
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="min-h-0 flex-1 overflow-auto bg-slate-100 p-3">
+        {img ? (
+          <img src={img} alt={`page ${page}`} className="mx-auto block max-w-full rounded-lg bg-white shadow-sm" />
+        ) : (
+          <div className="flex h-full items-center justify-center"><Spinner className="h-6 w-6" /></div>
+        )}
+      </div>
+      {pages > 1 && (
+        <div className="flex shrink-0 items-center justify-center gap-3 border-t border-slate-200 bg-white py-2">
+          <button
+            type="button"
+            disabled={page <= 1}
+            onClick={() => setPage((p) => Math.max(1, p - 1))}
+            className="rounded-lg border border-slate-200 p-1.5 text-slate-500 hover:bg-slate-50 disabled:opacity-40"
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+          <span className="text-xs font-semibold text-slate-600">Page {page} / {pages}</span>
+          <button
+            type="button"
+            disabled={page >= pages}
+            onClick={() => setPage((p) => Math.min(pages, p + 1))}
+            className="rounded-lg border border-slate-200 p-1.5 text-slate-500 hover:bg-slate-50 disabled:opacity-40"
+          >
+            <ChevronRight className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Image lightbox — true full-screen viewer (Outlook style). Dark backdrop,
 // centered image, click to toggle fit ↔ actual size, Esc / click-out to close.
 // ---------------------------------------------------------------------------
@@ -318,7 +396,11 @@ export function FilePreviewModal({
   const pdf = isPdf(file.filename, file.contentType);
   const eml = isEml(file.filename, file.contentType);
   const docx = isDocx(file.filename, file.contentType);
-  const image = !pdf && !eml && !docx && isPreviewable(file.filename, file.contentType);
+  const xlsx = isXlsx(file.filename, file.contentType);
+  const image = !pdf && !eml && !docx && !xlsx && isPreviewable(file.filename, file.contentType);
+  // Server render-to-image for office docs when a render URL is available
+  // (inbox attachments, pipeline raw copies). Original stays downloadable.
+  const serverRender = !!file.renderUrl && (docx || xlsx);
 
   // Images get a dedicated full-screen lightbox instead of the framed card.
   if (image) return <ImageLightbox file={file} onClose={onClose} />;
@@ -358,12 +440,26 @@ export function FilePreviewModal({
         {/* Body */}
         <div className={cn(
           "min-h-0 flex-1 overflow-auto",
-          eml || docx ? "bg-white" : "bg-slate-100 p-2",
+          eml || docx || serverRender ? "bg-white" : "bg-slate-100 p-2",
         )}>
           {eml ? (
             <EmlPreviewPane fileUrl={file.url} filename={file.filename} />
+          ) : serverRender ? (
+            <ServerRenderPane renderUrl={file.renderUrl!} />
           ) : docx ? (
             <DocxPreviewPane fileUrl={file.url} />
+          ) : xlsx ? (
+            <div className="flex h-full min-h-[40vh] flex-col items-center justify-center gap-3 text-slate-500">
+              <FileText className="h-10 w-10 text-slate-300" />
+              <p className="text-sm">No inline preview for this spreadsheet here.</p>
+              <a
+                href={file.url}
+                download={file.filename}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                <Download className="h-4 w-4" /> Download original
+              </a>
+            </div>
           ) : pdf ? (
             <iframe
               src={file.url}

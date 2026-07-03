@@ -218,6 +218,29 @@ export default function Dashboard() {
         }
       />
 
+      {/* One glance, one click: everything waiting on a human. */}
+      {((stats?.needs_review ?? 0) + (stats?.failed ?? 0)) > 0 && (
+        <Link
+          to="/review"
+          className="mb-5 flex items-center gap-4 rounded-2xl border border-amber-200 bg-gradient-to-r from-amber-50 to-orange-50 p-4 shadow-card transition-all hover:-translate-y-0.5 hover:shadow-card-hover"
+        >
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-amber-100 text-amber-600">
+            <AlertTriangle className="h-5 w-5" />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block text-sm font-bold text-slate-900">
+              {(stats?.needs_review ?? 0) + (stats?.failed ?? 0)} item(s) need your review
+            </span>
+            <span className="block text-xs text-slate-600">
+              Extracted timesheets waiting to be checked and accepted — one click each.
+            </span>
+          </span>
+          <span className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-amber-500 px-3.5 py-2 text-sm font-semibold text-white shadow-sm">
+            Review now <ChevronRight className="h-4 w-4" />
+          </span>
+        </Link>
+      )}
+
       <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-5">
         <Kpi
           label="Employees"
@@ -254,7 +277,7 @@ export default function Dashboard() {
           value={stats?.failed ?? "—"}
           icon={<XCircle className="h-5 w-5 text-rose-600" />}
           tone="bg-rose-50"
-          hint={stats?.failed ? "open Pipeline to resolve" : "all clear"}
+          hint={stats?.failed ? "fix them in Review" : "all clear"}
         />
       </div>
 

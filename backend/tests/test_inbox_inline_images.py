@@ -59,28 +59,3 @@ def test_attachment_count_excludes_images():
     ]
     assert _doc_count(atts) == 3
     assert is_doc_attachment(atts[0]) and not is_doc_attachment(atts[2])
-
-
-def test_unchecked_email_triggers_ai_check():
-    """Every unchecked email is AI-checked automatically (body or attachments)."""
-    from app.api.routes.inbox import _should_run_ai_check
-    from app.models.email_message import EmailMessage, EmailStatus
-
-    row = EmailMessage(
-        provider_message_id="inline-body-1",
-        sender_name="Test",
-        sender_email="t@example.com",
-        subject="Timesheet June",
-        body_text=(
-            "Please approve my timesheet below.\n"
-            "EMP NO: E2306345 NAME: Mohamed Abdelshahid\n"
-            "MONTH: June YEAR: 2026\n"
-            "1-Jun-26 Annual Leave 7\n2-Jun-26 8:00 AM 4:00 PM 7"
-        ),
-        attachments=[{"filename": "logo.png", "content_type": "image/png"}],
-        status=EmailStatus.NEW,
-    )
-    assert _should_run_ai_check(row) is True
-    row.ai_check = {"summary": "done", "checked_at": "2026-01-01T00:00:00+00:00"}
-    assert _should_run_ai_check(row) is False
-    assert _should_run_ai_check(row, refresh_ai=True) is True

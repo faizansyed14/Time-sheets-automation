@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useRef, useState } from "react";
 
 /** Debounce a fast-changing value (e.g. a search box) so we only hit the
  *  server-side search after the user pauses typing. */
@@ -21,7 +21,9 @@ export function useDebounced<T>(value: T, delay = 350): T {
 export function useSentinel<T extends HTMLElement = HTMLDivElement>(
   onHit: () => void,
   enabled: boolean,
-  rootRef?: RefObject<HTMLElement | null>
+  /** Scroll container element — pass the mounted node, not a RefObject, so the
+   *  observer re-binds when the list panel mounts. Omit for viewport scrolling. */
+  scrollRoot?: HTMLElement | null
 ) {
   const ref = useRef<T | null>(null);
   const cb = useRef(onHit);
@@ -33,10 +35,10 @@ export function useSentinel<T extends HTMLElement = HTMLDivElement>(
       (entries) => {
         if (entries[0]?.isIntersecting) cb.current();
       },
-      { root: rootRef?.current ?? null, rootMargin: "400px" }
+      { root: scrollRoot ?? null, rootMargin: "400px", threshold: 0 }
     );
     obs.observe(el);
     return () => obs.disconnect();
-  }, [enabled, rootRef]);
+  }, [enabled, scrollRoot]);
   return ref;
 }

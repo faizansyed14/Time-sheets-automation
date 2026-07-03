@@ -38,22 +38,6 @@ class MatchedEmployeeOut(BaseModel):
     source: str | None = None
 
 
-class EmailAiCheckOut(BaseModel):
-    summary: str
-    model: str | None = None
-    used_llm: bool = False
-    checked_at: str | None = None
-    attachments: list[dict] = []
-    body_category: str = "other"
-    body_reason: str = ""
-    recommended_timesheet_ids: list[str] = []
-    recommended_approval_id: str | None = None
-    extract_body: bool = False
-    matched_employee: MatchedEmployeeOut | None = None
-    missing: list[str] = []
-    found: list[str] = []
-
-
 class EmailListItem(BaseModel):
     id: str
     provider_message_id: str
@@ -64,9 +48,7 @@ class EmailListItem(BaseModel):
     status: str
     attachment_count: int
     has_approval_screenshot: bool
-    # Whether the inbox AI check has already run (drives the "calling AI…" hint
-    # so an already-checked email never shows it / implies a re-check).
-    ai_checked: bool = False
+    extract_email_at: datetime | None = None  # last Extract Email run (any pipeline item)
 
 
 class EmailDetail(EmailListItem):
@@ -76,8 +58,6 @@ class EmailDetail(EmailListItem):
     # Attachment ids embedded inline in body_html (resolved to data URIs) —
     # hidden from the separate attachment list, as Outlook does.
     inline_attachment_ids: list[str] = []
-    ai_check: EmailAiCheckOut | None = None
-    ai_check_running: bool = False
 
 
 # ---- agentic chat ----

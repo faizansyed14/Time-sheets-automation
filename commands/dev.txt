@@ -8,8 +8,9 @@
 with start script
 ./scripts/dev/start.sh
 
-to delete data(pipelinefiles,timesheet_records,email_messages,employe matcher)
-docker compose -f docker-compose.dev.yml exec backend python -m app.seed.clear_business_data 2>&1
+# ---- clear DB data (keeps employees + users) ----
+bash scripts/db/delete-pipeline.sh
+bash scripts/db/delete-records.sh
 # ---- setup (once) ----
 cp .env.dev .env    # then edit .env — DATABASE_URL -> your RDS endpoint,
                     # STORAGE_PROVIDER=s3 + S3_BUCKET/S3_REGION -> your bucket

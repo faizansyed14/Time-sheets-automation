@@ -219,6 +219,8 @@ async def pipeline_manual_fix(
     year: int = Form(...),
     buckets: str = Form("{}"),
     note: str | None = Form(default=None),
+    approval_status: str | None = Form(default=None),   # "approved" | "not_approved"
+    approval_detail: str | None = Form(default=None),
     files: list[UploadFile] = File(default=[]),
     db: AsyncSession = Depends(get_db),
 ):
@@ -265,10 +267,16 @@ async def pipeline_manual_fix(
             fn = t.filename or "attachment"
             ct = _mt.guess_type(fn)[0] or "application/octet-stream"
             attachments.append((fn, ct, raw_bytes))
+    approval = None
+    if approval_status in ("approved", "not_approved"):
+        approval = {"approved": approval_status == "approved",
+                    "detail": (approval_detail or "").strip()}
+
     try:
         rec, new_tracker = await ingest_manual_entry(
             db, employee_pk=employee_pk, month=month, year=year,
             buckets=bucket_data, attachments=attachments, note=note,
+            approval=approval,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -317,6 +325,34 @@ async def pipeline_raw_preview(pipeline_id: str, db: AsyncSession = Depends(get_
     disp = "inline" if any(ctype.startswith(p) for p in inline_types) else "attachment"
     return _Response(content=data, media_type=ctype,
                      headers={"Content-Disposition": f'{disp}; filename="{fname}"'})
+
+
+@router.get("/{pipeline_id}/raw-render")
+async def pipeline_raw_render(
+    pipeline_id: str,
+    page: int = Query(default=1, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+):
+    """Server-side render of the raw DOCX/XLSX/PDF copy to a page image —
+    previews that work in every browser; the original stays downloadable."""
+    from fastapi import Response as _Response
+    from app.services.extraction.file_processor import detect_file_type, to_images
+    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "Pipeline file not found")
+    from app.services.pipeline.ingestion import read_raw_copy
+    data = read_raw_copy(t)
+    if not data:
+        raise HTTPException(404, "Raw file copy is no longer available")
+    ftype = detect_file_type(t.filename or "", data)
+    if ftype not in ("docx", "xlsx", "pdf"):
+        raise HTTPException(400, f"No server render for type '{ftype}'")
+    imgs = to_images(ftype, data)
+    if not imgs:
+        raise HTTPException(422, "Could not render this file")
+    idx = min(page, len(imgs)) - 1
+    return _Response(content=imgs[idx], media_type="image/jpeg",
+                     headers={"X-Page-Count": str(len(imgs))})
 
 
 @router.get("/{pipeline_id}/raw-eml-preview")
