@@ -49,3 +49,9 @@ class EmailProvider(ABC):
     async def get_attachment_bytes(self, message_id: str, attachment_id: str) -> tuple[bytes, str, str]:
         """Return (bytes, filename, content_type)."""
         ...
+
+    async def get_message_mime(self, message_id: str) -> bytes | None:
+        """Full raw RFC-822 MIME of the message, when the provider supports it
+        (Graph: GET /messages/{id}/$value). None → caller reconstructs the .eml
+        from the stored fields + attachments instead."""
+        return None

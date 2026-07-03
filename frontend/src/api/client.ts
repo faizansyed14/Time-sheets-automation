@@ -69,7 +69,7 @@ export interface EmailListItem {
   status: "new" | "archived" | "ingested";
   attachment_count: number;
   has_approval_screenshot: boolean;
-  ai_checked: boolean;
+  extract_email_at: string | null;
 }
 
 export interface Attachment {
@@ -85,8 +85,6 @@ export interface EmailDetail extends EmailListItem {
   body_html: string | null;
   attachments: Attachment[];
   inline_attachment_ids: string[];
-  ai_check: EmailAiCheck | null;
-  ai_check_running: boolean;
 }
 
 export interface MatchedEmployee {
@@ -98,31 +96,6 @@ export interface MatchedEmployee {
   matched_email: string | null;
   is_sender: boolean;
   source: string | null;
-}
-
-export interface EmailAiCheck {
-  summary: string;
-  model: string | null;
-  used_llm: boolean;
-  checked_at: string | null;
-  attachments: {
-    attachment_id: string;
-    filename: string;
-    category: string;
-    reason: string;
-    source_kind?: string;
-    used_ocr?: boolean;
-    text_chars?: number;
-    nested?: { filename?: string; file_type?: string; text_chars?: number; used_ocr?: boolean }[];
-  }[];
-  body_category: string;
-  body_reason: string;
-  recommended_timesheet_ids: string[];
-  recommended_approval_id: string | null;
-  extract_body: boolean;
-  matched_employee: MatchedEmployee | null;
-  missing: string[];
-  found: string[];
 }
 
 export interface SourceFileEntry {
@@ -286,10 +259,8 @@ export interface IngestSelection {
   extract_body?: boolean;
 }
 
-export const fetchEmail = (id: string, refreshAi = false) =>
-  api
-    .get<EmailDetail>(`/inbox/${id}`, { params: refreshAi ? { refresh_ai: true } : undefined })
-    .then((r) => r.data);
+export const fetchEmail = (id: string) =>
+  api.get<EmailDetail>(`/inbox/${id}`).then((r) => r.data);
 
 // Run Extraction → stage the selected attachments/body into the pipeline as
 // needs-review items (no record yet); the returned PipelineFiles are reviewed
@@ -305,11 +276,6 @@ export const stageExtraction = (
     })
     .then((r) => r.data);
 
-// Fire-and-forget: ask the backend to AI-check inbox sheets in the background
-// (Celery). Called once on app open; skips already-checked emails server-side.
-export const triggerBackgroundScan = () =>
-  api.post<{ queued: boolean }>(`/inbox/background-scan`).then((r) => r.data).catch(() => ({ queued: false }));
-
 export const decideEmail = (id: string, accepted: boolean, selection?: IngestSelection) =>
   api.post(`/inbox/${id}/decision`, {
     accepted,
@@ -323,11 +289,42 @@ export const restoreEmail = (id: string) => api.post(`/inbox/${id}/restore`).the
 export const rerunExtraction = (id: string, selection: IngestSelection) =>
   api.post(`/inbox/${id}/rerun`, selection).then((r) => r.data);
 
-export const bodyImagePreviewUrl = (msgId: string) =>
-  withAuthParam(`/api/v1/inbox/${msgId}/body-image-preview`);
-
 export const attachmentUrl = (msgId: string, attId: string) =>
   withAuthParam(`/api/v1/inbox/${msgId}/attachments/${encodeURIComponent(attId)}`);
+
+// Server-side page-image render for DOCX/XLSX/PDF (previews in any browser).
+export const attachmentRenderUrl = (msgId: string, attId: string) =>
+  withAuthParam(`/api/v1/inbox/${msgId}/attachments/${encodeURIComponent(attId)}/render`);
+
+export const pipelineRawRenderUrl = (pipelineId: string) =>
+  withAuthParam(`/api/v1/pipeline/${pipelineId}/raw-render`);
+
+// ---- full-email .eml export (3-dot menu) ----
+export const emlUrl = (msgId: string) =>
+  withAuthParam(`/api/v1/inbox/${encodeURIComponent(msgId)}/as-eml`);
+
+export const stageEmlExtraction = (msgId: string) =>
+  api.post<PipelineFile>(`/inbox/${encodeURIComponent(msgId)}/as-eml/stage`).then((r) => r.data);
+
+export const saveEmlToVault = (
+  msgId: string, body: { manager: string; employee: string; month: number; year: number },
+) =>
+  api.post<{ saved: boolean; path: string; filename: string }>(
+    `/inbox/${encodeURIComponent(msgId)}/as-eml/save-to-vault`, body).then((r) => r.data);
+
+// ---- Extract Email (one button: full .eml → batch vision → grouped review items) ----
+export interface FullEmailExtractOut {
+  staged: PipelineFile[];
+  groups: number;
+  sheets: { filename: string; kind: string; employee: string | null }[];
+  employees: string[];
+  approval: { detected: boolean; detail: string };
+  message: string;
+}
+
+export const extractFullEmail = (msgId: string) =>
+  api.post<FullEmailExtractOut>(
+    `/inbox/${encodeURIComponent(msgId)}/extract-full`).then((r) => r.data);
 
 // ---------------------------------------------------------------------------
 // Agentic chat (timesheet assistant)
@@ -636,6 +633,9 @@ export function fetchEmlPreview(fileUrl: string): Promise<EmlParsed> {
     // Agentic-chat ephemeral upload: /api/v1/agentic-chat/attachments/{token}
     const chat = u.pathname.match(/\/agentic-chat\/attachments\/([^/]+)$/);
     if (chat) return api.get<EmlParsed>(`/agentic-chat/attachments/${encodeURIComponent(chat[1])}/eml-preview`).then((r) => r.data);
+    // Full-email export: /api/v1/inbox/{msgId}/as-eml
+    const full = u.pathname.match(/\/inbox\/([^/]+)\/as-eml$/);
+    if (full) return api.get<EmlParsed>(`/inbox/${full[1]}/as-eml/preview`).then((r) => r.data);
   } catch { /* fall through */ }
   return Promise.reject(new Error("Cannot derive EML preview URL from: " + fileUrl));
 }
@@ -657,6 +657,8 @@ export const pipelineManualFix = (
     year: number;
     buckets: Record<string, string[]>;
     note?: string;
+    approval_status?: "approved" | "not_approved";
+    approval_detail?: string;
     files?: File[];
   }
 ) => {
@@ -666,6 +668,8 @@ export const pipelineManualFix = (
   form.append("year", String(body.year));
   form.append("buckets", JSON.stringify(body.buckets));
   if (body.note) form.append("note", body.note);
+  if (body.approval_status) form.append("approval_status", body.approval_status);
+  if (body.approval_detail) form.append("approval_detail", body.approval_detail);
   (body.files ?? []).forEach((f) => form.append("files", f, f.name));
   return api
     .post<PipelineFile>(`/pipeline/${id}/manual-fix`, form, {

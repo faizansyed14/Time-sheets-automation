@@ -220,11 +220,24 @@ class GraphEmailProvider(EmailProvider):
             "$select": _SELECT,
             "$expand": _EXPAND,
         }
+        msgs: list[ProviderMessage] = []
+        next_url: str | None = url
+        next_params: dict | None = params
+        # Safety cap — paginate the whole folder, but never loop forever.
+        _MAX_SYNC = 5000
         async with httpx.AsyncClient(timeout=60) as c:
-            r = await c.get(url, params=params, headers=await _headers(text_body=True))
-            if r.status_code != 200:
-                raise RuntimeError(f"Graph list error {r.status_code}: {r.text[:400]}")
-            msgs = [_build(m) for m in r.json().get("value", [])]
+            while next_url and len(msgs) < _MAX_SYNC:
+                r = await c.get(
+                    next_url,
+                    params=next_params,
+                    headers=await _headers(text_body=True),
+                )
+                if r.status_code != 200:
+                    raise RuntimeError(f"Graph list error {r.status_code}: {r.text[:400]}")
+                body = r.json()
+                msgs.extend(_build(m) for m in body.get("value", []))
+                next_url = body.get("@odata.nextLink")
+                next_params = None  # nextLink is a fully-qualified URL
         if query:
             q = query.lower().strip()
             msgs = [
@@ -246,6 +259,16 @@ class GraphEmailProvider(EmailProvider):
             if r.status_code != 200:
                 raise RuntimeError(f"Graph get error {r.status_code}: {r.text[:400]}")
             return _build(r.json())
+
+    async def get_message_mime(self, message_id: str) -> bytes | None:
+        """Byte-exact original MIME (headers, body, every attachment, nested
+        forwarded emails) — the highest-fidelity .eml export possible."""
+        url = f"{GRAPH}/users/{settings.graph_mailbox}/messages/{message_id}/$value"
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.get(url, headers=await _headers())
+            if r.status_code != 200 or not r.content:
+                return None
+            return r.content
 
     async def get_attachment_bytes(self, message_id: str, attachment_id: str) -> tuple[bytes, str, str]:
         url = f"{GRAPH}/users/{settings.graph_mailbox}/messages/{message_id}/attachments/{attachment_id}"

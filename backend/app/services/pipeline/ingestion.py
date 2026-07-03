@@ -655,9 +655,6 @@ async def ingest_email(
             approval_bytes = None
 
     inbox_employee_pk: str | None = None
-    if email.ai_check:
-        me = email.ai_check.get("matched_employee") or {}
-        inbox_employee_pk = me.get("employee_pk")
 
     created: list[TimesheetRecord] = []
 
@@ -799,6 +796,66 @@ async def stage_email_extraction(
     return staged
 
 
+async def stage_extra_source(
+    db: AsyncSession, email, *, filename: str, content_type: str, data: bytes,
+    source_tag: str = "__full_eml__",
+) -> PipelineFile:
+    """Stage ONE synthetic source for an email (e.g. the exported full .eml)
+    as a pending-review pipeline item — same review flow as stage_email_extraction.
+    Re-running reuses the existing un-accepted tracker (no duplicates)."""
+    from app.services.agents.extract_service import extract_from_upload
+
+    msg_id = email.provider_message_id
+    tracker = (await db.execute(select(PipelineFile).where(
+        PipelineFile.source_kind == "email",
+        PipelineFile.source_id == msg_id,
+        PipelineFile.attachment_id == source_tag,
+        PipelineFile.failure_code == FailureCode.PENDING_REVIEW,
+    ))).scalars().first()
+    if tracker is None:
+        tracker = PipelineFile(
+            filename=filename, content_type=content_type, size_bytes=len(data or b""),
+            source_kind="email", source_id=msg_id, attachment_id=source_tag)
+        db.add(tracker)
+        await db.flush()
+    if not tracker.raw_path:
+        _save_raw_copy(tracker, filename, data or b"")
+
+    result = await extract_from_upload(
+        db, filename=filename, content_type=content_type, data=data)
+    matched = result.get("matched_employee") or {}
+    tracker.employee_id = matched.get("employee_id") or result.get("extracted_employee_id")
+    tracker.employee_name = matched.get("name") or result.get("extracted_employee_name")
+    tracker.month = result.get("month")
+    tracker.year = result.get("year")
+    tracker.status = PipelineStatus.NEEDS_REVIEW
+    tracker.failure_code = FailureCode.PENDING_REVIEW
+    tracker.failure_detail = "Extracted from the full .eml — review the leaves and accept to file."
+    tracker.extraction_meta = {
+        "staged": {
+            "employee_pk": matched.get("employee_pk"),
+            "matched_name": matched.get("name"),
+            "matched_employee_id": matched.get("employee_id"),
+            "month": result.get("month"),
+            "year": result.get("year"),
+            "buckets": result.get("buckets") or {},
+            "validation_status": result.get("validation_status"),
+            "flags": result.get("flags") or [],
+            "summary": result.get("summary"),
+            "extraction_status": result.get("status"),
+        },
+        "source_kind": "email",
+    }
+    tracker.events = (tracker.events or []) + [{
+        "stage": PipelineStage.EXTRACTION, "status": "ok",
+        "detail": f"Extracted {result.get('total_leaves', 0)} leave day(s) from the full .eml; awaiting review.",
+        "at": _now_iso(),
+    }]
+    await db.commit()
+    await db.refresh(tracker)
+    return tracker
+
+
 async def ingest_upload(
     db: AsyncSession, *, filename: str, content_type: str, data: bytes,
 ) -> tuple[TimesheetRecord | None, PipelineFile]:
@@ -819,11 +876,16 @@ async def ingest_manual_entry(
     buckets: dict[str, list[str]],
     attachments: list[tuple[str, str, bytes]] | None = None,
     note: str | None = None,
+    approval: dict | None = None,
 ) -> tuple[TimesheetRecord, PipelineFile]:
     """Create/merge a monthly record from MANUALLY entered leave data (no LLM),
     optionally with attached files. Runs the SAME vault filing + validation +
     pipeline-tracker flow as upload/email. The employee MUST be picked from the
-    matcher (strict identity — we never guess)."""
+    matcher (strict identity — we never guess).
+
+    `approval` is the reviewer's explicit manager-approval verdict from
+    Compare & Fix: {"approved": bool, "detail": str} — it overrides whatever
+    the record currently says. None keeps the existing behaviour."""
     attachments = attachments or []
     if not (1 <= month <= 12 and year >= 2000):
         raise ValueError("Invalid month or year.")
@@ -884,7 +946,7 @@ async def ingest_manual_entry(
             "period": {"month": month, "year": year},
             "leaves": {k: cleaned[k] for k in BUCKET_FIELDS},
             "validation": {"status": validation_status, "summary": summary, "flags": flags},
-            "manual": {"note": note}, "ingested_at": _now_iso(),
+            "manual": {"note": note}, "approval": approval, "ingested_at": _now_iso(),
         }, indent=2, default=str))
         folder_rel = sp.folder_rel(account_manager, employee_name, month, year)
         _event(tracker, PipelineStage.FILING, "ok", f"Filed under {folder_rel}.")
@@ -909,7 +971,15 @@ async def ingest_manual_entry(
     rec.validation_status = validation_status
     rec.llm_summary = summary
     rec.hr_flags = flags
-    if not existing:
+    if approval is not None:
+        approved = bool(approval.get("approved"))
+        rec.approval_status = ApprovalStatus.APPROVED if approved else ApprovalStatus.NOT_APPROVED
+        rec.approval_detected = approved
+        rec.approval_detail = (str(approval.get("detail") or "").strip()
+                               or ("Marked approved by the reviewer in Compare & Fix."
+                                   if approved else
+                                   "Marked NOT approved by the reviewer in Compare & Fix."))
+    elif not existing:
         rec.approval_detected = False
         rec.approval_detail = "Manually entered — pending manager sign-off."
         rec.approval_status = ApprovalStatus.PENDING

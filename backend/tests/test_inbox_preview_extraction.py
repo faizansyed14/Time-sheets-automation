@@ -49,11 +49,12 @@ async def test_stage_extraction_unknown_email_404(client, admin_token):
     assert r.status_code == 404
 
 
-async def test_opening_email_auto_runs_ai_check(client, admin_token):
-    """Opening an unchecked email auto-runs the AI check (once only)."""
+async def test_opening_email_returns_detail(client, admin_token):
+    """Opening an email returns the detail with attachments (no AI check runs)."""
     h = auth_headers(admin_token)
     r = await client.get("/api/v1/inbox/MSG-0001", headers=h)
     assert r.status_code == 200, r.text
     body = r.json()
-    # The detail carries the AI-check result (run on open — no batch endpoint).
-    assert body["ai_check"] is not None
+    assert body["provider_message_id"] == "MSG-0001"
+    assert "attachments" in body
+    assert body.get("extract_email_at") is None

@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   LayoutDashboard,
+  ClipboardCheck,
   Mail,
   MessagesSquare,
   UploadCloud,
@@ -18,16 +19,22 @@ import {
   PanelLeftOpen,
   RefreshCw,
 } from "lucide-react";
-import { fetchHealth, fetchPipelineStats, triggerBackgroundScan } from "../api/client";
+import { fetchHealth, fetchPipelineStats } from "../api/client";
 import { cn, avatarColor, initials } from "../lib/utils";
 import { useAuth } from "../lib/auth";
 
+// The everyday loop: read email → extract → review → done. Everything else
+// is a tool you reach for occasionally, so it lives in its own quieter group.
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
-  { to: "/inbox", label: "Email Inbox", icon: Mail },
-  { to: "/chat", label: "Agentic Chat", icon: MessagesSquare },
+  { to: "/inbox", label: "Inbox", icon: Mail },
+  { to: "/review", label: "Review", icon: ClipboardCheck, attention: true },
+];
+
+const TOOLS_NAV = [
+  { to: "/chat", label: "Ask AI", icon: MessagesSquare },
   { to: "/upload", label: "Upload", icon: UploadCloud },
-  { to: "/pipeline", label: "Pipeline", icon: Activity },
+  { to: "/pipeline", label: "Activity log", icon: Activity },
   { to: "/employees", label: "Employees", icon: Users },
   { to: "/files", label: "File Vault", icon: FolderOpen },
 ];
@@ -39,10 +46,11 @@ const ADMIN_NAV = [
 
 const TITLES: Record<string, string> = {
   "/": "Dashboard",
-  "/inbox": "Email Inbox",
-  "/chat": "Agentic Chat",
+  "/inbox": "Inbox",
+  "/review": "Review",
+  "/chat": "Ask AI",
   "/upload": "Upload timesheets",
-  "/pipeline": "Pipeline tracker",
+  "/pipeline": "Activity log",
   "/employees": "Employee matcher",
   "/files": "File vault",
 };
@@ -60,16 +68,6 @@ export default function Shell({ children }: { children: ReactNode }) {
     refetchInterval: 15_000,
   });
   const attention = (stats?.failed ?? 0) + (stats?.needs_review ?? 0);
-
-  // On app open, kick a background AI-check pass over inbox sheets (Celery,
-  // non-blocking). Fires once per app load; the backend skips already-checked
-  // emails so this never reprocesses work.
-  const scanKicked = useRef(false);
-  useEffect(() => {
-    if (scanKicked.current) return;
-    scanKicked.current = true;
-    triggerBackgroundScan();
-  }, []);
 
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem(COLLAPSE_KEY) === "1");
   const toggleCollapsed = () => {
@@ -125,7 +123,7 @@ export default function Shell({ children }: { children: ReactNode }) {
         </div>
 
         <nav className="flex-1 space-y-1 overflow-y-auto px-3">
-          {NAV.filter((n) => canWrite || n.to !== "/upload").map(({ to, label, icon: Icon, end }) => (
+          {NAV.map(({ to, label, icon: Icon, end, attention: showAttention }) => (
             <NavLink key={to} to={to} end={end} title={collapsed ? label : undefined} className={navLinkClass}>
               {({ isActive }) => (
                 <>
@@ -138,7 +136,7 @@ export default function Shell({ children }: { children: ReactNode }) {
                   />
                   <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive && "text-brand-600")} />
                   {!collapsed && <span className="flex-1">{label}</span>}
-                  {to === "/pipeline" && attention > 0 && (
+                  {showAttention && attention > 0 && (
                     <span
                       className={cn(
                         "rounded-full bg-rose-500 font-bold text-white shadow-sm",
@@ -148,6 +146,27 @@ export default function Shell({ children }: { children: ReactNode }) {
                       {collapsed ? "" : attention}
                     </span>
                   )}
+                </>
+              )}
+            </NavLink>
+          ))}
+
+          {!collapsed && (
+            <p className="px-3 pb-1 pt-5 text-[10px] font-bold uppercase tracking-wider text-slate-400">Tools</p>
+          )}
+          {collapsed && <div className="my-2 border-t border-slate-200" />}
+          {TOOLS_NAV.filter((n) => canWrite || n.to !== "/upload").map(({ to, label, icon: Icon }) => (
+            <NavLink key={to} to={to} title={collapsed ? label : undefined} className={navLinkClass}>
+              {({ isActive }) => (
+                <>
+                  <span
+                    className={cn(
+                      "absolute left-0 top-1/2 h-5 w-1 -translate-y-1/2 rounded-r-full bg-brand-600 transition-opacity",
+                      isActive ? "opacity-100" : "opacity-0"
+                    )}
+                  />
+                  <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive && "text-brand-600")} />
+                  {!collapsed && <span className="flex-1">{label}</span>}
                 </>
               )}
             </NavLink>

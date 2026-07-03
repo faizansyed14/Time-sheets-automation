@@ -290,7 +290,10 @@ export default function PipelinePage() {
     onSuccess: () => {
       toast("info", "Tracker entry removed");
       invalidate();
+      qc.invalidateQueries({ queryKey: ["inbox"] });
+      qc.invalidateQueries({ queryKey: ["review"] });
     },
+    onError: (e: any) => toast("error", "Delete failed", e?.response?.data?.detail ?? String(e)),
   });
 
   const failureCodes = Object.entries(stats?.by_failure_code ?? {});
@@ -298,7 +301,7 @@ export default function PipelinePage() {
   return (
     <div className="animate-fade-up">
       <PageHeader
-        title="Pipeline tracker"
+        title="Activity log"
         subtitle="Every file that entered the extraction pipeline — where it is, where it failed and exactly why."
       />
 
@@ -433,6 +436,20 @@ export default function PipelinePage() {
                       <FailureChip code={f.failure_code} label={f.failure_label} />
                     </span>
                     <PipelineStatusBadge status={f.status} />
+                    {(f.status === "needs_review" || f.status === "failed") && (
+                      <button
+                        type="button"
+                        title="Delete"
+                        disabled={deleteMut.isPending}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          deleteMut.mutate(f.id);
+                        }}
+                        className="shrink-0 rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    )}
                   </button>
 
                   {expanded && (
@@ -512,9 +529,10 @@ export default function PipelinePage() {
                           size="sm"
                           variant="ghost"
                           className="ml-auto text-rose-500 hover:bg-rose-50"
+                          disabled={deleteMut.isPending}
                           onClick={() => deleteMut.mutate(f.id)}
                         >
-                          <Trash2 className="h-4 w-4" /> Remove entry
+                          <Trash2 className="h-4 w-4" /> Delete
                         </Button>
                       </div>
                     </div>
@@ -536,6 +554,7 @@ export default function PipelinePage() {
         file={assigning}
         onClose={() => setAssigning(null)}
         onSaved={onAssignSaved}
+        onDiscarded={invalidate}
       />
 
       <Modal

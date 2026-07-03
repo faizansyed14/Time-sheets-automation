@@ -40,7 +40,6 @@ CONFIG_KEYS: dict[str, dict] = {
     "extraction_model":   {"category": ConfigCategory.MODEL, "secret": False, "env": "extraction_model", "default": "gpt-4o"},
     "vision_image_detail":{"category": ConfigCategory.MODEL, "secret": False, "env": "vision_image_detail", "default": "high"},
     "validation_model":   {"category": ConfigCategory.MODEL, "secret": False, "env": "validation_model", "default": "gpt-4o-mini"},
-    "ai_check_model":     {"category": ConfigCategory.MODEL, "secret": False, "env": "ai_check_model", "default": "gpt-4o-mini"},
     "agent_chat_model":   {"category": ConfigCategory.MODEL, "secret": False, "env": "agent_chat_model", "default": "gpt-4o-mini"},
     "enable_text_validation": {"category": ConfigCategory.MODEL, "secret": False, "env": "enable_text_validation", "default": True},
     # cost / accuracy tuning
