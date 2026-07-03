@@ -83,17 +83,16 @@ async def _fetch_captcha(client):
 
 
 async def _login(client, username: str, password: str):
-    cid, answer = await _fetch_captcha(client)
+    """Step 1 of the login: username + password only. The response says which
+    single challenge (captcha / otp / totp) finishes the sign-in."""
     return await client.post("/api/v1/auth/login", json={
         "username": username,
         "password": password,
-        "captcha_id": cid,
-        "captcha_answer": answer,
     })
 
 
 async def login_2fa(client, username: str, password: str) -> str:
-    """Full login: credentials + CAPTCHA, then second factor if required."""
+    """Full login: credentials, then the user's ONE challenge (never stacked)."""
     import pyotp
     from app.core.database import SessionLocal
     from app.models.auth import User
@@ -105,7 +104,12 @@ async def login_2fa(client, username: str, password: str) -> str:
     data = r.json()
     if data["status"] == "authenticated":
         return data["access_token"]
-    if data["status"] == "otp_required":
+    if data["status"] == "captcha_required":
+        cid, answer = await _fetch_captcha(client)
+        v = await client.post("/api/v1/auth/verify-captcha",
+                              json={"login_token": data["login_token"],
+                                    "captcha_id": cid, "answer": answer})
+    elif data["status"] == "otp_required":
         v = await client.post("/api/v1/auth/verify-otp",
                               json={"login_token": data["login_token"], "code": data["debug_otp"]})
     elif data["status"] in ("totp_required", "totp_enrollment_required"):

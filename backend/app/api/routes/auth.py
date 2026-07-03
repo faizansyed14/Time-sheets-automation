@@ -1,18 +1,25 @@
 """
 Authentication routes — the full login flow.
 
-  POST /auth/login          username+password+captcha -> 2FA branch or session
+  POST /auth/login          username+password -> which single challenge is next
+  POST /auth/verify-captcha finish captcha-mode login
   POST /auth/verify-otp     finish email OTP login
   POST /auth/resend-otp     resend the code
   POST /auth/verify-totp    finish authenticator (TOTP) login
-  GET  /auth/captcha        fresh CAPTCHA image (login page + refresh)
-  POST /auth/verify-captcha legacy captcha-mode completion (kept for API compat)
+  GET  /auth/captcha        fresh CAPTCHA image
   GET  /auth/me             current user
   POST /auth/logout
 
-Every login starts with username, password, and a CAPTCHA on the client. After
-that, users with auth_mode=otp receive an email code; auth_mode=totp enter their
-authenticator app code; legacy auth_mode=captcha users are signed in immediately.
+Login is username + password followed by exactly ONE challenge — never
+stacked — chosen per user by the admin (auth_mode on the user):
+  captcha -> solve the image CAPTCHA          (verify-captcha)
+  totp    -> 6-digit authenticator app code   (verify-totp; QR enrollment on first login)
+  otp     -> 6-digit code emailed to the user (verify-otp)
+
+Brute-force protection is uniform regardless of mode: per-username+IP rate
+limiting on /login, per-user+IP limits on every verify endpoint, single-use
+time-boxed login tokens bound to the device fingerprint, and each verify
+endpoint only completes for users whose auth_mode actually uses it.
 """
 from __future__ import annotations
 
@@ -104,9 +111,6 @@ async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_
     if not allowed:
         raise HTTPException(429, f"Too many login attempts. Try again in {retry}s.")
 
-    if not await captcha_svc.verify(body.captcha_id, body.captcha_answer):
-        raise HTTPException(401, "Incorrect CAPTCHA — try again.")
-
     user = (await db.execute(
         select(User).where(User.username == body.username))).scalar_one_or_none()
     if not user or not user.is_active or not verify_password(body.password, user.password_hash):
@@ -116,10 +120,21 @@ async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_
     flow_id = secrets.token_urlsafe(16)
     login_token = create_login_token(user.id, flow_id, fp)
 
-    # Legacy captcha-mode users: login-page CAPTCHA was their only second factor.
+    # captcha-mode: the image CAPTCHA is this user's ONLY challenge. Inline
+    # answer (old clients) completes in one request; otherwise the client is
+    # told to show the CAPTCHA step and finish via /verify-captcha.
     if user.auth_mode == AuthMode.CAPTCHA:
-        token = await _issue_session(db, user)
-        return LoginResult(status="authenticated", access_token=token, user=_user_out(user))
+        if body.captcha_id and body.captcha_answer:
+            if not await captcha_svc.verify(body.captcha_id, body.captcha_answer):
+                raise HTTPException(401, "Incorrect CAPTCHA — try again.")
+            token = await _issue_session(db, user)
+            return LoginResult(status="authenticated", access_token=token, user=_user_out(user))
+        return LoginResult(
+            status="captcha_required",
+            login_token=login_token,
+            user=_user_out(user),
+            message="Solve the CAPTCHA to finish signing in.",
+        )
 
     if user.auth_mode == AuthMode.TOTP:
         secret = _ensure_totp_secret(user)
@@ -181,7 +196,7 @@ async def verify_otp(body: VerifyOtpIn, request: Request, db: AsyncSession = Dep
         raise HTTPException(401, _otp_error(res.reason))
 
     user = (await db.execute(select(User).where(User.id == payload["sub"]))).scalar_one_or_none()
-    if not user or not user.is_active:
+    if not user or not user.is_active or user.auth_mode != AuthMode.OTP:
         raise HTTPException(401, "User not found or inactive")
     token = await _issue_session(db, user)
     return TokenResult(access_token=token, user=_user_out(user))
@@ -244,7 +259,7 @@ async def get_captcha(request: Request):
 
 @router.post("/verify-captcha", response_model=TokenResult)
 async def verify_captcha(body: VerifyCaptchaIn, request: Request, db: AsyncSession = Depends(get_db)):
-    """Legacy endpoint — new logins complete via POST /login with inline CAPTCHA."""
+    """Finish a captcha-mode login (status="captcha_required" from /login)."""
     payload = _validate_login_token(body.login_token, request, body.fingerprint)
     allowed, retry = await rate_limit.hit(
         "rl:captcha-verify", _client_ip(request),
@@ -256,6 +271,10 @@ async def verify_captcha(body: VerifyCaptchaIn, request: Request, db: AsyncSessi
     user = (await db.execute(select(User).where(User.id == payload["sub"]))).scalar_one_or_none()
     if not user or not user.is_active:
         raise HTTPException(401, "User not found or inactive")
+    # A CAPTCHA can only complete the login of a captcha-mode user — an
+    # otp/totp user's login token must never skip their code this way.
+    if user.auth_mode != AuthMode.CAPTCHA:
+        raise HTTPException(401, "This account signs in with a verification code.")
     token = await _issue_session(db, user)
     return TokenResult(access_token=token, user=_user_out(user))
 
