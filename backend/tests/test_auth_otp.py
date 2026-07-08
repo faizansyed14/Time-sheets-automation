@@ -13,16 +13,41 @@ async def _make_user(client, admin_token, username="alice", mode="otp", email="a
 
 
 async def test_admin_login_captcha_mode(client):
-    # Bootstrap admin uses legacy captcha auth_mode: inline CAPTCHA completes login.
+    # Bootstrap admin's challenge is the CAPTCHA — and ONLY the captcha:
+    # password first, then the captcha step, nothing else.
     r = await _login(client, "admin", "admin")
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "authenticated"
-    assert body["access_token"]
-    assert body["user"]["role"] == "admin"
+    assert body["status"] == "captcha_required"
+    assert body["login_token"] and not body.get("access_token")
     token = await login_2fa(client, "admin", "admin")
     me = await client.get("/api/v1/auth/me", headers=auth_headers(token))
     assert me.status_code == 200 and me.json()["role"] == "admin"
+
+
+async def test_inline_captcha_still_completes_in_one_request(client):
+    # API compat: a captcha-mode login that already carries a solved CAPTCHA
+    # signs in with a single request.
+    from tests.conftest import _fetch_captcha
+    cid, answer = await _fetch_captcha(client)
+    r = await client.post("/api/v1/auth/login", json={
+        "username": "admin", "password": "admin",
+        "captcha_id": cid, "captcha_answer": answer})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "authenticated"
+
+
+async def test_challenges_never_stack_and_captcha_cannot_replace_otp(client, admin_token):
+    """An otp-mode user gets NO captcha (single challenge), and their login
+    token must never complete through the captcha endpoint instead."""
+    from tests.conftest import _fetch_captcha
+    await _make_user(client, admin_token, username="singlechal", email="s2@e.com", mode="otp")
+    r = (await _login(client, "singlechal", "Password123")).json()
+    assert r["status"] == "otp_required"
+    cid, answer = await _fetch_captcha(client)
+    bypass = await client.post("/api/v1/auth/verify-captcha", json={
+        "login_token": r["login_token"], "captcha_id": cid, "answer": answer})
+    assert bypass.status_code == 401, "captcha must not substitute for the OTP challenge"
 
 
 async def test_wrong_password_rejected(client):

@@ -4,6 +4,7 @@ import { Zap, Loader2, RefreshCw, ShieldCheck, KeyRound, Smartphone } from "luci
 import {
   authLogin,
   authResendOtp,
+  authVerifyCaptcha,
   authVerifyOtp,
   authVerifyTotp,
   captchaUrl,
@@ -13,7 +14,12 @@ import { useAuth } from "../lib/auth";
 import { Button, Input } from "../components/ui";
 import { useToast } from "../components/toast";
 
-type Stage = "credentials" | "otp" | "totp";
+// Sign-in = username + password, then exactly ONE challenge — never stacked.
+// Which challenge appears is the user's auth_mode, set by the admin:
+//   captcha -> solve the image CAPTCHA
+//   otp     -> 6-digit code emailed to the user
+//   totp    -> 6-digit authenticator-app code (QR enrollment on first login)
+type Stage = "credentials" | "captcha" | "otp" | "totp";
 
 export default function Login() {
   const nav = useNavigate();
@@ -39,10 +45,6 @@ export default function Login() {
   const [captchaImg, setCaptchaImg] = useState("");
   const [captchaAns, setCaptchaAns] = useState("");
   const [captchaTick, setCaptchaTick] = useState(0);
-
-  useEffect(() => {
-    refreshCaptcha();
-  }, []);
 
   const captchaLockedSec = (() => {
     void captchaTick;
@@ -96,6 +98,10 @@ export default function Login() {
   const handleLoginResult = async (res: LoginResult) => {
     if (res.status === "authenticated" && res.access_token) {
       finish(res.access_token, res.user);
+    } else if (res.status === "captcha_required") {
+      setLoginToken(res.login_token!);
+      setStage("captcha");
+      await refreshCaptcha();
     } else if (res.status === "otp_required") {
       setLoginToken(res.login_token!);
       setDebugOtp(res.debug_otp ?? null);
@@ -120,10 +126,24 @@ export default function Login() {
     setBusy(true);
     setErr(null);
     try {
-      const res = await authLogin(username.trim(), password, captchaId, captchaAns.trim());
+      const res = await authLogin(username.trim(), password);
       await handleLoginResult(res);
     } catch (e: any) {
       setErr(e?.response?.data?.detail ?? "Login failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onCaptcha = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setErr(null);
+    try {
+      const res = await authVerifyCaptcha(loginToken, captchaId, captchaAns.trim());
+      finish(res.access_token, res.user);
+    } catch (e: any) {
+      setErr(e?.response?.data?.detail ?? "Verification failed");
       refreshCaptcha();
     } finally {
       setBusy(false);
@@ -175,7 +195,10 @@ export default function Login() {
     setTotp("");
     setTotpQr(null);
     setTotpEnrolling(false);
-    refreshCaptcha();
+    setCaptchaId("");
+    setCaptchaImg("");
+    setCaptchaAns("");
+    setErr(null);
   };
 
   return (
@@ -210,46 +233,58 @@ export default function Login() {
                 <label className="mb-1 block text-xs font-semibold text-slate-500">Password</label>
                 <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" />
               </div>
-              <div>
-                <label className="mb-1 block text-xs font-semibold text-slate-500">CAPTCHA</label>
-                {captchaLockedSec > 0 ? (
-                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-5 text-center">
-                    <p className="text-sm font-semibold text-amber-800">Too many requests</p>
-                    <p className="mt-2 font-mono text-3xl font-bold tabular-nums text-amber-900">
-                      {captchaLockedSec}s
-                    </p>
-                    <p className="mt-2 text-xs text-amber-700">Wait, then try again.</p>
-                  </div>
-                ) : (
-                  <>
-                    <div className="flex items-center gap-2">
-                      {captchaImg ? (
-                        <img src={captchaImg} alt="captcha" className="h-[70px] flex-1 rounded-lg border border-slate-200" />
-                      ) : (
-                        <div className="h-[70px] flex-1 rounded-lg border border-slate-200 bg-slate-50" />
-                      )}
-                      <button
-                        type="button"
-                        onClick={refreshCaptcha}
-                        className="rounded-lg border border-slate-200 p-2 text-slate-500 hover:bg-slate-50"
-                        title="Refresh"
-                      >
-                        <RefreshCw className="h-4 w-4" />
-                      </button>
-                    </div>
-                    <Input
-                      value={captchaAns}
-                      onChange={(e) => setCaptchaAns(e.target.value.toUpperCase())}
-                      placeholder="Type the characters"
-                      className="mt-2 text-center tracking-[0.3em]"
-                    />
-                  </>
-                )}
-              </div>
-              <Button className="w-full" disabled={busy || captchaLockedSec > 0 || !username || !password || !captchaAns || !captchaId}>
+              <Button className="w-full" disabled={busy || !username || !password}>
                 {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
                 Sign in
               </Button>
+            </form>
+          )}
+
+          {stage === "captcha" && (
+            <form onSubmit={onCaptcha} className="space-y-3">
+              <div className="flex items-center gap-2 text-sm font-semibold text-slate-700">
+                <ShieldCheck className="h-4 w-4 text-brand-600" /> Solve the CAPTCHA
+              </div>
+              {captchaLockedSec > 0 ? (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-5 text-center">
+                  <p className="text-sm font-semibold text-amber-800">Too many requests</p>
+                  <p className="mt-2 font-mono text-3xl font-bold tabular-nums text-amber-900">
+                    {captchaLockedSec}s
+                  </p>
+                  <p className="mt-2 text-xs text-amber-700">Wait, then try again.</p>
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center gap-2">
+                    {captchaImg ? (
+                      <img src={captchaImg} alt="captcha" className="h-[70px] flex-1 rounded-lg border border-slate-200" />
+                    ) : (
+                      <div className="h-[70px] flex-1 rounded-lg border border-slate-200 bg-slate-50" />
+                    )}
+                    <button
+                      type="button"
+                      onClick={refreshCaptcha}
+                      className="rounded-lg border border-slate-200 p-2 text-slate-500 hover:bg-slate-50"
+                      title="Refresh"
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                    </button>
+                  </div>
+                  <Input
+                    value={captchaAns}
+                    onChange={(e) => setCaptchaAns(e.target.value.toUpperCase())}
+                    placeholder="Type the characters"
+                    className="text-center tracking-[0.3em]"
+                    autoFocus
+                  />
+                </>
+              )}
+              <Button className="w-full" disabled={busy || captchaLockedSec > 0 || !captchaAns || !captchaId}>
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Verify
+              </Button>
+              <button type="button" onClick={backToCredentials} className="text-xs text-slate-500 hover:text-slate-700">
+                ← Back
+              </button>
             </form>
           )}
 

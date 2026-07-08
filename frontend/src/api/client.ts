@@ -813,7 +813,7 @@ export interface AuthUser {
 }
 
 export interface LoginResult {
-  status: "authenticated" | "otp_required" | "totp_required" | "totp_enrollment_required";
+  status: "authenticated" | "captcha_required" | "otp_required" | "totp_required" | "totp_enrollment_required";
   access_token?: string | null;
   login_token?: string | null;
   captcha_id?: string | null;
@@ -838,8 +838,10 @@ export interface TotpSetupResult {
 
 const fp = () => deviceFingerprint();
 
-export const authLogin = (username: string, password: string, captcha_id: string, captcha_answer: string) =>
-  api.post<LoginResult>("/auth/login", { username, password, captcha_id, captcha_answer, fingerprint: fp() }).then((r) => r.data);
+// Login is username + password only; the backend replies with which single
+// challenge (captcha / otp / totp) finishes the sign-in for this user.
+export const authLogin = (username: string, password: string) =>
+  api.post<LoginResult>("/auth/login", { username, password, fingerprint: fp() }).then((r) => r.data);
 
 export const authVerifyOtp = (login_token: string, code: string) =>
   api.post<TokenResult>("/auth/verify-otp", { login_token, code, fingerprint: fp() }).then((r) => r.data);

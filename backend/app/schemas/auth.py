@@ -10,8 +10,10 @@ from pydantic import BaseModel, EmailStr, Field
 class LoginIn(BaseModel):
     username: str
     password: str
-    captcha_id: str
-    captcha_answer: str
+    # Optional inline CAPTCHA — only meaningful for auth_mode=captcha users;
+    # the normal flow answers the CAPTCHA as its own step after the password.
+    captcha_id: str | None = None
+    captcha_answer: str | None = None
     fingerprint: str | None = None  # opaque client device id (hashed server-side)
 
 
@@ -50,7 +52,8 @@ class UserOut(BaseModel):
 
 
 class LoginResult(BaseModel):
-    # status: authenticated | otp_required | totp_required | totp_enrollment_required
+    # status: authenticated | captcha_required | otp_required | totp_required
+    #         | totp_enrollment_required
     status: str
     access_token: str | None = None
     login_token: str | None = None

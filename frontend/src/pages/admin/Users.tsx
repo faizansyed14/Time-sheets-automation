@@ -22,7 +22,7 @@ const EMPTY: Form = { username: "", password: "", email: "", role: "user", auth_
 
 function authModeLabel(mode: AuthModeT) {
   if (mode === "totp") return "Authenticator";
-  if (mode === "captcha") return "CAPTCHA (legacy)";
+  if (mode === "captcha") return "CAPTCHA";
   return "OTP (email)";
 }
 
@@ -104,7 +104,7 @@ export default function AdminUsers() {
     <div className="animate-fade-up">
       <PageHeader
         title="Users & access"
-        subtitle="Create users and choose OTP (email) or Authenticator (TOTP). Every role signs in with CAPTCHA + 2FA."
+        subtitle="Create users and choose their sign-in challenge: CAPTCHA, Authenticator (TOTP) or OTP (email) — exactly one, after username + password."
         actions={<Button onClick={openCreate}><UserPlus className="h-4 w-4" /> Add user</Button>}
       />
 
@@ -179,7 +179,7 @@ export default function AdminUsers() {
         title={isEdit ? `Edit ${modal && "user" in modal ? modal.user.username : ""}` : "Add user"}
         subtitle={isEdit
           ? "Update role, email, 2-factor method, or set a new password."
-          : "OTP users need an email. Authenticator users scan a QR code on first login."}
+          : "OTP users need an email. Authenticator users scan a QR code on first login. CAPTCHA users just solve the image check."}
       >
         <div className="grid grid-cols-2 gap-3">
           <Field label="Username">
@@ -203,6 +203,7 @@ export default function AdminUsers() {
           </Field>
           <Field label="2-factor mode">
             <Select className="w-full" value={form.auth_mode} onChange={(e) => setForm({ ...form, auth_mode: e.target.value as AuthModeT })}>
+              <option value="captcha">CAPTCHA (image check at sign-in)</option>
               <option value="otp">OTP (email)</option>
               <option value="totp">Authenticator (Microsoft / Google)</option>
             </Select>
