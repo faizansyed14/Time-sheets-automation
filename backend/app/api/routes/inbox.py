@@ -1,7 +1,7 @@
 """Inbox routes — read emails, preview attachments, Accept/Reject/Restore."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import datacache
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.cache import cache
 from app.models.email_message import EmailMessage, EmailStatus
@@ -87,6 +88,49 @@ async def _sync_message(db: AsyncSession, msg) -> EmailMessage:
     return row
 
 
+_SYNC_LOCK_KEY = "inbox:sync:lock"
+_SYNC_FRESH_KEY = "inbox:sync:fresh"
+_SYNC_LAST_KEY = "inbox:sync:last"   # epoch seconds of the last successful sync
+# Re-fetch window overlap: clock skew / out-of-order receivedDateTime; the
+# upsert dedupes anything fetched twice.
+_SYNC_OVERLAP = timedelta(minutes=10)
+
+
+async def _sync_inbox(db: AsyncSession) -> None:
+    """Throttled, incremental provider sync. Never blocks the UI on a full
+    mailbox download:
+
+    - fresh (synced < INBOX_SYNC_MIN_INTERVAL_SECONDS ago) → no-op, serve DB;
+    - otherwise ask the provider only for messages received after the LAST
+      SUCCESSFUL SYNC (one small request). A full folder crawl happens only
+      when there is no sync marker (first boot / cache flushed);
+    - any provider/cache error → serve existing DB rows, never raise.
+    """
+    try:
+        if await cache.exists(_SYNC_FRESH_KEY) or await cache.exists(_SYNC_LOCK_KEY):
+            return
+        await cache.set(_SYNC_LOCK_KEY, True, ttl=60)
+    except Exception:
+        return  # cache layer down → skip sync, DB rows still serve
+    try:
+        last = await cache.get(_SYNC_LAST_KEY)
+        since = (datetime.fromtimestamp(float(last), tz=timezone.utc) - _SYNC_OVERLAP) if last else None
+        started_at = datetime.now(timezone.utc).timestamp()
+        provider = get_email_provider()
+        for m in await provider.list_messages(None, since=since):
+            await _sync_message(db, m)
+        await db.commit()
+        await cache.set(_SYNC_LAST_KEY, started_at)
+        await cache.set(_SYNC_FRESH_KEY, True, ttl=settings.inbox_sync_min_interval_seconds)
+    except Exception:
+        await db.rollback()
+    finally:
+        try:
+            await cache.delete(_SYNC_LOCK_KEY)
+        except Exception:
+            pass
+
+
 # Document attachments that go through extraction. Images/logos/screenshots are
 # excluded from the inbox attachment count (the user wants only real files).
 _DOC_CONTENT_TYPES = {
@@ -149,47 +193,44 @@ def _to_list_item(row: EmailMessage, extract_email_at: datetime | None = None) -
 
 @router.get("", response_model=Page[EmailListItem])
 async def list_inbox(
-    q: str | None = Query(default=None, description="search subject/sender/body (whole inbox)"),
-    status: str | None = Query(default=None, description="new | archived | ingested"),
+    q: str | None = Query(default=None, description="search the sender's name or email address — every word must match (any order)"),
+    status: str | None = Query(default=None, description="new | archived | ingested | extracted (= Extract Email was run, any lifecycle status)"),
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    """Paginated, server-side searched inbox. The search hits the whole table
-    (subject / sender / body) in SQL, not just the current page."""
-    # Best-effort provider sync. Must never block the UI: when a background
-    # scan/worker is already syncing the inbox, skip syncing here to avoid Graph
-    # throttling + DB contention that would stall this endpoint.
+    """Paginated, server-side searched inbox. The search matches the SENDER
+    (name or email address) across the whole table, not just the current page.
+    Provider sync is throttled + incremental so typing in the search box never
+    waits on Microsoft Graph."""
     if offset == 0:
-        lock_key = "inbox:sync:lock"
-        try:
-            if not await cache.exists(lock_key):
-                await cache.set(lock_key, True, ttl=30)
-                try:
-                    provider = get_email_provider()
-                    for m in await provider.list_messages(None):
-                        await _sync_message(db, m)
-                    await db.commit()
-                except Exception:
-                    # Any provider error should not break listing existing rows.
-                    await db.rollback()
-                finally:
-                    await cache.delete(lock_key)
-        except Exception:
-            # Cache unavailable → just skip provider sync and serve DB results.
-            pass
+        await _sync_inbox(db)
 
     base = select(EmailMessage)
-    if status:
+    if status == "extracted":
+        # Not a lifecycle status — "Extract Email has been run on this email",
+        # the same condition that shows the green Extracted badge. Matches any
+        # new/ingested/archived row with an extract-tagged pipeline item.
+        base = base.where(
+            select(PipelineFile.id).where(
+                PipelineFile.source_kind == "email",
+                PipelineFile.source_id == EmailMessage.provider_message_id,
+                PipelineFile.attachment_id.like(f"{_EXTRACT_EMAIL_TAG}%"),
+            ).exists()
+        )
+    elif status:
         base = base.where(EmailMessage.status == status)
     if q and q.strip():
-        like = f"%{q.strip().lower()}%"
-        base = base.where(or_(
-            func.lower(EmailMessage.subject).like(like),
-            func.lower(EmailMessage.sender_name).like(like),
-            func.lower(EmailMessage.sender_email).like(like),
-            func.lower(EmailMessage.body_text).like(like),
-        ))
+        # Sender-only search: every word must match the sender's name or
+        # address, in any order — "ritta ibrahim" or "ritta.m.ibrahim@gmail.com".
+        # Subject/body/attachments are deliberately NOT searched.
+        for term in q.strip().lower().split()[:8]:
+            esc = term.replace("\\", r"\\").replace("%", r"\%").replace("_", r"\_")
+            like = f"%{esc}%"
+            base = base.where(or_(
+                func.lower(EmailMessage.sender_name).like(like, escape="\\"),
+                func.lower(EmailMessage.sender_email).like(like, escape="\\"),
+            ))
 
     total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
     rows = (await db.execute(

@@ -35,6 +35,12 @@ from app.services.extraction.validation import (
 _WEEKEND = {"Saturday", "Sunday"}
 
 
+def _provider_key(provider: str) -> str:
+    """The API key configured for a provider (to gate optional AI steps)."""
+    _, _, key, _, _ = vision_client._chat_endpoint(provider)
+    return key or ""
+
+
 def _dates(occs) -> list[str]:
     return [o.date.isoformat() for o in occs if (o.day_of_week not in _WEEKEND)]
 
@@ -171,7 +177,7 @@ class VisionExtractionEngine(ExtractionEngine):
             pass
 
         # optional text cross-validation (mirrors your worker's diff step)
-        if settings.enable_text_validation and (settings.openai_api_key or "").strip():
+        if settings.enable_text_validation and _provider_key(vision_client.validation_provider()).strip():
             try:
                 period_flag, date_flags = await self._text_crosscheck(
                     doc_text, cleaned, month, year)
@@ -344,7 +350,7 @@ class VisionExtractionEngine(ExtractionEngine):
 
     async def summarize(self, context: dict) -> str | None:
         """Polished plain-English summary via the SUMMARY prompt (vision mode)."""
-        if not (settings.openai_api_key or "").strip():
+        if not _provider_key(vision_client.validation_provider()).strip():
             return None
         try:
             prompt = parser.build_summary_prompt(context)
@@ -359,28 +365,37 @@ class VisionExtractionEngine(ExtractionEngine):
     async def extract_approval(
         self, data: bytes, message_id: str, attachment_id: str,
     ) -> ApprovalExtraction:
-        api_key = (settings.openai_api_key or "").strip()
-        if not api_key:
-            return ApprovalExtraction(detected=False, detail="No OpenAI key for approval reading.")
+        question = ('Does this screenshot show a manager APPROVING leave? '
+                    'Return ONLY JSON: {"approved": true/false, "detail": "<who/when, short>"}')
+        model = settings.extraction_model
+        provider = vision_client.vision_provider()
         try:
-            b64 = base64.b64encode(data).decode("utf-8")
-            api_root, _ = openai_urls(settings.openai_base_url)
-            payload = {
-                "model": settings.extraction_model if not settings.extraction_model.startswith("gpt-5") else "gpt-4o",
-                "messages": [{"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}},
-                    {"type": "text", "text": 'Does this screenshot show a manager APPROVING leave? '
-                     'Return ONLY JSON: {"approved": true/false, "detail": "<who/when, short>"}'},
-                ]}],
-                "max_tokens": 200, "temperature": 0.0,
-            }
-            async with httpx.AsyncClient(timeout=httpx.Timeout(settings.openai_timeout)) as client:
-                r = await client.post(f"{api_root}/v1/chat/completions", json=payload,
-                                      headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
-                r.raise_for_status()
-                import json
-                txt = r.json()["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
-                obj = json.loads(txt)
-                return ApprovalExtraction(detected=bool(obj.get("approved")), detail=str(obj.get("detail") or ""))
+            if provider == "openai":
+                api_key = (settings.openai_api_key or "").strip()
+                if not api_key:
+                    return ApprovalExtraction(detected=False, detail="No OpenAI key for approval reading.")
+                b64 = base64.b64encode(data).decode("utf-8")
+                api_root, _ = openai_urls(settings.openai_base_url)
+                payload = {
+                    "model": model if not model.startswith("gpt-5") else "gpt-4o",
+                    "messages": [{"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}},
+                        {"type": "text", "text": question},
+                    ]}],
+                    "max_tokens": 200, "temperature": 0.0,
+                }
+                async with httpx.AsyncClient(timeout=httpx.Timeout(settings.openai_timeout)) as client:
+                    r = await client.post(f"{api_root}/v1/chat/completions", json=payload,
+                                          headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+                    r.raise_for_status()
+                    raw = r.json()
+            else:
+                if not vision_client._chat_endpoint(provider)[2]:
+                    return ApprovalExtraction(detected=False, detail=f"No {provider} key for approval reading.")
+                raw = await vision_client._chat_compatible(provider, [data], question, None, model, "low")
+            import json
+            txt = raw["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
+            obj = json.loads(txt)
+            return ApprovalExtraction(detected=bool(obj.get("approved")), detail=str(obj.get("detail") or ""))
         except Exception as e:
             return ApprovalExtraction(detected=False, detail=f"Could not read approval ({str(e)[:80]}).")

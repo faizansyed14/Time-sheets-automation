@@ -1,9 +1,9 @@
 ==========================================================================
  DEVELOPMENT — Docker commands
  Stack: Redis + backend (uvicorn --workers 3) + Celery worker (concurrency 3)
-        + built frontend/nginx. Same build as prod. Uses AWS RDS (Postgres)
+        + frontend + nginx gateway. Same build as prod. Uses AWS RDS (Postgres)
         + AWS S3 (files) via .env — no local db / storage container.
- File:  docker-compose.dev.yml      Env: .env  (copy from .env.dev)
+ File:  docker-compose.dev.yml      Env: .env  (from .env.example + DEV profile)
 ==========================================================================
 with start script
 ./scripts/dev/start.sh
@@ -12,8 +12,9 @@ with start script
 bash scripts/db/delete-pipeline.sh
 bash scripts/db/delete-records.sh
 # ---- setup (once) ----
-cp .env.dev .env    # then edit .env — DATABASE_URL -> your RDS endpoint,
-                    # STORAGE_PROVIDER=s3 + S3_BUCKET/S3_REGION -> your bucket
+./scripts/create-env.sh          # pick LOCAL / DEV / PROD → writes .env
+# or: ./scripts/create-env.sh DEV
+# then edit DATABASE_URL -> RDS; S3_BUCKET; secrets
 
 # ---- start / stop (or use scripts/dev/start.sh | stop.sh) ----
 docker compose -f docker-compose.dev.yml --env-file .env up --build
@@ -30,6 +31,11 @@ docker compose -f docker-compose.dev.yml logs -f worker
 docker compose -f docker-compose.dev.yml ps
 docker compose -f docker-compose.dev.yml restart backend
 docker compose -f docker-compose.dev.yml build backend
+
+# ---- rebuild frontend ONLY (no backend changes) ----
+docker compose -f docker-compose.dev.yml --env-file .env build frontend
+docker compose -f docker-compose.dev.yml --env-file .env up -d frontend
+docker compose -f docker-compose.dev.yml restart nginx
 
 # ---- shells ----
 docker compose -f docker-compose.dev.yml exec backend bash

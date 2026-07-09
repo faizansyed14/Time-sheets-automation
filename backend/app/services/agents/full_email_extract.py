@@ -7,9 +7,11 @@ heuristic pre-filtering deciding what gets analysed.
             THEIR attachments, nothing missing)
         ──► EVERY attachment inside + the email body is rendered to page
             images (plus the file's own text, when it has one, as grounding)
-        ──► vision model, 2 sheets per call (batched), ONE clean prompt:
-            per sheet → kind, identity as written, period, every leave
-            category, manager signature on the sheet, approval evidence
+        ──► vision model, up to 2 sheets per call (batched, fewer when a
+            provider's per-prompt image cap requires it — a heavy sheet
+            never gets truncated, it just gets its own call), ONE clean
+            prompt: per sheet → kind, identity as written, period, every
+            leave category, manager signature on the sheet, approval evidence
         ──► per-sheet results grouped by EMPLOYEE + MONTH
         ──► one pending-review pipeline item PER GROUP, whose raw copy is the
             full .eml — so Compare & Fix shows the whole email and all its
@@ -63,8 +65,18 @@ _BUCKETS = ("annual", "remote", "sick", "unpaid", "absent", "public_holiday")
 # Used ONLY by the keyless fallback (`used_vision=False`) — with an API key
 # the model reads approvals; nothing is pattern-matched.
 _NEG_APPROVAL_RE = re.compile(r"\b(not\s+approved|un-?approved|disapproved|reject(?:ed)?)\b", re.I)
+# A REQUEST / ask to approve is NOT an approval — these veto a positive match so
+# "please approve", "need your approval", "for your approval" don't count as approved.
+_REQ_APPROVAL_RE = re.compile(
+    r"\b(please|kindly|pls|need(?:s|ed)?|require[ds]?|request(?:ing)?|await(?:ing)?|"
+    r"pending|seeking|for\s+your|to\s+be)\b[^.\n]{0,30}\bapprov(?:e|al|ing)\b", re.I)
+# Future / passive-pending phrasing that ends in past-tense "approved" but still
+# means NOT-yet-approved: "to be approved", "yet to be approved", "awaiting approved".
+_REQ2_APPROVAL_RE = re.compile(
+    r"\b((?:yet\s+)?to\s+be|awaiting|pending|needs?\s+to\s+be)\s+approved\b", re.I)
+# Only GRANTED wording (past-tense "approved", not the bare verb "approve").
 _POS_APPROVAL_RE = re.compile(
-    r"\b(approved?|approval\s+(?:granted|given|confirmed)|ok(?:ay)?\s+to\s+process|"
+    r"\b(approved|approval\s+(?:granted|given|confirmed)|ok(?:ay)?\s+to\s+process|"
     r"looks\s+good|lgtm|sign(?:ed)?\s*[- ]?off)\b", re.I)
 
 _SYSTEM_PROMPT = """You read documents from ONE email sent to an HR timesheet portal.
@@ -96,8 +108,15 @@ Leave dates, ISO YYYY-MM-DD, each date in exactly ONE list:
 manager_signature — true only when THAT sheet visibly carries a manager/supervisor
   signature, stamp, or signed approval block.
 
-approval_evidence — a short quote or description when the sheet shows a manager
-  approving a timesheet/leave; "" otherwise. A rejection or "not approved" is NOT approval.
+approval_evidence — fill this ONLY when a manager has ALREADY approved the
+  timesheet/leave: a signed/stamped approval block, or clearly GRANTED wording such
+  as "Approved", "Approval granted", "Timesheet approved", or "please find the
+  approved timesheet". Quote the exact granting words; otherwise "".
+  A REQUEST, ask, or intention to approve is NOT approval — leave it "" for phrasing
+  like "please approve", "kindly approve", "need/awaiting your approval", "for your
+  approval", "pending approval", "to be approved", "please review and approve".
+  A rejection ("not approved", "rejected") is NOT approval — leave it "".
+  When in doubt, treat it as NOT approved and leave it "".
 
 Special case — the sheet named "(email body)" is the message text itself:
   it IS a timesheet when a day-by-day attendance grid is pasted anywhere in the text —
@@ -105,8 +124,10 @@ Special case — the sheet named "(email body)" is the message text itself:
   employee pastes the grid with IN/OUT hours, the manager replies "Approved" on top —
   read the grid rows for identity, period and leave; rows marked Holiday/Leave/Sick
   are leave dates, worked days and weekend rows are not). It is "other" ONLY when the
-  text merely refers to an ATTACHED file and contains no grid itself. Always report
-  any manager-approval wording it contains in approval_evidence.
+  text merely refers to an ATTACHED file and contains no grid itself. Record wording
+  in approval_evidence ONLY if it GRANTS approval (e.g. the manager replies "Approved"
+  on top of the thread); an employee ASKING for approval ("please approve", "need your
+  approval") is NOT approval and must leave approval_evidence "".
 
 Never invent values — when unsure, use null / empty. Reply with ONLY the requested JSON."""
 
@@ -252,8 +273,11 @@ async def _engine_sheet(unit: SheetUnit) -> dict:
 
 
 def _batch_prompt(email: EmailMessage, batch: list[SheetUnit]) -> str:
+    # No sender line: the prompt forbids using the address as identity, and
+    # sender matching runs locally after the model call — so it never needs to
+    # reach the provider at all. The subject stays (it often names the employee
+    # and period); any address/phone in it is scrubbed at the client boundary.
     lines = [
-        f"EMAIL FROM: {email.sender_name or ''} <{email.sender_email or ''}>",
         f"EMAIL SUBJECT: {email.subject or ''}",
         "",
         f"This batch contains {len(batch)} sheet(s), as page images in order:",
@@ -282,7 +306,7 @@ def _batch_prompt(email: EmailMessage, batch: list[SheetUnit]) -> str:
         '      "annual": ["YYYY-MM-DD", ...],\n'
         '      "remote": [], "sick": [], "unpaid": [], "absent": [], "public_holiday": [],\n'
         '      "manager_signature": true | false,\n'
-        '      "approval_evidence": "<short quote>" | ""\n'
+        '      "approval_evidence": "<exact GRANTED-approval quote; \\"\\" for a request to approve>" | ""\n'
         "    }\n"
         "  ]\n"
         "}")
@@ -294,10 +318,38 @@ def _batch_prompt(email: EmailMessage, batch: list[SheetUnit]) -> str:
     return "\n".join(lines)
 
 
+def _make_batches(units: list[SheetUnit], max_per_batch: int, max_images: int | None) -> list[list[int]]:
+    """Group sheet indices into vision calls: up to `max_per_batch` sheets per
+    call, and never more than `max_images` total page images in one call (a
+    hosted vLLM server can reject the whole call above its per-prompt cap —
+    see VLLM_MAX_IMAGES_PER_PROMPT). A sheet is NEVER split or truncated to
+    fit; a heavy sheet just gets its own call, so nothing is lost for
+    accuracy — it only means fewer sheets share that particular call."""
+    batches: list[list[int]] = []
+    current: list[int] = []
+    current_images = 0
+    for i, u in enumerate(units):
+        n = len(u.images or [])
+        over_count = len(current) >= max_per_batch
+        over_images = max_images is not None and current_images + n > max_images
+        if current and (over_count or over_images):
+            batches.append(current)
+            current, current_images = [], 0
+        current.append(i)
+        current_images += n
+    if current:
+        batches.append(current)
+    return batches
+
+
 async def _analyse_units(email: EmailMessage, units: list[SheetUnit]) -> tuple[list[dict], dict]:
     """Vision batches first; any sheet the batch could not cover falls back to
     the per-file engine. Returns (sheets, run_meta)."""
-    api_key = (settings.openai_api_key or "").strip()
+    from app.services.extraction import vision_client
+
+    model = settings.extraction_model
+    provider = vision_client.vision_provider()
+    _, _, api_key, _, _ = vision_client._chat_endpoint(provider)
     use_vision = bool(api_key) and api_key.lower() != "change-me"
     sheets: list[dict | None] = [None] * len(units)
     batches = 0
@@ -305,10 +357,11 @@ async def _analyse_units(email: EmailMessage, units: list[SheetUnit]) -> tuple[l
 
     if use_vision:
         from app.services.extraction.parser import extract_json_from_vllm_response
-        from app.services.extraction.vision_client import _openai_by_images
-        model = settings.extraction_model
-        for start in range(0, len(units), _BATCH_SIZE):
-            batch = units[start:start + _BATCH_SIZE]
+        # OpenAI has no meaningful per-prompt image cap for this batch size;
+        # vLLM (and other self-hosted OpenAI-compatible servers) do.
+        max_images = None if provider == "openai" else settings.vllm_max_images_per_prompt
+        for batch_no, idx_group in enumerate(_make_batches(units, _BATCH_SIZE, max_images), 1):
+            batch = [units[i] for i in idx_group]
             images = [img for u in batch for img in (u.images or [])]
             # A sheet with no image but readable text (e.g. a body whose render
             # failed) still goes to the model — the prompt points at its text.
@@ -317,9 +370,14 @@ async def _analyse_units(email: EmailMessage, units: list[SheetUnit]) -> tuple[l
             # Sheets grounded by their own text only need LOW image detail.
             detail = "low" if all(u.text for u in batch) else settings.vision_image_detail
             try:
-                raw = await _openai_by_images(
-                    images, _batch_prompt(email, batch), _SYSTEM_PROMPT,
-                    model, detail, api_key)
+                if provider == "openai":
+                    raw = await vision_client._openai_by_images(
+                        images, _batch_prompt(email, batch), _SYSTEM_PROMPT,
+                        model, detail, api_key)
+                else:
+                    raw = await vision_client._chat_compatible(
+                        provider, images, _batch_prompt(email, batch), _SYSTEM_PROMPT,
+                        model, detail)
                 parsed = extract_json_from_vllm_response(raw)
                 entries = parsed.get("sheets") if isinstance(parsed, dict) else None
                 if not isinstance(entries, list):
@@ -328,14 +386,14 @@ async def _analyse_units(email: EmailMessage, units: list[SheetUnit]) -> tuple[l
                 for e in entries:
                     if isinstance(e, dict) and isinstance(e.get("index"), int):
                         by_index[e["index"]] = e
-                for i, u in enumerate(batch, 1):
-                    e = by_index.get(i) or (entries[i - 1] if i - 1 < len(entries)
-                                            and isinstance(entries[i - 1], dict) else None)
+                for pos, sheet_idx in enumerate(idx_group, 1):
+                    e = by_index.get(pos) or (entries[pos - 1] if pos - 1 < len(entries)
+                                              and isinstance(entries[pos - 1], dict) else None)
                     if e is not None:
-                        sheets[start + i - 1] = _normalize_sheet(u, e)
+                        sheets[sheet_idx] = _normalize_sheet(units[sheet_idx], e)
                 batches += 1
             except Exception as exc:
-                errors.append(f"batch {start // _BATCH_SIZE + 1}: {str(exc)[:120]}")
+                errors.append(f"batch {batch_no}: {str(exc)[:120]}")
 
     for idx, u in enumerate(units):
         if sheets[idx] is None:
@@ -374,7 +432,10 @@ def _detect_approval(email: EmailMessage, sheets: list[dict], used_vision: bool 
         # Keyless fallback only: the engine cannot read approvals, so a plain
         # pattern check of the body is better than reporting nothing.
         body = (email.body_text or "")[:4000]
-        if body and not _NEG_APPROVAL_RE.search(body) and _POS_APPROVAL_RE.search(body):
+        if (body and not _NEG_APPROVAL_RE.search(body)
+                and not _REQ_APPROVAL_RE.search(body)
+                and not _REQ2_APPROVAL_RE.search(body)
+                and _POS_APPROVAL_RE.search(body)):
             evidence.append("approval wording in the email body (pattern match — no API key)")
     return {
         "detected": bool(evidence),

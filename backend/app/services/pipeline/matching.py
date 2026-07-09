@@ -1,16 +1,19 @@
 """
 Match an extracted (employee_id, name) against all_employee_data.
 
-Matching is STRICT: a confident match requires BOTH the employee_id AND the
-name to agree on the SAME matcher row. We never match on the ID alone or the
-name alone, and we never search the whole table by name — that would risk
-filing a sheet under the wrong person. Anything that isn't a clean ID+name
-agreement returns no match (employee=None) and is flagged in the pipeline
-tracker for a human to assign.
+The primary path requires BOTH the employee_id AND the name to agree on the
+SAME matcher row (id_and_name). employee_id is NOT globally unique — the AUH
+and DXB teams have overlapping ID ranges, so the same ID can belong to two
+different people; the name decides which one when several rows share an ID.
 
-employee_id is NOT globally unique — the AUH and DXB teams have overlapping ID
-ranges, so the same ID can belong to two different people. The name decides
-which one; if it can't, the file is flagged as ambiguous rather than guessed.
+When the ID does not lead to a confident match (not found in the matcher, its
+owner's name disagrees, or a shared ID can't be disambiguated), we fall back
+to a global fuzzy NAME search across every employee — the sheet's name is
+trusted over a possibly misread/OCR'd ID. That fallback only ever returns a
+match when exactly ONE employee's name confidently agrees (or one clearly
+outscores every other agreeing candidate); a tie or no agreement leaves the
+sheet unmatched for a human to assign, same as before. Every name-fallback
+match carries a note flagging the ID mismatch so the reviewer can verify it.
 
 Returns a MatchResult carrying the matched Employee (or None), a human-readable
 note, and a machine code the pipeline tracker uses.
@@ -26,10 +29,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.employee import Employee
 
-# A fuzzy name match (used ONLY to confirm the sheet name against the row(s) the
-# ID already points to — never as a global name search) must clear both an
-# overall score and a token-overlap floor, so "Mohd Ali" ≈ "Mohammed Ali" is
-# accepted while "John Doe" vs "John Murphy Ibanez" is not.
+# A fuzzy name match — used both to confirm the sheet name against the row(s)
+# the ID points to, and as the global fallback search when the ID fails — must
+# clear both an overall score and a token-overlap floor, so "Mohd Ali" ≈
+# "Mohammed Ali" is accepted while "John Doe" vs "John Murphy Ibanez" is not.
 FUZZY_THRESHOLD = 82
 FUZZY_TOKEN_FLOOR = 70
 
@@ -131,6 +134,7 @@ def _name_score(extracted: str, candidate: str) -> float:
 class MatchCode:
     ID_AND_NAME = "id_and_name"
     EMAIL_AND_NAME = "email_and_name"  # sender / AI employee + sheet name, no id on PDF
+    NAME_FALLBACK = "name_fallback"    # ID failed to resolve; matched by name alone instead
     AMBIGUOUS_ID = "ambiguous_id"
     NO_MATCH = "no_match"              # id or name missing / not found / disagree
     NO_IDENTITY = "no_identity"        # nothing extracted to match on
@@ -145,6 +149,25 @@ class MatchResult:
 
 def _loc(e: Employee) -> str:
     return f" [{e.location}]" if e.location else ""
+
+
+async def _match_by_name(db: AsyncSession, name_norm: str) -> Employee | None:
+    """Global fuzzy name search — used ONLY as a fallback once the ID has
+    already failed to produce a confident match. Returns a single Employee
+    only when exactly one agrees (or one clearly outscores the rest); a tie
+    or no agreement returns None so we never guess."""
+    all_employees = (await db.execute(select(Employee))).scalars().all()
+    agreeing = [e for e in all_employees if _name_agrees(name_norm, e.name)]
+    if len(agreeing) == 1:
+        return agreeing[0]
+    if len(agreeing) > 1:
+        ranked = sorted(((_name_score(name_norm, e.name), e) for e in agreeing),
+                        key=lambda t: t[0], reverse=True)
+        best_score, best = ranked[0]
+        second = ranked[1][0]
+        if best_score - second >= 8:
+            return best
+    return None
 
 
 async def match_employee(
@@ -192,6 +215,14 @@ async def match_employee(
         await db.execute(select(Employee).where(Employee.employee_id == id_norm))
     ).scalars().all()
     if not candidates:
+        alt = await _match_by_name(db, name_norm)
+        if alt:
+            return MatchResult(
+                alt, f'No employee with ID {id_norm} in the matcher, but the sheet name '
+                     f'"{extracted_name}" matched "{alt.name}" · {alt.employee_id}{_loc(alt)} — '
+                     "matched by name; please verify the ID.",
+                MatchCode.NAME_FALLBACK,
+            )
         return MatchResult(
             None,
             f'No employee with ID {id_norm} in the matcher (sheet name "{extracted_name}"). '
@@ -207,6 +238,14 @@ async def match_employee(
                 emp, f"Matched by employee ID ({id_norm}) + name "
                      f'("{extracted_name}" → "{emp.name}"{_loc(emp)}).',
                 MatchCode.ID_AND_NAME,
+            )
+        alt = await _match_by_name(db, name_norm)
+        if alt:
+            return MatchResult(
+                alt, f'Employee ID {id_norm} belongs to "{emp.name}"{_loc(emp)}, but the sheet '
+                     f'name "{extracted_name}" matched "{alt.name}" · {alt.employee_id}{_loc(alt)} '
+                     "instead — matched by name; please verify the ID.",
+                MatchCode.NAME_FALLBACK,
             )
         return MatchResult(
             None,
@@ -237,6 +276,14 @@ async def match_employee(
                 MatchCode.ID_AND_NAME,
             )
 
+    alt = await _match_by_name(db, name_norm)
+    if alt:
+        return MatchResult(
+            alt, f'Employee ID {id_norm} is shared by multiple people and the sheet name didn\'t '
+                 f'clearly pick one of them, but "{extracted_name}" matched "{alt.name}" · '
+                 f'{alt.employee_id}{_loc(alt)} — matched by name; please verify the ID.',
+            MatchCode.NAME_FALLBACK,
+        )
     who = ", ".join(f"{c.name}{_loc(c)}" for c in candidates)
     return MatchResult(
         None,

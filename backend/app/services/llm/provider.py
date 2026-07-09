@@ -28,6 +28,7 @@ from app.services.config.service import get_overlay
 PROVIDERS = {
     "openai": {"base": "openai_base_url", "key": "openai_api_key", "model": "gpt-4o"},
     "deepseek": {"base": "deepseek_base_url", "key": "deepseek_api_key", "model": "deepseek-chat"},
+    "vllm": {"base": "vllm_base_url", "key": "vllm_api_key", "model": "qwen3-vl-32b"},
 }
 
 
@@ -36,7 +37,22 @@ def _build_model(provider: str, model: str, base_url: str, api_key: str, tempera
     """Construct (and cache) a LangChain chat model for the given provider."""
     from langchain_openai import ChatOpenAI
 
-    _, langchain_base = openai_urls(base_url) if provider == "openai" else (base_url, base_url)
+    kwargs: dict = {}
+    if provider == "vllm":
+        # Self-hosted endpoint: honour the pinned CA / verify setting, and make
+        # sure the base ends in /v1 like every OpenAI-compatible server expects.
+        import httpx
+
+        from app.services.extraction.vision_client import _vllm_verify
+        base = (base_url or "").rstrip("/")
+        langchain_base = base if base.endswith("/v1") else f"{base}/v1"
+        verify = _vllm_verify()
+        kwargs["http_client"] = httpx.Client(verify=verify)
+        kwargs["http_async_client"] = httpx.AsyncClient(verify=verify)
+    elif provider == "openai":
+        _, langchain_base = openai_urls(base_url)
+    else:
+        langchain_base = base_url
 
     return ChatOpenAI(
         model=model,
@@ -45,6 +61,7 @@ def _build_model(provider: str, model: str, base_url: str, api_key: str, tempera
         temperature=temperature,
         timeout=60,
         max_retries=1,
+        **kwargs,
     )
 
 
@@ -60,6 +77,10 @@ async def _resolve(db: AsyncSession, kind: str, provider_override: str | None = 
         model = cfg.get("agent_chat_model") or "gpt-4o-mini"
     else:
         model = cfg.get("extraction_model") or meta["model"]
+    # A vLLM server only serves its own model — a leftover gpt-* model name
+    # (e.g. an old validation_model setting) would 404, so fall back.
+    if provider == "vllm" and str(model).lower().startswith("gpt-"):
+        model = meta["model"]
     return provider, model, base_url, api_key
 
 

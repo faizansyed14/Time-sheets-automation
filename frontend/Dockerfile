@@ -21,8 +21,7 @@ RUN npm run build
 # ---------- prod ----------
 FROM nginx:1.27-alpine AS prod
 COPY --from=build /app/dist /usr/share/nginx/html
-# nginx config is NOT baked in — it is mounted at runtime from the repo-root
-# ./nginx/default.conf by both docker-compose.dev.yml and docker-compose.prod.yml
-# (single shared source of truth). See nginx/default.conf.
+# nginx config is NOT baked in — mounted at runtime from nginx/frontend.conf
+# by docker-compose.*.yml (frontend service).
 EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]

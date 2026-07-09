@@ -63,14 +63,15 @@ If you don't care about losing in-flight jobs on restart, you can drop it too.
 redis    — Celery broker + cache (small appendonly volume)
 backend  — FastAPI, uvicorn --workers ${UVICORN_WORKERS:-4}; runs Alembic on boot
 worker   — Celery worker + beat (--concurrency ${CELERY_CONCURRENCY:-3})
-nginx    — built SPA + reverse proxy to backend; published on 127.0.0.1:8080
+frontend — built SPA (static nginx)
+nginx    — gateway: SPA → frontend, API → backend; published on 127.0.0.1:8080
 ```
 
 - Same `.env` drives local and EC2. Tune `UVICORN_WORKERS` / `CELERY_CONCURRENCY`
   in `.env` without editing the compose file.
 - **t3.large (2 vCPU):** `UVICORN_WORKERS=2`, `CELERY_CONCURRENCY=2`.
-- The `nginx` service is the **built** SPA (minified, gzipped) — not the Vite dev
-  server. Config lives at `nginx/nginx.conf` (mounted into the container).
+- **`frontend`** serves the minified SPA; **`nginx`** is the public gateway.
+  Config: `nginx/frontend.conf` + `nginx/gateway.conf` (mounted, no image rebuild).
 - `nginx` is bound to `127.0.0.1:8080` so a **host nginx + certbot** owns 80/443
   and terminates HTTPS (see §7).
 
@@ -178,7 +179,8 @@ cd time-sheets-automation
 git checkout dev
 git pull origin dev          # get latest (nginx service, celery fix, etc.)
 
-cp .env.dev .env
+cp .env.example .env
+# apply DEV profile values from the comments, then:
 nano .env
 ```
 
@@ -295,8 +297,8 @@ docker compose -f docker-compose.dev.yml logs nginx --tail 50
 git pull origin dev
 docker compose -f docker-compose.dev.yml --env-file .env up -d --build
 
-# restart nginx after editing nginx/nginx.conf (no image rebuild needed)
-docker compose -f docker-compose.dev.yml restart nginx
+# restart gateway after editing nginx/gateway.conf or nginx/frontend.conf
+docker compose -f docker-compose.dev.yml restart nginx frontend
 
 # run a migration manually (targets DATABASE_URL in .env)
 docker compose -f docker-compose.dev.yml exec backend alembic upgrade head

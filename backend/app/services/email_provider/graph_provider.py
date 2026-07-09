@@ -212,7 +212,9 @@ class GraphEmailProvider(EmailProvider):
         if missing:
             raise RuntimeError(f"Graph config missing in .env: {', '.join(missing)}")
 
-    async def list_messages(self, query: str | None = None) -> list[ProviderMessage]:
+    async def list_messages(
+        self, query: str | None = None, since: datetime | None = None,
+    ) -> list[ProviderMessage]:
         url = f"{GRAPH}/users/{settings.graph_mailbox}/mailFolders/{_folder()}/messages"
         params = {
             "$top": "50",
@@ -220,6 +222,11 @@ class GraphEmailProvider(EmailProvider):
             "$select": _SELECT,
             "$expand": _EXPAND,
         }
+        if since is not None:
+            # Incremental sync: only messages received after `since` — one
+            # small page instead of paginating the entire folder.
+            iso = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            params["$filter"] = f"receivedDateTime gt {iso}"
         msgs: list[ProviderMessage] = []
         next_url: str | None = url
         next_params: dict | None = params

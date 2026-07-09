@@ -15,10 +15,11 @@ import { Link } from "react-router-dom";
 import {
   Send, Sparkles, BookOpen, User, Loader2, AlertTriangle, Paperclip,
   ArrowRight, Plus, Minus, RotateCcw, Trash2, FileText, Eye, UserCheck, CalendarDays,
+  Save, Check, X, ShieldQuestion,
 } from "lucide-react";
 import {
-  fetchChatSuggestions, sendChat, extractChatSheet, chatAttachmentUrl,
-  type ChatMessage, type ChatChange, type ChatResponse, type ChatExtraction,
+  fetchChatSuggestions, sendChat, extractChatSheet, chatAttachmentUrl, storeChatSheet,
+  type ChatMessage, type ChatChange, type ChatResponse, type ChatExtraction, type UploadResult,
 } from "../api/client";
 import { Badge, Button, Card, Modal, PageHeader, Spinner } from "../components/ui";
 import { FilePreviewModal } from "../components/FilePreview";
@@ -73,7 +74,87 @@ function ChangeCard({ c }: { c: ChatChange }) {
   );
 }
 
-function ExtractionCard({ e, onPreview }: { e: ChatExtraction; onPreview: () => void }) {
+// Per-upload "store this in the real pipeline?" decision. Keyed by the
+// upload's ephemeral token — nothing is persisted unless the user says yes.
+type StoreState =
+  | { status: "asking" }
+  | { status: "storing" }
+  | { status: "stored"; result: UploadResult }
+  | { status: "declined" }
+  | { status: "error"; message: string };
+
+function StoreConfirm({
+  store, onYes, onNo,
+}: { store: StoreState | undefined; onYes: () => void; onNo: () => void }) {
+  if (!store || store.status === "asking") {
+    return (
+      <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border border-brand-200 bg-brand-50/60 px-2.5 py-2">
+        <ShieldQuestion className="h-3.5 w-3.5 shrink-0 text-brand-500" />
+        <span className="text-slate-600">Store this file's extracted details as a real timesheet record?</span>
+        <div className="ml-auto flex items-center gap-1.5">
+          <button onClick={onNo} className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 font-semibold text-slate-600 hover:bg-slate-50">
+            <X className="h-3 w-3" /> No
+          </button>
+          <button onClick={onYes} className="inline-flex items-center gap-1 rounded-md bg-brand-600 px-2 py-1 font-semibold text-white hover:bg-brand-700">
+            <Save className="h-3 w-3" /> Yes, store it
+          </button>
+        </div>
+      </div>
+    );
+  }
+  if (store.status === "storing") {
+    return (
+      <div className="mt-2 flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-slate-500">
+        <Loader2 className="h-3.5 w-3.5 animate-spin" /> Storing through the pipeline…
+      </div>
+    );
+  }
+  if (store.status === "declined") {
+    return (
+      <p className="mt-2 flex items-center gap-1.5 text-slate-400">
+        <X className="h-3 w-3" /> Not stored — kept in this chat only.
+      </p>
+    );
+  }
+  if (store.status === "error") {
+    return (
+      <p className="mt-2 flex items-center gap-1.5 text-rose-600">
+        <AlertTriangle className="h-3 w-3" /> {store.message}
+      </p>
+    );
+  }
+  const r = store.result;
+  const failed = r.status === "failed";
+  const review = r.status === "needs_review";
+  return (
+    <div className={cn(
+      "mt-2 flex flex-wrap items-center gap-2 rounded-lg border px-2.5 py-2",
+      failed ? "border-rose-200 bg-rose-50 text-rose-700"
+        : review ? "border-amber-200 bg-amber-50 text-amber-700"
+        : "border-emerald-200 bg-emerald-50 text-emerald-700")}>
+      {failed ? <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> : <Check className="h-3.5 w-3.5 shrink-0" />}
+      <span>
+        {failed
+          ? `Could not file it: ${r.failure_detail || r.failure_code || "unknown error"}.`
+          : review
+          ? "Stored, but flagged for review — check it on the Pipeline page."
+          : "Stored as a timesheet record."}
+      </span>
+      {r.record_id && (
+        <Link to={`/records/${r.record_id}`} className="ml-auto inline-flex items-center gap-0.5 font-semibold hover:underline">
+          <FileText className="h-3 w-3" /> Record
+        </Link>
+      )}
+    </div>
+  );
+}
+
+function ExtractionCard({
+  e, onPreview, store, onStoreYes, onStoreNo,
+}: {
+  e: ChatExtraction; onPreview: () => void;
+  store: StoreState | undefined; onStoreYes: () => void; onStoreNo: () => void;
+}) {
   const ok = e.status === "ok";
   const buckets = Object.entries(e.leaves ?? {}).filter(([, d]) => d.length > 0);
   return (
@@ -122,6 +203,7 @@ function ExtractionCard({ e, onPreview }: { e: ChatExtraction; onPreview: () => 
               <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />{e.flags.join(" ")}
             </p>
           )}
+          {e.token && e.matched_employee && <StoreConfirm store={store} onYes={onStoreYes} onNo={onStoreNo} />}
         </>
       )}
     </div>
@@ -155,7 +237,13 @@ function Typewriter({ text, onTick }: { text: string; onTick?: () => void }) {
   );
 }
 
-function Bubble({ turn, onPreview, onTick }: { turn: Turn; onPreview: (e: ChatExtraction) => void; onTick?: () => void }) {
+function Bubble({
+  turn, onPreview, onTick, storeState, onStoreYes, onStoreNo,
+}: {
+  turn: Turn; onPreview: (e: ChatExtraction) => void; onTick?: () => void;
+  storeState: Record<string, StoreState>;
+  onStoreYes: (token: string) => void; onStoreNo: (token: string) => void;
+}) {
   const isUser = turn.role === "user";
   return (
     <div className={cn("flex animate-bubble-in gap-3", isUser && "flex-row-reverse")}>
@@ -180,7 +268,15 @@ function Bubble({ turn, onPreview, onTick }: { turn: Turn; onPreview: (e: ChatEx
             )}
           </div>
         )}
-        {turn.extraction && <ExtractionCard e={turn.extraction} onPreview={() => onPreview(turn.extraction!)} />}
+        {turn.extraction && (
+          <ExtractionCard
+            e={turn.extraction}
+            onPreview={() => onPreview(turn.extraction!)}
+            store={turn.extraction.token ? storeState[turn.extraction.token] : undefined}
+            onStoreYes={() => onStoreYes(turn.extraction!.token!)}
+            onStoreNo={() => onStoreNo(turn.extraction!.token!)}
+          />
+        )}
         {turn.changes?.map((c) => <ChangeCard key={c.record_id + c.leave_type + c.action} c={c} />)}
       </div>
     </div>
@@ -196,6 +292,7 @@ export default function AgenticChatPage() {
   const [uploading, setUploading] = useState(false);
   const [bookOpen, setBookOpen] = useState(false);
   const [preview, setPreview] = useState<PreviewFile | null>(null);
+  const [storeState, setStoreState] = useState<Record<string, StoreState>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
 
@@ -257,6 +354,28 @@ export default function AgenticChatPage() {
     } finally {
       setUploading(false);
       if (fileRef.current) fileRef.current.value = "";
+    }
+  };
+
+  const handleStoreNo = (token: string) => {
+    setStoreState((prev) => ({ ...prev, [token]: { status: "declined" } }));
+  };
+
+  const handleStoreYes = async (token: string) => {
+    setStoreState((prev) => ({ ...prev, [token]: { status: "storing" } }));
+    try {
+      const result = await storeChatSheet(token);
+      setStoreState((prev) => ({ ...prev, [token]: { status: "stored", result } }));
+      if (result.status === "failed") {
+        toast("error", "Could not file the record", result.failure_detail || result.failure_code || undefined);
+      } else {
+        toast("success", result.status === "needs_review" ? "Stored — flagged for review" : "Stored as a timesheet record");
+      }
+    } catch {
+      setStoreState((prev) => ({
+        ...prev, [token]: { status: "error", message: "Could not store this file. Please try again." },
+      }));
+      toast("error", "Could not store this file", "Please try again.");
     }
   };
 
@@ -323,7 +442,12 @@ export default function AgenticChatPage() {
               </div>
             </div>
           ) : (
-            turns.map((t, i) => <Bubble key={i} turn={t} onPreview={openPreview} onTick={scrollToBottom} />)
+            turns.map((t, i) => (
+              <Bubble
+                key={i} turn={t} onPreview={openPreview} onTick={scrollToBottom}
+                storeState={storeState} onStoreYes={handleStoreYes} onStoreNo={handleStoreNo}
+              />
+            ))
           )}
           {(sending || uploading) && (
             <div className="flex animate-bubble-in items-center gap-3 text-sm text-slate-400">

@@ -1,7 +1,7 @@
 # Host-level nginx site for the shared dev/staging EC2 (and prod, same pattern).
 # Terminates HTTPS with a Let's Encrypt cert and reverse-proxies to the Docker
-# frontend container published on 127.0.0.1:8080 (which itself serves the SPA
-# and proxies /api|/auth|/health to the backend container).
+# gateway (nginx service) on 127.0.0.1:8080, which routes SPA → frontend and
+# /api|/auth|/health → backend.
 #
 # Install:
 #   sudo apt-get update && sudo apt-get install -y nginx

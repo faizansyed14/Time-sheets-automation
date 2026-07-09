@@ -58,3 +58,12 @@ def get(token: str) -> CachedUpload | None:
     if entry and entry.expires_at > time.time():
         return entry
     return None
+
+
+def pop(token: str) -> CachedUpload | None:
+    """Fetch and remove an entry — used once the user opts to persist it
+    through the real pipeline, so the same token can't file it twice."""
+    entry = get(token)
+    if entry:
+        _STORE.pop(token, None)
+    return entry

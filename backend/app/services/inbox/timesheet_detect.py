@@ -9,7 +9,9 @@ _ATTENDANCE_FN = re.compile(
     r"attendance|time\s*sheet|timesheet|time_sheet|attendance_shee",
     re.I,
 )
-_EMP_ID_FN = re.compile(r"\bE\d{6,8}\b", re.I)
+# Underscores count as separators in filenames (ATTENDANCE_E2507237_202605),
+# but \b treats them as word characters — so use explicit lookarounds.
+_EMP_ID_FN = re.compile(r"(?<![A-Za-z0-9])E\d{6,8}(?![0-9])", re.I)
 
 _TS_KEYWORDS = (
     "timesheet", "time sheet", "attendance", "time card", "working hours",

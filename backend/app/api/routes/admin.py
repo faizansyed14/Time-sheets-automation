@@ -28,6 +28,7 @@ from app.models.auth import AuthMode, Role, User
 from app.schemas.auth import (
     AdminUserCreate,
     AdminUserUpdate,
+    AiStatusItem,
     ConfigItem,
     ConfigUpdate,
     ProviderTestIn,
@@ -212,6 +213,42 @@ async def reveal_config_secret(key: str, db: AsyncSession = Depends(get_db)):
 async def test_config(body: ProviderTestIn, db: AsyncSession = Depends(get_db)):
     res = await llm_provider.test_provider(db, body.provider, body.prompt)
     return ProviderTestResult(**res)
+
+
+@router.get("/config/status", response_model=list[AiStatusItem])
+async def config_status(db: AsyncSession = Depends(get_db)):
+    """The ACTUAL resolved provider + model for every AI call site, read the
+    same way each call routes — each service picks its own provider, and the
+    endpoint + key come from that provider."""
+    overlay = await config_service.get_overlay(db)
+
+    def _key_configured(provider: str) -> bool:
+        key = ((overlay.get("openai_api_key") if provider == "openai"
+                else overlay.get("vllm_api_key") if provider == "vllm"
+                else overlay.get("deepseek_api_key")) or "").strip().lower()
+        return bool(key) and key not in ("change-me", "missing")
+
+    def _item(kind: str, label: str, provider_key: str, model_key: str,
+              note: str | None = None) -> AiStatusItem:
+        provider = str(overlay.get(provider_key) or "openai").lower()
+        return AiStatusItem(kind=kind, label=label, provider=provider,
+                            model=str(overlay.get(model_key) or ""),
+                            has_key=_key_configured(provider), note=note)
+
+    agent_provider = str(overlay.get("ai_provider") or "openai").lower()
+    agent_note = None
+    if agent_provider != "openai":
+        agent_note = ("Agentic chat needs OpenAI-style tool calling; self-hosted "
+                      "servers must run with --enable-auto-tool-choice and a "
+                      "matching --tool-call-parser or chat will fail.")
+
+    return [
+        _item("extraction", "Vision extraction (Extract Email, per-file, approvals)",
+              "vision_provider", "extraction_model"),
+        _item("validation", "Validation / cross-check / summaries",
+              "validation_provider", "validation_model"),
+        _item("agent", "Agentic chat", "ai_provider", "agent_chat_model", note=agent_note),
+    ]
 
 
 @router.get("/config/prompts/defaults")

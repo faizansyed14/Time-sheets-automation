@@ -4,11 +4,13 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import datacache
 from app.core.database import get_db
-from app.schemas import ChatRequest, ChatResponse, ChatSuggestions
+from app.schemas import ChatRequest, ChatResponse, ChatSuggestions, UploadResult
 from app.services.agents import chat_agent, upload_cache
 from app.services.agents.extract_service import extract_from_upload
 from app.services.llm import provider as llm_provider
+from app.services.pipeline.ingestion import ingest_upload
 
 router = APIRouter(prefix="/agentic-chat", tags=["agentic-chat"])
 
@@ -16,7 +18,7 @@ router = APIRouter(prefix="/agentic-chat", tags=["agentic-chat"])
 @router.get("/suggestions", response_model=ChatSuggestions)
 async def suggestions(db: AsyncSession = Depends(get_db)):
     """Starter questions + the prompt book shown when the chat opens."""
-    cfg = await llm_provider.active_config(db, kind="extraction")
+    cfg = await llm_provider.active_config(db, kind="agent")
     return ChatSuggestions(
         suggestions=chat_agent.SUGGESTIONS,
         prompt_book=chat_agent.PROMPT_BOOK,
@@ -62,6 +64,33 @@ async def extract_uploaded_sheet(
         raise HTTPException(413, str(e)) from e
 
     return {**result, "token": token, "content_type": content_type}
+
+
+@router.post("/attachments/{token}/store", response_model=UploadResult)
+async def store_uploaded_sheet(token: str, db: AsyncSession = Depends(get_db)):
+    """Opt-in persistence: only called when the user explicitly confirms they
+    want this chat-uploaded sheet filed. Runs the file through the exact same
+    pipeline as the Upload page (ingest_upload) — extract, match, validate,
+    file — and creates a PipelineFile + TimesheetRecord like any other upload.
+    The ephemeral chat copy is consumed (popped) so it can't be filed twice."""
+    entry = upload_cache.pop(token)
+    if not entry:
+        raise HTTPException(404, "Attachment expired or not found. Please re-upload it.")
+    rec, tracker = await ingest_upload(
+        db, filename=entry.filename, content_type=entry.content_type, data=entry.data)
+    await datacache.bust_pipeline()
+    return UploadResult(
+        pipeline_id=tracker.id, filename=tracker.filename, status=tracker.status,
+        failure_code=tracker.failure_code, failure_detail=tracker.failure_detail,
+        record_id=rec.id if rec else None,
+        employee_name=rec.employee_name if rec else tracker.employee_name,
+        employee_id=rec.employee_id if rec else tracker.employee_id,
+        month=rec.month if rec else tracker.month,
+        year=rec.year if rec else tracker.year,
+        validation_status=rec.validation_status if rec else None,
+        llm_summary=rec.llm_summary if rec else None,
+        match_note=rec.match_note if rec else None,
+    )
 
 
 @router.get("/attachments/{token}/eml-preview")

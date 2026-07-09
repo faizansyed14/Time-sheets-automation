@@ -121,7 +121,7 @@ instead of keys.
 
 ### 3. Root `.env` for prod (read by `docker-compose.prod.yml`)
 ```bash
-cp .env.prod .env     # then edit:
+cp .env.example .env     # apply PROD profile block, then edit:
 ```
 ```bash
 ENVIRONMENT=prod

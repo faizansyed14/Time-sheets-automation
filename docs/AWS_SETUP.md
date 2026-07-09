@@ -157,7 +157,7 @@ DATABASE_URL='postgresql+asyncpg://ts_app:STRONG_RANDOM_DB_PASSWORD@localhost:54
 
 ## Part C — What to put in `.env` after creation
 
-Add/replace these keys (start from `.env.prod`). Use the **RDS endpoint** for the
+Add/replace these keys (start from `.env.example`, PROD profile). Use the **RDS endpoint** for the
 host, the scoped IAM user for S3:
 
 ```bash

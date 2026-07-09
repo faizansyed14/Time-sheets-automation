@@ -877,6 +877,8 @@ async def ingest_manual_entry(
     attachments: list[tuple[str, str, bytes]] | None = None,
     note: str | None = None,
     approval: dict | None = None,
+    source_key: str | None = None,
+    source_filename: str | None = None,
 ) -> tuple[TimesheetRecord, PipelineFile]:
     """Create/merge a monthly record from MANUALLY entered leave data (no LLM),
     optionally with attached files. Runs the SAME vault filing + validation +
@@ -918,8 +920,15 @@ async def ingest_manual_entry(
     _event(tracker, PipelineStage.MATCHING, "ok",
            f"Manually assigned to {employee_name} ({matched.employee_id}).")
 
+    # Each distinct source sheet gets its OWN key so accepting a SECOND sheet
+    # for the same employee+month (e.g. the attendance sheet, then a separate
+    # sick-leave certificate) UNIONS with the first instead of replacing it.
+    # Re-accepting the SAME sheet reuses its key → its contribution is replaced,
+    # not doubled. A bare manual-form entry (no source) keeps the legacy single
+    # "manual_entry" key so re-submitting corrects the prior manual entry.
     entry = {
-        "key": "manual_entry", "filename": "Manual entry",
+        "key": source_key or "manual_entry",
+        "filename": source_filename or "Manual entry",
         "source_id": tracker.source_id, "attachment_id": None, "ingested_at": _now_iso(),
         "buckets": {b: list(buckets.get(b, []) or []) for b in BUCKET_FIELDS},
     }
@@ -1011,6 +1020,20 @@ async def ingest_manual_entry(
     return rec, tracker
 
 
+async def mark_source_email_ingested(db: AsyncSession, tracker: PipelineFile) -> None:
+    """A record filed from an email-sourced pipeline item means that email has
+    been ingested — reflect it on the inbox row so the New/Ingested filter is
+    truthful. The staged flows (Extract Email, Run Extraction) file records via
+    the pipeline, never via the legacy Accept decision that used to set this."""
+    if (tracker.source_kind or "") != "email" or not tracker.source_id:
+        return
+    row = (await db.execute(select(EmailMessage).where(
+        EmailMessage.provider_message_id == tracker.source_id))).scalar_one_or_none()
+    if row is not None and row.status != EmailStatus.INGESTED:
+        row.status = EmailStatus.INGESTED
+        row.decided_at = datetime.now(timezone.utc)
+
+
 def can_resolve_assign(tracker: PipelineFile) -> bool:
     if tracker.status not in (PipelineStatus.FAILED, PipelineStatus.NEEDS_REVIEW):
         return False
@@ -1052,6 +1075,8 @@ async def resolve_pipeline_with_employee(
         manual_employee_pk=employee_pk, manual_month=month, manual_year=year,
         resolution_note=note,
     )
+    if rec is not None:
+        await mark_source_email_ingested(db, tracker)
     await db.commit()
     if rec is not None:
         await db.refresh(rec)
@@ -1076,6 +1101,8 @@ async def retry_pipeline_file(db: AsyncSession, tracker: PipelineFile) -> tuple[
         approval_bytes=None, approval_name="manager_approval.png",
         source_id=tracker.source_id, attachment_id=tracker.attachment_id,
         source_kind=tracker.source_kind, tracker=tracker)
+    if rec is not None:
+        await mark_source_email_ingested(db, tracker)
     await db.commit()
     if rec is not None:
         await db.refresh(rec)

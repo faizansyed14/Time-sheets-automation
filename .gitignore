@@ -6,7 +6,10 @@ data/
 storage/
 employees_data/
 test/
+# Secrets / machine-local env — only .env.example is committed
 .env
+.env.*
+!.env.example
 
 # local data / fixtures (not source)
 *.xlsx

@@ -119,3 +119,15 @@ class ProviderTestResult(BaseModel):
     latency_ms: int | None = None
     reply: str | None = None
     error: str | None = None
+
+
+class AiStatusItem(BaseModel):
+    """Live, resolved (not just configured) provider + model for one AI call
+    site — computed the same way the actual call routes, so this can never
+    drift from reality the way a static label could."""
+    kind: str            # "extraction" | "validation" | "agent"
+    label: str
+    provider: str         # "openai" | "vllm" | "deepseek"
+    model: str
+    has_key: bool
+    note: str | None = None

@@ -412,6 +412,12 @@ export const extractChatSheet = (file: File) => {
 export const chatAttachmentUrl = (token: string) =>
   withAuthParam(`/api/v1/agentic-chat/attachments/${encodeURIComponent(token)}`);
 
+// Opt-in only: files the chat-uploaded sheet through the SAME pipeline as the
+// Upload page (extract -> match -> validate -> record). Never called unless
+// the user explicitly confirms — the file otherwise stays in-memory only.
+export const storeChatSheet = (token: string) =>
+  api.post<UploadResult>(`/agentic-chat/attachments/${encodeURIComponent(token)}/store`).then((r) => r.data);
+
 // ---------------------------------------------------------------------------
 // Dashboard / employees
 // ---------------------------------------------------------------------------
@@ -898,6 +904,17 @@ export const adminTestConfig = (provider?: string, prompt?: string) =>
 export const adminPromptDefaults = () =>
   api.get<Record<string, string>>("/admin/config/prompts/defaults").then((r) => r.data);
 
+export interface AiStatusItem {
+  kind: "extraction" | "validation" | "agent";
+  label: string;
+  provider: "openai" | "vllm" | "deepseek";
+  model: string;
+  has_key: boolean;
+  note: string | null;
+}
+export const adminConfigStatus = () =>
+  api.get<AiStatusItem[]>("/admin/config/status").then((r) => r.data);
+
 /** Provider → the secret/base-URL config keys + common model choices, so the
  *  AI Settings page only shows the fields for the active provider. Model lists
  *  are suggestions — the inputs remain editable for anything not listed. */
@@ -915,6 +932,13 @@ export const AI_PROVIDERS = {
     baseField: "deepseek_base_url",
     extractionModels: ["deepseek-chat", "deepseek-reasoner"],
     validationModels: ["deepseek-chat", "deepseek-reasoner"],
+  },
+  vllm: {
+    label: "vLLM (self-hosted)",
+    keyField: "vllm_api_key",
+    baseField: "vllm_base_url",
+    extractionModels: ["qwen3-vl-32b"],
+    validationModels: ["qwen3-vl-32b"],
   },
 } as const;
 export type AiProviderId = keyof typeof AI_PROVIDERS;

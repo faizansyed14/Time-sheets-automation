@@ -69,8 +69,24 @@ def _user_out(u: User) -> UserOut:
 
 
 def _client_ip(request: Request) -> str:
+    """Real client IP for rate-limiting keys.
+
+    Our nginx sets `X-Real-IP $remote_addr` (the actual socket IP) and
+    OVERWRITES any client-supplied value, so it cannot be spoofed — prefer it.
+    Never trust the FIRST X-Forwarded-For entry (the client controls it); if
+    XREAL is absent fall back to the LAST XFF hop (the one our proxy appended
+    via proxy_add_x_forwarded_for), then the direct socket. This keeps
+    per-IP throttles effective even when a client sends a forged XFF to try to
+    rotate its apparent IP and bypass the limit."""
+    xreal = (request.headers.get("x-real-ip") or "").strip()
+    if xreal:
+        return xreal
     fwd = request.headers.get("x-forwarded-for")
-    return (fwd.split(",")[0].strip() if fwd else None) or (request.client.host if request.client else "unknown")
+    if fwd:
+        hops = [p.strip() for p in fwd.split(",") if p.strip()]
+        if hops:
+            return hops[-1]
+    return request.client.host if request.client else "unknown"
 
 
 def _fp_from(request: Request, supplied: str | None) -> str:
