@@ -60,7 +60,7 @@ _MAX_PAGES_PER_SHEET = 4   # page images sent per sheet
 _MAX_SHEETS = 12           # hard cap of sheets analysed per email
 _TAG_PREFIX = "__email_extract__"
 
-_BUCKETS = ("annual", "remote", "sick", "unpaid", "absent", "public_holiday")
+_BUCKETS = ("annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday")
 
 # Used ONLY by the keyless fallback (`used_vision=False`) — with an API key
 # the model reads approvals; nothing is pattern-matched.
@@ -100,10 +100,19 @@ Leave dates, ISO YYYY-MM-DD, each date in exactly ONE list:
   remote           work from home / remote work
   sick             sick leave (for a leave_certificate, put the certified days here
                    unless it clearly states another type)
+  maternity        maternity leave (not annual or sick)
   unpaid           unpaid leave / LOP
   absent           absence without leave
   public_holiday   public holidays marked on the sheet
   Normal worked days and weekends are NOT leave. An empty grid means empty lists.
+  MERGED / SPANNING MARKS: one label, merged cell, bracket or colored block that
+  covers SEVERAL date rows applies to EVERY date it covers (e.g. "Eid Al Adha"
+  written once across 25–29 = five public_holiday dates). Count the rows the
+  mark spans — do not record only the first row.
+  COLOR-CODED SHEETS: when leave is marked by cell colour/highlight, find the
+  legend, map each colour to its leave type, and mark EVERY date whose row or
+  cell carries that colour. Text annotations like [fill=...] describe cell
+  colours — match them against the legend the same way.
 
 manager_signature — true only when THAT sheet visibly carries a manager/supervisor
   signature, stamp, or signed approval block.
@@ -222,16 +231,134 @@ def _clean_dates(vals, month, year) -> list[str]:
     return sorted(out)
 
 
+def _as_month(v) -> int | None:
+    """1-12 from an int, a numeric string, or a month name/abbr ("May", "Sep").
+    Models differ: some return month as an integer, others echo the sheet's
+    wording — both must land on the same value."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v if 1 <= v <= 12 else None
+    s = str(v or "").strip().lower()
+    if not s:
+        return None
+    if s.isdigit():
+        i = int(s)
+        return i if 1 <= i <= 12 else None
+    import calendar
+    for i in range(1, 13):
+        if s == calendar.month_name[i].lower() or s[:3] == calendar.month_abbr[i].lower():
+            return i
+    return None
+
+
+def _as_year(v) -> int | None:
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v if v >= 2000 else None
+    s = str(v or "").strip()
+    return int(s) if s.isdigit() and int(s) >= 2000 else None
+
+
+def _month_token(tok: str) -> int | None:
+    import calendar
+    s = (tok or "").strip().lower()
+    if not s:
+        return None
+    if s.isdigit():
+        m = int(s)
+        return m if 1 <= m <= 12 else None
+    for i in range(1, 13):
+        if s == calendar.month_name[i].lower() or s[:3] == calendar.month_abbr[i].lower():
+            return i
+    return None
+
+
+# Filename/subject hints when the vision model returns kind=other (common when
+# the configured model cannot read images or returns empty JSON).
+_TIMESHEET_FNAME_RE = re.compile(
+    r"(?i)timesheet[_\s-]+(?P<month>[a-z]{3,9}|\d{1,2})[_\s-]+"
+    r"(?P<year>20\d{2})(?:[_\s-]+(?P<tail>[^.]+))?"
+)
+_EMP_ID_IN_TEXT = re.compile(r"(?i)\b(E\d{3,})\b")
+_LEAVE_CERT_FNAME_RE = re.compile(
+    r"(?i)\b(sick[\s_-]*leave|medical[\s_-]*(cert|certificate)|"
+    r"leave[\s_-]*cert(?:ificate)?)\b"
+)
+_SUBJECT_TS_RE = re.compile(
+    r"(?i)timesheet\s+for\s+(?P<month>[a-z]+|\d{1,2})\s+(?P<year>20\d{2})"
+    r"\s*\|\s*(?P<name>[^|]+?)\s*\|\s*(?P<id>E\d+)"
+)
+
+
+def _infer_from_filename(filename: str, subject: str | None = None) -> dict:
+    """Best-effort kind / identity / period from attachment name (+ subject)."""
+    name = (filename or "").strip()
+    if not name or name == "(email body)":
+        return {}
+    low = name.lower()
+    out: dict = {}
+
+    m = _TIMESHEET_FNAME_RE.search(name)
+    if m:
+        out["kind"] = "timesheet"
+        if month := _month_token(m.group("month")):
+            out["month"] = month
+        if year := _as_year(m.group("year")):
+            out["year"] = year
+        tail = (m.group("tail") or "").strip()
+        if tail:
+            if id_m := _EMP_ID_IN_TEXT.search(tail):
+                out["employee_id"] = id_m.group(1).upper()
+                name_part = tail[:id_m.start()].strip(" _-")
+                if name_part and not _EMP_ID_IN_TEXT.fullmatch(name_part):
+                    out["employee_name"] = name_part.replace("_", " ").title()
+    elif _LEAVE_CERT_FNAME_RE.search(low):
+        out["kind"] = "leave_certificate"
+        for i in range(1, 13):
+            import calendar
+            for label in (calendar.month_name[i].lower(), calendar.month_abbr[i].lower()):
+                if len(label) >= 3 and label in low:
+                    out["month"] = i
+                    break
+            if out.get("month"):
+                break
+    elif "timesheet" in low:
+        out["kind"] = "timesheet"
+        if id_m := _EMP_ID_IN_TEXT.search(name):
+            out["employee_id"] = id_m.group(1).upper()
+
+    subj = subject or ""
+    if subj_m := _SUBJECT_TS_RE.search(subj):
+        out.setdefault("kind", "timesheet")
+        out.setdefault("month", _month_token(subj_m.group("month")))
+        out.setdefault("year", _as_year(subj_m.group("year")))
+        out.setdefault("employee_name", subj_m.group("name").strip())
+        out.setdefault("employee_id", subj_m.group("id").upper())
+
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _boost_sheet_from_hints(sheet: dict, unit: SheetUnit, subject: str | None) -> dict:
+    hints = _infer_from_filename(unit.name, subject)
+    if not hints:
+        return sheet
+    out = dict(sheet)
+    if out.get("kind") == "other" and hints.get("kind"):
+        out["kind"] = hints["kind"]
+    for key in ("employee_name", "employee_id", "month", "year"):
+        if not out.get(key) and hints.get(key):
+            out[key] = hints[key]
+    return out
+
+
 def _normalize_sheet(unit: SheetUnit, raw: dict) -> dict:
     kind = str(raw.get("kind") or "other").lower()
     if kind not in ("timesheet", "leave_certificate", "approval", "other"):
         kind = "other"
-    month = raw.get("month") if isinstance(raw.get("month"), int) else None
-    year = raw.get("year") if isinstance(raw.get("year"), int) else None
-    if not (month and 1 <= month <= 12):
-        month = None
-    if not (year and year >= 2000):
-        year = None
+    month = _as_month(raw.get("month"))
+    year = _as_year(raw.get("year"))
     return {
         "name": unit.name,
         "kind": kind,
@@ -258,7 +385,8 @@ async def _engine_sheet(unit: SheetUnit) -> dict:
         return _normalize_sheet(unit, {"kind": "other"})
     buckets = {
         "annual": ext.annual_leave_dates or [], "remote": ext.remote_work_dates or [],
-        "sick": ext.sick_leave_dates or [], "unpaid": ext.unpaid_leave_dates or [],
+        "sick": ext.sick_leave_dates or [], "maternity": ext.maternity_leave_dates or [],
+        "unpaid": ext.unpaid_leave_dates or [],
         "absent": ext.absent_dates or [], "public_holiday": ext.public_holiday_dates or [],
     }
     has_period = bool(1 <= (ext.month or 0) <= 12 and (ext.year or 0) >= 2000)
@@ -304,7 +432,7 @@ def _batch_prompt(email: EmailMessage, batch: list[SheetUnit]) -> str:
         '      "month": 1-12 | null,\n'
         '      "year": <int> | null,\n'
         '      "annual": ["YYYY-MM-DD", ...],\n'
-        '      "remote": [], "sick": [], "unpaid": [], "absent": [], "public_holiday": [],\n'
+        '      "remote": [], "sick": [], "maternity": [], "unpaid": [], "absent": [], "public_holiday": [],\n'
         '      "manager_signature": true | false,\n'
         '      "approval_evidence": "<exact GRANTED-approval quote; \\"\\" for a request to approve>" | ""\n'
         "    }\n"
@@ -347,8 +475,8 @@ async def _analyse_units(email: EmailMessage, units: list[SheetUnit]) -> tuple[l
     the per-file engine. Returns (sheets, run_meta)."""
     from app.services.extraction import vision_client
 
-    model = settings.extraction_model
     provider = vision_client.vision_provider()
+    model = vision_client.model_for(provider, "vision")
     _, _, api_key, _, _ = vision_client._chat_endpoint(provider)
     use_vision = bool(api_key) and api_key.lower() != "change-me"
     sheets: list[dict | None] = [None] * len(units)
@@ -404,13 +532,18 @@ async def _analyse_units(email: EmailMessage, units: list[SheetUnit]) -> tuple[l
         method = "vision-batch+fallback"
     meta = {
         "method": method,
-        "model": settings.extraction_model if use_vision and batches else None,
+        "model": model if use_vision and batches else None,
         "batches": batches,
         "batch_size": _BATCH_SIZE,
         "sheet_count": len(units),
         "errors": errors[:4],
     }
-    return [s for s in sheets if s is not None], meta
+    boosted = [
+        _boost_sheet_from_hints(sheets[i], units[i], email.subject)
+        for i in range(len(units))
+        if sheets[i] is not None
+    ]
+    return boosted, meta
 
 
 # --------------------------------------------------------------------------- #
@@ -428,15 +561,15 @@ def _detect_approval(email: EmailMessage, sheets: list[dict], used_vision: bool 
         elif s["approval_evidence"]:
             where = "in the email body" if s["name"] == "(email body)" else f'on "{s["name"]}"'
             evidence.append(f'approval wording {where} — "{s["approval_evidence"]}"')
-    if not evidence and not used_vision:
-        # Keyless fallback only: the engine cannot read approvals, so a plain
-        # pattern check of the body is better than reporting nothing.
+    if not evidence:
+        # Backstop when the model missed approval wording in the thread body.
         body = (email.body_text or "")[:4000]
         if (body and not _NEG_APPROVAL_RE.search(body)
                 and not _REQ_APPROVAL_RE.search(body)
                 and not _REQ2_APPROVAL_RE.search(body)
                 and _POS_APPROVAL_RE.search(body)):
-            evidence.append("approval wording in the email body (pattern match — no API key)")
+            tag = "pattern match" if used_vision else "pattern match — no API key"
+            evidence.append(f"approval wording in the email body ({tag})")
     return {
         "detected": bool(evidence),
         "detail": ("Manager approval: " + "; ".join(evidence) + ".") if evidence
@@ -672,6 +805,15 @@ async def _stage_groups(
     return staged
 
 
+async def _mark_no_sheets(db: AsyncSession, email: EmailMessage, note: str) -> None:
+    """Persist "Extract Email ran, found nothing to stage" on the email row
+    itself so the UI can show a lasting badge/filter instead of the user
+    having to re-click Extract Email to rediscover the same empty result."""
+    email.no_sheets_found_at = _now()
+    email.no_sheets_note = note[:500]
+    await db.commit()
+
+
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
@@ -684,9 +826,11 @@ async def extract_full_email(db: AsyncSession, email: EmailMessage) -> dict:
     eml_bytes, eml_name = await build_full_eml(get_email_provider(), email)
     units = _collect_units(email, eml_bytes)
     if not units:
+        message = "No readable sheets found inside this email."
+        await _mark_no_sheets(db, email, message)
         return {"staged": [], "groups": 0, "sheets": [], "employees": [],
                 "approval": {"detected": False, "detail": "No sheets to check."},
-                "message": "No readable sheets found inside this email."}
+                "message": message}
 
     sheets, run_meta = await _analyse_units(email, units)
     approval = _detect_approval(email, sheets,
@@ -694,11 +838,21 @@ async def extract_full_email(db: AsyncSession, email: EmailMessage) -> dict:
     groups = await _group_sheets(db, email, sheets)
     if not groups:
         kinds = ", ".join(f"{s['name']} ({s['kind']})" for s in sheets)
+        message = f"Nothing to stage — no timesheet or certificate found ({kinds})."
+        await _mark_no_sheets(db, email, message)
         return {"staged": [], "groups": 0,
                 "sheets": [{"filename": s["name"], "kind": s["kind"],
                             "employee": s["employee_name"]} for s in sheets],
                 "employees": [], "approval": approval,
-                "message": f"Nothing to stage — no timesheet or certificate found ({kinds})."}
+                "message": message}
+
+    # This run DID find something — clear a stale "no sheets" mark from an
+    # earlier attempt (e.g. the email was re-processed after attachments
+    # became readable).
+    if email.no_sheets_found_at is not None:
+        email.no_sheets_found_at = None
+        email.no_sheets_note = None
+        await db.commit()
 
     staged = await _stage_groups(db, email, eml_bytes, eml_name, groups, approval, run_meta)
 

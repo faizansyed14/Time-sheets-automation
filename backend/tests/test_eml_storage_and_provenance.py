@@ -71,6 +71,7 @@ async def test_eml_attachment_stored_separately_with_provenance(client, admin_to
     emp = await client.post("/api/v1/employee-matcher", headers=h,
                             json={"employee_id": "E2506966", "name": "Sri Naachammai", "location": "AUH"})
     assert emp.status_code == 201, emp.text
+    emp_pk = emp.json()["id"]
 
     pdf = _timesheet_pdf("Sri Naachammai", "E2506966", "May 2026")
     eml_name = "TIMESHEET for May 2026 _ Sri Naachammai _ E2506966.eml"
@@ -81,24 +82,40 @@ async def test_eml_attachment_stored_separately_with_provenance(client, admin_to
                            files={"files": (eml_name, eml, "message/rfc822")})
     assert up.status_code == 200, up.text
     result = up.json()[0]
-    assert result["status"] in ("success", "needs_review"), result
+    assert result["status"] == "needs_review"
+    assert result["failure_code"] == "pending_review"
     assert result["employee_name"] == "Sri Naachammai"
+    assert result["record_id"] is None
 
-    # ---- provenance surfaced on the pipeline tracker (mock engine here) ----
     pl = await client.get("/api/v1/pipeline?limit=50", headers=h)
     assert pl.status_code == 200, pl.text
     tracked = next(f for f in pl.json()["items"] if f["filename"] == eml_name)
+    staged = tracked["extraction_meta"]["staged"]
+    assert tracked["extraction_meta"]["source_kind"] == "upload"
+
+    # Accept in Compare & Fix — same as Run Extraction review path.
+    fix = await client.post(
+        f"/api/v1/pipeline/{tracked['id']}/manual-fix",
+        headers=h,
+        data={
+            "employee_pk": emp_pk,
+            "month": str(staged["month"]),
+            "year": str(staged["year"]),
+            "buckets": json.dumps(staged["buckets"]),
+        },
+    )
+    assert fix.status_code == 200, fix.text
+    tracked = fix.json()
+    assert tracked["status"] == "success"
     assert tracked["extraction_method"] == "mock"
     assert tracked["used_ocr"] is False
     assert "extraction_model" in tracked
 
-    # ---- the vault holds the mail AND the attachment AND the json result ----
     files = _vault_files()
     assert eml_name in files, f"original .eml not stored: {files}"
     assert att_name in files, f"attached sheet not stored separately: {files}"
     assert "extraction_result.json" in files, f"json result not stored: {files}"
 
-    # the json records the extraction provenance + the extracted attachment list
     from app.core.config import settings
     jpath = next(p for p in settings.storage_path.rglob("extraction_result.json"))
     meta = json.loads(jpath.read_text())
@@ -107,9 +124,7 @@ async def test_eml_attachment_stored_separately_with_provenance(client, admin_to
     assert meta["extraction"]["method"] == "mock"
     assert meta["extraction"]["used_ocr"] is False
 
-    # the tracker carries a rich metadata blob for the UI dropdown
     assert tracked["extraction_meta"]["file_type"] == "eml"
-    assert tracked["extraction_meta"]["source_kind"] == "upload"
 
 
 async def test_nested_email_inside_email_pdf_is_extracted(client, admin_token):
@@ -131,10 +146,11 @@ async def test_nested_email_inside_email_pdf_is_extracted(client, admin_token):
     assert any(t == "pdf" for _n, _p, t in atts), f"nested PDF not found: {atts}"
     assert "Nested Person" in fp.extract_document_text("eml", outer)
 
-    # and the full upload pipeline extracts + matches it end-to-end
+    # upload stages for review (Run Extraction path) — employee matched from sheet
     up = await client.post("/api/v1/upload", headers=h,
                            files={"files": ("forwarded.eml", outer, "message/rfc822")})
     assert up.status_code == 200, up.text
     result = up.json()[0]
-    assert result["status"] in ("success", "needs_review"), result
+    assert result["status"] == "needs_review"
+    assert result["failure_code"] == "pending_review"
     assert result["employee_name"] == "Nested Person"

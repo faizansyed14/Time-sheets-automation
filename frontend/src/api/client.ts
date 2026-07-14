@@ -70,6 +70,8 @@ export interface EmailListItem {
   attachment_count: number;
   has_approval_screenshot: boolean;
   extract_email_at: string | null;
+  no_sheets_found_at: string | null;
+  no_sheets_note: string | null;
 }
 
 export interface Attachment {
@@ -78,6 +80,7 @@ export interface Attachment {
   content_type: string;
   kind: "timesheet" | "approval_screenshot" | "other";
   cid?: string | null;
+  is_inline?: boolean | null;
 }
 
 export interface EmailDetail extends EmailListItem {
@@ -120,12 +123,14 @@ export interface TimesheetRecord {
   annual_leave_dates: string[];
   remote_work_dates: string[];
   sick_leave_dates: string[];
+  maternity_leave_dates: string[];
   unpaid_leave_dates: string[];
   absent_dates: string[];
   public_holiday_dates: string[];
   annual_leave_count: number;
   remote_work_count: number;
   sick_leave_count: number;
+  maternity_leave_count: number;
   unpaid_leave_count: number;
   absent_count: number;
   public_holiday_count: number;
@@ -303,9 +308,6 @@ export const pipelineRawRenderUrl = (pipelineId: string) =>
 export const emlUrl = (msgId: string) =>
   withAuthParam(`/api/v1/inbox/${encodeURIComponent(msgId)}/as-eml`);
 
-export const stageEmlExtraction = (msgId: string) =>
-  api.post<PipelineFile>(`/inbox/${encodeURIComponent(msgId)}/as-eml/stage`).then((r) => r.data);
-
 export const saveEmlToVault = (
   msgId: string, body: { manager: string; employee: string; month: number; year: number },
 ) =>
@@ -324,7 +326,10 @@ export interface FullEmailExtractOut {
 
 export const extractFullEmail = (msgId: string) =>
   api.post<FullEmailExtractOut>(
-    `/inbox/${encodeURIComponent(msgId)}/extract-full`).then((r) => r.data);
+    `/inbox/${encodeURIComponent(msgId)}/extract-full`,
+    undefined,
+    { timeout: 600_000 },
+  ).then((r) => r.data);
 
 // ---------------------------------------------------------------------------
 // Agentic chat (timesheet assistant)
@@ -412,9 +417,8 @@ export const extractChatSheet = (file: File) => {
 export const chatAttachmentUrl = (token: string) =>
   withAuthParam(`/api/v1/agentic-chat/attachments/${encodeURIComponent(token)}`);
 
-// Opt-in only: files the chat-uploaded sheet through the SAME pipeline as the
-// Upload page (extract -> match -> validate -> record). Never called unless
-// the user explicitly confirms — the file otherwise stays in-memory only.
+// Opt-in only: files the chat-uploaded sheet through ingest_upload. Never
+// called unless the user explicitly confirms.
 export const storeChatSheet = (token: string) =>
   api.post<UploadResult>(`/agentic-chat/attachments/${encodeURIComponent(token)}/store`).then((r) => r.data);
 
@@ -477,6 +481,7 @@ export interface TimesheetUpdate {
   annual_leave_dates?: string[];
   remote_work_dates?: string[];
   sick_leave_dates?: string[];
+  maternity_leave_dates?: string[];
   unpaid_leave_dates?: string[];
   absent_dates?: string[];
   public_holiday_dates?: string[];
@@ -521,6 +526,9 @@ export const fetchPipeline = (params?: {
 
 export const fetchPipelineStats = () =>
   api.get<PipelineStats>("/pipeline/stats").then((r) => r.data);
+
+export const fetchPipelineFile = (id: string) =>
+  api.get<PipelineFile>(`/pipeline/${id}`).then((r) => r.data);
 
 export const resolvePipelineFile = (id: string, note: string) =>
   api.post<PipelineFile>(`/pipeline/${id}/resolve`, { note }).then((r) => r.data);
@@ -764,7 +772,7 @@ export const uploadTimesheets = (files: File[], onProgress?: (pct: number) => vo
   const form = new FormData();
   files.forEach((f) => form.append("files", f, f.name));
   return api
-    .post<UploadResult[]>("/upload", form, {
+    .post<PipelineFile[]>("/upload", form, {
       headers: { "Content-Type": "multipart/form-data" },
       onUploadProgress: (e) =>
         onProgress && e.total ? onProgress(Math.round((e.loaded / e.total) * 100)) : undefined,
@@ -890,19 +898,23 @@ export interface ConfigItem {
   category: "provider" | "model" | "prompt" | "general";
   is_secret: boolean;
 }
-export interface ProviderTestResult {
-  ok: boolean; provider: string; model: string;
-  latency_ms?: number | null; reply?: string | null; error?: string | null;
-}
 export const adminGetConfig = () => api.get<ConfigItem[]>("/admin/config").then((r) => r.data);
 export const adminUpdateConfig = (values: Record<string, unknown>) =>
   api.put<ConfigItem[]>("/admin/config", { values }).then((r) => r.data);
-export const adminRevealSecret = (key: string) =>
-  api.get<{ key: string; value: string }>(`/admin/config/reveal/${key}`).then((r) => r.data.value);
-export const adminTestConfig = (provider?: string, prompt?: string) =>
-  api.post<ProviderTestResult>("/admin/config/test", { provider, prompt: prompt || "Reply with the single word: OK" }).then((r) => r.data);
 export const adminPromptDefaults = () =>
   api.get<Record<string, string>>("/admin/config/prompts/defaults").then((r) => r.data);
+
+export interface PromptInfo {
+  key: string;
+  title: string;
+  used_by: string;
+  content: string;
+  editable: boolean;
+  override_key: string | null;
+  dynamic: boolean;
+}
+export const adminPromptsAll = () =>
+  api.get<PromptInfo[]>("/admin/config/prompts/all").then((r) => r.data);
 
 export interface AiStatusItem {
   kind: "extraction" | "validation" | "agent";
@@ -914,31 +926,3 @@ export interface AiStatusItem {
 }
 export const adminConfigStatus = () =>
   api.get<AiStatusItem[]>("/admin/config/status").then((r) => r.data);
-
-/** Provider → the secret/base-URL config keys + common model choices, so the
- *  AI Settings page only shows the fields for the active provider. Model lists
- *  are suggestions — the inputs remain editable for anything not listed. */
-export const AI_PROVIDERS = {
-  openai: {
-    label: "OpenAI",
-    keyField: "openai_api_key",
-    baseField: "openai_base_url",
-    extractionModels: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"],
-    validationModels: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
-  },
-  deepseek: {
-    label: "DeepSeek",
-    keyField: "deepseek_api_key",
-    baseField: "deepseek_base_url",
-    extractionModels: ["deepseek-chat", "deepseek-reasoner"],
-    validationModels: ["deepseek-chat", "deepseek-reasoner"],
-  },
-  vllm: {
-    label: "vLLM (self-hosted)",
-    keyField: "vllm_api_key",
-    baseField: "vllm_base_url",
-    extractionModels: ["qwen3-vl-32b"],
-    validationModels: ["qwen3-vl-32b"],
-  },
-} as const;
-export type AiProviderId = keyof typeof AI_PROVIDERS;

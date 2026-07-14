@@ -36,27 +36,44 @@ async def test_otp_user_requires_email(client, admin_token):
     assert r.status_code == 400
 
 
-async def test_config_get_set_masks_secrets(client, admin_token):
-    put = await client.put("/api/v1/admin/config", headers=auth_headers(admin_token),
-                           json={"values": {"openai_api_key": "sk-secret-123",
-                                            "vision_image_detail": "low",
-                                            "ai_provider": "deepseek",
-                                            "enable_text_validation": False}})
+async def test_config_api_exposes_only_providers_and_prompts(client, admin_token):
+    """Keys/URLs/models are .env-only: the API neither returns nor accepts them."""
+    h = auth_headers(admin_token)
+    got = await client.get("/api/v1/admin/config", headers=h)
+    assert got.status_code == 200
+    keys = {c["key"] for c in got.json()}
+    assert keys == {"vision_provider", "validation_provider", "ai_provider",
+                    "system_prompt", "extraction_prompt", "summary_prompt"}
+    assert all(c["is_secret"] is False for c in got.json())
+
+    # Provider switch works…
+    put = await client.put("/api/v1/admin/config", headers=h,
+                           json={"values": {"ai_provider": "deepseek"}})
     assert put.status_code == 200, put.text
     cfg = {c["key"]: c for c in put.json()}
-    assert cfg["openai_api_key"]["is_secret"] is True
-    assert cfg["openai_api_key"]["value"] != "sk-secret-123"
-    assert cfg["vision_image_detail"]["value"] == "low"
     assert cfg["ai_provider"]["value"] == "deepseek"
+    # …restore
+    await client.put("/api/v1/admin/config", headers=h,
+                     json={"values": {"ai_provider": "openai"}})
 
-    from app.core.config import settings
-    assert settings.vision_image_detail == "low"
-    assert settings.enable_text_validation is False
+
+async def test_config_rejects_key_material_and_models(client, admin_token):
+    h = auth_headers(admin_token)
+    for blocked in ("openai_api_key", "vllm_api_key", "vllm_base_url",
+                    "extraction_model", "vision_image_detail"):
+        r = await client.put("/api/v1/admin/config", headers=h,
+                             json={"values": {blocked: "x"}})
+        assert r.status_code == 400, f"{blocked} must not be settable via API"
+
+
+async def test_config_reveal_endpoint_removed(client, admin_token):
+    r = await client.post("/api/v1/admin/config/reveal/openai_api_key",
+                          headers=auth_headers(admin_token), json={"password": "admin"})
+    assert r.status_code in (404, 405)
 
 
 async def test_config_test_endpoint_handles_no_key(client, admin_token):
-    await client.put("/api/v1/admin/config", headers=auth_headers(admin_token),
-                     json={"values": {"ai_provider": "deepseek", "deepseek_api_key": ""}})
+    # DeepSeek has no key in the test env — the live-test reports that cleanly.
     r = await client.post("/api/v1/admin/config/test", headers=auth_headers(admin_token),
                           json={"provider": "deepseek", "prompt": "ping"})
     assert r.status_code == 200

@@ -259,6 +259,60 @@ async def test_accept_files_the_reviewers_approval_verdict():
         assert rec2.approval_detected is False
 
 
+def test_filename_hints_upgrade_other_timesheets():
+    """When vision returns kind=other, obvious attachment names still stage."""
+    unit_may = fx.SheetUnit(
+        "TIMESHEET_MAY_2026_SAOODABDURAHMAN_E2206304.pdf", "pdf", b"")
+    unit_jun = fx.SheetUnit(
+        "TIMESHEET_JUNE_2026_SAOODABDURAHMAN_E2206304.pdf", "pdf", b"")
+    unit_sick = fx.SheetUnit("Sick Leave June 5-6- Saood.pdf", "pdf", b"")
+    subject = "Fw: TIMESHEET for JUNE 2026 | SAOOD ABDURAHMAN | E2206304"
+
+    may = fx._boost_sheet_from_hints(
+        fx._normalize_sheet(unit_may, {"kind": "other"}), unit_may, subject)
+    jun = fx._boost_sheet_from_hints(
+        fx._normalize_sheet(unit_jun, {"kind": "other"}), unit_jun, subject)
+    sick = fx._boost_sheet_from_hints(
+        fx._normalize_sheet(unit_sick, {"kind": "other"}), unit_sick, subject)
+
+    assert may["kind"] == "timesheet" and may["month"] == 5 and may["year"] == 2026
+    assert may["employee_id"] == "E2206304"
+    assert jun["kind"] == "timesheet" and jun["month"] == 6
+    assert sick["kind"] == "leave_certificate" and sick["month"] == 6
+
+
+async def test_filename_hints_group_saood_email():
+    async with SessionLocal() as db:
+        mail = _mail(
+            subject="Fw: TIMESHEET for JUNE 2026 | SAOOD ABDURAHMAN | E2206304",
+            sender_email="saood.a@adnocdistribution.ae",
+            body_text="Approved.\nRegards,\nWafa",
+        )
+        sheets = [
+            fx._boost_sheet_from_hints(
+                fx._normalize_sheet(
+                    fx.SheetUnit("TIMESHEET_MAY_2026_SAOODABDURAHMAN_E2206304.pdf", "pdf", b""),
+                    {"kind": "other"}),
+                fx.SheetUnit("TIMESHEET_MAY_2026_SAOODABDURAHMAN_E2206304.pdf", "pdf", b""),
+                mail.subject),
+            fx._boost_sheet_from_hints(
+                fx._normalize_sheet(
+                    fx.SheetUnit("TIMESHEET_JUNE_2026_SAOODABDURAHMAN_E2206304.pdf", "pdf", b""),
+                    {"kind": "other"}),
+                fx.SheetUnit("TIMESHEET_JUNE_2026_SAOODABDURAHMAN_E2206304.pdf", "pdf", b""),
+                mail.subject),
+            fx._boost_sheet_from_hints(
+                fx._normalize_sheet(
+                    fx.SheetUnit("Sick Leave June 5-6- Saood.pdf", "pdf", b""),
+                    {"kind": "other"}),
+                fx.SheetUnit("Sick Leave June 5-6- Saood.pdf", "pdf", b""),
+                mail.subject),
+        ]
+        groups = await fx._group_sheets(db, mail, sheets)
+        assert len(groups) == 2, [(g["month"], g["year"]) for g in groups]
+        assert fx._detect_approval(mail, sheets)["detected"]
+
+
 def test_approval_detection_signature_screenshot_and_body():
     """Approval is read by the MODEL: signature on a sheet, an approval
     screenshot, or approval wording in the body (which is itself an analysed
@@ -271,9 +325,9 @@ def test_approval_detection_signature_screenshot_and_body():
     assert fx._detect_approval(_mail(), [ts])["detected"]
     assert fx._detect_approval(_mail(), [appr])["detected"]
     assert fx._detect_approval(_mail(), [body])["detected"]
-    # Keyless fallback: body pattern check, with negation rejected.
+    # Body pattern backstop when the model missed approval wording.
     assert fx._detect_approval(
-        _mail(body_text="Approved, please process."), [], used_vision=False)["detected"]
+        _mail(body_text="Approved, please process."), [], used_vision=True)["detected"]
     assert not fx._detect_approval(
         _mail(body_text="This is not approved yet."), [_sheet("t.pdf")],
-        used_vision=False)["detected"]
+        used_vision=True)["detected"]

@@ -1,10 +1,8 @@
 """
-Upload route — manually upload timesheets that run the SAME pipeline as the
-email "Accept" action (extract -> validate -> match -> file -> record).
+Upload route — stage files through the same Run Extraction path as inbox:
+extract → pending_review → Compare & Fix → Accept files the record.
 
-Every file gets a PipelineFile tracker row; a failing file no longer aborts
-the batch or returns a 500 — its failure code/detail comes back in the result
-and is visible on the Pipeline page (with Resolve / Retry).
+Manual entry (no LLM) still files immediately via ingest_manual_entry.
 """
 from __future__ import annotations
 
@@ -15,46 +13,38 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import datacache
 from app.core.database import get_db
-from app.schemas import UploadResult
-from app.services.pipeline.ingestion import ingest_manual_entry, ingest_upload
+from app.schemas import PipelineFileOut, UploadResult
+from app.services.pipeline.ingestion import ingest_manual_entry, stage_upload_extraction
 
 # Leave buckets a manual entry may carry (matches the extraction buckets).
-_MANUAL_BUCKETS = ("annual", "remote", "sick", "unpaid", "absent", "public_holiday")
+_MANUAL_BUCKETS = ("annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday")
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 
 
-@router.post("", response_model=list[UploadResult])
+@router.post("", response_model=list[PipelineFileOut])
 async def upload_timesheets(
     files: list[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
 ):
     if not files:
         raise HTTPException(400, "No files uploaded")
-    results: list[UploadResult] = []
+    batch: list[tuple[str, str, bytes]] = []
     for f in files:
         data = await f.read()
-        rec, tracker = await ingest_upload(
-            db, filename=f.filename or "upload",
-            content_type=f.content_type or "application/octet-stream", data=data,
-        )
-        results.append(UploadResult(
-            pipeline_id=tracker.id,
-            filename=tracker.filename,
-            status=tracker.status,
-            failure_code=tracker.failure_code,
-            failure_detail=tracker.failure_detail,
-            record_id=rec.id if rec else None,
-            employee_name=rec.employee_name if rec else tracker.employee_name,
-            employee_id=rec.employee_id if rec else tracker.employee_id,
-            month=rec.month if rec else tracker.month,
-            year=rec.year if rec else tracker.year,
-            validation_status=rec.validation_status if rec else None,
-            llm_summary=rec.llm_summary if rec else None,
-            match_note=rec.match_note if rec else None,
-        ))
+        if data:
+            batch.append((
+                f.filename or "upload",
+                f.content_type or "application/octet-stream",
+                data,
+            ))
+    if not batch:
+        raise HTTPException(400, "All uploaded files were empty.")
+    from app.api.routes.pipeline import _out as _pipeline_out
+
+    staged = await stage_upload_extraction(db, files=batch)
     await datacache.bust_pipeline()
-    return results
+    return [_pipeline_out(t) for t in staged]
 
 
 @router.post("/manual", response_model=UploadResult)

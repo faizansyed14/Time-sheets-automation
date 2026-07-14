@@ -437,14 +437,17 @@ def _score_eml_attachment(filename: str, payload: bytes, ftype: str) -> int:
 
 
 def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
-    """Return (filename, payload, file_type) for real timesheet attachments inside .eml.
+    """Return (filename, payload, file_type) for real attachments inside .eml.
 
     Excluded:
-    - Any part with a Content-Id header: these are CID-inline images (logos,
-      banners, signatures) referenced from the HTML body — never timesheet docs.
-    - Images with inline/no-disposition and no CID: likely decorative graphics.
-    Only images that are explicitly Content-Disposition: attachment are kept.
-    """
+    - Small CID-referenced inline images (logos, icons embedded in HTML).
+    - Other tiny inline images without an attachment disposition.
+
+    Kept:
+    - PDF / Office / nested .eml parts — even when they carry a Content-Id
+      (Outlook and Graph often tag file attachments with CIDs too).
+    - Parts with Content-Disposition: attachment.
+    - Large inline images (e.g. approval screenshots)."""
     try:
         msg = _parse_eml(eml_bytes)
     except Exception:
@@ -471,25 +474,35 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
         if not payload:
             continue
 
-        # CID-referenced parts are embedded HTML resources (logos, signatures).
-        cid = (part.get("Content-Id") or "").strip()
-        if cid:
-            continue
-
         filename = part.get_filename() or ""
         disposition = (part.get_content_disposition() or "").lower()
+        cid = (part.get("Content-Id") or "").strip()
         ftype = _part_file_type(part, payload)
         if not ftype:
             continue
 
+        # Documents are always real attachments — Graph/Outlook assign Content-Id
+        # to PDFs and Office files, not only HTML-embedded images.
+        if ftype in ("pdf", "docx", "xlsx", "eml"):
+            found.append((filename, payload, ftype))
+            continue
+
         if disposition == "attachment":
-            # Explicit file attachment — keep all supported document types.
             found.append((filename, payload, ftype))
-        elif ftype in ("pdf", "docx", "xlsx"):
-            # Inline or no-disposition document (e.g. embedded PDF) — keep.
-            found.append((filename, payload, ftype))
-        # Images without an explicit attachment disposition are skipped —
-        # they are decorative graphics, not standalone timesheet files.
+            continue
+
+        if ftype == "image":
+            fn = filename.lower()
+            # Approval screenshots and similar — keep even when inline + CID.
+            if (
+                len(payload) >= 50_000
+                or any(k in fn for k in (
+                    "screenshot", "approval", "attendance", "timesheet",
+                    "smarttime", "report", "capture",
+                ))
+            ):
+                found.append((filename, payload, ftype))
+            # else: decorative inline image (logo, signature banner, etc.)
 
     # De-duplicate (a nested message can surface the same bytes twice).
     seen: set[tuple[str, int]] = set()
@@ -838,12 +851,56 @@ def extract_document_text(file_type: str, data: bytes) -> str:
             from openpyxl import load_workbook
             wb = load_workbook(io.BytesIO(data), data_only=True)
             ws = wb.active
+
+            def _fill_rgb(cell) -> str | None:
+                """Solid fill colour as RRGGBB, or None for no/plain fill.
+                Colour often carries the MEANING on timesheets (legend-coded
+                leave), which plain text loses — so annotate it."""
+                try:
+                    f = cell.fill
+                    if f is None or f.patternType != "solid":
+                        return None
+                    rgb = getattr(f.fgColor, "rgb", None)
+                    if not isinstance(rgb, str) or len(rgb) < 6:
+                        return None
+                    rgb = rgb[-6:].upper()
+                    return None if rgb in ("000000", "FFFFFF") else rgb
+                except Exception:
+                    return None
+
             lines = []
             for r in range(1, min(ws.max_row or 1, 500) + 1):
-                vals = [("" if ws.cell(r, c + 1).value is None else str(ws.cell(r, c + 1).value))
-                        for c in range(min(ws.max_column or 1, 50))]
+                vals = []
+                row_fill: str | None = None
+                for c in range(min(ws.max_column or 1, 50)):
+                    cell = ws.cell(r, c + 1)
+                    v = "" if cell.value is None else str(cell.value)
+                    fill = _fill_rgb(cell)
+                    if fill and not v:
+                        row_fill = row_fill or fill
+                    elif fill:
+                        v = f"{v} [fill={fill}]"
+                    vals.append(v)
                 if any(vals):
-                    lines.append(" | ".join(vals))
+                    line = " | ".join(vals)
+                    if row_fill:
+                        line += f"  [row fill={row_fill}]"
+                    lines.append(line)
+            # Merged ranges: the label lives only in the top-left cell — spell
+            # out the span so "Eid Al Adha" across 5 rows reads as 5 days.
+            try:
+                merged = []
+                for rng in list(ws.merged_cells.ranges)[:80]:
+                    tl = ws.cell(rng.min_row, rng.min_col).value
+                    if tl is not None and str(tl).strip() and rng.max_row > rng.min_row:
+                        merged.append(f'MERGED {rng.coord}: "{str(tl).strip()[:60]}" '
+                                      f"spans rows {rng.min_row}-{rng.max_row} "
+                                      "(applies to every row in the span)")
+                if merged:
+                    lines.append("--- MERGED CELLS ---")
+                    lines.extend(merged)
+            except Exception:
+                pass
             return "\n".join(lines).strip()
         if file_type == "eml":
             best = eml_best_attachment(data)

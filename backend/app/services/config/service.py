@@ -26,6 +26,8 @@ from app.core.crypto import decrypt, encrypt
 from app.models.app_config import AppConfig, ConfigCategory
 
 _CACHE_KEY = "appconfig:overlay"
+_REV_KEY = "appconfig:rev"
+_local_rev = 0
 
 # key -> (category, is_secret, env_attr_or_None, default)
 CONFIG_KEYS: dict[str, dict] = {
@@ -123,6 +125,8 @@ async def set_settings(db: AsyncSession, values: dict, updated_by: str | None = 
     await db.commit()
     await cache.delete(_CACHE_KEY)
     apply_overlay_to_runtime(await _load_overlay(db))
+    global _local_rev
+    _local_rev = int(await cache.incr(_REV_KEY))
 
 
 def apply_overlay_to_runtime(stored: dict) -> None:
@@ -145,28 +149,37 @@ def apply_overlay_to_runtime(stored: dict) -> None:
 async def load_and_apply(db: AsyncSession) -> None:
     """Called on startup to apply any persisted config to the live process."""
     apply_overlay_to_runtime(await _load_overlay(db))
+    global _local_rev
+    _local_rev = int(await cache.get(_REV_KEY) or 0)
+
+
+async def sync_runtime_if_stale(db: AsyncSession) -> None:
+    """Reload admin config when another worker (or process) saved new settings."""
+    global _local_rev
+    remote = int(await cache.get(_REV_KEY) or 0)
+    if remote == _local_rev:
+        return
+    apply_overlay_to_runtime(await _load_overlay(db))
+    _local_rev = remote
+
+
+# The ONLY keys the admin UI may read or write: the per-service provider
+# switch and the prompt overrides. Everything else — API keys, base URLs,
+# model names, tuning knobs — lives in .env only and NEVER crosses the API,
+# in either direction.
+UI_EDITABLE_KEYS = frozenset({
+    "vision_provider", "validation_provider", "ai_provider",
+    "system_prompt", "extraction_prompt", "summary_prompt",
+})
 
 
 async def public_view(db: AsyncSession) -> list[dict]:
-    """Config for the admin UI — secrets masked, grouped with metadata."""
+    """Config for the admin UI — restricted to UI_EDITABLE_KEYS (no secrets,
+    no key material, not even masked)."""
     overlay = await get_overlay(db)
     out = []
-    for key, meta in CONFIG_KEYS.items():
-        val = overlay.get(key)
-        if meta["secret"]:
-            val = SECRET_MASK if val else ""
-        out.append({"key": key, "value": val, "category": meta["category"], "is_secret": meta["secret"]})
-    return out
-
-
-async def reveal_secret(db: AsyncSession, key: str) -> str:
-    """Return the *plaintext* value of a secret config key (admin-only).
-
-    Backs the "show key" toggle in AI Settings so an admin can confirm exactly
-    which key is in use. Returns "" when the key isn't a known secret or nothing
-    is stored yet."""
-    meta = CONFIG_KEYS.get(key)
-    if not meta or not meta["secret"]:
-        raise KeyError(key)
-    overlay = await get_overlay(db)          # secrets are decrypted in the overlay
-    return overlay.get(key) or ""
+    for key in UI_EDITABLE_KEYS:
+        meta = CONFIG_KEYS[key]
+        out.append({"key": key, "value": overlay.get(key),
+                    "category": meta["category"], "is_secret": False})
+    return sorted(out, key=lambda c: c["key"])

@@ -36,6 +36,7 @@ _MONTH_NUM = fp._MONTH_NUM
 _BUCKET_KEYWORDS = [
     ("public_holiday", ("public holiday", "(ph)", "holiday")),
     ("remote", ("work from home", "wfh", "work remotely", "remote", "grp")),
+    ("maternity", ("maternity leave", "maternity", "(ml)")),
     ("sick", ("sick leave", "sick", "medical leave", "(sl)")),
     ("unpaid", ("unpaid", "lop", "leave without pay", "(ul)")),
     ("absent", ("absent", "unauthorized", "no time", "absence")),
@@ -133,6 +134,7 @@ class MockExtractionEngine(ExtractionEngine):
             "annual": case.get("annual", []),
             "remote": case.get("remote", []),
             "sick": case.get("sick", []),
+            "maternity": case.get("maternity", []),
             "unpaid": case.get("unpaid", []),
             "absent": case.get("absent", []),
             "public_holiday": case.get("public_holiday", []),
@@ -169,6 +171,7 @@ class MockExtractionEngine(ExtractionEngine):
             annual_leave_dates=cleaned["annual"],
             remote_work_dates=cleaned["remote"],
             sick_leave_dates=cleaned["sick"],
+            maternity_leave_dates=cleaned["maternity"],
             unpaid_leave_dates=cleaned["unpaid"],
             absent_dates=cleaned["absent"],
             public_holiday_dates=cleaned["public_holiday"],

@@ -60,6 +60,7 @@ class TimesheetRecord(Base):
     annual_leave_dates: Mapped[list] = mapped_column(JSON, default=list)
     remote_work_dates: Mapped[list] = mapped_column(JSON, default=list)
     sick_leave_dates: Mapped[list] = mapped_column(JSON, default=list)
+    maternity_leave_dates: Mapped[list] = mapped_column(JSON, default=list)
     unpaid_leave_dates: Mapped[list] = mapped_column(JSON, default=list)
     absent_dates: Mapped[list] = mapped_column(JSON, default=list)
     public_holiday_dates: Mapped[list] = mapped_column(JSON, default=list)
@@ -103,6 +104,10 @@ class TimesheetRecord(Base):
     @property
     def sick_leave_count(self) -> int:
         return len(self.sick_leave_dates or [])
+
+    @property
+    def maternity_leave_count(self) -> int:
+        return len(self.maternity_leave_dates or [])
 
     @property
     def unpaid_leave_count(self) -> int:

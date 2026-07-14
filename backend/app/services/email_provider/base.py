@@ -20,6 +20,7 @@ class ProviderAttachment:
     size: int
     kind: str  # "timesheet" | "approval_screenshot" | "other"
     cid: str | None = None  # MIME Content-ID for inline CID resolution
+    is_inline: bool = False  # Graph's own "this is a body-embedded image" flag
 
 
 @dataclass

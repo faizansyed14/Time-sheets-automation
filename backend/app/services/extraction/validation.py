@@ -15,15 +15,16 @@ import calendar
 import datetime as dt
 from collections import Counter
 
-BUCKETS = ["annual", "remote", "sick", "unpaid", "absent", "public_holiday"]
+BUCKETS = ["annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday"]
 _LABEL = {
     "annual": "Annual leave", "remote": "Remote/WFH", "sick": "Sick leave",
+    "maternity": "Maternity leave",
     "unpaid": "Unpaid leave", "absent": "Absent", "public_holiday": "Public holiday",
 }
 
 
 _SHORT = {
-    "annual": "annual", "remote": "WFH", "sick": "sick",
+    "annual": "annual", "remote": "WFH", "sick": "sick", "maternity": "maternity",
     "unpaid": "unpaid", "absent": "absent", "public_holiday": "public holiday",
 }
 

@@ -1,6 +1,7 @@
 """Inbox routes — read emails, preview attachments, Accept/Reject/Restore."""
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -13,6 +14,7 @@ from app.core import datacache
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.cache import cache
+from app.core.http_headers import content_disposition
 from app.models.email_message import EmailMessage, EmailStatus
 from app.models.pipeline_file import PipelineFile
 from app.models.timesheet_record import TimesheetRecord
@@ -44,7 +46,8 @@ async def _sync_message(db: AsyncSession, msg) -> EmailMessage:
     """
     atts = [
         {"attachment_id": a.attachment_id, "filename": a.filename,
-         "content_type": a.content_type, "size": a.size, "kind": a.kind, "cid": a.cid}
+         "content_type": a.content_type, "size": a.size, "kind": a.kind, "cid": a.cid,
+         "is_inline": a.is_inline}
         for a in msg.attachments
     ]
     has_approval = any(a["kind"] == "approval_screenshot" for a in atts)
@@ -156,8 +159,50 @@ def is_doc_attachment(a) -> bool:
     return ct in _DOC_CONTENT_TYPES or fn.endswith(_DOC_EXTS)
 
 
-def _doc_count(attachments) -> int:
-    return sum(1 for a in (attachments or []) if is_doc_attachment(a))
+def _is_image_attachment(a) -> bool:
+    if not isinstance(a, dict):
+        return False
+    return (a.get("content_type") or "").lower().startswith("image/")
+
+
+# Auto-generated names for images embedded in a signature/body, never a real
+# attachment: Outlook's own body-image naming ("image007.png", "Outlook-…"),
+# and signature-management add-ins that inject template icons named
+# "C2_signature_<logo|facebook|instagram|linkedin|x|youtube|banner>_<uuid>".
+_GENERIC_INLINE_RE = re.compile(
+    r"^(image\d{2,3}\.(png|jpe?g|gif)|outlook-.+\.(png|jpe?g|gif|bmp)"
+    r"|c2_signature_.+\.(png|jpe?g|gif))$", re.I)
+
+
+def _is_body_junk_image(a, body_html: str | None) -> bool:
+    """Signature/logo images living in the body — Outlook doesn't count these
+    as attachments, and neither do we (list count + detail chips agree).
+
+    Three signals, checked in order of trust:
+      - Graph's own `isInline` flag (authoritative — set at sync time from
+        the provider, not guessed from a filename);
+      - a CID that's actually referenced in the HTML body (only available
+        after the detail view's full resync — the LIST fetch's $select
+        can't include contentId, Graph 400s on it for the base type); or
+      - a filename matching a known auto-generated body-image pattern, for
+        rows synced before `is_inline` existed."""
+    if not _is_image_attachment(a):
+        return False
+    if a.get("is_inline") is True:
+        return True
+    cid = (a.get("cid") or "").strip().strip("<>")
+    if cid and body_html and f"cid:{cid}" in body_html:
+        return True
+    return bool(_GENERIC_INLINE_RE.match(a.get("filename") or ""))
+
+
+def _doc_count(attachments, body_html: str | None = None) -> int:
+    """Paperclip count: documents plus REAL image files (Outlook-style)."""
+    return sum(
+        1 for a in (attachments or [])
+        if is_doc_attachment(a)
+        or (_is_image_attachment(a) and not _is_body_junk_image(a, body_html))
+    )
 
 
 async def _extract_email_times(db: AsyncSession, msg_ids: list[str]) -> dict[str, datetime]:
@@ -185,16 +230,18 @@ def _to_list_item(row: EmailMessage, extract_email_at: datetime | None = None) -
         subject=row.subject,
         received_at=row.received_at,
         status=row.status,
-        attachment_count=_doc_count(row.attachments),
+        attachment_count=_doc_count(row.attachments, row.body_html),
         has_approval_screenshot=row.has_approval_screenshot,
         extract_email_at=extract_email_at,
+        no_sheets_found_at=row.no_sheets_found_at,
+        no_sheets_note=row.no_sheets_note,
     )
 
 
 @router.get("", response_model=Page[EmailListItem])
 async def list_inbox(
     q: str | None = Query(default=None, description="search the sender's name or email address — every word must match (any order)"),
-    status: str | None = Query(default=None, description="new | archived | ingested | extracted (= Extract Email was run, any lifecycle status)"),
+    status: str | None = Query(default=None, description="new | archived | ingested | extracted | no_sheets"),
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -218,6 +265,10 @@ async def list_inbox(
                 PipelineFile.attachment_id.like(f"{_EXTRACT_EMAIL_TAG}%"),
             ).exists()
         )
+    elif status == "no_sheets":
+        # Extract Email was run and found nothing to stage — surfaced so it
+        # never needs to be reprocessed just to rediscover the same result.
+        base = base.where(EmailMessage.no_sheets_found_at.isnot(None))
     elif status:
         base = base.where(EmailMessage.status == status)
     if q and q.strip():
@@ -274,7 +325,7 @@ async def get_email(
             AttachmentOut(
                 attachment_id=a["attachment_id"], filename=a["filename"],
                 content_type=a["content_type"], kind=a["kind"],
-                cid=a.get("cid"),
+                cid=a.get("cid"), is_inline=a.get("is_inline"),
             )
             for a in (row.attachments or [])
         ],
@@ -319,21 +370,6 @@ async def preview_as_eml(provider_message_id: str, db: AsyncSession = Depends(ge
     row = await _email_row_or_404(db, provider_message_id)
     data, _ = await build_full_eml(get_email_provider(), row)
     return parse_eml(data)
-
-
-@router.post("/{provider_message_id}/as-eml/stage", response_model=PipelineFileOut)
-async def stage_as_eml(provider_message_id: str, db: AsyncSession = Depends(get_db)):
-    """Run Extraction on the full .eml (manual): stages it in the pipeline as
-    pending review — nothing is filed until Accept in Compare & Fix."""
-    from app.api.routes.pipeline import _out as _pipeline_out
-    from app.services.inbox.eml_export import build_full_eml
-    from app.services.pipeline.ingestion import stage_extra_source
-    row = await _email_row_or_404(db, provider_message_id)
-    data, fname = await build_full_eml(get_email_provider(), row)
-    tracker = await stage_extra_source(
-        db, row, filename=fname, content_type="message/rfc822", data=data)
-    await datacache.bust_pipeline()
-    return _pipeline_out(tracker)
 
 
 @router.post("/{provider_message_id}/extract-full")
@@ -427,7 +463,7 @@ async def get_attachment(provider_message_id: str, attachment_id: str):
     return Response(
         content=data,
         media_type=content_type,
-        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(disposition, filename)},
     )
 
 

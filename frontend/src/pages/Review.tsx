@@ -10,7 +10,7 @@
  */
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle, ArrowRight, CalendarDays, CheckCircle2, ClipboardCheck,
   FileText, PartyPopper, Trash2, User, Wand2,
@@ -19,6 +19,7 @@ import { deletePipelineFile, fetchPipeline, MONTHS_LONG, type PipelineFile } fro
 import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
 import { Badge, Button, Card, PageHeader, Skeleton } from "../components/ui";
 import { useToast } from "../components/toast";
+import { useSentinel } from "../lib/useInfinite";
 import { cn, formatBytes, formatDateTime } from "../lib/utils";
 
 function stagedMeta(f: PipelineFile) {
@@ -116,33 +117,49 @@ export default function ReviewPage() {
   const { toast } = useToast();
   const [reviewing, setReviewing] = useState<PipelineFile | null>(null);
 
-  const { data: needsReview, isLoading: l1 } = useQuery({
+  const { data: needsReview, isLoading: l1, fetchNextPage: fetchNextReview, hasNextPage: hasMoreReview, isFetchingNextPage: fetchingReview } = useInfiniteQuery({
     queryKey: ["review", "needs_review"],
-    queryFn: () => fetchPipeline({ status: "needs_review", limit: 100 }),
+    queryFn: ({ pageParam }) => fetchPipeline({ status: "needs_review", offset: pageParam as number }),
+    initialPageParam: 0,
+    getNextPageParam: (last) => (last.has_more ? last.offset + last.items.length : undefined),
     refetchInterval: 10_000,
   });
-  const { data: failed, isLoading: l2 } = useQuery({
+  const { data: failed, isLoading: l2, fetchNextPage: fetchNextFailed, hasNextPage: hasMoreFailed, isFetchingNextPage: fetchingFailed } = useInfiniteQuery({
     queryKey: ["review", "failed"],
-    queryFn: () => fetchPipeline({ status: "failed", limit: 100 }),
+    queryFn: ({ pageParam }) => fetchPipeline({ status: "failed", offset: pageParam as number }),
+    initialPageParam: 0,
+    getNextPageParam: (last) => (last.has_more ? last.offset + last.items.length : undefined),
     refetchInterval: 10_000,
   });
+
+  const needsReviewItems = needsReview?.pages.flatMap((p) => p.items) ?? [];
+  const failedItems = failed?.pages.flatMap((p) => p.items) ?? [];
+  const needsReviewTotal = needsReview?.pages[0]?.total ?? 0;
+  const failedTotal = failed?.pages[0]?.total ?? 0;
 
   const items = useMemo(() => {
-    const a = needsReview?.items ?? [];
-    const b = failed?.items ?? [];
-    // Newest first, review items before failures.
     const sort = (x: PipelineFile[]) =>
       [...x].sort((p, q) => (q.created_at ?? "").localeCompare(p.created_at ?? ""));
-    return [...sort(a), ...sort(b)];
-  }, [needsReview, failed]);
+    return [...sort(needsReviewItems), ...sort(failedItems)];
+  }, [needsReviewItems, failedItems]);
 
   const loading = l1 || l2;
+  const hasNextPage = hasMoreReview || hasMoreFailed;
+  const isFetchingNextPage = fetchingReview || fetchingFailed;
+  const fetchNextPage = () => {
+    if (hasMoreReview && !fetchingReview) fetchNextReview();
+    if (hasMoreFailed && !fetchingFailed) fetchNextFailed();
+  };
+  const sentinelRef = useSentinel(
+    () => hasNextPage && !isFetchingNextPage && fetchNextPage(),
+    !!hasNextPage
+  );
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["review"] });
     qc.invalidateQueries({ queryKey: ["pipeline"] });
     qc.invalidateQueries({ queryKey: ["pipeline-stats"] });
-    qc.invalidateQueries({ queryKey: ["dashboard"] });
+    qc.invalidateQueries({ queryKey: ["coverage"] });
     qc.invalidateQueries({ queryKey: ["inbox"] });
   };
 
@@ -199,7 +216,7 @@ export default function ReviewPage() {
         <>
           <div className="mb-4 flex items-center gap-2 text-sm text-slate-600">
             <CheckCircle2 className="h-4 w-4 text-brand-600" />
-            <span className="font-semibold">{items.length}</span> item(s) waiting — accepting files the record and its documents automatically.
+            <span className="font-semibold">{needsReviewTotal + failedTotal}</span> item(s) waiting — accepting files the record and its documents automatically.
           </div>
           <div className="space-y-3">
             {items.map((f) => (
@@ -211,6 +228,11 @@ export default function ReviewPage() {
                 deleting={deleteMut.isPending && deleteMut.variables === f.id}
               />
             ))}
+            {hasNextPage && (
+              <div ref={sentinelRef} className="py-4 text-center text-xs text-slate-400">
+                {isFetchingNextPage ? "Loading more…" : ""}
+              </div>
+            )}
           </div>
         </>
       )}

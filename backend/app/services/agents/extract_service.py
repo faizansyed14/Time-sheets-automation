@@ -29,6 +29,7 @@ _BUCKET_LABELS = {
     "annual": "Annual leave",
     "remote": "Remote work (WFH)",
     "sick": "Sick leave",
+    "maternity": "Maternity leave",
     "unpaid": "Unpaid leave (LOP)",
     "absent": "Absent",
     "public_holiday": "Public holiday",
@@ -72,7 +73,8 @@ async def extract_from_upload(
     # Validate/clean exactly as the pipeline would (dedupe, out-of-month flags…).
     raw_buckets = {
         "annual": ext.annual_leave_dates or [], "remote": ext.remote_work_dates or [],
-        "sick": ext.sick_leave_dates or [], "unpaid": ext.unpaid_leave_dates or [],
+        "sick": ext.sick_leave_dates or [], "maternity": ext.maternity_leave_dates or [],
+        "unpaid": ext.unpaid_leave_dates or [],
         "absent": ext.absent_dates or [], "public_holiday": ext.public_holiday_dates or [],
     }
     has_period = bool(1 <= (ext.month or 0) <= 12 and (ext.year or 0) >= 2000)

@@ -14,6 +14,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import datacache
+from app.core.http_headers import content_disposition
 from app.core.database import get_db
 from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
 from app.schemas import Page, PipelineFileOut, PipelineResolveAssignIn, PipelineResolveIn, PipelineStats
@@ -208,7 +209,7 @@ async def delete_pipeline_file(pipeline_id: str, db: AsyncSession = Depends(get_
     return {"deleted": pipeline_id}
 
 
-_MANUAL_BUCKETS = ("annual", "remote", "sick", "unpaid", "absent", "public_holiday")
+_MANUAL_BUCKETS = ("annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday")
 
 
 @router.post("/{pipeline_id}/manual-fix", response_model=PipelineFileOut)
@@ -334,7 +335,7 @@ async def pipeline_raw_preview(pipeline_id: str, db: AsyncSession = Depends(get_
     inline_types = ("image/", "application/pdf", "message/", "text/")
     disp = "inline" if any(ctype.startswith(p) for p in inline_types) else "attachment"
     return _Response(content=data, media_type=ctype,
-                     headers={"Content-Disposition": f'{disp}; filename="{fname}"'})
+                     headers={"Content-Disposition": content_disposition(disp, fname)})
 
 
 @router.get("/{pipeline_id}/raw-render")

@@ -44,6 +44,8 @@ def _render_timesheet_pdf(case: dict) -> bytes:
         rows.append((d, "Work From Home (WFH)"))
     for d in case.get("sick", []):
         rows.append((d, "Sick Leave (SL)"))
+    for d in case.get("maternity", []):
+        rows.append((d, "Maternity Leave (ML)"))
     for d in case.get("unpaid", []):
         rows.append((d, "Unpaid Leave (LOP)"))
     for d in case.get("absent", []):
@@ -192,6 +194,7 @@ def _build_attachments(msg: dict) -> list[ProviderAttachment]:
             size=0,
             kind="other",
             cid=im["cid"],
+            is_inline=True,
         ))
     return atts
 

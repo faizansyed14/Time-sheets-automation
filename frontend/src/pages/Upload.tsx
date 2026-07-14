@@ -11,11 +11,17 @@ import {
   ExternalLink,
   Layers,
 } from "lucide-react";
-import { uploadTimesheets, MONTHS_LONG, type UploadResult } from "../api/client";
+import {
+  uploadTimesheets,
+  MONTHS_LONG,
+  type PipelineFile,
+  type UploadResult,
+} from "../api/client";
 import { cn, formatBytes } from "../lib/utils";
 import { Button, Card, PageHeader } from "../components/ui";
 import StoredFilesPreview from "../components/StoredFilesPreview";
 import ManualEntryForm from "../components/ManualEntryForm";
+import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
 import { FailureChip } from "../components/status";
 import { useToast } from "../components/toast";
 
@@ -27,13 +33,14 @@ export default function UploadPage() {
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [results, setResults] = useState<UploadResult[]>([]);
+  const [manualResults, setManualResults] = useState<UploadResult[]>([]);
+  const [stagedQueue, setStagedQueue] = useState<PipelineFile[]>([]);
   const [mode, setMode] = useState<"files" | "manual">("files");
 
   const afterChange = () => {
     qc.invalidateQueries({ queryKey: ["pipeline"] });
     qc.invalidateQueries({ queryKey: ["pipeline-stats"] });
-    qc.invalidateQueries({ queryKey: ["dashboard"] });
+    qc.invalidateQueries({ queryKey: ["coverage"] });
     qc.invalidateQueries({ queryKey: ["files"] });
   };
 
@@ -58,19 +65,19 @@ export default function UploadPage() {
     setBusy(true);
     setProgress(0);
     try {
-      const res = await uploadTimesheets(queue, setProgress);
-      setResults((r) => [...res, ...r]);
+      const staged = await uploadTimesheets(queue, setProgress);
       setQueue([]);
-      const ok = res.filter((r) => r.status === "success").length;
-      const review = res.filter((r) => r.status === "needs_review").length;
-      const failed = res.filter((r) => r.status === "failed").length;
-      if (failed) toast("error", `${failed} file(s) failed`, "Open the Pipeline page for the exact reason — nothing was lost.");
-      if (review) toast("warning", `${review} file(s) need review`);
-      if (ok && !failed && !review) toast("success", `${ok} file(s) processed cleanly`);
-      qc.invalidateQueries({ queryKey: ["pipeline"] });
-      qc.invalidateQueries({ queryKey: ["pipeline-stats"] });
-      qc.invalidateQueries({ queryKey: ["dashboard"] });
-      qc.invalidateQueries({ queryKey: ["files"] });
+      if (!staged.length) {
+        toast("warning", "Nothing to extract", "No timesheet could be extracted from the selection.");
+        return;
+      }
+      toast(
+        "success",
+        staged.length === 1 ? "1 item ready to review" : `${staged.length} items ready to review`,
+        "Check the extracted leaves, then Accept to file the record."
+      );
+      setStagedQueue(staged);
+      afterChange();
     } catch (e: any) {
       toast("error", "Upload failed", e?.response?.data?.detail ?? String(e));
     } finally {
@@ -78,11 +85,18 @@ export default function UploadPage() {
     }
   };
 
+  const advanceQueue = () => setStagedQueue((q) => q.slice(1));
+  const onStagedSaved = () => {
+    toast("success", "Record filed", "Saved to the pipeline and File Vault.");
+    afterChange();
+    advanceQueue();
+  };
+
   return (
     <div className="mx-auto max-w-4xl animate-fade-up">
       <PageHeader
         title="Upload timesheets"
-        subtitle="Runs the exact same pipeline as accepting an email. Weekly or 15-day sheets for the same month merge automatically into one record."
+        subtitle="Same flow as Run Extraction on inbox emails — AI extracts each file, you review in Compare & Fix, then Accept files the record."
       />
 
       <div className="mb-5 inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
@@ -103,7 +117,7 @@ export default function UploadPage() {
       {mode === "manual" ? (
         <ManualEntryForm
           onResult={(r) => {
-            setResults((prev) => [r, ...prev]);
+            setManualResults((prev) => [r, ...prev]);
             afterChange();
           }}
         />
@@ -182,7 +196,7 @@ export default function UploadPage() {
               </Button>
               <Button onClick={run} disabled={busy}>
                 <UploadCloud className="h-4 w-4" />
-                {busy ? "Processing…" : `Process ${queue.length} file${queue.length > 1 ? "s" : ""}`}
+                {busy ? "Extracting…" : `Extract ${queue.length} file${queue.length > 1 ? "s" : ""}`}
               </Button>
             </div>
           </div>
@@ -190,13 +204,13 @@ export default function UploadPage() {
       </Card>
       )}
 
-      {results.length > 0 && (
+      {manualResults.length > 0 && (
         <Card className="mt-6">
           <div className="border-b border-slate-100 px-5 py-3.5">
-            <h2 className="text-sm font-bold text-slate-800">Results</h2>
+            <h2 className="text-sm font-bold text-slate-800">Manual entry results</h2>
           </div>
           <div className="divide-y divide-slate-100">
-            {results.map((r) => (
+            {manualResults.map((r) => (
               <div key={r.pipeline_id} className="flex items-start gap-3 px-5 py-3.5">
                 {r.status === "success" ? (
                   <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-500" />
@@ -243,6 +257,13 @@ export default function UploadPage() {
           </div>
         </Card>
       )}
+
+      <PipelineCompareFixModal
+        file={stagedQueue[0] ?? null}
+        onClose={advanceQueue}
+        onSaved={onStagedSaved}
+        onDiscarded={afterChange}
+      />
     </div>
   );
 }

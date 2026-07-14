@@ -1,5 +1,6 @@
 """
-Ingestion pipeline — shared by BOTH the email "Accept" action and the Upload page.
+Ingestion pipeline — shared by email Accept, Upload (stage → review), and
+Agentic Chat store (direct file).
 
 Core unit: ingest_timesheet_bytes(...) takes one timesheet's bytes and walks it
 through tracked stages (every file gets a PipelineFile audit row):
@@ -60,6 +61,7 @@ BUCKET_FIELDS = {
     "annual": "annual_leave_dates",
     "remote": "remote_work_dates",
     "sick": "sick_leave_dates",
+    "maternity": "maternity_leave_dates",
     "unpaid": "unpaid_leave_dates",
     "absent": "absent_dates",
     "public_holiday": "public_holiday_dates",
@@ -388,7 +390,8 @@ async def ingest_timesheet_bytes(
         "attachment_id": attachment_id, "ingested_at": _now_iso(),
         "buckets": {
             "annual": ext.annual_leave_dates or [], "remote": ext.remote_work_dates or [],
-            "sick": ext.sick_leave_dates or [], "unpaid": ext.unpaid_leave_dates or [],
+            "sick": ext.sick_leave_dates or [], "maternity": ext.maternity_leave_dates or [],
+            "unpaid": ext.unpaid_leave_dates or [],
             "absent": ext.absent_dates or [], "public_holiday": ext.public_holiday_dates or [],
         },
     }
@@ -654,7 +657,10 @@ async def ingest_email(
         except Exception:
             approval_bytes = None
 
-    inbox_employee_pk: str | None = None
+    from app.services.inbox.employee_match import match_sender
+
+    sm = await match_sender(db, sender_email=email.sender_email, body_text=email.body_text)
+    inbox_employee_pk: str | None = sm["employee_pk"] if sm else None
 
     created: list[TimesheetRecord] = []
 
@@ -704,118 +710,31 @@ async def ingest_email(
     return created
 
 
-async def stage_email_extraction(
-    db: AsyncSession, email, *, attachment_ids: list[str], extract_body: bool = False,
-) -> list[PipelineFile]:
-    """Extract the selected email sources and STAGE them in the pipeline for
-    review — without filing a record yet.
-
-    Each source becomes a needs-review PipelineFile carrying the AI-extracted
-    leave data (in extraction_meta["staged"]) plus a saved raw copy, so the
-    existing Compare & Fix overlay can pre-fill, let the reviewer edit, and
-    Accept → file the record + vault (via manual-fix). Rejecting simply leaves
-    the file in the pipeline to reprocess / modify / remove later."""
-    from app.services.agents.extract_service import extract_from_upload
-
-    provider = get_email_provider()
-    att_by_id = {a.get("attachment_id"): a for a in (email.attachments or [])}
-    msg_id = email.provider_message_id
-    staged: list[PipelineFile] = []
-
-    async def _stage_one(filename: str, content_type: str, data: bytes, attachment_id: str | None):
-        tracker: PipelineFile | None = None
-        if attachment_id is not None:
-            # Reuse an existing un-accepted staged tracker for this source.
-            tracker = (await db.execute(select(PipelineFile).where(
-                PipelineFile.source_kind == "email",
-                PipelineFile.source_id == msg_id,
-                PipelineFile.attachment_id == attachment_id,
-                PipelineFile.failure_code == FailureCode.PENDING_REVIEW,
-            ))).scalars().first()
-        if tracker is None:
-            tracker = PipelineFile(
-                filename=filename, content_type=content_type, size_bytes=len(data or b""),
-                source_kind="email", source_id=msg_id, attachment_id=attachment_id)
-            db.add(tracker)
-            await db.flush()
-        if not tracker.raw_path:
-            _save_raw_copy(tracker, filename, data or b"")
-
-        result = await extract_from_upload(
-            db, filename=filename, content_type=content_type, data=data)
-        matched = result.get("matched_employee") or {}
-        tracker.employee_id = matched.get("employee_id") or result.get("extracted_employee_id")
-        tracker.employee_name = matched.get("name") or result.get("extracted_employee_name")
-        tracker.month = result.get("month")
-        tracker.year = result.get("year")
-        tracker.status = PipelineStatus.NEEDS_REVIEW
-        tracker.failure_code = FailureCode.PENDING_REVIEW
-        tracker.failure_detail = "AI-extracted — review the leaves and accept to file the record."
-        tracker.extraction_meta = {
-            "staged": {
-                "employee_pk": matched.get("employee_pk"),
-                "matched_name": matched.get("name"),
-                "matched_employee_id": matched.get("employee_id"),
-                "month": result.get("month"),
-                "year": result.get("year"),
-                "buckets": result.get("buckets") or {},
-                "validation_status": result.get("validation_status"),
-                "flags": result.get("flags") or [],
-                "summary": result.get("summary"),
-                "extraction_status": result.get("status"),
-            },
-            "source_kind": "email",
-        }
-        tracker.events = (tracker.events or []) + [{
-            "stage": PipelineStage.EXTRACTION, "status": "ok",
-            "detail": f"AI-extracted {result.get('total_leaves', 0)} leave day(s); awaiting review.",
-            "at": _now_iso(),
-        }]
-        staged.append(tracker)
-
-    for aid in attachment_ids or []:
-        meta = att_by_id.get(aid)
-        try:
-            data, fn, ct = await provider.get_attachment_bytes(msg_id, aid)
-        except FileNotFoundError:
-            continue
-        await _stage_one(
-            fn or (meta.get("filename") if meta else aid) or aid,
-            ct or (meta.get("content_type") if meta else "application/octet-stream"),
-            data, aid)
-
-    if extract_body:
-        from app.services.extraction.file_processor import email_body_to_images
-        imgs = email_body_to_images(email.subject, email.body_text)
-        if imgs:
-            await _stage_one("email_body.jpg", "image/jpeg", imgs[0], None)
-
-    await db.commit()
-    for t in staged:
-        await db.refresh(t)
-    return staged
-
-
-async def stage_extra_source(
-    db: AsyncSession, email, *, filename: str, content_type: str, data: bytes,
-    source_tag: str = "__full_eml__",
+async def _stage_bytes_for_review(
+    db: AsyncSession,
+    *,
+    filename: str,
+    content_type: str,
+    data: bytes,
+    source_kind: str,
+    source_id: str,
+    attachment_id: str | None = None,
 ) -> PipelineFile:
-    """Stage ONE synthetic source for an email (e.g. the exported full .eml)
-    as a pending-review pipeline item — same review flow as stage_email_extraction.
-    Re-running reuses the existing un-accepted tracker (no duplicates)."""
+    """Shared Run Extraction path — extract one file, stage for Compare & Fix."""
     from app.services.agents.extract_service import extract_from_upload
 
-    msg_id = email.provider_message_id
-    tracker = (await db.execute(select(PipelineFile).where(
-        PipelineFile.source_kind == "email",
-        PipelineFile.source_id == msg_id,
-        PipelineFile.attachment_id == source_tag,
-        PipelineFile.failure_code == FailureCode.PENDING_REVIEW,
-    ))).scalars().first()
+    tracker: PipelineFile | None = None
+    if attachment_id is not None:
+        tracker = (await db.execute(select(PipelineFile).where(
+            PipelineFile.source_kind == source_kind,
+            PipelineFile.source_id == source_id,
+            PipelineFile.attachment_id == attachment_id,
+            PipelineFile.failure_code == FailureCode.PENDING_REVIEW,
+        ))).scalars().first()
     if tracker is None:
         tracker = PipelineFile(
             filename=filename, content_type=content_type, size_bytes=len(data or b""),
-            source_kind="email", source_id=msg_id, attachment_id=source_tag)
+            source_kind=source_kind, source_id=source_id, attachment_id=attachment_id)
         db.add(tracker)
         await db.flush()
     if not tracker.raw_path:
@@ -830,7 +749,7 @@ async def stage_extra_source(
     tracker.year = result.get("year")
     tracker.status = PipelineStatus.NEEDS_REVIEW
     tracker.failure_code = FailureCode.PENDING_REVIEW
-    tracker.failure_detail = "Extracted from the full .eml — review the leaves and accept to file."
+    tracker.failure_detail = "AI-extracted — review the leaves and accept to file the record."
     tracker.extraction_meta = {
         "staged": {
             "employee_pk": matched.get("employee_pk"),
@@ -844,21 +763,90 @@ async def stage_extra_source(
             "summary": result.get("summary"),
             "extraction_status": result.get("status"),
         },
-        "source_kind": "email",
+        "source_kind": source_kind,
     }
     tracker.events = (tracker.events or []) + [{
         "stage": PipelineStage.EXTRACTION, "status": "ok",
-        "detail": f"Extracted {result.get('total_leaves', 0)} leave day(s) from the full .eml; awaiting review.",
+        "detail": f"AI-extracted {result.get('total_leaves', 0)} leave day(s); awaiting review.",
         "at": _now_iso(),
     }]
-    await db.commit()
-    await db.refresh(tracker)
     return tracker
+
+
+async def stage_email_extraction(
+    db: AsyncSession, email, *, attachment_ids: list[str], extract_body: bool = False,
+) -> list[PipelineFile]:
+    """Extract the selected email sources and STAGE them in the pipeline for
+    review — without filing a record yet.
+
+    Each source becomes a needs-review PipelineFile carrying the AI-extracted
+    leave data (in extraction_meta["staged"]) plus a saved raw copy, so the
+    existing Compare & Fix overlay can pre-fill, let the reviewer edit, and
+    Accept → file the record + vault (via manual-fix). Rejecting simply leaves
+    the file in the pipeline to reprocess / modify / remove later."""
+    provider = get_email_provider()
+    att_by_id = {a.get("attachment_id"): a for a in (email.attachments or [])}
+    msg_id = email.provider_message_id
+    staged: list[PipelineFile] = []
+
+    for aid in attachment_ids or []:
+        meta = att_by_id.get(aid)
+        try:
+            data, fn, ct = await provider.get_attachment_bytes(msg_id, aid)
+        except FileNotFoundError:
+            continue
+        staged.append(await _stage_bytes_for_review(
+            db,
+            filename=fn or (meta.get("filename") if meta else aid) or aid,
+            content_type=ct or (meta.get("content_type") if meta else "application/octet-stream"),
+            data=data,
+            source_kind="email",
+            source_id=msg_id,
+            attachment_id=aid,
+        ))
+
+    if extract_body:
+        from app.services.extraction.file_processor import email_body_to_images
+        imgs = email_body_to_images(email.subject, email.body_text)
+        if imgs:
+            staged.append(await _stage_bytes_for_review(
+                db, filename="email_body.jpg", content_type="image/jpeg", data=imgs[0],
+                source_kind="email", source_id=msg_id, attachment_id=None,
+            ))
+
+    await db.commit()
+    for t in staged:
+        await db.refresh(t)
+    return staged
+
+
+async def stage_upload_extraction(
+    db: AsyncSession,
+    *,
+    files: list[tuple[str, str, bytes]],
+) -> list[PipelineFile]:
+    """Run Extraction for manual uploads — same staging path as inbox Run Extraction."""
+    staged: list[PipelineFile] = []
+    for filename, content_type, data in files:
+        staged.append(await _stage_bytes_for_review(
+            db,
+            filename=filename,
+            content_type=content_type,
+            data=data,
+            source_kind="upload",
+            source_id=f"upload:{filename}",
+            attachment_id=filename,
+        ))
+    await db.commit()
+    for t in staged:
+        await db.refresh(t)
+    return staged
 
 
 async def ingest_upload(
     db: AsyncSession, *, filename: str, content_type: str, data: bytes,
 ) -> tuple[TimesheetRecord | None, PipelineFile]:
+    """Direct file-and-record path — used by Agentic Chat store only."""
     rec, tracker = await ingest_timesheet_bytes(
         db, data=data, filename=filename, content_type=content_type,
         approval_detected=False, approval_detail="Uploaded manually (no email approval screenshot).",

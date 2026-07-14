@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     # Optional vLLM (Qwen etc.) for non-GPT models.
     vllm_api_key: str | None = None
     vllm_base_url: str = "https://myvllmserver.duckdns.org"
-    vllm_model: str = "qwen3-vl-32b"
+    vllm_model: str = "Qwen3.6-35B-A3B"
     vllm_max_tokens: int = 4096
     vllm_temperature: float = 0.0
     vllm_timeout: int = 90
@@ -120,10 +120,14 @@ class Settings(BaseSettings):
     # verification entirely and is a TEMPORARY test-phase escape hatch only.
     vllm_tls_verify: bool = True
     vllm_ca_bundle: str = ""
-    # Runtime model choices (same names your project uses).
+    # Runtime model choices. EXTRACTION_MODEL/VALIDATION_MODEL name the
+    # self-hosted (vLLM) models; the OPENAI_* pair is what OpenAI gets when a
+    # service's provider is switched to it (see vision_client.model_for).
     extraction_model: str = "gpt-4o"
     vision_image_detail: str = "high"   # low | high — used for SCANS/photos
     validation_model: str = "gpt-4o-mini"
+    openai_vision_model: str = "gpt-4o"
+    openai_validation_model: str = "gpt-4o-mini"
     enable_text_validation: bool = True
 
     # ----- Cost / accuracy tuning (all admin-editable) -----

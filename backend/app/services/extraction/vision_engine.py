@@ -45,6 +45,12 @@ def _dates(occs) -> list[str]:
     return [o.date.isoformat() for o in occs if (o.day_of_week not in _WEEKEND)]
 
 
+# Question asked about approval-screenshot attachments during email ingest.
+# Module-level so the admin UI can display it in the prompt inventory.
+APPROVAL_QUESTION = ('Does this screenshot show a manager APPROVING leave? '
+                     'Return ONLY JSON: {"approved": true/false, "detail": "<who/when, short>"}')
+
+
 class VisionExtractionEngine(ExtractionEngine):
     async def extract_timesheet(
         self, data: bytes, filename: str, content_type: str,
@@ -58,12 +64,16 @@ class VisionExtractionEngine(ExtractionEngine):
                 hr_flags=["Unsupported file type."],
                 extraction_method="unsupported")
 
-        model = settings.extraction_model
+        model = vision_client.model_for(vision_client.vision_provider(), "vision")
         # Authoritative cell/text content (for .eml this reads the embedded
         # attachment) — handed to the model so a poor image render can't make
         # it hallucinate names/IDs/dates.
         doc_text = fp.extract_document_text(ftype, data)
         has_text = len((doc_text or "").strip()) >= 24
+        # Scans/photos/screenshots have no digital text layer, so the read has
+        # no independent grounding (OCR at best) — remembered here, flagged
+        # below so such sheets are never filed as "verified" unseen.
+        born_digital = has_text
 
         # The bytes/type/name the LLM should treat as THE document. For an .eml
         # carrying a real PDF/Office sheet ("email inside the email"), point the
@@ -114,7 +124,8 @@ class VisionExtractionEngine(ExtractionEngine):
             "doc_text_chars": len((doc_text or "").strip()),
             "ocr_provider": ocr_provider,
             "ocr_status": ocr_status,
-            "validation_model": settings.validation_model if settings.enable_text_validation else None,
+            "validation_model": (vision_client.model_for(vision_client.validation_provider(), "validation")
+                                 if settings.enable_text_validation else None),
             **embedded_meta,
         }
 
@@ -157,6 +168,7 @@ class VisionExtractionEngine(ExtractionEngine):
             "annual": sorted(set(_dates(parsed.annual_leave_dates) + _dates(parsed.paid_leave_dates))),
             "remote": _dates(parsed.work_from_home_dates),
             "sick": _dates(parsed.sick_leave_dates),
+            "maternity": _dates(parsed.maternity_leave_dates),
             "unpaid": _dates(parsed.unpaid_leave_dates),
             "absent": _dates(parsed.absent_dates),
             "public_holiday": [o.date.isoformat() for o in parsed.public_holidays_dates],
@@ -188,6 +200,11 @@ class VisionExtractionEngine(ExtractionEngine):
             except Exception:
                 pass
 
+        if not born_digital and sum(len(v) for v in cleaned.values()) > 0:
+            flags = flags + ["Image-only sheet (scan/photo/screenshot) — auto-read "
+                             "can miss merged or colour-coded cells; please "
+                             "double-check the dates before approving."]
+
         flags = list(dict.fromkeys(flags))  # dedupe, keep order
         status = "manual_review" if flags else "verified"
         total = sum(len(v) for v in cleaned.values())
@@ -204,6 +221,7 @@ class VisionExtractionEngine(ExtractionEngine):
             annual_leave_dates=cleaned["annual"],
             remote_work_dates=cleaned["remote"],
             sick_leave_dates=cleaned["sick"],
+            maternity_leave_dates=cleaned["maternity"],
             unpaid_leave_dates=cleaned["unpaid"],
             absent_dates=cleaned["absent"],
             public_holiday_dates=cleaned["public_holiday"],
@@ -232,7 +250,7 @@ class VisionExtractionEngine(ExtractionEngine):
             return None
 
         raw = {b: parsed.get(b, []) for b in
-               ("annual", "remote", "sick", "unpaid", "absent", "public_holiday")}
+               ("annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday")}
         cleaned, flags = validate(raw, month, year)
         try:
             present = set(parsed.get("_present") or [])
@@ -253,7 +271,8 @@ class VisionExtractionEngine(ExtractionEngine):
         return TimesheetExtraction(
             employee_id=emp_id, employee_name=emp_name, month=month, year=year,
             annual_leave_dates=cleaned["annual"], remote_work_dates=cleaned["remote"],
-            sick_leave_dates=cleaned["sick"], unpaid_leave_dates=cleaned["unpaid"],
+            sick_leave_dates=cleaned["sick"], maternity_leave_dates=cleaned["maternity"],
+            unpaid_leave_dates=cleaned["unpaid"],
             absent_dates=cleaned["absent"], public_holiday_dates=cleaned["public_holiday"],
             validation_status=status, summary=summary, hr_flags=flags,
             extraction_model=None, extraction_method="deterministic-text",
@@ -272,7 +291,8 @@ class VisionExtractionEngine(ExtractionEngine):
             return None, []
         prompt = parser.build_text_extraction_prompt(doc_text)
         raw = await vision_client.validate_extraction(
-            prompt, system_prompt=parser.TEXT_EXTRACTION_SYSTEM, model=settings.validation_model
+            prompt, system_prompt=parser.TEXT_EXTRACTION_SYSTEM,
+            model=vision_client.model_for(vision_client.validation_provider(), "validation"),
         )
         tx = parser.parse_text_extraction(raw)
 
@@ -281,7 +301,7 @@ class VisionExtractionEngine(ExtractionEngine):
 
         # ---- period sanity: where do the text-read dates actually fall? ----
         text_dates = []
-        for lst in (tx.annual_dates, tx.sick_dates, tx.public_holiday_dates,
+        for lst in (tx.annual_dates, tx.sick_dates, tx.maternity_dates, tx.public_holiday_dates,
                     tx.unpaid_dates, tx.absent_dates, tx.work_from_home_dates):
             for d in lst or []:
                 pd = parser._parse_one_leave_date(str(d), None, None)
@@ -309,6 +329,7 @@ class VisionExtractionEngine(ExtractionEngine):
         out: list[str] = []
         pairs = [("annual leave", cleaned["annual"], tx.annual_dates),
                  ("sick leave", cleaned["sick"], tx.sick_dates),
+                 ("maternity leave", cleaned["maternity"], tx.maternity_dates),
                  ("public holiday", cleaned["public_holiday"], tx.public_holiday_dates),
                  ("unpaid leave", cleaned["unpaid"], tx.unpaid_dates),
                  ("absent", cleaned["absent"], tx.absent_dates)]
@@ -355,7 +376,8 @@ class VisionExtractionEngine(ExtractionEngine):
         try:
             prompt = parser.build_summary_prompt(context)
             raw = await vision_client.validate_extraction(
-                prompt, system_prompt=parser.SUMMARY_SYSTEM, model=settings.validation_model)
+                prompt, system_prompt=parser.SUMMARY_SYSTEM,
+                model=vision_client.model_for(vision_client.validation_provider(), "validation"))
             text = parser._collect_text(raw).strip()
             text = text.replace("```", "").strip()
             return text or None
@@ -365,10 +387,9 @@ class VisionExtractionEngine(ExtractionEngine):
     async def extract_approval(
         self, data: bytes, message_id: str, attachment_id: str,
     ) -> ApprovalExtraction:
-        question = ('Does this screenshot show a manager APPROVING leave? '
-                    'Return ONLY JSON: {"approved": true/false, "detail": "<who/when, short>"}')
-        model = settings.extraction_model
+        question = APPROVAL_QUESTION
         provider = vision_client.vision_provider()
+        model = vision_client.model_for(provider, "vision")
         try:
             if provider == "openai":
                 api_key = (settings.openai_api_key or "").strip()

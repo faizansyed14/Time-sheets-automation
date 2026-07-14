@@ -105,6 +105,20 @@ def _embeddable_preview_path(path: str) -> bool:
 
 
 @app.middleware("http")
+async def sync_runtime_config(request: Request, call_next):
+    """Each uvicorn worker keeps its own `settings` copy; bump rev on admin save
+    so every worker reloads the DB overlay on the next request."""
+    if request.url.path.startswith(f"{settings.api_prefix}/"):
+        try:
+            from app.services.config.service import sync_runtime_if_stale
+            async with SessionLocal() as db:
+                await sync_runtime_if_stale(db)
+        except Exception:
+            pass
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def security_headers(request: Request, call_next):
     """Baseline OWASP security headers on every API response."""
     response = await call_next(request)

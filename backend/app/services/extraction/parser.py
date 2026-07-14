@@ -35,6 +35,7 @@ class ExtractedTimesheet(BaseModel):
     work_from_home_dates: list[LeaveOccurrence] = Field(default_factory=list)
     paid_leave_dates: list[LeaveOccurrence] = Field(default_factory=list)
     sick_leave_dates: list[LeaveOccurrence] = Field(default_factory=list)
+    maternity_leave_dates: list[LeaveOccurrence] = Field(default_factory=list)
     public_holidays_dates: list[LeaveOccurrence] = Field(default_factory=list)
     unpaid_leave_dates: list[LeaveOccurrence] = Field(default_factory=list)
     absent_dates: list[LeaveOccurrence] = Field(default_factory=list)
@@ -49,6 +50,7 @@ class TextExtraction(BaseModel):
     annual_dates: list[str] = Field(default_factory=list)
     work_from_home_dates: list[str] = Field(default_factory=list)
     sick_dates: list[str] = Field(default_factory=list)
+    maternity_dates: list[str] = Field(default_factory=list)
     public_holiday_dates: list[str] = Field(default_factory=list)
     unpaid_dates: list[str] = Field(default_factory=list)
     absent_dates: list[str] = Field(default_factory=list)
@@ -100,6 +102,9 @@ work_from_home
 ⚠ These must NEVER appear in annual_leaves
 sick_leaves
 → Sick Leave, SL, Medical Leave, Sick
+maternity_leaves
+→ Maternity Leave, Maternity, ML
+⚠ Maternity is NOT annual leave and NOT sick leave — use this list only.
 unpaid_leaves
 → Unpaid Leave, UL, LOP, Leave Without Pay
 unauthorized_absences
@@ -117,6 +122,12 @@ One row = one date. Do not mix dates across rows.
 Weekends and Rest Days → ignore completely. Do not add to any list.
 Each count must always equal the exact number of dates in its list.
 Every leave, absence, or WFH row must appear in exactly one list — no duplicates, no omissions.
+MERGED / SPANNING MARKS — one label, merged cell or colored block covering SEVERAL
+date rows applies to EVERY date it covers (e.g. "Eid Al Adha" written once across
+25–29 = five public holidays). Count the rows the mark spans; never record only the first.
+COLOR-CODED SHEETS — when leave is marked by cell colour/highlight, find the legend,
+map each colour to its leave type, and mark EVERY date whose row carries that colour.
+Text annotations like [fill=...] describe cell colours — match them against the legend.
 
 ═══════════════════════════════════════
 OUTPUT JSON
@@ -131,6 +142,7 @@ OUTPUT JSON
 "annual_leaves":            {"count": 0, "dates": []},
 "work_from_home":           {"count": 0, "dates": []},
 "sick_leaves":              {"count": 0, "dates": []},
+"maternity_leaves":         {"count": 0, "dates": []},
 "unpaid_leaves":            {"count": 0, "dates": []},
 "unauthorized_absences":    {"count": 0, "dates": []},
 "confidence": "High"
@@ -145,7 +157,7 @@ Never hallucinate."""
 TEXT_EXTRACTION_PROMPT = """From the document text below, return ONLY this JSON (no markdown):
 {
   "annual_dates": [], "work_from_home_dates": [], "sick_dates": [],
-  "public_holiday_dates": [], "unpaid_dates": [], "absent_dates": []
+  "maternity_dates": [], "public_holiday_dates": [], "unpaid_dates": [], "absent_dates": []
 }
 Rules: ISO YYYY-MM-DD; classify by leave codes/keywords; ignore weekends/Present.
 
@@ -235,6 +247,7 @@ def build_summary_prompt(context: dict) -> str:
     leaves: dict[str, list[str]] = context.get("leaves") or {}
     labels = {
         "annual": "Annual leave", "remote": "Work from home", "sick": "Sick leave",
+        "maternity": "Maternity leave",
         "unpaid": "Unpaid leave", "absent": "Absent", "public_holiday": "Public holiday",
     }
     count_lines, sample_lines = [], []
@@ -297,13 +310,20 @@ def _collect_text(raw: Any) -> str:
 
     # 1) Chat Completions: choices[0].message.content (str OR list of parts)
     try:
-        c = raw["choices"][0]["message"]["content"]
+        msg = raw["choices"][0]["message"]
+        c = msg.get("content")
         if isinstance(c, str) and c.strip():
             return c
         if isinstance(c, list):
             parts = [p.get("text", "") for p in c if isinstance(p, dict)]
             if any(parts):
                 return "".join(parts)
+        # Qwen3.x reasoning models may put the answer in `reasoning` when
+        # `content` is null (common on vLLM with thinking enabled).
+        for alt in ("reasoning", "reasoning_content"):
+            r = msg.get(alt)
+            if isinstance(r, str) and r.strip():
+                return r
     except Exception:
         pass
 
@@ -406,7 +426,7 @@ def _infer_period(data: dict) -> tuple[int | None, int | None]:
     years: set[int] = set()
     for key in (
         "public_holidays", "annual_leaves", "work_from_home", "sick_leaves",
-        "unpaid_leaves", "unauthorized_absences", "paid_leaves",
+        "maternity_leaves", "unpaid_leaves", "unauthorized_absences", "paid_leaves",
     ):
         for raw in _bucket(data, key) or []:
             parsed = _parse_one_leave_date(str(raw), None, None)
@@ -436,6 +456,7 @@ def parse_extraction(raw_json: dict[str, Any]) -> ExtractedTimesheet:
         work_from_home_dates=_occ_list(_bucket(data, "work_from_home", "work_from_home_dates"), month, year),
         paid_leave_dates=_occ_list(_bucket(data, "paid_leaves", "paid_leave_dates"), month, year),
         sick_leave_dates=_occ_list(_bucket(data, "sick_leaves", "sick_leave_dates"), month, year),
+        maternity_leave_dates=_occ_list(_bucket(data, "maternity_leaves", "maternity_leave_dates"), month, year),
         public_holidays_dates=_occ_list(_bucket(data, "public_holidays", "public_holiday_dates"), month, year),
         unpaid_leave_dates=_occ_list(_bucket(data, "unpaid_leaves", "unpaid_leave_dates"), month, year),
         absent_dates=_occ_list(_bucket(data, "unauthorized_absences", "absent_dates"), month, year),
@@ -457,6 +478,7 @@ def parse_text_extraction(raw: dict[str, Any]) -> TextExtraction:
         annual_dates=_as_list("annual_dates"),
         work_from_home_dates=_as_list("work_from_home_dates"),
         sick_dates=_as_list("sick_dates"),
+        maternity_dates=_as_list("maternity_dates"),
         public_holiday_dates=_as_list("public_holiday_dates"),
         unpaid_dates=_as_list("unpaid_dates"),
         absent_dates=_as_list("absent_dates"),
@@ -479,6 +501,7 @@ def validate_dates_in_month(model: ExtractedTimesheet) -> list[str]:
     _check(model.annual_leave_dates, "annual")
     _check(model.work_from_home_dates, "work_from_home")
     _check(model.sick_leave_dates, "sick")
+    _check(model.maternity_leave_dates, "maternity")
     _check(model.public_holidays_dates, "public_holiday")
     _check(model.unpaid_leave_dates, "unpaid")
     _check(model.absent_dates, "absent")
