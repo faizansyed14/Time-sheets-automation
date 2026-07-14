@@ -54,3 +54,19 @@ async def test_strict_matching_variants(eid, name, code, matched):
 async def test_requires_both_id_and_name():
     assert (await _match("MT1", None)).employee is None        # id only
     assert (await _match(None, "Abdul Ghani")).employee is None  # name only
+
+
+@pytest.mark.parametrize("eid,name,code,matched", [
+    # id not in the matcher at all, but the name uniquely resolves -> fallback
+    ("MT404", "Mohammed Ali", "name_fallback", "Mohammed Ali"),
+    # id resolves to someone else, but the name uniquely matches a different
+    # employee -> fallback (prefer the extracted name over a bad/OCR'd id)
+    ("MT1", "Mohammed Ali", "name_fallback", "Mohammed Ali"),
+    # id not in the matcher and the name is ambiguous (two "Abdul Syed Ghani"
+    # rows under different ids) -> still unmatched, never guesses
+    ("MT404", "Abdul Syed Ghani", "no_match", None),
+])
+async def test_name_fallback_when_id_fails(eid, name, code, matched):
+    r = await _match(eid, name)
+    assert r.code == code, (eid, name, r.code, r.note)
+    assert (r.employee.name if r.employee else None) == matched

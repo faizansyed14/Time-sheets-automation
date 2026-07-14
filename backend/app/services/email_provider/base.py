@@ -38,7 +38,12 @@ class EmailProvider(ABC):
     """Read-only view over a mailbox/folder."""
 
     @abstractmethod
-    async def list_messages(self, query: str | None = None) -> list[ProviderMessage]:
+    async def list_messages(
+        self, query: str | None = None, since: datetime | None = None,
+    ) -> list[ProviderMessage]:
+        """List messages, newest first. `since` narrows to messages received
+        after that time — the incremental-sync fast path: one light request
+        instead of re-downloading the whole folder."""
         ...
 
     @abstractmethod

@@ -2,7 +2,7 @@
 # No AWS RDS required. No S3 required.
 #
 # Usage:
-#   cp .env.local .env
+#   cp .env.example .env   # apply LOCAL profile values from the comments
 #   docker compose -f docker-compose.local.yml --env-file .env up -d --build
 
 services:
@@ -64,13 +64,20 @@ services:
       db: { condition: service_healthy }
       backend: { condition: service_healthy }
 
-  nginx:
+  frontend:
     build: { context: ./frontend, target: prod }
+    volumes:
+      - ./nginx/frontend.conf:/etc/nginx/conf.d/default.conf:ro
+    expose: ["80"]
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
     ports: ["127.0.0.1:8080:80"]
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/gateway.conf:/etc/nginx/conf.d/default.conf:ro
     restart: unless-stopped
-    depends_on: [backend]
+    depends_on: [frontend, backend]
 
 volumes:
   pg_data:

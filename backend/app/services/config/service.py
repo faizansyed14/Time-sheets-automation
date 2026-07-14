@@ -30,11 +30,15 @@ _CACHE_KEY = "appconfig:overlay"
 # key -> (category, is_secret, env_attr_or_None, default)
 CONFIG_KEYS: dict[str, dict] = {
     # provider
-    "ai_provider":        {"category": ConfigCategory.PROVIDER, "secret": False, "env": None, "default": "openai"},
+    "ai_provider":        {"category": ConfigCategory.PROVIDER, "secret": False, "env": "ai_provider", "default": "openai"},
+    "vision_provider":    {"category": ConfigCategory.PROVIDER, "secret": False, "env": "vision_provider", "default": "openai"},
+    "validation_provider":{"category": ConfigCategory.PROVIDER, "secret": False, "env": "validation_provider", "default": "openai"},
     "openai_api_key":     {"category": ConfigCategory.PROVIDER, "secret": True,  "env": "openai_api_key", "default": ""},
     "openai_base_url":    {"category": ConfigCategory.PROVIDER, "secret": False, "env": "openai_base_url", "default": "https://api.openai.com/v1"},
-    "deepseek_api_key":   {"category": ConfigCategory.PROVIDER, "secret": True,  "env": None, "default": ""},
-    "deepseek_base_url":  {"category": ConfigCategory.PROVIDER, "secret": False, "env": None, "default": "https://api.deepseek.com/v1"},
+    "deepseek_api_key":   {"category": ConfigCategory.PROVIDER, "secret": True,  "env": "deepseek_api_key", "default": ""},
+    "deepseek_base_url":  {"category": ConfigCategory.PROVIDER, "secret": False, "env": "deepseek_base_url", "default": "https://api.deepseek.com/v1"},
+    "vllm_api_key":       {"category": ConfigCategory.PROVIDER, "secret": True,  "env": "vllm_api_key", "default": ""},
+    "vllm_base_url":      {"category": ConfigCategory.PROVIDER, "secret": False, "env": "vllm_base_url", "default": ""},
     # model controls
     "extraction_engine":  {"category": ConfigCategory.MODEL, "secret": False, "env": "extraction_engine", "default": "mock"},
     "extraction_model":   {"category": ConfigCategory.MODEL, "secret": False, "env": "extraction_model", "default": "gpt-4o"},

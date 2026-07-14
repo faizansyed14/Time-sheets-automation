@@ -34,8 +34,15 @@ class LocalStorageProvider(StorageProvider):
         return settings.storage_path
 
     def _abs(self, rel: str) -> Path:
-        p = (self.root / rel).resolve()
-        if not str(p).startswith(str(self.root.resolve())):
+        # Real path containment, NOT a string-prefix check: a bare
+        # str().startswith(root) lets a sibling dir that merely shares the
+        # name prefix through (e.g. root "/app/storage" would accept
+        # "/app/storage_backup/..."). is_relative_to compares path segments,
+        # so only paths genuinely inside the root pass. Legitimate vault paths
+        # (Manager/Employee/Month/file) never contain ".." and are unaffected.
+        root = self.root.resolve()
+        p = (root / rel).resolve()
+        if p != root and not p.is_relative_to(root):
             raise ValueError("Path escapes storage root")
         return p
 

@@ -57,6 +57,10 @@ class Settings(BaseSettings):
 
     # Which email provider to use: "mock" now, "graph" later.
     email_provider: str = "mock"
+    # Inbox provider sync is throttled: at most one incremental sync per this
+    # many seconds. Between syncs the inbox (and search) serve straight from
+    # the DB — instant, no Graph round-trip.
+    inbox_sync_min_interval_seconds: int = 60
 
     # Which file store to use: "local" | "s3" | "onedrive".
     # Switch to AWS S3 by setting STORAGE_PROVIDER=s3 + the S3_* values below.
@@ -79,18 +83,43 @@ class Settings(BaseSettings):
     # Which extraction engine to use: "mock" now, "vision" for your real LLM.
     extraction_engine: str = "mock"
 
+    # Each AI service picks its OWN provider — the endpoint + key are resolved
+    # from the provider, and the model name is sent as-is. This replaces the
+    # old "guess the provider from whether the model starts with gpt-" rule.
+    #   vision_provider     -> Extract Email / per-file / approval reading
+    #   validation_provider -> text cross-check + summaries
+    #   ai_provider         -> Agentic Chat (OpenAI only: needs tool calling)
+    # Each is one of: "openai" | "deepseek" | "vllm".
+    vision_provider: str = "openai"
+    validation_provider: str = "openai"
+    ai_provider: str = "openai"
+
     # ----- Real vision LLM (used when extraction_engine="vision") -----
     # OpenAI-compatible vision (GPT-4o / GPT-5.4 / GPT-4.1).
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com"
     openai_timeout: int = 120
+    # Optional DeepSeek (text-only; used for validation/agent, not vision).
+    deepseek_api_key: str | None = None
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
     # Optional vLLM (Qwen etc.) for non-GPT models.
     vllm_api_key: str | None = None
     vllm_base_url: str = "https://myvllmserver.duckdns.org"
-    vllm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
+    vllm_model: str = "qwen3-vl-32b"
     vllm_max_tokens: int = 4096
     vllm_temperature: float = 0.0
     vllm_timeout: int = 90
+    # Some vLLM deployments cap how many images can go in ONE prompt (ours
+    # rejects a call with a 400 above 4). Full-email extraction batches
+    # several sheets per vision call for cost — this keeps each call under
+    # that cap by splitting into smaller calls instead of dropping images.
+    vllm_max_images_per_prompt: int = 4
+    # TLS for the self-hosted vLLM endpoint. Prefer pinning the server's root
+    # CA (VLLM_CA_BUNDLE=path/to/root.crt) — it survives the server's
+    # short-lived leaf-cert rotation. VLLM_TLS_VERIFY=false disables
+    # verification entirely and is a TEMPORARY test-phase escape hatch only.
+    vllm_tls_verify: bool = True
+    vllm_ca_bundle: str = ""
     # Runtime model choices (same names your project uses).
     extraction_model: str = "gpt-4o"
     vision_image_detail: str = "high"   # low | high — used for SCANS/photos
@@ -116,6 +145,11 @@ class Settings(BaseSettings):
     ocr_provider: str = "none"
     # Model for the Agentic Chat assistant (text → safe DB actions).
     agent_chat_model: str = "gpt-4o-mini"
+    # Mask PII (email addresses, unambiguous phone numbers) in everything sent
+    # to external AI models — prompt text and rendered body images. Extraction
+    # targets (names, employee IDs, dates, hours) are never touched, so
+    # accuracy is unaffected. See app/core/pii.py.
+    pii_redaction: bool = True
 
     # CORS for the Vite dev server.
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]

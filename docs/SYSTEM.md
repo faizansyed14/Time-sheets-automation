@@ -44,6 +44,95 @@ backend/app/
 backend/tests/              end-to-end pytest suite (auth, admin, infra, pipeline, s3)
 ```
 
+## Extract Email → Compare & Fix → filed record
+
+You click **Extract Email** on an inbox message, review the extracted leaves
+next to the original, and press **Accept** to file the timesheet. Nothing is
+saved until you accept.
+
+### What happens, step by step
+
+```
+ 1. Click "Extract Email"        →  the whole email is packed into one .eml
+    (in the browser)                (subject, body, every attachment, and any
+                                     forwarded emails inside it)
+
+ 2. The .eml is opened up         →  each attachment is turned into page images
+    ON THE SERVER                    + its text; the email body becomes an image
+    (nothing sent anywhere yet)      too. These are the "sheets".
+
+ 3. PII is removed                →  email addresses and phone numbers are
+    (still on the server)            stripped from the text AND from the images
+                                     BEFORE anything leaves the server.
+
+ 4. Sheets sent to the AI         →  the ONLY step that talks to the AI. It reads
+    (vision model)                   each sheet and returns: who it is, the
+                                     month, the leave dates, and whether a
+                                     manager approved.
+
+ 5. Results matched & grouped     →  names/IDs are matched to your employee list,
+    ON THE SERVER (no AI)            grouped per employee + month, dates checked,
+                                     a plain-English summary written.
+
+ 6. Staged for review             →  one review item per employee/month appears
+                                     in the pipeline, pre-filled, with the whole
+                                     email attached as evidence.
+
+ 7. Compare & Fix                 →  LEFT: the extracted leaves (you can edit).
+    (in the browser)                 RIGHT: the original email + attachments.
+                                     Fix anything, then Accept.
+
+ 8. Accept → filed               →  the record is saved to the database and the
+                                     files land in the vault folder
+                                     <Manager>/<Employee>/<Month-Year>/. The
+                                     inbox message is marked "ingested".
+```
+
+### When and how is PII removed? — BEFORE the AI, always
+
+PII (email addresses, phone numbers) is removed **on your server, before step 4**,
+in two places so nothing slips through:
+
+- **In the text** — the prompt is scrubbed at the moment of sending
+  (`core/pii.py` → `scrub_text`, called inside `services/extraction/vision_client.py`).
+- **In the images** — the email body/subject are scrubbed *before* they are
+  rendered to a picture, so an address can never appear as pixels the AI could
+  read (`services/extraction/file_processor.py`).
+
+Emails become a stable placeholder (`person-3f2a1b@redacted.invalid`) and phones
+become `[phone-redacted]`. **Names, employee IDs, dates and hours are never
+touched** — those are the data being extracted, so accuracy is unaffected. The
+`.eml` file itself and your employee database are **never** sent to the AI.
+
+### How many AI (LLM) calls does one Extract Email make?
+
+Only the vision reads in step 4 — **nothing else calls the AI**:
+
+- **calls ≈ number of sheets ÷ 2** (sheets are sent 2 per call, and never more
+  than `VLLM_MAX_IMAGES_PER_PROMPT` images per call).
+- A typical email (one timesheet + the body) = **1–2 calls**.
+- There is **no separate "summary" AI call** and **no separate "validation" AI
+  call** in this flow — the summary and the date-validation are done by plain
+  server code (`services/extraction/validation.py`), not the model.
+- If the AI is unavailable, each sheet falls back to a local, no-AI reader so
+  the button still works.
+
+(The per-file upload path and the agentic chat are separate features that *do*
+make their own validation/summary AI calls — but the Extract Email button does
+not.)
+
+### Key guarantees
+
+- The AI only ever sees **scrubbed text and rendered images** — never the raw
+  `.eml`, never your employee list.
+- **Matching and validation happen after the AI, in plain server code** — the
+  model proposes, your code checks, and a **human must Accept** before any
+  record is written.
+- Re-running Extract Email on the same message **replaces** the previous review
+  items (no duplicates).
+
+Full detail: `services/agents/full_email_extract.py` (top-of-file docstring).
+
 ## Caching & queue
 - **Redis** backs the cache (OTP/CAPTCHA state, rate-limit sliding windows,
   config overlay) and the **Celery** broker/result backend.
@@ -103,18 +192,16 @@ adds hot-reload + source mounts.
 | Limits | small | large |
 
 - `backend/Dockerfile`, `frontend/Dockerfile` (dev + nginx prod targets).
-- `.env.example` — local backend template; `.env.dev` / `.env.prod` — Docker
-  examples (copy one to `.env` at repo root).
+- `.env.example` — **only** committed env template (active keys + commented
+  LOCAL / DEV / PROD profile blocks). Copy to root `.env` and apply one profile.
 - `scripts/dev/{start,stop}.sh`, `scripts/prod/{start,stop}.sh`, `scripts/test.sh`.
 - **`commands/dev.txt`** and **`commands/prod.txt`** — copy-paste Docker commands
   (up/down/logs/exec/psql/backup/scale) for each environment.
 
 ### About `backend/.env`
 Not required and not used by Docker — compose injects config from root `.env`
-(gitignored; copy from `.env.dev` or `.env.prod`), and the image `.dockerignore`s
-`.env*`. Keep a `backend/.env`
-**only** for a no-Docker local run (copy from `.env.example`); otherwise you can
-safely delete it.
+(gitignored; start from `.env.example`). The image `.dockerignore`s `.env*`.
+Keep a `backend/.env` **only** for a no-Docker local run; otherwise delete it.
 
 ## Database & storage — portable via `.env`
 **Database is PostgreSQL only** (SQLite was removed). The whole app talks to it
@@ -168,7 +255,7 @@ bash scripts/test.sh
 ## Quick start
 
 ```bash
-# Docker dev / prod (copy .env.dev or .env.prod → .env first)
+# Docker (cp .env.example → .env, apply LOCAL/DEV/PROD profile first)
 bash scripts/dev/start.sh        # admin / admin   (frontend :5173, api :8000)
 
 # Local backend (needs a reachable Postgres; set DATABASE_URL in backend/.env)

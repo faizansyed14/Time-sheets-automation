@@ -73,9 +73,10 @@ function StatCard({
   );
 }
 
-/** Per-file cost/provenance badge: which GPT model handled the file (gpt-4o vs
- * the cheaper gpt-4o-mini), or whether a no-LLM path read it, plus an OCR chip.
- * Lets reviewers see — and control — extraction cost at a glance. */
+/** Per-file cost/provenance badge: which model handled the file (OpenAI or a
+ * self-hosted vLLM model — whichever EXTRACTION_MODEL routed to for this
+ * file), or whether a no-LLM path read it, plus an OCR chip. Lets reviewers
+ * see — and control — extraction cost at a glance. */
 function ModelBadge({ file }: { file: PipelineFile }) {
   const method = file.extraction_method;
   if (!method) return null;
@@ -130,9 +131,10 @@ function ModelBadge({ file }: { file: PipelineFile }) {
 }
 
 /** Collapsible "Extraction details" panel: the full metadata for a file —
- * GPT model, method, OCR provider/status, render DPI, image detail, pages,
- * text-layer presence, validation model, embedded .eml attachment, etc. Lets a
- * reviewer audit exactly how (and how expensively) each file was read. */
+ * model (OpenAI or vLLM, whichever it actually used), method, OCR
+ * provider/status, render DPI, image detail, pages, text-layer presence,
+ * validation model, embedded .eml attachment, etc. Lets a reviewer audit
+ * exactly how (and how expensively) each file was read. */
 function ExtractionDetails({ file }: { file: PipelineFile }) {
   const [open, setOpen] = useState(false);
   const meta = (file.extraction_meta ?? {}) as Record<string, unknown>;
@@ -153,7 +155,7 @@ function ExtractionDetails({ file }: { file: PipelineFile }) {
   // Curated, human-labelled rows (in priority order); anything we don't
   // explicitly name is shown afterwards so nothing is hidden.
   const known: [string, string, unknown][] = [
-    ["GPT model", "model", file.extraction_model ?? meta["model"]],
+    ["Model", "model", file.extraction_model ?? meta["model"]],
     ["Method", "method", methodLabel[file.extraction_method ?? ""] ?? file.extraction_method ?? meta["method"]],
     ["OCR (Tesseract) used", "used_ocr", file.used_ocr],
     ["OCR provider", "ocr_provider", meta["ocr_provider"]],

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Save, FlaskConical, RotateCcw, Loader2, CheckCircle2, XCircle, Cpu, KeySquare, FileText, Eye, EyeOff } from "lucide-react";
+import { Save, FlaskConical, RotateCcw, Loader2, CheckCircle2, XCircle, Cpu, KeySquare, FileText, Eye, EyeOff, AlertTriangle } from "lucide-react";
 import {
+  adminConfigStatus,
   adminGetConfig,
   adminPromptDefaults,
   adminRevealSecret,
@@ -17,9 +18,24 @@ import { useToast } from "../../components/toast";
 
 const SECRET_MASK = "••••••••";
 
+interface ServiceDef {
+  key: "vision" | "validation" | "agent";
+  statusKind: "extraction" | "validation" | "agent";
+  providerField: string;
+  modelField: string;
+  label: string;
+  desc: string;
+  providers: readonly AiProviderId[];
+  lockNote?: string;
+}
+
 export default function AdminSettings() {
   const { toast } = useToast();
   const { data, isLoading, refetch } = useQuery({ queryKey: ["admin-config"], queryFn: adminGetConfig });
+  const { data: status } = useQuery({
+    queryKey: ["admin-config-status"], queryFn: adminConfigStatus,
+    refetchInterval: 15000, // stays live while the page is open, e.g. after a Save
+  });
   const [form, setForm] = useState<Record<string, unknown>>({});
   const [dirty, setDirty] = useState<Record<string, boolean>>({});
   const [shown, setShown] = useState<Record<string, boolean>>({});
@@ -67,16 +83,21 @@ export default function AdminSettings() {
     }
   };
 
-  const runTest = async () => {
+  const [testingProvider, setTestingProvider] = useState<string | null>(null);
+  const runTest = async (providerId: string) => {
     setTesting(true);
+    setTestingProvider(providerId);
     setTestResult(null);
     try {
-      const res = await adminTestConfig(String(form["ai_provider"] ?? ""));
+      // Save any unsaved credential edits first so the test hits the new values.
+      if (Object.keys(dirty).length) await save();
+      const res = await adminTestConfig(providerId);
       setTestResult(res);
     } catch (e: any) {
-      setTestResult({ ok: false, provider: String(form["ai_provider"]), model: "", error: e?.response?.data?.detail ?? String(e) });
+      setTestResult({ ok: false, provider: providerId, model: "", error: e?.response?.data?.detail ?? String(e) });
     } finally {
       setTesting(false);
+      setTestingProvider(null);
     }
   };
 
@@ -108,8 +129,32 @@ export default function AdminSettings() {
 
   if (isLoading) return <div className="space-y-3"><Skeleton className="h-40" /><Skeleton className="h-40" /></div>;
 
-  const provider = (String(form["ai_provider"] ?? "openai") as AiProviderId);
-  const pmeta = AI_PROVIDERS[provider] ?? AI_PROVIDERS.openai;
+  // Each AI service picks its OWN provider + model. The provider decides the
+  // endpoint/key (set once in "Provider credentials"); the model is sent as-is.
+  const SERVICES: ServiceDef[] = [
+    { key: "vision", statusKind: "extraction", providerField: "vision_provider", modelField: "extraction_model",
+      label: "Vision extraction", desc: "Reads timesheets & approvals from page images (Extract Email, per-file).",
+      providers: ["openai", "vllm"] },
+    { key: "validation", statusKind: "validation", providerField: "validation_provider", modelField: "validation_model",
+      label: "Validation & cross-check", desc: "A second, text-only read that flags mismatches and writes summaries.",
+      providers: ["openai", "deepseek", "vllm"] },
+    { key: "agent", statusKind: "agent", providerField: "ai_provider", modelField: "agent_chat_model",
+      label: "Agentic chat", desc: "The assistant that queries and edits leaves via tools.",
+      providers: ["openai"], lockNote: "OpenAI only — the chat needs OpenAI-style tool calling." },
+  ];
+  const modelsFor = (serviceKey: ServiceDef["key"], providerId: string): readonly string[] => {
+    const p = AI_PROVIDERS[providerId as AiProviderId] ?? AI_PROVIDERS.openai;
+    return serviceKey === "vision" ? p.extractionModels : p.validationModels;
+  };
+  // Switching provider must move the model to one that actually exists for
+  // it — otherwise the field silently keeps showing the OLD provider's model
+  // (e.g. "qwen3-vl-32b" after switching to OpenAI), which is exactly wrong.
+  const setServiceProvider = (svc: ServiceDef, newProvider: string) => {
+    set(svc.providerField, newProvider);
+    const models = modelsFor(svc.key, newProvider);
+    const current = String(form[svc.modelField] ?? "");
+    if (!models.includes(current)) set(svc.modelField, models[0] ?? "");
+  };
 
   // Rendered as plain functions (not <Components/>) so the inputs keep focus
   // across re-renders while typing.
@@ -142,36 +187,17 @@ export default function AdminSettings() {
     );
   };
 
-  const modelField = (k: string, label: string, options: readonly string[]) => (
-    <Field label={label}>
-      <Input
-        list={`models-${k}`}
-        value={String(form[k] ?? "")}
-        onChange={(e) => set(k, e.target.value)}
-        placeholder="e.g. gpt-4o"
-      />
-      <datalist id={`models-${k}`}>
-        {options.map((m) => <option key={m} value={m} />)}
-      </datalist>
-    </Field>
-  );
 
   return (
     <div className="mx-auto max-w-3xl animate-fade-up">
       <PageHeader
         title="AI Settings"
-        subtitle="Configure providers, models and prompts. Changes apply live — no redeploy."
+        subtitle="Pick a provider and model for each service. Changes apply live — no redeploy."
         actions={
-          <>
-            <Button variant="secondary" onClick={runTest} disabled={testing}>
-              {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <FlaskConical className="h-4 w-4" />}
-              Test provider
-            </Button>
-            <Button onClick={save} disabled={saving || Object.keys(dirty).length === 0}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-              Save
-            </Button>
-          </>
+          <Button onClick={save} disabled={saving || Object.keys(dirty).length === 0}>
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+            Save
+          </Button>
         }
       />
 
@@ -191,52 +217,118 @@ export default function AdminSettings() {
         </Card>
       )}
 
-      {/* providers — only the ACTIVE provider's fields are shown */}
+      {/* per-service provider + model */}
       <Card className="mb-5 p-5">
-        <h2 className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-800"><KeySquare className="h-4 w-4 text-slate-400" /> Provider &amp; API keys</h2>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Active provider">
-            <Select className="w-full" value={provider} onChange={(e) => set("ai_provider", e.target.value)}>
-              {Object.entries(AI_PROVIDERS).map(([id, m]) => (
-                <option key={id} value={id}>{m.label}</option>
-              ))}
-            </Select>
-          </Field>
-          <div />
-          {secretField(pmeta.keyField, `${pmeta.label} API key`)}
-          <Field label={`${pmeta.label} base URL`}>
-            <Input value={String(form[pmeta.baseField] ?? "")} onChange={(e) => set(pmeta.baseField, e.target.value)} />
-          </Field>
-        </div>
-        <p className="mt-3 text-xs text-slate-400">
-          Showing settings for <span className="font-semibold text-slate-600">{pmeta.label}</span> only. Switch the active provider to edit another.
-        </p>
-      </Card>
-
-      {/* model controls */}
-      <Card className="mb-5 p-5">
-        <h2 className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-800"><Cpu className="h-4 w-4 text-slate-400" /> Extraction controls</h2>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Extraction engine">
-            <Select className="w-full" value={String(form["extraction_engine"] ?? "mock")} onChange={(e) => set("extraction_engine", e.target.value)}>
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="flex items-center gap-2 text-sm font-bold text-slate-800"><Cpu className="h-4 w-4 text-slate-400" /> Model per service</h2>
+          <div className="flex items-center gap-2 text-xs font-semibold text-slate-500">
+            Extraction engine
+            <Select value={String(form["extraction_engine"] ?? "mock")} onChange={(e) => set("extraction_engine", e.target.value)}>
               <option value="mock">mock (deterministic)</option>
               <option value="vision">vision (LLM)</option>
             </Select>
-          </Field>
-          {modelField("extraction_model", "Extraction model", pmeta.extractionModels)}
-          <Field label="Vision image detail">
-            <Select className="w-full" value={String(form["vision_image_detail"] ?? "high")} onChange={(e) => set("vision_image_detail", e.target.value)}>
-              <option value="high">high</option>
-              <option value="low">low</option>
-            </Select>
-          </Field>
-          {modelField("validation_model", "Validation model", pmeta.validationModels)}
-          <Field label="Text cross-validation">
-            <label className="flex items-center gap-2 pt-2 text-sm text-slate-600">
-              <input type="checkbox" checked={Boolean(form["enable_text_validation"])} onChange={(e) => set("enable_text_validation", e.target.checked)} className="h-4 w-4 rounded border-slate-300 text-brand-600" />
-              ENABLE_TEXT_VALIDATION
-            </label>
-          </Field>
+          </div>
+        </div>
+        <div className="space-y-3">
+          {SERVICES.map((svc) => {
+            const prov = String(form[svc.providerField] ?? "openai");
+            const models = modelsFor(svc.key, prov);
+            const provKey = AI_PROVIDERS[prov as AiProviderId]?.keyField;
+            const noKey = provKey ? !byKey[provKey]?.value : false;
+            // What's ACTUALLY resolved right now, from the backend — reflects
+            // the last SAVED config, so it also catches "you edited this but
+            // haven't saved yet" (badge lags the form until you hit Save).
+            const live = status?.find((s) => s.kind === svc.statusKind);
+            return (
+              <div key={svc.key} className="rounded-xl border border-slate-200 p-4">
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-semibold text-slate-800">{svc.label}</span>
+                  {live && (
+                    <span
+                      className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${PROVIDER_TONE[live.provider] ?? "border-slate-200 bg-slate-50 text-slate-500"}`}
+                      title="What's actually in use right now (last saved config)"
+                    >
+                      Active: {PROVIDER_LABEL[live.provider] ?? live.provider} · <code className="font-mono">{live.model || "—"}</code>
+                    </span>
+                  )}
+                  {noKey && (
+                    <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-700" title="This provider has no API key set below">
+                      <AlertTriangle className="h-3 w-3" /> no key for {PROVIDER_LABEL[prov] ?? prov}
+                    </span>
+                  )}
+                </div>
+                <p className="mb-3 text-xs text-slate-500">{svc.desc}</p>
+                {live?.note && (
+                  <p className="mb-3 flex items-start gap-1.5 rounded-lg border border-sky-200 bg-sky-50 px-2.5 py-1.5 text-[11px] text-sky-700">
+                    <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" /> {live.note}
+                  </p>
+                )}
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Field label="Provider">
+                    <Select className="w-full" value={prov} disabled={svc.providers.length === 1}
+                            onChange={(e) => setServiceProvider(svc, e.target.value)}>
+                      {svc.providers.map((id) => (
+                        <option key={id} value={id}>{PROVIDER_LABEL[id] ?? id}</option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="Model">
+                    <Input
+                      list={`models-${svc.key}`}
+                      value={String(form[svc.modelField] ?? "")}
+                      onChange={(e) => set(svc.modelField, e.target.value)}
+                      placeholder={models[0] ?? "model name"}
+                    />
+                    <datalist id={`models-${svc.key}`}>
+                      {models.map((m) => <option key={m} value={m} />)}
+                    </datalist>
+                  </Field>
+                </div>
+                {svc.key === "vision" && (
+                  <div className="mt-3">
+                    <Field label="Vision image detail (scans/photos)">
+                      <Select className="w-full sm:w-1/2" value={String(form["vision_image_detail"] ?? "high")} onChange={(e) => set("vision_image_detail", e.target.value)}>
+                        <option value="high">high</option>
+                        <option value="low">low</option>
+                      </Select>
+                    </Field>
+                  </div>
+                )}
+                {svc.key === "validation" && (
+                  <label className="mt-3 flex items-center gap-2 text-sm text-slate-600">
+                    <input type="checkbox" checked={Boolean(form["enable_text_validation"])} onChange={(e) => set("enable_text_validation", e.target.checked)} className="h-4 w-4 rounded border-slate-300 text-brand-600" />
+                    Run the validation cross-check
+                  </label>
+                )}
+                {svc.lockNote && <p className="mt-2 text-[11px] text-slate-400">{svc.lockNote}</p>}
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      {/* provider credentials — set once, shared by whichever services use them */}
+      <Card className="mb-5 p-5">
+        <h2 className="mb-1 flex items-center gap-2 text-sm font-bold text-slate-800"><KeySquare className="h-4 w-4 text-slate-400" /> Provider credentials</h2>
+        <p className="mb-3 text-xs text-slate-500">One key + base URL per provider, shared by every service that selects it above.</p>
+        <div className="space-y-4">
+          {(Object.entries(AI_PROVIDERS) as [AiProviderId, typeof AI_PROVIDERS[AiProviderId]][]).map(([id, meta]) => (
+            <div key={id} className="rounded-xl border border-slate-200 p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${PROVIDER_TONE[id] ?? ""}`}>{meta.label}</span>
+                <Button size="sm" variant="secondary" onClick={() => runTest(id)} disabled={testing}>
+                  {testing && testingProvider === id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FlaskConical className="h-3.5 w-3.5" />}
+                  Test
+                </Button>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {secretField(meta.keyField, "API key")}
+                <Field label="Base URL">
+                  <Input value={String(form[meta.baseField] ?? "")} onChange={(e) => set(meta.baseField, e.target.value)} placeholder="https://…" />
+                </Field>
+              </div>
+            </div>
+          ))}
         </div>
       </Card>
 
@@ -303,6 +395,13 @@ export default function AdminSettings() {
     </div>
   );
 }
+
+const PROVIDER_LABEL: Record<string, string> = { openai: "OpenAI", vllm: "vLLM (self-hosted)", deepseek: "DeepSeek" };
+const PROVIDER_TONE: Record<string, string> = {
+  openai: "border-emerald-200 bg-emerald-50 text-emerald-700",
+  vllm: "border-sky-200 bg-sky-50 text-sky-700",
+  deepseek: "border-violet-200 bg-violet-50 text-violet-700",
+};
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (

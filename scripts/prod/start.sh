@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # Start the full PROD stack (postgres + redis + backend + worker + nginx).
+#
+# Needs a root .env — create one first:
+#   ./scripts/create-env.sh PROD
+# then replace every CHANGE_ME.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+
 if [ ! -f .env ]; then
-  echo "✗ No .env file. Copy the prod example and edit:" >&2
-  echo "    cp .env.prod .env" >&2
+  echo "✗ No .env found. Create one first:" >&2
+  echo "    ./scripts/create-env.sh" >&2
+  echo "    # or:  ./scripts/create-env.sh PROD" >&2
   exit 1
 fi
 if grep -q "CHANGE_ME" .env; then

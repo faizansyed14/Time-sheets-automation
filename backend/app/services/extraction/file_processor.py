@@ -650,11 +650,18 @@ def eml_body_to_images(eml_bytes: bytes) -> list[bytes]:
     full colours/borders, stitched into a single screenshot so nothing is split
     across a page break. Saved as evidence AND sent to the vision model. Falls
     back to a clean TrueType text render if no HTML engine is available."""
+    from app.core.pii import scrub_text
+
     try:
         subject, html_body, plain_body = _eml_subject_and_body_html(eml_bytes)
     except Exception:
-        return [_stitch_text_images(_extract_eml_body_text(eml_bytes))]
+        return [_stitch_text_images(scrub_text(_extract_eml_body_text(eml_bytes)))]
 
+    # Scrub BEFORE rendering — once addresses/phones are pixels in the JPEG the
+    # vision model reads them like any other text.
+    subject = scrub_text(subject)
+    html_body = scrub_text(html_body) if html_body else html_body
+    plain_body = scrub_text(plain_body)
     header = f"<p style='font-family:sans-serif'><b>Subject:</b> {unescape_safe(subject)}</p><hr/>"
     if html_body:
         doc = (
@@ -675,16 +682,20 @@ def eml_body_to_images(eml_bytes: bytes) -> list[bytes]:
         except Exception:
             pass
     # Fallback: legible text render (no HTML engine available)
-    text = f"Subject: {subject}\n\n" + _focus_timesheet_text(_extract_eml_body_text(eml_bytes))
+    text = f"Subject: {subject}\n\n" + _focus_timesheet_text(scrub_text(_extract_eml_body_text(eml_bytes)))
     return [_stitch_text_images(text)]
 
 
 def email_body_to_images(subject: str | None, body_text: str | None) -> list[bytes]:
     """Render a Graph/inbox plain-text email (subject + body) to JPEG — same
-    pipeline path as inline EML timesheets."""
+    pipeline path as inline EML timesheets. PII is scrubbed before rendering
+    so addresses/phones never become pixels the vision model can read."""
     from html import escape as _esc
 
-    focused = _focus_timesheet_text(body_text or "")
+    from app.core.pii import scrub_text
+
+    subject = scrub_text(subject)
+    focused = _focus_timesheet_text(scrub_text(body_text))
     header = (
         f"<p style='font-family:sans-serif'><b>Subject:</b> "
         f"{_esc(subject or '')}</p><hr/>"

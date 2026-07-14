@@ -272,11 +272,17 @@ async def pipeline_manual_fix(
         approval = {"approved": approval_status == "approved",
                     "detail": (approval_detail or "").strip()}
 
+    # Unique per-sheet source key so accepting several sheets for the same
+    # employee+month (attendance sheet + a separate sick-leave certificate)
+    # UNIONS their leaves instead of the later Accept overwriting the earlier.
+    from app.services.pipeline.ingestion import _file_key
+    source_key = _file_key(t.source_id, t.attachment_id, t.filename or t.id)
     try:
         rec, new_tracker = await ingest_manual_entry(
             db, employee_pk=employee_pk, month=month, year=year,
             buckets=bucket_data, attachments=attachments, note=note,
             approval=approval,
+            source_key=source_key, source_filename=(t.filename or "sheet"),
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -302,6 +308,10 @@ async def pipeline_manual_fix(
         "at": t.resolved_at.isoformat(),
     }]
     purge_raw_copy(t)
+    # Accepting an email-sourced item files its record → the inbox row is now
+    # "ingested" (the staged flows never go through the legacy Accept decision).
+    from app.services.pipeline.ingestion import mark_source_email_ingested
+    await mark_source_email_ingested(db, t)
     await db.commit()
     await db.refresh(t)
     await datacache.bust_pipeline()

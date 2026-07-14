@@ -59,7 +59,20 @@ export function downloadFile(url: string, filename: string) {
   a.click();
 }
 
-/** Strip scripts/event handlers from email HTML before sandboxed iframe render. */
+// Attributes that can carry a URL the browser may navigate/execute.
+const URL_ATTRS = new Set(["href", "src", "action", "formaction", "xlink:href", "data", "background", "poster"]);
+
+function isScriptUrl(value: string): boolean {
+  // Browsers ignore control chars/whitespace inside the scheme ("java\nscript:"),
+  // so strip them before testing — a plain /^javascript:/ test can be evaded.
+  const v = (value || "").replace(/[\u0000-\u0020]/g, "").toLowerCase();
+  return v.startsWith("javascript:") || v.startsWith("vbscript:");
+}
+
+/** Strip scripts / event handlers / executable URLs from email HTML before the
+ * sandboxed iframe render. The iframe sandbox (no allow-scripts) remains the
+ * hard boundary; this keeps the document clean so the browser has nothing to
+ * block (and logs no "Blocked script execution" console noise). */
 export function sanitizeEmailHtml(html: string): string {
   // Fast path for non-browser contexts (shouldn't happen in this app, but safe).
   if (typeof window === "undefined" || typeof DOMParser === "undefined") {
@@ -72,17 +85,22 @@ export function sanitizeEmailHtml(html: string): string {
   try {
     const doc = new DOMParser().parseFromString(html, "text/html");
 
-    // Remove script-like / active content nodes completely.
-    doc.querySelectorAll("script,noscript,iframe,object,embed,link[rel='preload'][as='script']").forEach((n) => n.remove());
+    // Remove script-like / active / navigation-hijacking nodes completely.
+    doc.querySelectorAll(
+      "script,noscript,iframe,frame,object,embed,base,template," +
+      "link[rel='preload'][as='script'],meta[http-equiv='refresh' i]"
+    ).forEach((n) => n.remove());
 
-    // Strip inline event handlers + javascript: URLs.
+    // Strip inline event handlers + javascript:/vbscript: URLs anywhere.
     doc.querySelectorAll("*").forEach((el) => {
       // Clone list because we'll mutate attributes while iterating.
       Array.from(el.attributes).forEach((a) => {
         const name = a.name.toLowerCase();
-        const value = (a.value || "").trim();
-        if (name.startsWith("on")) el.removeAttribute(a.name);
-        if ((name === "href" || name === "src") && /^javascript:/i.test(value)) el.removeAttribute(a.name);
+        if (name.startsWith("on")) {
+          el.removeAttribute(a.name);
+          return;
+        }
+        if (URL_ATTRS.has(name) && isScriptUrl(a.value)) el.removeAttribute(a.name);
       });
     });
 

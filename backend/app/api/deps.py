@@ -30,12 +30,6 @@ _DEV_ADMIN = User(id="dev-admin", username="dev", email=None,
                   password_hash="", role=Role.ADMIN, auth_mode="otp", is_active=True)
 
 
-def client_fingerprint(request: Request, x_fingerprint: str | None = Header(default=None)) -> str:
-    """Raw fingerprint material = User-Agent + client-supplied id. Hashed later."""
-    ua = request.headers.get("user-agent", "")
-    return f"{ua}|{x_fingerprint or ''}"
-
-
 async def get_current_user(
     request: Request,
     authorization: str | None = Header(default=None),

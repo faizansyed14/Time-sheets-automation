@@ -1,0 +1,47 @@
+==========================================================================
+ LOCAL — Docker commands
+ Stack: Postgres + Redis + backend + Celery worker + frontend + nginx gateway
+        Fully self-contained: DB + files in Docker volumes (no AWS needed).
+ File:  docker-compose.local.yml     Env: .env  (from .env.example + LOCAL profile)
+==========================================================================
+
+with start script
+./scripts/local/start.sh
+
+# ---- clear DB data (keeps employees + users) ----
+bash scripts/db/delete-pipeline.sh
+bash scripts/db/delete-records.sh
+
+# ---- setup (once) ----
+./scripts/create-env.sh LOCAL       # or interactive: ./scripts/create-env.sh
+# (LOCAL profile sets DATABASE_URL to db, storage_provider=local, etc.)
+
+# ---- start / stop ----
+docker compose -f docker-compose.local.yml --env-file .env up --build
+docker compose -f docker-compose.local.yml --env-file .env up --build -d   # detached
+docker compose -f docker-compose.local.yml down                                # stop (keeps volumes)
+docker compose -f docker-compose.local.yml down --volumes                      # stop + DROP db+redis+storage (irreversible)
+
+# ---- logs ----
+docker compose -f docker-compose.local.yml logs -f
+docker compose -f docker-compose.local.yml logs -f backend
+docker compose -f docker-compose.local.yml logs -f worker
+
+# ---- status / restart / rebuild ----
+docker compose -f docker-compose.local.yml ps
+docker compose -f docker-compose.local.yml restart backend frontend nginx
+docker compose -f docker-compose.local.yml build backend frontend
+
+# ---- rebuild frontend ONLY (no backend changes) ----
+docker compose -f docker-compose.local.yml --env-file .env build frontend
+docker compose -f docker-compose.local.yml --env-file .env up -d frontend
+docker compose -f docker-compose.local.yml restart nginx
+
+# ---- shells / DB ----
+docker compose -f docker-compose.local.yml exec backend bash
+docker compose -f docker-compose.local.yml exec db psql -U timesheet -d timesheet
+
+# ---- health ----
+curl -fsS http://localhost:8080/health     # via gateway -> backend
+# App: http://localhost:8080   Login: admin / admin
+

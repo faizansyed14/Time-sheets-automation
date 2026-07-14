@@ -811,13 +811,14 @@ export default function InboxPage() {
               <input
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                placeholder="Search emails…"
+                placeholder="Search sender name or email…"
                 className="w-full rounded-lg border border-slate-200 bg-slate-50 py-1.5 pl-8 pr-3 text-sm placeholder:text-slate-400 focus:border-brand-400 focus:bg-white focus:outline-none"
               />
             </div>
             <Select value={status} onChange={(e) => setStatus(e.target.value)} className="py-1.5 text-xs">
               <option value="">All</option>
               <option value="new">New</option>
+              <option value="extracted">Extracted</option>
               <option value="ingested">Ingested</option>
               <option value="archived">Archived</option>
             </Select>

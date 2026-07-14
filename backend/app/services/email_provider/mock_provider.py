@@ -210,8 +210,10 @@ def _to_provider_message(msg: dict) -> ProviderMessage:
 
 
 class MockEmailProvider(EmailProvider):
-    async def list_messages(self, query: str | None = None) -> list[ProviderMessage]:
+    async def list_messages(self, query=None, since=None) -> list[ProviderMessage]:
         msgs = [_to_provider_message(m) for m in mock_data.MESSAGES]
+        if since is not None:
+            msgs = [m for m in msgs if m.received_at and m.received_at > since]
         if query:
             q = query.lower().strip()
             msgs = [

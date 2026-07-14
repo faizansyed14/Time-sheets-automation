@@ -13,9 +13,52 @@ import httpx
 
 from app.core.config import settings
 from app.core.openai_url import openai_urls
+from app.core.pii import scrub_text
 
 
 _AUX_TEXT_MAX = 24_000
+
+
+VISION_PROVIDERS = ("openai", "vllm")          # deepseek has no vision model
+VALIDATION_PROVIDERS = ("openai", "deepseek", "vllm")
+
+
+def vision_provider() -> str:
+    return (settings.vision_provider or "openai").strip().lower()
+
+
+def validation_provider() -> str:
+    return (settings.validation_provider or "openai").strip().lower()
+
+
+def _vllm_verify():
+    """httpx `verify` for the vLLM endpoint: a pinned CA bundle when configured
+    (survives short-lived leaf-cert rotation), else standard verification.
+    VLLM_TLS_VERIFY=false is a temporary test-phase escape hatch."""
+    bundle = (settings.vllm_ca_bundle or "").strip()
+    return bundle if bundle else settings.vllm_tls_verify
+
+
+def _chat_endpoint(provider: str) -> tuple[str, str, str, object, int]:
+    """Resolve an OpenAI-compatible provider to
+    (chat_completions_url, auth_header, api_key, tls_verify, timeout).
+    All three providers speak the same /v1/chat/completions API — only the
+    base URL, key and (for vLLM) the TLS trust differ."""
+    p = (provider or "openai").strip().lower()
+    if p == "vllm":
+        base = str(settings.vllm_base_url or "").rstrip("/")
+        base = base if base.endswith("/v1") else base + "/v1"
+        key = (settings.vllm_api_key or "").strip()
+        auth = key if key.lower().startswith("bearer ") else f"Bearer {key}"
+        return f"{base}/chat/completions", auth, key, _vllm_verify(), settings.vllm_timeout
+    if p == "deepseek":
+        base = str(settings.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
+        base = base if base.endswith("/v1") else base + "/v1"
+        key = (settings.deepseek_api_key or "").strip()
+        return f"{base}/chat/completions", f"Bearer {key}", key, True, settings.openai_timeout
+    api_root, _ = openai_urls(settings.openai_base_url)
+    key = (settings.openai_api_key or "").strip()
+    return f"{api_root}/v1/chat/completions", f"Bearer {key}", key, True, settings.openai_timeout
 
 
 def _augment_prompt_with_text(prompt: str, aux_text: str | None) -> str:
@@ -57,11 +100,11 @@ async def extract_timesheet(
 ) -> dict:
     prompt = _augment_prompt_with_text(prompt, aux_text)
     m = (model or "").strip()
-    is_gpt = m.startswith(("gpt-4", "gpt-5")) or m.lower() in {"gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-5.4"}
-    if is_gpt:
+    provider = vision_provider()
+    if provider == "openai":
         return await _extract_openai(images_jpeg, prompt, system_prompt, m, image_detail,
                                      file_bytes, file_type, filename)
-    return await _extract_vllm(images_jpeg, prompt, system_prompt, m, image_detail)
+    return await _chat_compatible(provider, images_jpeg, prompt, system_prompt, m, image_detail)
 
 
 async def _extract_openai(images_jpeg, prompt, system_prompt, model, image_detail,
@@ -79,6 +122,7 @@ async def _extract_openai(images_jpeg, prompt, system_prompt, model, image_detai
 
 
 async def _openai_by_images(images_jpeg, prompt, system_prompt, model, image_detail, api_key) -> dict:
+    prompt = scrub_text(prompt)  # last line of defence: no PII leaves in prompt text
     api_root, _ = openai_urls(settings.openai_base_url)
     detail = (image_detail or "").strip().lower()
     if detail not in {"low", "high"}:
@@ -113,6 +157,7 @@ async def _openai_by_images(images_jpeg, prompt, system_prompt, model, image_det
 
 
 async def _openai_by_file_id(file_bytes, filename, file_type, prompt, system_prompt, model, api_key) -> dict:
+    prompt = scrub_text(prompt)
     api_root, _ = openai_urls(settings.openai_base_url)
     mime = {"pdf": "application/pdf",
             "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -127,29 +172,41 @@ async def _openai_by_file_id(file_bytes, filename, file_type, prompt, system_pro
         file_id = (fr.json() or {}).get("id")
         if not file_id:
             raise RuntimeError("no file id")
-        payload: dict = {"model": model,
-                         "input": [{"role": "user", "content": [
-                             {"type": "input_file", "file_id": file_id},
-                             {"type": "input_text", "text": prompt}]}]}
-        if (system_prompt or "").strip():
-            payload["instructions"] = system_prompt.strip()
-        if model.startswith("gpt-5"):
-            payload["max_output_tokens"] = 8192
-            payload["reasoning"] = {"effort": "high"}
-        else:
-            payload["max_output_tokens"] = 4096
-        rr = await client.post(f"{api_root}/v1/responses", json=payload,
-                               headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
-        if rr.status_code != 200:
-            raise RuntimeError(f"responses {rr.status_code}: {rr.text[:300]}")
-        return rr.json()
+        try:
+            payload: dict = {"model": model,
+                             "input": [{"role": "user", "content": [
+                                 {"type": "input_file", "file_id": file_id},
+                                 {"type": "input_text", "text": prompt}]}]}
+            if (system_prompt or "").strip():
+                payload["instructions"] = system_prompt.strip()
+            if model.startswith("gpt-5"):
+                payload["max_output_tokens"] = 8192
+                payload["reasoning"] = {"effort": "high"}
+            else:
+                payload["max_output_tokens"] = 4096
+            rr = await client.post(f"{api_root}/v1/responses", json=payload,
+                                   headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+            if rr.status_code != 200:
+                raise RuntimeError(f"responses {rr.status_code}: {rr.text[:300]}")
+            return rr.json()
+        finally:
+            # The upload is transient model input holding employee PII — it must
+            # not persist in OpenAI's file storage after the model has answered.
+            try:
+                await client.delete(f"{api_root}/v1/files/{file_id}",
+                                    headers={"Authorization": f"Bearer {api_key}"})
+            except Exception:
+                pass
 
 
-async def _extract_vllm(images_jpeg, prompt, system_prompt, model, image_detail) -> dict:
-    base_url = str(settings.vllm_base_url).rstrip("/")
-    api_key = (settings.vllm_api_key or "").strip()
+async def _chat_compatible(provider, images_jpeg, prompt, system_prompt, model, image_detail) -> dict:
+    """Generic OpenAI-compatible /v1/chat/completions call for any non-native
+    provider (vLLM, DeepSeek). Sends base64 images + text; no file upload and
+    no json_mode (those are OpenAI-only features)."""
+    prompt = scrub_text(prompt)
+    url, auth, api_key, verify, timeout = _chat_endpoint(provider)
     if not api_key:
-        raise RuntimeError("VLLM_API_KEY is not set.")
+        raise RuntimeError(f"{provider} API key is not set. Add it in AI Settings.")
     detail = (image_detail or "low").strip().lower()
     content: list[dict] = []
     for img in images_jpeg:
@@ -162,28 +219,36 @@ async def _extract_vllm(images_jpeg, prompt, system_prompt, model, image_detail)
     messages.append({"role": "user", "content": content})
     payload = {"model": model, "max_tokens": min(settings.vllm_max_tokens, 4096),
                "temperature": settings.vllm_temperature, "messages": messages}
-    auth = api_key if api_key.lower().startswith("bearer ") else f"Bearer {api_key}"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(settings.vllm_timeout)) as client:
-        r = await client.post(f"{base_url}/v1/chat/completions", json=payload,
-                              headers={"Authorization": auth})
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout), verify=verify) as client:
+        r = await client.post(url, json=payload, headers={"Authorization": auth})
         if r.status_code != 200:
-            raise RuntimeError(f"vLLM returned {r.status_code}: {r.text[:500]}")
+            raise RuntimeError(f"{provider} returned {r.status_code}: {r.text[:500]}")
         return r.json()
 
 
+async def _extract_vllm(images_jpeg, prompt, system_prompt, model, image_detail) -> dict:
+    """Back-compat wrapper — vLLM is one OpenAI-compatible provider."""
+    return await _chat_compatible("vllm", images_jpeg, prompt, system_prompt, model, image_detail)
+
+
 async def validate_extraction(prompt: str, system_prompt: str | None, model: str = "gpt-4o-mini") -> dict:
-    api_key = (settings.openai_api_key or "").strip()
+    """Text-only call routed to the configured VALIDATION provider."""
+    provider = validation_provider()
+    if provider != "openai":
+        # DeepSeek / vLLM — a plain text chat call (scrubbed inside).
+        return await _chat_compatible(provider, [], prompt, system_prompt, model, "low")
+    prompt = scrub_text(prompt)
+    url, auth, api_key, verify, timeout = _chat_endpoint("openai")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY required for text validation.")
-    api_root, _ = openai_urls(settings.openai_base_url)
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
     payload: dict = {"model": model, "messages": messages, "temperature": 0.0, "max_tokens": 8192}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(settings.openai_timeout)) as client:
-        r = await client.post(f"{api_root}/v1/chat/completions", json=payload,
-                              headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+        r = await client.post(url, json=payload,
+                              headers={"Authorization": auth, "Content-Type": "application/json"})
         if r.status_code != 200:
             raise RuntimeError(f"validation {r.status_code}: {r.text[:300]}")
         return r.json()
