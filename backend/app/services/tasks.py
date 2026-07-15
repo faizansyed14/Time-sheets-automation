@@ -82,19 +82,20 @@ def purge_pipeline_raw_task():
 
 @celery_app.task(name="ingestion.process_upload")
 def process_upload_task(filename: str, content_type: str, data_b64: str):
-    """Run the upload pipeline in a worker. Bytes are passed base64-encoded."""
+    """Stage an upload in a worker (same Run Extraction path as the Upload page)."""
     import base64
 
     from app.core.database import SessionLocal
-    from app.services.pipeline.ingestion import ingest_upload
+    from app.services.pipeline.ingestion import stage_upload_extraction
 
     data = base64.b64decode(data_b64)
 
     async def _run():
         async with SessionLocal() as db:
-            rec, tracker = await ingest_upload(
-                db, filename=filename, content_type=content_type, data=data)
-            return {"pipeline_id": tracker.id, "record_id": rec.id if rec else None,
-                    "status": tracker.status}
+            staged = await stage_upload_extraction(
+                db, files=[(filename, content_type, data)])
+            t = staged[0]
+            return {"pipeline_id": t.id, "record_id": t.record_id,
+                    "status": t.status}
 
     return _run_coro(_run)

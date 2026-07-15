@@ -79,12 +79,14 @@ async def build_full_eml(provider, email: EmailMessage) -> tuple[bytes, str]:
 
         maintype, _, subtype = (ct.partition("/") if "/" in ct
                                 else ("application", "/", "octet-stream"))
-        # Inline signature/logo images keep their Content-ID and inline
-        # disposition, exactly like the original — so .eml consumers can both
-        # render them in the HTML body and tell them apart from real documents.
+        # Timesheet / approval files are real attachments — mark them as such
+        # so .eml parsers don't treat them as decorative CID-inline images.
+        kind = (a.get("kind") or "").strip()
         cid = (a.get("cid") or "").strip()
         headers: dict = {}
-        if cid:
+        if kind in ("timesheet", "approval_screenshot"):
+            headers = {"disposition": "attachment"}
+        elif cid:
             headers = {"cid": f"<{cid.strip('<>')}>", "disposition": "inline"}
         try:
             msg.add_attachment(data, maintype=maintype or "application",

@@ -106,7 +106,7 @@ async def test_chat_eml_preview_endpoint(client, admin_token):
     eml = (b"From: mgr@alpha.ae\r\nTo: timesheet@alpha.ae\r\n"
            b"Subject: Re: TIMESHEET May 2026\r\nContent-Type: text/plain\r\n\r\n"
            b"Please find the approval attached.\r\n")
-    tok = upload_cache.put(eml, "approval.eml", "message/rfc822")
+    tok = await upload_cache.put(eml, "approval.eml", "message/rfc822")
     h = auth_headers(admin_token)
     r = await client.get(f"/api/v1/agentic-chat/attachments/{tok}/eml-preview", headers=h)
     assert r.status_code == 200, r.text

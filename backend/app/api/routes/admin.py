@@ -11,7 +11,7 @@ Users:
 Config (prompts, AI provider + keys, model controls):
   GET    /admin/config               current values (secrets masked)
   PUT    /admin/config               update a batch of values
-  GET    /admin/config/reveal/{key}  plaintext of one secret (the "show" toggle)
+  GET    /admin/config/reveal/{key}  plaintext of one secret (password re-check)
   POST   /admin/config/test          live-test the configured provider
   GET    /admin/config/prompts/defaults  built-in prompt text (to pre-fill the editor)
 """
@@ -192,21 +192,13 @@ async def get_config(db: AsyncSession = Depends(get_db)):
 @router.put("/config", response_model=list[ConfigItem])
 async def update_config(body: ConfigUpdate, admin: User = Depends(require_admin),
                         db: AsyncSession = Depends(get_db)):
-    bad = [k for k in body.values if k not in config_service.CONFIG_KEYS]
+    # Only the per-service provider switch and prompt overrides are writable
+    # over the API; keys, URLs and models are .env-only by design.
+    bad = [k for k in body.values if k not in config_service.UI_EDITABLE_KEYS]
     if bad:
-        raise HTTPException(400, f"Unknown config keys: {bad}")
+        raise HTTPException(400, f"Not editable via the API (set in .env): {bad}")
     await config_service.set_settings(db, body.values, updated_by=admin.username)
     return [ConfigItem(**c) for c in await config_service.public_view(db)]
-
-
-@router.get("/config/reveal/{key}")
-async def reveal_config_secret(key: str, db: AsyncSession = Depends(get_db)):
-    """Return the plaintext value of a secret key so the admin can confirm which
-    key is in use (backs the "show" toggle in AI Settings)."""
-    try:
-        return {"key": key, "value": await config_service.reveal_secret(db, key)}
-    except KeyError:
-        raise HTTPException(400, f"'{key}' is not a revealable secret key")
 
 
 @router.post("/config/test", response_model=ProviderTestResult)
@@ -228,11 +220,15 @@ async def config_status(db: AsyncSession = Depends(get_db)):
                 else overlay.get("deepseek_api_key")) or "").strip().lower()
         return bool(key) and key not in ("change-me", "missing")
 
-    def _item(kind: str, label: str, provider_key: str, model_key: str,
-              note: str | None = None) -> AiStatusItem:
+    from app.services.extraction.vision_client import model_for
+
+    def _item(kind: str, label: str, provider_key: str, purpose: str,
+              note: str | None = None, model: str | None = None) -> AiStatusItem:
         provider = str(overlay.get(provider_key) or "openai").lower()
+        # The model FOLLOWS the provider (model_for) — showing a global model
+        # here once masked a real bug: OpenAI being sent a vLLM model name.
         return AiStatusItem(kind=kind, label=label, provider=provider,
-                            model=str(overlay.get(model_key) or ""),
+                            model=model if model is not None else model_for(provider, purpose),
                             has_key=_key_configured(provider), note=note)
 
     agent_provider = str(overlay.get("ai_provider") or "openai").lower()
@@ -244,10 +240,11 @@ async def config_status(db: AsyncSession = Depends(get_db)):
 
     return [
         _item("extraction", "Vision extraction (Extract Email, per-file, approvals)",
-              "vision_provider", "extraction_model"),
+              "vision_provider", "vision"),
         _item("validation", "Validation / cross-check / summaries",
-              "validation_provider", "validation_model"),
-        _item("agent", "Agentic chat", "ai_provider", "agent_chat_model", note=agent_note),
+              "validation_provider", "validation"),
+        _item("agent", "Agentic chat", "ai_provider", "validation", note=agent_note,
+              model=str(overlay.get("agent_chat_model") or "gpt-4o-mini")),
     ]
 
 
@@ -259,3 +256,60 @@ async def prompt_defaults():
         "extraction_prompt": parser.EXTRACTION_PROMPT,
         "summary_prompt": parser.SUMMARY_PROMPT,
     }
+
+
+@router.get("/config/prompts/all")
+async def prompt_inventory():
+    """Every LLM prompt in the backend, with where it is actually used.
+
+    All of these have live call paths (verified) — none are dead code. The
+    three engine prompts are the only ones editable (via the existing
+    system_prompt / extraction_prompt / summary_prompt config overrides);
+    `content` shows the ACTIVE text, i.e. the override when one is saved."""
+    from app.services.agents import chat_agent
+    from app.services.agents import full_email_extract as fx
+    from app.services.extraction import parser, vision_engine
+
+    def item(key, title, used_by, content, editable=False,
+             override_key=None, dynamic=False):
+        return {"key": key, "title": title, "used_by": used_by,
+                "content": content, "editable": editable,
+                "override_key": override_key, "dynamic": dynamic}
+
+    return [
+        item("extract_email_system", "Extract Email — sheet analysis (system)",
+             "Extract Email button in the Inbox: reads every sheet in the email "
+             "(kinds, identity, leave dates, signatures, approval evidence).",
+             fx._SYSTEM_PROMPT),
+        item("extract_email_batch", "Extract Email — per-batch request",
+             "Built dynamically for each email: lists the sheets in the batch, the "
+             "JSON schema to fill, and each sheet's exact extracted text.",
+             "(dynamic — assembled per email from the sheet list, the JSON schema "
+             "and each sheet's exact text; see _batch_prompt in full_email_extract.py)",
+             dynamic=True),
+        item("engine_system", "Per-file engine — system",
+             "Upload page, chat uploads, 'Run Extraction (selected)' in the Inbox, "
+             "and the per-sheet fallback when an Extract Email batch call fails.",
+             parser.get_prompt("system"), editable=True, override_key="system_prompt"),
+        item("engine_extraction", "Per-file engine — extraction rules",
+             "Same flows as the engine system prompt (Upload / chat / selected / fallback).",
+             parser.get_prompt("extraction"), editable=True, override_key="extraction_prompt"),
+        item("engine_summary", "Filed-record review note",
+             "Written when a record is filed: Upload page, email ingest, "
+             "resolve-with-employee and retry. Falls back to a deterministic note.",
+             parser.get_prompt("summary"), editable=True, override_key="summary_prompt"),
+        item("text_crosscheck_system", "Text cross-check — system",
+             "Second, text-only read that double-checks the vision result "
+             "(runs when text validation is enabled).",
+             parser.TEXT_EXTRACTION_SYSTEM),
+        item("text_crosscheck", "Text cross-check — request",
+             "Same cross-check step; the document text is inserted into it.",
+             parser.TEXT_EXTRACTION_PROMPT),
+        item("approval_screenshot", "Approval screenshot question",
+             "Asked about manager-approval screenshots during "
+             "'Run Extraction (selected)' email ingest.",
+             vision_engine.APPROVAL_QUESTION),
+        item("chat_system", "Agentic chat — system",
+             "The chat assistant on the Agentic Chat page (tools + grounding rules).",
+             chat_agent.SYSTEM_PROMPT),
+    ]

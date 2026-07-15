@@ -28,12 +28,14 @@ def to_out(r: TimesheetRecord) -> TimesheetOut:
         annual_leave_dates=r.annual_leave_dates or [],
         remote_work_dates=r.remote_work_dates or [],
         sick_leave_dates=r.sick_leave_dates or [],
+        maternity_leave_dates=r.maternity_leave_dates or [],
         unpaid_leave_dates=r.unpaid_leave_dates or [],
         absent_dates=r.absent_dates or [],
         public_holiday_dates=r.public_holiday_dates or [],
         annual_leave_count=r.annual_leave_count,
         remote_work_count=r.remote_work_count,
         sick_leave_count=r.sick_leave_count,
+        maternity_leave_count=r.maternity_leave_count,
         unpaid_leave_count=r.unpaid_leave_count,
         absent_count=r.absent_count,
         public_holiday_count=r.public_holiday_count,
@@ -116,6 +118,8 @@ async def update_record(record_id: str, body: TimesheetUpdate, db: AsyncSession 
         r.remote_work_dates = _clean(body.remote_work_dates)
     if body.sick_leave_dates is not None:
         r.sick_leave_dates = _clean(body.sick_leave_dates)
+    if body.maternity_leave_dates is not None:
+        r.maternity_leave_dates = _clean(body.maternity_leave_dates)
     if body.unpaid_leave_dates is not None:
         r.unpaid_leave_dates = _clean(body.unpaid_leave_dates)
     if body.absent_dates is not None:
@@ -125,13 +129,15 @@ async def update_record(record_id: str, body: TimesheetUpdate, db: AsyncSession 
 
     buckets = {
         "annual": r.annual_leave_dates or [], "remote": r.remote_work_dates or [],
-        "sick": r.sick_leave_dates or [], "unpaid": r.unpaid_leave_dates or [],
+        "sick": r.sick_leave_dates or [], "maternity": r.maternity_leave_dates or [],
+        "unpaid": r.unpaid_leave_dates or [],
         "absent": r.absent_dates or [], "public_holiday": r.public_holiday_dates or [],
     }
     cleaned, flags = _validate(buckets, r.month, r.year)
     r.annual_leave_dates = cleaned["annual"]
     r.remote_work_dates = cleaned["remote"]
     r.sick_leave_dates = cleaned["sick"]
+    r.maternity_leave_dates = cleaned["maternity"]
     r.unpaid_leave_dates = cleaned["unpaid"]
     r.absent_dates = cleaned["absent"]
     r.public_holiday_dates = cleaned["public_holiday"]

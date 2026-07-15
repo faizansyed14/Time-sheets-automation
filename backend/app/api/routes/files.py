@@ -11,6 +11,7 @@ from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.core.http_headers import content_disposition
 from app.services import storage_provider as sp
 from app.services.storage_provider.archive import iter_zip, scope_size, year_summary
 
@@ -75,7 +76,7 @@ def file_content(rel_path: str = Query(...)):
         raise HTTPException(404, "File not found")
     disp = "inline" if ctype.startswith(("image/", "application/pdf", "text/", "application/json", "message/")) else "attachment"
     return Response(content=data, media_type=ctype,
-                    headers={"Content-Disposition": f'{disp}; filename="{name}"'})
+                    headers={"Content-Disposition": content_disposition(disp, name)})
 
 
 @router.get("/eml-preview")
@@ -140,7 +141,7 @@ def download_zip(
     return StreamingResponse(
         stream,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition("attachment", filename)},
     )
 
 

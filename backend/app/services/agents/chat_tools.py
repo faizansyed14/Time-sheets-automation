@@ -35,6 +35,9 @@ LEAVE_FIELDS: dict[str, str] = {
     "sick": "sick_leave_dates",
     "sick_leave": "sick_leave_dates",
     "sl": "sick_leave_dates",
+    "maternity": "maternity_leave_dates",
+    "maternity_leave": "maternity_leave_dates",
+    "ml": "maternity_leave_dates",
     "unpaid": "unpaid_leave_dates",
     "unpaid_leave": "unpaid_leave_dates",
     "lop": "unpaid_leave_dates",
@@ -50,6 +53,7 @@ _FIELD_LABELS = {
     "annual_leave_dates": "Annual leave",
     "remote_work_dates": "Remote work (WFH)",
     "sick_leave_dates": "Sick leave",
+    "maternity_leave_dates": "Maternity leave",
     "unpaid_leave_dates": "Unpaid leave (LOP)",
     "absent_dates": "Absent",
     "public_holiday_dates": "Public holiday",
@@ -354,13 +358,15 @@ async def update_leaves(
     # Re-validate the whole month and refresh status/summary (same as the UI edit).
     buckets = {
         "annual": rec.annual_leave_dates or [], "remote": rec.remote_work_dates or [],
-        "sick": rec.sick_leave_dates or [], "unpaid": rec.unpaid_leave_dates or [],
+        "sick": rec.sick_leave_dates or [], "maternity": rec.maternity_leave_dates or [],
+        "unpaid": rec.unpaid_leave_dates or [],
         "absent": rec.absent_dates or [], "public_holiday": rec.public_holiday_dates or [],
     }
     cleaned, flags = _validate(buckets, rec.month, rec.year)
     rec.annual_leave_dates = cleaned["annual"]
     rec.remote_work_dates = cleaned["remote"]
     rec.sick_leave_dates = cleaned["sick"]
+    rec.maternity_leave_dates = cleaned["maternity"]
     rec.unpaid_leave_dates = cleaned["unpaid"]
     rec.absent_dates = cleaned["absent"]
     rec.public_holiday_dates = cleaned["public_holiday"]

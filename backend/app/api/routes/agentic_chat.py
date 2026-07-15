@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFil
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import datacache
+from app.core.http_headers import content_disposition
 from app.core.database import get_db
 from app.schemas import ChatRequest, ChatResponse, ChatSuggestions, UploadResult
 from app.services.agents import chat_agent, upload_cache
@@ -59,7 +60,7 @@ async def extract_uploaded_sheet(
 
     # Keep the bytes only long enough to preview them in the chat (ephemeral).
     try:
-        token = upload_cache.put(data, filename, content_type)
+        token = await upload_cache.put(data, filename, content_type)
     except ValueError as e:
         raise HTTPException(413, str(e)) from e
 
@@ -69,11 +70,10 @@ async def extract_uploaded_sheet(
 @router.post("/attachments/{token}/store", response_model=UploadResult)
 async def store_uploaded_sheet(token: str, db: AsyncSession = Depends(get_db)):
     """Opt-in persistence: only called when the user explicitly confirms they
-    want this chat-uploaded sheet filed. Runs the file through the exact same
-    pipeline as the Upload page (ingest_upload) — extract, match, validate,
-    file — and creates a PipelineFile + TimesheetRecord like any other upload.
+    want this chat-uploaded sheet filed. Runs ingest_upload — extract, match,
+    validate, file — and creates a PipelineFile + TimesheetRecord.
     The ephemeral chat copy is consumed (popped) so it can't be filed twice."""
-    entry = upload_cache.pop(token)
+    entry = await upload_cache.pop(token)
     if not entry:
         raise HTTPException(404, "Attachment expired or not found. Please re-upload it.")
     rec, tracker = await ingest_upload(
@@ -96,7 +96,7 @@ async def store_uploaded_sheet(token: str, db: AsyncSession = Depends(get_db)):
 @router.get("/attachments/{token}/eml-preview")
 async def preview_uploaded_eml(token: str):
     """Parse a chat-uploaded .eml from the ephemeral store (Outlook-style view)."""
-    entry = upload_cache.get(token)
+    entry = await upload_cache.get(token)
     if not entry:
         raise HTTPException(404, "Attachment expired or not found.")
     if not entry.filename.lower().endswith(".eml"):
@@ -108,7 +108,7 @@ async def preview_uploaded_eml(token: str):
 @router.get("/attachments/{token}")
 async def preview_uploaded_sheet(token: str):
     """Serve a chat-uploaded file from the ephemeral store for preview only."""
-    entry = upload_cache.get(token)
+    entry = await upload_cache.get(token)
     if not entry:
         raise HTTPException(404, "Attachment expired or not found.")
     disposition = "inline" if entry.content_type.startswith(
@@ -116,5 +116,5 @@ async def preview_uploaded_sheet(token: str):
     return Response(
         content=entry.data,
         media_type=entry.content_type,
-        headers={"Content-Disposition": f'{disposition}; filename="{entry.filename}"'},
+        headers={"Content-Disposition": content_disposition(disposition, entry.filename)},
     )

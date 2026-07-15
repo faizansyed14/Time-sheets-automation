@@ -41,11 +41,11 @@ async def test_extract_rejects_unsupported_type():
     assert result["status"] == "unsupported_type"
 
 
-def test_upload_cache_roundtrip_and_expiry():
-    tok = upload_cache.put(b"abc", "x.pdf", "application/pdf")
-    entry = upload_cache.get(tok)
+async def test_upload_cache_roundtrip_and_expiry():
+    tok = await upload_cache.put(b"abc", "x.pdf", "application/pdf")
+    entry = await upload_cache.get(tok)
     assert entry and entry.data == b"abc" and entry.filename == "x.pdf"
-    assert upload_cache.get("nope") is None
+    assert await upload_cache.get("nope") is None
 
 
 async def test_extract_endpoint_and_ephemeral_preview(client, admin_token, seed_employee_7001):

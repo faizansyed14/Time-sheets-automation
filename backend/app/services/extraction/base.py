@@ -20,6 +20,7 @@ class TimesheetExtraction:
     annual_leave_dates: list[str] = field(default_factory=list)
     remote_work_dates: list[str] = field(default_factory=list)
     sick_leave_dates: list[str] = field(default_factory=list)
+    maternity_leave_dates: list[str] = field(default_factory=list)
     unpaid_leave_dates: list[str] = field(default_factory=list)
     absent_dates: list[str] = field(default_factory=list)
     public_holiday_dates: list[str] = field(default_factory=list)

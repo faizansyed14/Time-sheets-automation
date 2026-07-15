@@ -27,8 +27,10 @@ async def test_upload_pipeline_and_tracker(client, admin_token):
                            files={"files": ("e2e.pdf", data, "application/pdf")})
     assert up.status_code == 200, up.text
     result = up.json()[0]
-    assert result["status"] in ("success", "needs_review")
+    assert result["status"] == "needs_review"
+    assert result["failure_code"] == "pending_review"
     assert result["employee_name"] == "Tester"
+    assert result["record_id"] is None
 
     # pipeline tracker is paginated and lists the file
     pl = await client.get("/api/v1/pipeline?limit=50", headers=h)

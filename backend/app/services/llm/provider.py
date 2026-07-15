@@ -28,7 +28,7 @@ from app.services.config.service import get_overlay
 PROVIDERS = {
     "openai": {"base": "openai_base_url", "key": "openai_api_key", "model": "gpt-4o"},
     "deepseek": {"base": "deepseek_base_url", "key": "deepseek_api_key", "model": "deepseek-chat"},
-    "vllm": {"base": "vllm_base_url", "key": "vllm_api_key", "model": "qwen3-vl-32b"},
+    "vllm": {"base": "vllm_base_url", "key": "vllm_api_key", "model": "Qwen3.6-35B-A3B"},
 }
 
 
@@ -115,8 +115,7 @@ async def test_provider(db: AsyncSession, provider: str | None, prompt: str) -> 
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.prompts import ChatPromptTemplate
 
-    p, _, base_url, api_key = await _resolve(db, "extraction", provider)
-    model = "gpt-4o-mini" if p == "openai" else (PROVIDERS.get(p) or PROVIDERS["openai"])["model"]
+    p, model, base_url, api_key = await _resolve(db, "extraction", provider)
     if not api_key:
         return {"ok": False, "provider": p, "model": model, "error": "No API key configured for this provider."}
     t0 = time.time()

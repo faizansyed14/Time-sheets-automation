@@ -7,6 +7,7 @@ Non-GPT models fall through to the vLLM chat path.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 
 import httpx
@@ -29,6 +30,25 @@ def vision_provider() -> str:
 
 def validation_provider() -> str:
     return (settings.validation_provider or "openai").strip().lower()
+
+
+def model_for(provider: str, purpose: str = "vision") -> str:
+    """The model to send to THIS provider — never a global one.
+
+    EXTRACTION_MODEL/VALIDATION_MODEL name the self-hosted (vLLM) models;
+    OpenAI gets its own OPENAI_VISION_MODEL / OPENAI_VALIDATION_MODEL. This is
+    what lets the admin flip a service's provider without touching models:
+    sending a vLLM model name to OpenAI just 404s ("model does not exist")."""
+    p = (provider or "openai").strip().lower()
+    if p == "vllm":
+        base = settings.vllm_model or (
+            settings.extraction_model if purpose == "vision" else settings.validation_model)
+        return (base or "").strip()
+    if p == "deepseek":
+        return "deepseek-chat"
+    if purpose == "vision":
+        return (settings.openai_vision_model or "gpt-4o").strip()
+    return (settings.openai_validation_model or "gpt-4o-mini").strip()
 
 
 def _vllm_verify():
@@ -220,7 +240,17 @@ async def _chat_compatible(provider, images_jpeg, prompt, system_prompt, model, 
     payload = {"model": model, "max_tokens": min(settings.vllm_max_tokens, 4096),
                "temperature": settings.vllm_temperature, "messages": messages}
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout), verify=verify) as client:
-        r = await client.post(url, json=payload, headers={"Authorization": auth})
+        # Self-hosted boxes over VPN/wifi drop the odd TCP connect — one quick
+        # retry saves the whole sheet from falling into the slow per-file
+        # fallback (which would call the same flaky endpoint again anyway).
+        for attempt in (1, 2):
+            try:
+                r = await client.post(url, json=payload, headers={"Authorization": auth})
+                break
+            except httpx.ConnectError:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(2)
         if r.status_code != 200:
             raise RuntimeError(f"{provider} returned {r.status_code}: {r.text[:500]}")
         return r.json()

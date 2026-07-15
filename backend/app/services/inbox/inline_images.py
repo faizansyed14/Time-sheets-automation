@@ -14,6 +14,7 @@ extra network requests.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import re
 
@@ -64,24 +65,34 @@ async def inline_cid_images(
     if not refs:
         return body_html, []
 
-    data_uris: dict[str, str] = {}     # cid ref -> data: URI
-    inlined_ids: set[str] = set()
-    for ref in refs:
-        att = _find_attachment(ref, attachments)
-        if not att:
-            continue
+    # Resolve every cid: reference to its attachment first (no I/O), then fetch
+    # ALL of them concurrently — a signature block alone can carry 5-10 inline
+    # images, and fetching them one-by-one from Graph serialises that many
+    # network round trips before the email can even render.
+    pairs = [(ref, att) for ref in refs if (att := _find_attachment(ref, attachments))]
+
+    async def _fetch(ref: str, att: dict) -> tuple[str, str | None]:
         try:
             data, _fn, ctype = await provider.get_attachment_bytes(
                 message_id, att["attachment_id"])
         except Exception:
-            continue
+            return ref, None
         if not data:
-            continue
+            return ref, None
         ctype = (ctype or att.get("content_type") or "image/png").split(";")[0]
         if not ctype.startswith("image/"):
-            continue
+            return ref, None
         b64 = base64.b64encode(data).decode()
-        data_uris[ref] = f"data:{ctype};base64,{b64}"
+        return ref, f"data:{ctype};base64,{b64}"
+
+    results = await asyncio.gather(*(_fetch(ref, att) for ref, att in pairs))
+
+    data_uris: dict[str, str] = {}     # cid ref -> data: URI
+    inlined_ids: set[str] = set()
+    for (ref, att), (_ref2, uri) in zip(pairs, results):
+        if uri is None:
+            continue
+        data_uris[ref] = uri
         inlined_ids.add(att["attachment_id"])
 
     if not data_uris:

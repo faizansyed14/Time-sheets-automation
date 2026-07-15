@@ -253,7 +253,7 @@ export default function PipelinePage() {
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["pipeline"] });
     qc.invalidateQueries({ queryKey: ["pipeline-stats"] });
-    qc.invalidateQueries({ queryKey: ["dashboard"] });
+    qc.invalidateQueries({ queryKey: ["coverage"] });
   };
 
   const resolveMut = useMutation({

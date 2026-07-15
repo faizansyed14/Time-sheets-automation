@@ -41,8 +41,6 @@ _DOC_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
 }
-_MIN_INLINE_BYTES = 6000  # skip tiny inline images (signatures/logos)
-
 _msal_app = None
 
 
@@ -116,7 +114,17 @@ def _is_doc(name: str, ctype: str) -> bool:
     return (ctype in _DOC_TYPES) or n.endswith((".pdf", ".docx", ".xlsx")) or _is_eml(name, ctype)
 
 
-def _classify(name: str, ctype: str, has_doc: bool) -> str:
+# Auto-generated signature/logo images that are never a real screenshot:
+# Outlook's own body-image naming ("image007.png", "Outlook-…") and
+# signature-add-in template icons ("C2_signature_facebook2_<uuid>.png").
+# Same patterns the Inbox UI hides from the attachment strip — kept in sync
+# so "has a real approval screenshot" means the same thing everywhere.
+_GENERIC_IMAGE_RE = re.compile(
+    r"^(image\d{2,3}\.(png|jpe?g|gif)|outlook-.+\.(png|jpe?g|gif|bmp)"
+    r"|c2_signature_.+\.(png|jpe?g|gif))$", re.I)
+
+
+def _classify(name: str, ctype: str, has_doc: bool, is_inline: bool = False) -> str:
     n = (name or "").lower()
     # An .eml/message is a document container — classify it first so it can
     # never be mistaken for an approval screenshot or rendered as a flat image.
@@ -127,8 +135,13 @@ def _classify(name: str, ctype: str, has_doc: bool) -> str:
     if ctype in _DOC_TYPES or n.endswith((".pdf", ".docx", ".xlsx")):
         return "timesheet"
     if (ctype or "").startswith("image/") or n.endswith((".png", ".jpg", ".jpeg")):
-        # an image alongside a real doc is most likely the approval screenshot;
-        # an image on its own is treated as the timesheet itself.
+        # Graph's own "this is embedded in the body" flag is authoritative —
+        # never a real screenshot regardless of name. The filename pattern is
+        # a fallback for providers/rows that predate this flag.
+        if is_inline or _GENERIC_IMAGE_RE.match(name or ""):
+            return "other"  # signature/logo — never a real approval screenshot
+        # a REAL image alongside a real doc is most likely the approval
+        # screenshot; a real image on its own is treated as the timesheet itself.
         return "approval_screenshot" if has_doc else "timesheet"
     return "other"
 
@@ -149,15 +162,15 @@ def _build(msg: dict) -> ProviderMessage:
     atts: list[ProviderAttachment] = []
     for a in files:
         size = a.get("size") or 0
-        if a.get("isInline") and 0 < size < _MIN_INLINE_BYTES:
-            continue
+        is_inline = bool(a.get("isInline"))
         atts.append(ProviderAttachment(
             attachment_id=a["id"],
             filename=a.get("name") or "attachment",
             content_type=a.get("contentType") or "application/octet-stream",
             size=size,
-            kind=_classify(a.get("name"), a.get("contentType"), has_doc),
+            kind=_classify(a.get("name"), a.get("contentType"), has_doc, is_inline),
             cid=a.get("contentId") or None,
+            is_inline=is_inline,
         ))
     for a in items:
         # Treat the forwarded email as a timesheet candidate; its bytes are
@@ -195,7 +208,12 @@ def _build(msg: dict) -> ProviderMessage:
 
 
 _SELECT = "id,subject,from,receivedDateTime,bodyPreview,body,hasAttachments"
-# List view: base attachment type supports these fields in $select
+# List view: base attachment type only supports these fields in $select.
+# contentId is NOT selectable on the base type — Graph 400s
+# ("Could not find a property named 'contentId' on type
+# 'microsoft.graph.attachment'"), verified against the live API — so cid stays
+# unavailable until the detail view's full resync. isInline IS on the base
+# type though, and is what actually fixes the list-vs-detail count mismatch.
 _EXPAND = "attachments($select=id,name,contentType,size,isInline)"
 # Detail view: no $select → Graph returns all fields including contentId on fileAttachment subtype
 _EXPAND_DETAIL = "attachments"

@@ -220,7 +220,7 @@ DATABASE_URL=postgresql+asyncpg://USER:PASS@my-db.xxxx.rds.amazonaws.com:5432/ti
 |---|---|
 | `local` (default) | local disk under `storage/` |
 | `s3` | **AWS S3** (or any S3-compatible store via `S3_ENDPOINT_URL`) |
-| `onedrive` | OneDrive / SharePoint (stub) |
+| `onedrive` | OneDrive / SharePoint (**stub — not implemented; app will fail at startup**) |
 
 Switch to S3 purely from `.env` — no code changes:
 ```

@@ -25,6 +25,7 @@ class AttachmentOut(BaseModel):
     content_type: str
     kind: str
     cid: str | None = None
+    is_inline: bool | None = None
 
 
 class MatchedEmployeeOut(BaseModel):
@@ -49,6 +50,8 @@ class EmailListItem(BaseModel):
     attachment_count: int
     has_approval_screenshot: bool
     extract_email_at: datetime | None = None  # last Extract Email run (any pipeline item)
+    no_sheets_found_at: datetime | None = None  # last run found NOTHING to stage
+    no_sheets_note: str | None = None
 
 
 class EmailDetail(EmailListItem):
@@ -152,12 +155,14 @@ class TimesheetOut(BaseModel):
     annual_leave_dates: list[str]
     remote_work_dates: list[str]
     sick_leave_dates: list[str]
+    maternity_leave_dates: list[str]
     unpaid_leave_dates: list[str]
     absent_dates: list[str]
     public_holiday_dates: list[str]
     annual_leave_count: int
     remote_work_count: int
     sick_leave_count: int
+    maternity_leave_count: int
     unpaid_leave_count: int
     absent_count: int
     public_holiday_count: int
@@ -218,6 +223,7 @@ class TimesheetUpdate(BaseModel):
     annual_leave_dates: list[str] | None = None
     remote_work_dates: list[str] | None = None
     sick_leave_dates: list[str] | None = None
+    maternity_leave_dates: list[str] | None = None
     unpaid_leave_dates: list[str] | None = None
     absent_dates: list[str] | None = None
     public_holiday_dates: list[str] | None = None

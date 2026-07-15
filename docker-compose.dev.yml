@@ -59,9 +59,9 @@ services:
 
   worker:
     build: { context: ./backend }
-    # -B = embedded beat scheduler (AI-check + pipeline-raw purge on the
-    # INBOX_AI_CHECK_INTERVAL_HOURS / PIPELINE_RAW_PURGE_INTERVAL_HOURS cadence
-    # from .env). Keep this a SINGLE replica — beat must not run twice.
+    # -B = embedded beat scheduler (pipeline-raw purge on
+    # PIPELINE_RAW_PURGE_INTERVAL_HOURS from .env). Keep this a SINGLE replica
+    # — beat must not run twice.
     command: celery -A app.core.celery_app.celery_app worker -B --loglevel=info --concurrency=${CELERY_CONCURRENCY:-3}
     env_file: [.env]
     environment:

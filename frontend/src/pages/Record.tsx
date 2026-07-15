@@ -42,6 +42,7 @@ const BUCKETS: { key: keyof TimesheetRecord & string; field: string; label: stri
   { key: "annual_leave_dates", field: "annual_leave_dates", label: "Annual leave", tone: "bg-indigo-50 text-indigo-700 ring-indigo-200" },
   { key: "remote_work_dates", field: "remote_work_dates", label: "Remote / WFH", tone: "bg-sky-50 text-sky-700 ring-sky-200" },
   { key: "sick_leave_dates", field: "sick_leave_dates", label: "Sick leave", tone: "bg-rose-50 text-rose-700 ring-rose-200" },
+  { key: "maternity_leave_dates", field: "maternity_leave_dates", label: "Maternity leave", tone: "bg-fuchsia-50 text-fuchsia-700 ring-fuchsia-200" },
   { key: "unpaid_leave_dates", field: "unpaid_leave_dates", label: "Unpaid leave", tone: "bg-slate-100 text-slate-700 ring-slate-200" },
   { key: "absent_dates", field: "absent_dates", label: "Absent", tone: "bg-amber-50 text-amber-700 ring-amber-200" },
   { key: "public_holiday_dates", field: "public_holiday_dates", label: "Public holiday", tone: "bg-emerald-50 text-emerald-700 ring-emerald-200" },
@@ -92,7 +93,7 @@ export default function RecordPage() {
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["record", id] });
-    qc.invalidateQueries({ queryKey: ["dashboard"] });
+    qc.invalidateQueries({ queryKey: ["coverage"] });
     qc.invalidateQueries({ queryKey: ["pipeline"] });
   };
 
@@ -130,7 +131,7 @@ export default function RecordPage() {
     mutationFn: () => deleteRecord(id!),
     onSuccess: () => {
       toast("info", "Record deleted");
-      qc.invalidateQueries({ queryKey: ["dashboard"] });
+      qc.invalidateQueries({ queryKey: ["coverage"] });
       navigate("/");
     },
   });
