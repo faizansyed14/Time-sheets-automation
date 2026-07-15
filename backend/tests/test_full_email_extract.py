@@ -221,9 +221,11 @@ async def test_pasted_grid_body_reaches_the_model_and_stages():
         assert approval["detected"] and "Sylvia" in approval["detail"]
 
         staged = await fx._stage_groups(
-            db, mail, eml, "kevin.eml", groups, approval,
-            {"method": "vision-batch", "model": "gpt-4o", "batches": 1,
-             "batch_size": 2, "sheet_count": 1, "errors": []})
+            db, source_kind="email", source_id=mail.provider_message_id,
+            raw_bytes=eml, raw_name="kevin.eml", content_type="message/rfc822",
+            groups=groups, approval=approval,
+            run_meta={"method": "vision-batch", "model": "gpt-4o", "batches": 1,
+                      "batch_size": 2, "sheet_count": 1, "errors": []})
         assert staged[0].employee_id == "E2507067" and staged[0].month == 6
 
 

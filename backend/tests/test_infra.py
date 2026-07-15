@@ -39,7 +39,8 @@ async def test_celery_process_upload_eager(client, admin_token):
             "Month: March 2026\n2026-03-03 Annual Leave\n").encode()
     res = process_upload_task.delay("infra.pdf", "text/plain", base64.b64encode(text).decode())
     out = res.get()
-    assert "pipeline_id" in out
+    # The worker task now runs the unified pipeline → stages review items.
+    assert "staged" in out
 
 
 async def test_langchain_model_factory_builds():

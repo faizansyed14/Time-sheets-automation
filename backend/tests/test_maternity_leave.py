@@ -6,11 +6,10 @@ def test_parse_upload_text_detects_maternity_leave():
 ATTENDANCE SHEET
 EMP NO: E2406757
 NAME: Anfal Taj
-MONTH: June
-YEAR: 2026
-1-Jun-26 Maternity Leave
-8-Jun-26 Sick Leave
-22-Jun-26 9:00 AM 5:30 PM 8
+Month: June 2026
+1-Jun-2026 Maternity Leave
+8-Jun-2026 Sick Leave
+22-Jun-2026 9:00 AM 5:30 PM 8
 """
   parsed = _parse_upload_text(text)
   assert parsed is not None

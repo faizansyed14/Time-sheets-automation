@@ -5,8 +5,7 @@ Covers the two guarantees added for cost visibility and email storage:
 
   1. When an .eml carries an attached timesheet (e.g. a forwarded
      "TIMESHEET … .eml" with Sri_Timesheet_May2026.pdf inside), the vault keeps
-     the ORIGINAL .eml AND the extracted attachment AND the extraction_result.json
-     — not just the mail.
+     the ORIGINAL .eml AND the extracted attachment — not just the mail.
   2. Every pipeline file records HOW it was read (extraction_method / model /
      used_ocr) so the tracker can show cost per file.
 """
@@ -107,24 +106,19 @@ async def test_eml_attachment_stored_separately_with_provenance(client, admin_to
     assert fix.status_code == 200, fix.text
     tracked = fix.json()
     assert tracked["status"] == "success"
-    assert tracked["extraction_method"] == "mock"
+    # Upload now runs through the unified extraction pipeline; without a vision
+    # key it falls back to the deterministic per-file engine (the mock in tests).
+    assert tracked["extraction_method"] in ("engine-per-file", "mock")
     assert tracked["used_ocr"] is False
     assert "extraction_model" in tracked
 
     files = _vault_files()
     assert eml_name in files, f"original .eml not stored: {files}"
     assert att_name in files, f"attached sheet not stored separately: {files}"
-    assert "extraction_result.json" in files, f"json result not stored: {files}"
+    assert "extraction_result.json" not in files, f"json sidecar must not be filed: {files}"
 
-    from app.core.config import settings
-    jpath = next(p for p in settings.storage_path.rglob("extraction_result.json"))
-    meta = json.loads(jpath.read_text())
-    assert meta["eml"]["original"] == eml_name
-    assert att_name in meta["eml"]["extracted_attachments"]
-    assert meta["extraction"]["method"] == "mock"
-    assert meta["extraction"]["used_ocr"] is False
-
-    assert tracked["extraction_meta"]["file_type"] == "eml"
+    # Unified flow tracks the source on the pipeline item.
+    assert tracked["extraction_meta"]["source_kind"] == "upload"
 
 
 async def test_nested_email_inside_email_pdf_is_extracted(client, admin_token):

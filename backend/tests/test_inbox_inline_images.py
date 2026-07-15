@@ -47,15 +47,19 @@ async def test_email_detail_endpoint_inlines_logo(client, admin_token):
     assert logo["attachment_id"] in inlined
 
 
-def test_attachment_count_excludes_images():
-    """Part 1: inbox count is documents only (pdf/docx/xlsx/eml), not images/logos."""
+def test_attachment_count_counts_docs_and_real_images_but_not_signature_junk():
+    """Outlook-style count: documents + REAL image attachments (screenshots),
+    but NOT auto-generated signature/logo images (imageNNN / Outlook- /
+    C2_signature_ names, or images referenced inline in the body)."""
     from app.api.routes.inbox import _doc_count, is_doc_attachment
     atts = [
         {"filename": "timesheet.pdf", "content_type": "application/pdf"},
         {"filename": "sheet.docx", "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
-        {"filename": "alpha_data_footer_gradient1.png", "content_type": "image/png"},
-        {"filename": "manager_approval.png", "content_type": "image/png"},
+        {"filename": "manager_approval.png", "content_type": "image/png"},          # real screenshot → counts
         {"filename": "nested.eml", "content_type": "message/rfc822"},
+        {"filename": "image003.png", "content_type": "image/png", "cid": "x"},       # signature junk → excluded
+        {"filename": "C2_signature_facebook2_abc.png", "content_type": "image/png"}, # signature junk → excluded
     ]
-    assert _doc_count(atts) == 3
+    # 2 docs + 1 eml + 1 real screenshot = 4; the two signature images are hidden.
+    assert _doc_count(atts) == 4
     assert is_doc_attachment(atts[0]) and not is_doc_attachment(atts[2])

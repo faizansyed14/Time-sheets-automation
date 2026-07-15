@@ -11,6 +11,7 @@ with start script
 # ---- clear DB data (keeps employees + users) ----
 bash scripts/db/delete-pipeline.sh
 bash scripts/db/delete-records.sh
+bash scripts/db/reset-inbox.sh          # ingested/archived/extracted → new
 
 # ---- setup (once) ----
 ./scripts/create-env.sh LOCAL       # or interactive: ./scripts/create-env.sh
@@ -44,4 +45,11 @@ docker compose -f docker-compose.local.yml exec db psql -U timesheet -d timeshee
 # ---- health ----
 curl -fsS http://localhost:8080/health     # via gateway -> backend
 # App: http://localhost:8080   Login: admin / admin
+
+# ---- tests (must use db host + test DB; backend image must be rebuilt after code changes) ----
+docker compose -f docker-compose.local.yml build backend
+docker compose -f docker-compose.local.yml exec -T \
+  -e TEST_DATABASE_URL=postgresql+asyncpg://timesheet:timesheet@db:5432/timesheet_test \
+  -e CELERY_TASK_ALWAYS_EAGER=true \
+  backend python -m pytest tests/ -q
 

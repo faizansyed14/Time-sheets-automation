@@ -9,7 +9,7 @@ Where the copy lives:
   - otherwise (local/onedrive) -> local disk under settings.pipeline_raw_path
     (data/pipeline_raw/<id>/<file>).
 
-Lifecycle: a copy is created on ingest, READ on retry / resolve-assign, and
+Lifecycle: a copy is created on ingest, READ on retry / manual-fix, and
 DELETED once the file is processed successfully or its pipeline entry is removed.
 So the store only ever holds originals for files that are still awaiting a retry
 (failed / needs-review) — it does not grow without bound.

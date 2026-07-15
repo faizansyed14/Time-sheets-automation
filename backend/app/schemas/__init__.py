@@ -111,25 +111,16 @@ class ChatSuggestions(BaseModel):
 
 
 class DecisionIn(BaseModel):
+    """Archive (accepted=False). Direct accept-and-ingest was removed — every
+    extraction goes through Extract Email + Compare & Fix review."""
     accepted: bool
-    # Timesheet attachment IDs to send through extraction. When omitted on accept,
-    # all attachments classified as timesheet are processed (legacy behaviour).
+
+
+class ExtractFullIn(BaseModel):
+    """Optional scope for Extract Email: when attachment_ids is present, ONLY
+    those sheets (and optionally the body) are analysed — the stored raw copy
+    stays the full .eml. Omit entirely for the whole email."""
     attachment_ids: list[str] | None = None
-    # Optional manager-approval screenshot — only processed when explicitly set.
-    approval_attachment_id: str | None = None
-    # Render email body as image and extract (inline timesheet in message text).
-    extract_body: bool = False
-
-
-class RerunExtractionIn(BaseModel):
-    attachment_ids: list[str]
-    approval_attachment_id: str | None = None
-    extract_body: bool = False
-
-
-class ExtractionPreviewIn(BaseModel):
-    """Run-extraction request — extract selected sources (attachments / body)."""
-    attachment_ids: list[str] = []
     extract_body: bool = False
 
 
@@ -178,6 +169,15 @@ class TimesheetOut(BaseModel):
     source_file_count: int = 0
 
 
+class TimesheetExportOut(TimesheetOut):
+    """Timesheet row plus matcher fields for the Export page / XLSX."""
+    location: str | None = None
+    project: str | None = None
+    employee_email: str | None = None
+    contact_no: str | None = None
+    has_record: bool = True
+
+
 class DashboardRow(BaseModel):
     employee_pk: str | None
     employee_id: str | None
@@ -195,6 +195,10 @@ class DashboardRow(BaseModel):
     submitted_months: list[int] = []
     in_matcher: bool = True
     has_records: bool = True
+    # Record for the dashboard's focus month+year (one-click open from the table).
+    focus_record_id: str | None = None
+    focus_validation_status: str | None = None
+    focus_approval_status: str | None = None
 
 
 class DashboardSummary(BaseModel):
@@ -324,13 +328,6 @@ class PipelineStats(BaseModel):
 
 
 class PipelineResolveIn(BaseModel):
-    note: str | None = None
-
-
-class PipelineResolveAssignIn(BaseModel):
-    employee_pk: str
-    month: int
-    year: int
     note: str | None = None
 
 

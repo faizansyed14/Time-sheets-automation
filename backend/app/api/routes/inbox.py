@@ -17,19 +17,16 @@ from app.core.cache import cache
 from app.core.http_headers import content_disposition
 from app.models.email_message import EmailMessage, EmailStatus
 from app.models.pipeline_file import PipelineFile
-from app.models.timesheet_record import TimesheetRecord
 from app.schemas import (
     AttachmentOut,
     DecisionIn,
     EmailDetail,
     EmailListItem,
-    ExtractionPreviewIn,
+    ExtractFullIn,
     Page,
     PipelineFileOut,
-    RerunExtractionIn,
 )
 from app.services.email_provider import get_email_provider
-from app.services.pipeline.ingestion import IngestSelectionError, ingest_email, stage_email_extraction
 
 router = APIRouter(prefix="/inbox", tags=["inbox"])
 
@@ -373,18 +370,25 @@ async def preview_as_eml(provider_message_id: str, db: AsyncSession = Depends(ge
 
 
 @router.post("/{provider_message_id}/extract-full")
-async def extract_full(provider_message_id: str, db: AsyncSession = Depends(get_db)):
+async def extract_full(provider_message_id: str,
+                       body: ExtractFullIn | None = None,
+                       db: AsyncSession = Depends(get_db)):
     """Extract Email — the one-button flow: convert the whole email to a full
     .eml, analyse EVERY sheet inside it (attachments, forwarded emails and
     their attachments, pasted body grids) with the vision model in batches,
     detect manager signatures / approval screenshots, group the results per
     employee + month, and stage one pending-review pipeline item per group.
-    Nothing is filed until Accept in Compare & Fix."""
+    With a body carrying `attachment_ids`, ONLY the selected sheets (and
+    optionally the email body) are analysed — the stored raw copy stays the
+    full .eml. Nothing is filed until Accept in Compare & Fix."""
     from app.api.routes.pipeline import _out as _pipeline_out
     from app.services.agents.full_email_extract import extract_full_email
     row = await _email_row_or_404(db, provider_message_id)
     try:
-        res = await extract_full_email(db, row)
+        res = await extract_full_email(
+            db, row,
+            attachment_ids=(body.attachment_ids if body else None),
+            extract_body=bool(body.extract_body) if body else False)
     except HTTPException:
         raise
     except Exception as e:
@@ -483,33 +487,6 @@ async def get_attachment_eml_preview(provider_message_id: str, attachment_id: st
     return parse_eml(data)
 
 
-@router.post("/{provider_message_id}/stage-extraction", response_model=list[PipelineFileOut])
-async def stage_extraction(
-    provider_message_id: str,
-    body: ExtractionPreviewIn,
-    db: AsyncSession = Depends(get_db),
-):
-    """Run Extraction: extract the selected attachments (and optionally the
-    email body) and STAGE them in the pipeline as needs-review items carrying
-    the AI-extracted leaves — without filing a record yet. The frontend then
-    opens the existing Compare & Fix overlay to review/edit and Accept (file)
-    or Reject (leave staged in the pipeline)."""
-    from app.api.routes.pipeline import _out as _pipeline_out
-
-    provider = get_email_provider()
-    msg = await provider.get_message(provider_message_id)
-    if not msg:
-        raise HTTPException(404, "Email not found")
-    row = await _sync_message(db, msg)
-    await db.commit()
-    await db.refresh(row)
-
-    staged = await stage_email_extraction(
-        db, row, attachment_ids=body.attachment_ids, extract_body=body.extract_body)
-    await datacache.bust_pipeline()
-    return [_pipeline_out(t) for t in staged]
-
-
 @router.post("/{provider_message_id}/decision")
 async def decide(provider_message_id: str, body: DecisionIn, db: AsyncSession = Depends(get_db)):
     provider = get_email_provider()
@@ -525,24 +502,17 @@ async def decide(provider_message_id: str, body: DecisionIn, db: AsyncSession = 
     if row.status == EmailStatus.ARCHIVED and not body.accepted:
         raise HTTPException(409, "Email already archived. Use /restore to reopen.")
 
-    if not body.accepted:
-        row.status = EmailStatus.ARCHIVED
-        row.decided_at = datetime.now(timezone.utc)
-        await db.commit()
-        return {"status": "archived", "records_created": 0}
+    if body.accepted:
+        # Instant filing is gone by design: every extraction goes through
+        # Compare & Fix review. Use Extract Email (full or selected).
+        raise HTTPException(
+            400, "Direct accept was removed — run Extract Email and review the "
+                 "staged items instead.")
 
-    try:
-        records = await ingest_email(
-            db, row,
-            attachment_ids=body.attachment_ids,
-            approval_attachment_id=body.approval_attachment_id,
-            extract_body=body.extract_body,
-        )
-    except IngestSelectionError as e:
-        raise HTTPException(400, str(e)) from e
-    await datacache.bust_pipeline()
-    return {"status": "ingested", "records_created": len(records),
-            "record_ids": [r.id for r in records]}
+    row.status = EmailStatus.ARCHIVED
+    row.decided_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {"status": "archived", "records_created": 0}
 
 
 @router.post("/{provider_message_id}/restore")
@@ -574,37 +544,3 @@ async def restore_email(provider_message_id: str, db: AsyncSession = Depends(get
     return {"status": "new", "id": row.id, "provider_message_id": row.provider_message_id}
 
 
-@router.post("/{provider_message_id}/rerun")
-async def rerun_extraction(
-    provider_message_id: str,
-    body: RerunExtractionIn,
-    db: AsyncSession = Depends(get_db),
-):
-    """Wipe existing month folders for related records and re-run selected attachments."""
-    row = (await db.execute(select(EmailMessage).where(EmailMessage.provider_message_id == provider_message_id))).scalar_one_or_none()
-    if not row:
-        raise HTTPException(404, "Email session not found")
-    if row.status != EmailStatus.INGESTED:
-        raise HTTPException(400, "Only accepted emails can be re-run")
-
-    recs = (await db.execute(select(TimesheetRecord).where(TimesheetRecord.source_email_id == provider_message_id))).scalars().all()
-
-    from app.services import storage_provider as sp
-    for r in recs:
-        if r.storage_folder:
-            try:
-                sp.get_storage_provider().delete_folder(r.storage_folder)
-            except Exception:
-                pass
-
-    try:
-        records = await ingest_email(
-            db, row,
-            attachment_ids=body.attachment_ids,
-            approval_attachment_id=body.approval_attachment_id,
-            extract_body=body.extract_body,
-        )
-    except IngestSelectionError as e:
-        raise HTTPException(400, str(e)) from e
-    await datacache.bust_pipeline()
-    return {"status": "re-ingested", "records_count": len(records)}

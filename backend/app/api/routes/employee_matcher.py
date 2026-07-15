@@ -34,8 +34,7 @@ async def list_employees(db: AsyncSession = Depends(get_db)):
         rows = (await db.execute(select(Employee).order_by(Employee.name))).scalars().all()
         return [_out(e).model_dump() for e in rows]
 
-    # Cached — the matcher list is read on the Employees page and in the
-    # resolve-assign modal; busted whenever a row is added/edited/deleted/imported.
+    # Cached — the matcher list is read on the Employees page and Compare & Fix.
     return await datacache.get_or_set(
         datacache.NS_EMPLOYEES, "list", datacache.TTL_EMPLOYEES, _compute)
 

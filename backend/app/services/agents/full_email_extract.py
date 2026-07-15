@@ -140,6 +140,19 @@ Special case — the sheet named "(email body)" is the message text itself:
 
 Never invent values — when unsure, use null / empty. Reply with ONLY the requested JSON."""
 
+# Admin-editable override (Admin → Settings → Prompts). Applied by the config
+# service; empty/None means "use the built-in prompt above".
+_SYSTEM_PROMPT_OVERRIDE: str | None = None
+
+
+def set_system_prompt_override(value: str | None) -> None:
+    global _SYSTEM_PROMPT_OVERRIDE
+    _SYSTEM_PROMPT_OVERRIDE = (value or "").strip() or None
+
+
+def system_prompt() -> str:
+    return _SYSTEM_PROMPT_OVERRIDE or _SYSTEM_PROMPT
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -160,45 +173,67 @@ class SheetUnit:
 
 
 # --------------------------------------------------------------------------- #
-# 1) Collect every sheet inside the full .eml
+# 1) Collect sheets — from a full .eml, a selection, or one uploaded file.
+#    EVERY entry point builds SheetUnits the same way (images + text + OCR),
+#    so Upload / chat / selected-attachments behave exactly like Extract Email.
 # --------------------------------------------------------------------------- #
-def _collect_units(email: EmailMessage, eml_bytes: bytes) -> list[SheetUnit]:
+def _unit_from_bytes(name: str, ftype: str, payload: bytes) -> SheetUnit | None:
+    """One document → one analysable unit: page images (capped), the digital
+    text layer, and an OCR fallback for scans/photos so the model is always
+    grounded by text when any can be produced."""
+    from app.services.extraction import ocr
+    from app.services.extraction.file_processor import extract_document_text, to_images
+
+    try:
+        images = to_images(ftype, payload)[:_MAX_PAGES_PER_SHEET]
+    except Exception:
+        images = []
+    text = ""
+    try:
+        text = extract_document_text(ftype, payload) or ""
+    except Exception:
+        pass
+    if not text.strip() and images and ocr.ocr_status() == "ready":
+        try:
+            text = ocr.ocr_text(images, payload, ftype) or ""
+        except Exception:
+            pass
+    if images or text.strip():
+        return SheetUnit(name or "attachment", ftype, payload, images, text.strip())
+    return None
+
+
+def _body_unit(subject: str | None, body_text: str | None) -> SheetUnit | None:
+    """The email body rendered as its own sheet (pasted grids are common)."""
+    from app.services.extraction.file_processor import email_body_to_images
+
+    body = (body_text or "").strip()
+    if not body:
+        return None
+    try:
+        imgs = email_body_to_images(subject, body_text)
+    except Exception:
+        imgs = []
+    if imgs:
+        return SheetUnit("(email body)", "image", imgs[0],
+                         imgs[:_MAX_PAGES_PER_SHEET], body[:12000])
+    return None
+
+
+def _collect_units(email, eml_bytes: bytes) -> list[SheetUnit]:
     """EVERY document inside the .eml (attachments, forwarded emails and their
     attachments) plus the email body — no heuristic filtering; the vision
     model decides what each sheet is."""
-    from app.services.extraction import ocr
-    from app.services.extraction.file_processor import (
-        email_body_to_images, eml_all_attachments, extract_document_text, to_images,
-    )
+    from app.services.extraction.file_processor import eml_all_attachments
 
     units: list[SheetUnit] = []
     for name, payload, ftype in eml_all_attachments(eml_bytes)[:_MAX_SHEETS]:
-        try:
-            images = to_images(ftype, payload)[:_MAX_PAGES_PER_SHEET]
-        except Exception:
-            images = []
-        text = ""
-        try:
-            text = extract_document_text(ftype, payload) or ""
-        except Exception:
-            pass
-        if not text.strip() and images and ocr.ocr_status() == "ready":
-            try:
-                text = ocr.ocr_text(images, payload, ftype) or ""
-            except Exception:
-                pass
-        if images or text.strip():
-            units.append(SheetUnit(name or "attachment", ftype, payload, images, text.strip()))
-
-    body = (email.body_text or "").strip()
-    if body:
-        try:
-            imgs = email_body_to_images(email.subject, email.body_text)
-        except Exception:
-            imgs = []
-        if imgs:
-            units.append(SheetUnit("(email body)", "image", imgs[0],
-                                   imgs[:_MAX_PAGES_PER_SHEET], body[:12000]))
+        u = _unit_from_bytes(name, ftype, payload)
+        if u:
+            units.append(u)
+    bu = _body_unit(email.subject, email.body_text)
+    if bu:
+        units.append(bu)
     return units
 
 
@@ -478,7 +513,11 @@ async def _analyse_units(email: EmailMessage, units: list[SheetUnit]) -> tuple[l
     provider = vision_client.vision_provider()
     model = vision_client.model_for(provider, "vision")
     _, _, api_key, _, _ = vision_client._chat_endpoint(provider)
-    use_vision = bool(api_key) and api_key.lower() != "change-me"
+    # EXTRACTION_ENGINE gates the real vision call: "vision" uses the model,
+    # "mock" (tests, keyless dev) goes straight to the deterministic per-sheet
+    # engine — no network, no timeout waits.
+    use_vision = (settings.extraction_engine == "vision"
+                  and bool(api_key) and api_key.lower() != "change-me")
     sheets: list[dict | None] = [None] * len(units)
     batches = 0
     errors: list[str] = []
@@ -500,11 +539,11 @@ async def _analyse_units(email: EmailMessage, units: list[SheetUnit]) -> tuple[l
             try:
                 if provider == "openai":
                     raw = await vision_client._openai_by_images(
-                        images, _batch_prompt(email, batch), _SYSTEM_PROMPT,
+                        images, _batch_prompt(email, batch), system_prompt(),
                         model, detail, api_key)
                 else:
                     raw = await vision_client._chat_compatible(
-                        provider, images, _batch_prompt(email, batch), _SYSTEM_PROMPT,
+                        provider, images, _batch_prompt(email, batch), system_prompt(),
                         model, detail)
                 parsed = extract_json_from_vllm_response(raw)
                 entries = parsed.get("sheets") if isinstance(parsed, dict) else None
@@ -705,17 +744,21 @@ async def _group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict
 # 5) Stage — one pending-review item per group, raw copy = the full .eml
 # --------------------------------------------------------------------------- #
 async def _stage_groups(
-    db: AsyncSession, email: EmailMessage, eml_bytes: bytes, eml_name: str,
+    db: AsyncSession, *, source_kind: str, source_id: str,
+    raw_bytes: bytes, raw_name: str, content_type: str,
     groups: list[dict], approval: dict, run_meta: dict,
 ) -> list[PipelineFile]:
+    """One pending-review item per employee+month group — the SINGLE staging
+    path for every entry point (Extract Email, selected attachments, Upload,
+    chat store). The raw copy previewed in Compare & Fix is the whole source
+    (.eml or the uploaded file)."""
     from app.services.extraction.validation import summarize as summarize_record
     from app.services.extraction.validation import validate
     from app.services.pipeline import raw_store
 
-    msg_id = email.provider_message_id
     existing = (await db.execute(select(PipelineFile).where(
-        PipelineFile.source_kind == "email",
-        PipelineFile.source_id == msg_id,
+        PipelineFile.source_kind == source_kind,
+        PipelineFile.source_id == source_id,
         PipelineFile.attachment_id.like(f"{_TAG_PREFIX}%"),
         PipelineFile.failure_code == FailureCode.PENDING_REVIEW,
     ))).scalars().all()
@@ -734,21 +777,21 @@ async def _stage_groups(
         flags = list(dict.fromkeys(g["overlap_flags"] + g["fold_notes"] + val_flags))
         summary = f"{summary} {approval['detail']}"
 
-        display = eml_name if len(groups) == 1 else \
-            f"{g['name'] or 'Unassigned sheets'} — {eml_name}"
+        display = raw_name if len(groups) == 1 else \
+            f"{g['name'] or 'Unassigned sheets'} — {raw_name}"
         tag = g["tag"]
         used.add(tag)
         t = by_tag.get(tag)
         if t is None:
             t = PipelineFile(
-                filename=display, content_type="message/rfc822",
-                size_bytes=len(eml_bytes), source_kind="email",
-                source_id=msg_id, attachment_id=tag)
+                filename=display, content_type=content_type,
+                size_bytes=len(raw_bytes), source_kind=source_kind,
+                source_id=source_id, attachment_id=tag)
             db.add(t)
             await db.flush()
         t.filename = display
         if not t.raw_path:
-            t.raw_path = raw_store.save_raw(t.id, eml_name, eml_bytes)
+            t.raw_path = raw_store.save_raw(t.id, raw_name, raw_bytes)
         t.employee_id = g["employee_id"]
         t.employee_name = g["name"]
         t.month, t.year = month, year
@@ -782,7 +825,7 @@ async def _stage_groups(
                     "leave_days": sum(len(v) for v in s["buckets"].values()),
                 } for s in g["sheets"]],
             },
-            "source_kind": "email",
+            "source_kind": source_kind,
         }
         total = sum(len(v) for v in cleaned.values())
         t.events = (t.events or []) + [{
@@ -815,57 +858,22 @@ async def _mark_no_sheets(db: AsyncSession, email: EmailMessage, note: str) -> N
 
 
 # --------------------------------------------------------------------------- #
-# Entry point
+# Entry points — Extract Email (full or selected), Upload, and chat analysis.
+# All of them run the SAME pipeline: units → analyse → approval → group →
+# stage NEEDS_REVIEW. Nothing files a record without a human Accept.
 # --------------------------------------------------------------------------- #
-async def extract_full_email(db: AsyncSession, email: EmailMessage) -> dict:
-    """The whole flow. Returns
-    {staged, groups, sheets, employees, approval, message}."""
-    from app.services.email_provider import get_email_provider
-    from app.services.inbox.eml_export import build_full_eml
+@dataclass
+class _SourceCtx:
+    """Duck-typed stand-in for an EmailMessage when the source is an uploaded
+    file: the analysis pipeline only reads these attributes."""
+    subject: str | None = None
+    body_text: str | None = None
+    sender_email: str | None = None
+    provider_message_id: str | None = None
 
-    eml_bytes, eml_name = await build_full_eml(get_email_provider(), email)
-    units = _collect_units(email, eml_bytes)
-    if not units:
-        message = "No readable sheets found inside this email."
-        await _mark_no_sheets(db, email, message)
-        return {"staged": [], "groups": 0, "sheets": [], "employees": [],
-                "approval": {"detected": False, "detail": "No sheets to check."},
-                "message": message}
 
-    sheets, run_meta = await _analyse_units(email, units)
-    approval = _detect_approval(email, sheets,
-                                used_vision=run_meta["method"].startswith("vision"))
-    groups = await _group_sheets(db, email, sheets)
-    if not groups:
-        kinds = ", ".join(f"{s['name']} ({s['kind']})" for s in sheets)
-        message = f"Nothing to stage — no timesheet or certificate found ({kinds})."
-        await _mark_no_sheets(db, email, message)
-        return {"staged": [], "groups": 0,
-                "sheets": [{"filename": s["name"], "kind": s["kind"],
-                            "employee": s["employee_name"]} for s in sheets],
-                "employees": [], "approval": approval,
-                "message": message}
-
-    # This run DID find something — clear a stale "no sheets" mark from an
-    # earlier attempt (e.g. the email was re-processed after attachments
-    # became readable).
-    if email.no_sheets_found_at is not None:
-        email.no_sheets_found_at = None
-        email.no_sheets_note = None
-        await db.commit()
-
-    staged = await _stage_groups(db, email, eml_bytes, eml_name, groups, approval, run_meta)
-
+def _result(staged, groups, sheets, approval, message) -> dict:
     employees = [g["name"] for g in groups if g["name"]]
-    n_sheets = sum(len(g["sheets"]) for g in groups)
-    if len(groups) == 1:
-        who = employees[0] if employees else "an unidentified employee"
-        message = (f"{n_sheets} sheet(s) extracted for {who} → 1 item to review. "
-                   f"{approval['detail']}")
-    else:
-        message = (f"{n_sheets} sheet(s) across {len(groups)} employee/month group(s) "
-                   f"({', '.join(employees) or 'names pending'}) → {len(groups)} items "
-                   f"to review. {approval['detail']}")
     return {
         "staged": staged,
         "groups": len(groups),
@@ -875,3 +883,163 @@ async def extract_full_email(db: AsyncSession, email: EmailMessage) -> dict:
         "approval": approval,
         "message": message,
     }
+
+
+def _staged_message(groups: list[dict], approval: dict) -> str:
+    employees = [g["name"] for g in groups if g["name"]]
+    n_sheets = sum(len(g["sheets"]) for g in groups)
+    if len(groups) == 1:
+        who = employees[0] if employees else "an unidentified employee"
+        return (f"{n_sheets} sheet(s) extracted for {who} → 1 item to review. "
+                f"{approval['detail']}")
+    return (f"{n_sheets} sheet(s) across {len(groups)} employee/month group(s) "
+            f"({', '.join(employees) or 'names pending'}) → {len(groups)} items "
+            f"to review. {approval['detail']}")
+
+
+async def _selected_units(email: EmailMessage, attachment_ids: list[str],
+                          extract_body: bool) -> list[SheetUnit]:
+    """Units for ONLY the selected attachments (and optionally the body) —
+    the 'process just these sheets' variant of Extract Email."""
+    from app.services.email_provider import get_email_provider
+
+    provider = get_email_provider()
+    from app.services.extraction.file_processor import detect_file_type
+
+    units: list[SheetUnit] = []
+    for aid in attachment_ids[:_MAX_SHEETS]:
+        try:
+            data, fn, _ct = await provider.get_attachment_bytes(
+                email.provider_message_id, aid)
+        except FileNotFoundError:
+            continue
+        if not data:
+            continue
+        ftype = detect_file_type(fn or "", data)
+        if not ftype:
+            continue
+        u = _unit_from_bytes(fn or aid, ftype, data)
+        if u:
+            units.append(u)
+    if extract_body:
+        bu = _body_unit(email.subject, email.body_text)
+        if bu:
+            units.append(bu)
+    return units
+
+
+async def extract_full_email(
+    db: AsyncSession, email: EmailMessage, *,
+    attachment_ids: list[str] | None = None, extract_body: bool = False,
+) -> dict:
+    """Extract Email. With `attachment_ids`, only the selected sheets (and
+    optionally the body) are analysed — but the stored raw copy stays the FULL
+    .eml so the review preview always shows the whole email. Returns
+    {staged, groups, sheets, employees, approval, message}."""
+    from app.services.email_provider import get_email_provider
+    from app.services.inbox.eml_export import build_full_eml
+
+    selected = attachment_ids is not None
+    eml_bytes, eml_name = await build_full_eml(get_email_provider(), email)
+    units = (await _selected_units(email, attachment_ids, extract_body)
+             if selected else _collect_units(email, eml_bytes))
+    if not units:
+        message = ("No readable sheets in the selection." if selected
+                   else "No readable sheets found inside this email.")
+        if not selected:
+            await _mark_no_sheets(db, email, message)
+        return _result([], [], [],
+                       {"detected": False, "detail": "No sheets to check."}, message)
+
+    sheets, run_meta = await _analyse_units(email, units)
+    approval = _detect_approval(email, sheets,
+                                used_vision=run_meta["method"].startswith("vision"))
+    groups = await _group_sheets(db, email, sheets)
+    if not groups:
+        kinds = ", ".join(f"{s['name']} ({s['kind']})" for s in sheets)
+        message = f"Nothing to stage — no timesheet or certificate found ({kinds})."
+        if not selected:
+            await _mark_no_sheets(db, email, message)
+        return _result([], [], sheets, approval, message)
+
+    # This run DID find something — clear a stale "no sheets" mark from an
+    # earlier attempt (e.g. the email was re-processed after attachments
+    # became readable).
+    if email.no_sheets_found_at is not None:
+        email.no_sheets_found_at = None
+        email.no_sheets_note = None
+        await db.commit()
+
+    staged = await _stage_groups(
+        db, source_kind="email", source_id=email.provider_message_id,
+        raw_bytes=eml_bytes, raw_name=eml_name, content_type="message/rfc822",
+        groups=groups, approval=approval, run_meta=run_meta)
+    return _result(staged, groups, sheets, approval,
+                   _staged_message(groups, approval))
+
+
+def _units_from_upload(filename: str, data: bytes) -> tuple[_SourceCtx, list[SheetUnit]]:
+    """Uploaded bytes → (context, units). An uploaded .eml unpacks exactly like
+    Extract Email (attachments + forwarded emails + body); anything else is one
+    sheet."""
+    from app.services.extraction.file_processor import detect_file_type
+
+    ftype = detect_file_type(filename, data)
+    if ftype == "eml":
+        import email as email_lib
+        from email import policy
+        subject, body_text = filename, None
+        try:
+            msg = email_lib.message_from_bytes(data, policy=policy.default)
+            subject = str(msg["subject"] or filename)
+            body = msg.get_body(preferencelist=("plain",))
+            body_text = body.get_content() if body else None
+        except Exception:
+            pass
+        ctx = _SourceCtx(subject=subject, body_text=body_text)
+        return ctx, _collect_units(ctx, data)
+    ctx = _SourceCtx(subject=filename)
+    if not ftype:
+        return ctx, []
+    u = _unit_from_bytes(filename, ftype, data)
+    return ctx, [u] if u else []
+
+
+async def analyse_upload(db: AsyncSession, *, filename: str, data: bytes) -> dict:
+    """Analysis WITHOUT staging (chat preview): the same pipeline, returning
+    {sheets, groups, approval, run_meta}. Nothing is persisted."""
+    ctx, units = _units_from_upload(filename, data)
+    if not units:
+        return {"sheets": [], "groups": [], "run_meta": {"method": "none"},
+                "approval": {"detected": False, "detail": "No readable sheets."}}
+    sheets, run_meta = await _analyse_units(ctx, units)
+    approval = _detect_approval(ctx, sheets,
+                                used_vision=run_meta["method"].startswith("vision"))
+    groups = await _group_sheets(db, ctx, sheets)
+    return {"sheets": sheets, "groups": groups, "approval": approval,
+            "run_meta": run_meta}
+
+
+async def extract_upload(
+    db: AsyncSession, *, filename: str, content_type: str, data: bytes,
+    source_id: str | None = None,
+) -> dict:
+    """Upload page / chat store: the SAME flow as Extract Email for an uploaded
+    file — every sheet analysed, grouped per employee+month, staged for
+    Compare & Fix review. Returns the same shape as extract_full_email."""
+    import uuid as _uuid
+
+    res = await analyse_upload(db, filename=filename, data=data)
+    sheets, groups, approval = res["sheets"], res["groups"], res["approval"]
+    if not groups:
+        kinds = ", ".join(f"{s['name']} ({s['kind']})" for s in sheets) or "nothing readable"
+        message = f"Nothing to stage — no timesheet or certificate found ({kinds})."
+        return _result([], [], sheets, approval, message)
+
+    staged = await _stage_groups(
+        db, source_kind="upload",
+        source_id=source_id or f"upload:{_uuid.uuid4().hex[:12]}",
+        raw_bytes=data, raw_name=filename, content_type=content_type,
+        groups=groups, approval=approval, run_meta=res["run_meta"])
+    return _result(staged, groups, sheets, approval,
+                   _staged_message(groups, approval))

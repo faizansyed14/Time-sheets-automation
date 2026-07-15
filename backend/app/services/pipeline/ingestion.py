@@ -1,36 +1,26 @@
 """
-Ingestion pipeline — shared by email Accept, Upload (stage → review), and
-Agentic Chat store (direct file).
+Record filing + pipeline-tracker plumbing.
 
-Core unit: ingest_timesheet_bytes(...) takes one timesheet's bytes and walks it
-through tracked stages (every file gets a PipelineFile audit row):
+EXTRACTION lives in services/agents/full_email_extract.py — the ONE pipeline
+every entry point uses (Extract Email, selected attachments, Upload page,
+chat store). It stages NEEDS_REVIEW items; nothing here runs an LLM.
 
-  received -> protection_check -> extraction (LLM) -> identification
-  -> matching -> validation -> filing -> recorded
-
-Outcomes:
-  - success       record created (or merged into the month's record)
-  - needs_review  record created but flagged (validation mismatch, ID/name
-                  disagreement, storage problem)
-  - failed        nothing recorded; failure_code says exactly where it died
-                  (protected_pdf, llm_failed, name_not_found, month_not_found,
-                   employee_not_matched, ambiguous_id, unsupported_type, ...)
+This module owns what happens around review:
+  - ingest_manual_entry: the reviewer's Accept (Compare & Fix / manual form)
+    — files the record, unions multi-file months, writes the vault.
+  - retry / resolve-with-employee: re-analyse via the shared pipeline and
+    re-stage, or file under a reviewer-chosen employee.
+  - raw-copy storage helpers + tracker event helpers.
 
 MULTI-FILE MONTHS: clients sending weekly / 15-day sheets produce several files
 for the same employee + month. Each file's extracted buckets are stored as an
 entry in TimesheetRecord.source_files and the record's buckets are the UNION of
 all entries — so a second file MERGES into the month instead of being treated
 as a duplicate. Re-uploading the same file replaces its own entry (idempotent).
-
-DUPLICATE IDs (AUH vs DXB): matching uses employee_id AND name (see
-services/matching.py); an ID shared across teams is resolved by the name, and
-an unresolvable one fails as `ambiguous_id` instead of filing under the wrong
-person.
 """
 from __future__ import annotations
 
 import calendar
-import json as _json
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -41,21 +31,11 @@ from app.models.email_message import EmailMessage, EmailStatus
 from app.models.employee import Employee
 from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
 from app.models.timesheet_record import ApprovalStatus, TimesheetRecord, ValidationStatus
-from app.services.pipeline import matching
 from app.services.pipeline import raw_store
 from app.services import storage_provider as sp
 from app.services.email_provider import get_email_provider
-from app.services.extraction import get_extraction_engine
-from app.services.extraction.base import ApprovalExtraction
-from app.services.extraction.file_processor import (
-    detect_file_type,
-    email_body_to_images,
-    eml_all_attachments,
-    eml_body_to_images,
-)
 from app.services.extraction.validation import summarize as summarize_record
 from app.services.extraction.validation import validate
-from app.services.pipeline.matching import MatchCode
 
 BUCKET_FIELDS = {
     "annual": "annual_leave_dates",
@@ -142,20 +122,6 @@ def relocate_legacy_pipeline_raw() -> None:
         pass
 
 
-def _pdf_is_protected(data: bytes) -> bool:
-    """True if the PDF needs a password to open."""
-    try:
-        import fitz  # PyMuPDF
-        doc = fitz.open(stream=data, filetype="pdf")
-        try:
-            return bool(doc.needs_pass)
-        finally:
-            doc.close()
-    except Exception:
-        # PyMuPDF unavailable/failed — fall back to a byte scan.
-        return b"/Encrypt" in data
-
-
 # ---------------------------------------------------------------------------
 # Multi-file month merging
 # ---------------------------------------------------------------------------
@@ -222,643 +188,6 @@ async def _find_existing(
 # ---------------------------------------------------------------------------
 # The core unit
 # ---------------------------------------------------------------------------
-async def ingest_timesheet_bytes(
-    db: AsyncSession, *, data: bytes, filename: str, content_type: str,
-    approval_detected: bool, approval_detail: str, approval_bytes: bytes | None,
-    approval_name: str, source_id: str | None, attachment_id: str | None = None,
-    source_kind: str = "upload", tracker: PipelineFile | None = None,
-    manual_employee_pk: str | None = None,
-    email_employee_pk: str | None = None,
-    manual_month: int | None = None,
-    manual_year: int | None = None,
-    resolution_note: str | None = None,
-) -> tuple[TimesheetRecord | None, PipelineFile]:
-    """Process one timesheet file. Always returns the PipelineFile audit row;
-    the TimesheetRecord is None when the file failed before being recorded."""
-    # ---- stage: received ----
-    if tracker is None:
-        tracker = PipelineFile(
-            filename=filename, content_type=content_type, size_bytes=len(data or b""),
-            source_kind=source_kind, source_id=source_id, attachment_id=attachment_id,
-        )
-        db.add(tracker)
-        # Populate the primary key now so the raw-copy folder (data/pipeline_raw/<id>/)
-        # has a real id — otherwise uploads could never be retried.
-        await db.flush()
-    else:  # retry: reset the previous outcome
-        tracker.status = PipelineStatus.PROCESSING
-        tracker.failure_code = None
-        tracker.failure_detail = None
-        tracker.resolved_at = None
-        tracker.resolution_note = None
-    _event(tracker, PipelineStage.RECEIVED, "ok",
-           f"Received {filename} ({len(data or b'')} bytes) from {source_kind}.")
-    if not tracker.raw_path:
-        _save_raw_copy(tracker, filename, data or b"")
-
-    # ---- stage: protection / type check ----
-    if not data:
-        _fail(tracker, PipelineStage.PROTECTION_CHECK, FailureCode.EMPTY_FILE,
-              "The file is empty (0 bytes).")
-        return None, tracker
-    ftype = detect_file_type(filename, data)
-    if ftype == "unknown":
-        _fail(tracker, PipelineStage.PROTECTION_CHECK, FailureCode.UNSUPPORTED_TYPE,
-              f"Unsupported file type for '{filename}'. Accepted: PDF, DOCX, XLSX, image, EML.")
-        return None, tracker
-    if ftype == "pdf" and _pdf_is_protected(data):
-        _fail(tracker, PipelineStage.PROTECTION_CHECK, FailureCode.PROTECTED_PDF,
-              "This PDF is password-protected and cannot be read. "
-              "Ask the sender for an unprotected copy (or the password) and retry.")
-        return None, tracker
-    _event(tracker, PipelineStage.PROTECTION_CHECK, "ok",
-           f"File type '{ftype}' accepted; not password-protected.")
-
-    # ---- stage: extraction (LLM) ----
-    engine = get_extraction_engine()
-    try:
-        ext = await engine.extract_timesheet(
-            data, filename, content_type, source_id or "", attachment_id or filename)
-    except Exception as e:  # missing key, API/network error, bad file ...
-        _fail(tracker, PipelineStage.EXTRACTION, FailureCode.LLM_FAILED,
-              f"The extraction model failed on this file: {str(e)[:300]}")
-        return None, tracker
-    # Record how this file was read so the tracker can show cost/provenance
-    # (which GPT model, deterministic-no-LLM, or local OCR) per file.
-    tracker.extraction_model = getattr(ext, "extraction_model", None)
-    tracker.extraction_method = getattr(ext, "extraction_method", None)
-    tracker.used_ocr = bool(getattr(ext, "used_ocr", False))
-    tracker.extraction_meta = {
-        **(getattr(ext, "extraction_meta", None) or {}),
-        "source_kind": source_kind,
-        "content_type": content_type,
-        "size_bytes": len(data or b""),
-        "model": tracker.extraction_model,
-        "method": tracker.extraction_method,
-        "used_ocr": tracker.used_ocr,
-    }
-    _method_label = {
-        "vision-llm": f"{tracker.extraction_model or 'vision model'}",
-        "deterministic-text": "deterministic text parser (no LLM)",
-        "mock": "mock engine (no LLM)",
-        "unsupported": "unsupported file",
-    }.get(tracker.extraction_method or "", tracker.extraction_method or "engine")
-    _ocr_note = " · OCR text layer used" if tracker.used_ocr else ""
-    _event(tracker, PipelineStage.EXTRACTION, "ok",
-           f"Read with {_method_label}{_ocr_note} "
-           f"(name='{ext.employee_name or '—'}', "
-           f"id='{ext.employee_id or '—'}', period={ext.month}/{ext.year}).")
-
-    # ---- stage: identification (did the sheet contain usable identity/period?) ----
-    has_identity = bool((ext.employee_name or "").strip() or (ext.employee_id or "").strip())
-    has_month = bool(1 <= (ext.month or 0) <= 12 and (ext.year or 0) >= 2000)
-    has_manual_period = (
-        manual_month is not None and manual_year is not None
-        and 1 <= manual_month <= 12 and manual_year >= 2000
-    )
-    if not has_identity and not has_month and not has_manual_period and not manual_employee_pk:
-        _fail(tracker, PipelineStage.IDENTIFICATION, FailureCode.EXTRACTION_UNREADABLE,
-              f"Nothing usable could be read from the sheet (no name, no ID, no month). "
-              f"Engine said: {ext.summary or 'no detail'}")
-        return None, tracker
-    if not has_identity and not manual_employee_pk:
-        _fail(tracker, PipelineStage.IDENTIFICATION, FailureCode.NAME_NOT_FOUND,
-              "No employee name or employee ID could be found on the sheet.")
-        return None, tracker
-    period_month = manual_month if manual_month is not None else ext.month
-    period_year = manual_year if manual_year is not None else ext.year
-    if not (1 <= (period_month or 0) <= 12 and (period_year or 0) >= 2000):
-        if manual_month is not None or manual_year is not None:
-            _fail(tracker, PipelineStage.IDENTIFICATION, FailureCode.MONTH_NOT_FOUND,
-                  f"Invalid period selected (month={period_month}, year={period_year}).")
-        else:
-            _fail(tracker, PipelineStage.IDENTIFICATION, FailureCode.MONTH_NOT_FOUND,
-                  f"No usable month/year on the sheet (got month={ext.month}, year={ext.year}).")
-        return None, tracker
-    ext.month, ext.year = period_month, period_year
-    tracker.month, tracker.year = period_month, period_year
-    tracker.employee_name = ext.employee_name
-    tracker.employee_id = ext.employee_id
-    _event(tracker, PipelineStage.IDENTIFICATION, "ok",
-           f"Sheet identifies '{ext.employee_name or ext.employee_id}' for "
-           f"{calendar.month_name[period_month]} {period_year}.")
-
-    # ---- stage: matching (employee_id AND name must agree — AUH/DXB share IDs) ----
-    if manual_employee_pk:
-        matched = (
-            await db.execute(select(Employee).where(Employee.id == manual_employee_pk))
-        ).scalar_one_or_none()
-        if not matched:
-            _fail(tracker, PipelineStage.MATCHING, FailureCode.EMPLOYEE_NOT_MATCHED,
-                  "The selected employee was not found in the matcher list.")
-            return None, tracker
-        loc = f" [{matched.location}]" if matched.location else ""
-        m_note = (
-            (resolution_note or "").strip()
-            or f"Manually assigned to {matched.name} ({matched.employee_id}{loc})."
-        )
-        _event(tracker, PipelineStage.MATCHING, "ok", m_note)
-        m = matching.MatchResult(matched, m_note, MatchCode.ID_AND_NAME)
-    else:
-        email_hint = None
-        if email_employee_pk:
-            email_hint = (
-                await db.execute(select(Employee).where(Employee.id == email_employee_pk))
-            ).scalar_one_or_none()
-        m = await matching.match_employee(
-            db, ext.employee_id, ext.employee_name, email_hint=email_hint)
-        if m.employee is None:
-            code = FailureCode.AMBIGUOUS_ID if m.code == MatchCode.AMBIGUOUS_ID \
-                else FailureCode.EMPLOYEE_NOT_MATCHED
-            _fail(tracker, PipelineStage.MATCHING, code, m.note)
-            return None, tracker
-        matched = m.employee
-        _event(tracker, PipelineStage.MATCHING, "ok", m.note)
-    employee_name = matched.name
-    account_manager = matched.account_manager
-    tracker.employee_name = employee_name
-    tracker.employee_id = matched.employee_id
-
-    cal_days = calendar.monthrange(period_year, period_month)[1]
-
-    # ---- stage: validation + multi-file merge ----
-    existing = await _find_existing(db, matched.id, matched.employee_id,
-                                    employee_name, period_month, period_year)
-    key = _file_key(source_id, attachment_id, filename)
-    new_entry = {
-        "key": key, "filename": filename, "source_id": source_id,
-        "attachment_id": attachment_id, "ingested_at": _now_iso(),
-        "buckets": {
-            "annual": ext.annual_leave_dates or [], "remote": ext.remote_work_dates or [],
-            "sick": ext.sick_leave_dates or [], "maternity": ext.maternity_leave_dates or [],
-            "unpaid": ext.unpaid_leave_dates or [],
-            "absent": ext.absent_dates or [], "public_holiday": ext.public_holiday_dates or [],
-        },
-    }
-    prior_entries = (existing.source_files if existing else []) or []
-    same_key_prior = next((e for e in prior_entries if e.get("key") == key), None)
-    if same_key_prior and same_key_prior.get("buckets") == new_entry["buckets"]:
-        _event(tracker, PipelineStage.VALIDATION, "warn",
-               "Identical file already processed for this month — no changes made.")
-    entries = _merge_source_files(prior_entries, new_entry)
-    merged, overlap_flags = _union_buckets(entries)
-    cleaned, flags = validate(merged, period_month, period_year)
-    flags = list(dict.fromkeys((ext.hr_flags or []) + overlap_flags + flags))
-    validation_status = ValidationStatus.MANUAL_REVIEW if flags else ValidationStatus.VERIFIED
-    if len(entries) > 1:
-        _event(tracker, PipelineStage.VALIDATION,
-               "warn" if flags else "ok",
-               f"Merged into existing {calendar.month_name[period_month]} {period_year} record "
-               f"({len(entries)} files now cover this month)."
-               + (f" {len(flags)} flag(s) raised." if flags else ""))
-    else:
-        _event(tracker, PipelineStage.VALIDATION, "warn" if flags else "ok",
-               ("Validation raised: " + " ".join(flags[:4])) if flags else "Validation clean.")
-
-    mname = calendar.month_name[period_month]
-    # Clean, human-readable summary. Prefer the engine's polished LLM note
-    # (vision mode); always fall back to the deterministic summarizer so the
-    # record never shows a raw dump of dates.
-    summary_ctx = {
-        "employee": employee_name, "month": period_month, "year": period_year,
-        "leaves": cleaned, "issues": flags, "n_files": len(entries),
-    }
-    summary: str | None = None
-    try:
-        summary = await engine.summarize(summary_ctx)
-    except Exception:
-        summary = None
-    if not summary:
-        summary = summarize_record(cleaned, flags, period_month, period_year, len(entries))
-
-    # ---- stage: filing on disk (best-effort; never blocks record creation) ----
-    folder_rel = None
-    storage_warn = None
-    eml_extracted_name: str | None = None
-    eml_extracted_names: list[str] = []
-    try:
-        # Always keep the ORIGINAL incoming file in the vault (the .eml itself,
-        # the PDF, the image, …) so the source of every record is preserved.
-        sp.save_file(account_manager, employee_name, period_month, period_year, filename, data)
-        if ftype == "eml":
-            # Store EACH attached sheet separately next to the original .eml
-            # (e.g. Sri_Timesheet_May2026.pdf), so the vault holds the mail AND
-            # every attachment AND the .json result — not just the mail.
-            attachments = eml_all_attachments(data)
-            if attachments:
-                for save_name, att_payload, _att_ftype in attachments:
-                    sp.save_file(
-                        account_manager, employee_name, period_month, period_year,
-                        save_name, att_payload,
-                    )
-                    eml_extracted_names.append(save_name)
-                eml_extracted_name = eml_extracted_names[0]
-            else:
-                # Inline timesheet (no attachment): save the rendered image of
-                # the email (Subject + body) — the same image sent to the model.
-                try:
-                    imgs = eml_body_to_images(data)
-                    for idx, img in enumerate(imgs[:8], 1):
-                        nm = "email_view.jpg" if len(imgs) == 1 else f"email_view_p{idx}.jpg"
-                        sp.save_file(account_manager, employee_name, period_month, period_year, nm, img)
-                        eml_extracted_names.append(nm)
-                    if imgs:
-                        eml_extracted_name = "email_view.jpg"
-                except Exception:
-                    pass
-        if approval_bytes is not None:
-            sp.save_file(account_manager, employee_name, period_month, period_year, approval_name, approval_bytes)
-        sp.save_text(account_manager, employee_name, period_month, period_year, "extraction_result.json", _json.dumps({
-            "employee": {"extracted_id": ext.employee_id, "extracted_name": ext.employee_name,
-                         "matched_id": matched.employee_id, "matched_name": matched.name,
-                         "location": matched.location, "dco_number": matched.dco_number,
-                         "account_manager": account_manager, "match_note": m.note},
-            "period": {"month": period_month, "year": period_year},
-            "source_files": [{"filename": e["filename"], "ingested_at": e["ingested_at"]} for e in entries],
-            "eml": {"original": filename, "extracted_attachment": eml_extracted_name,
-                    "extracted_attachments": eml_extracted_names} if ftype == "eml" else None,
-            "extraction": tracker.extraction_meta or {
-                "model": tracker.extraction_model, "method": tracker.extraction_method,
-                "used_ocr": bool(tracker.used_ocr)},
-            "leaves": {k: cleaned[k] for k in BUCKET_FIELDS},
-            "validation": {"status": validation_status, "summary": summary, "flags": flags},
-            "approval": {"detected": approval_detected, "detail": approval_detail},
-            "source": source_id, "ingested_at": _now_iso(),
-        }, indent=2, default=str))
-        folder_rel = sp.folder_rel(account_manager, employee_name, period_month, period_year)
-        filed = f"Filed under {folder_rel}."
-        if eml_extracted_names:
-            if len(eml_extracted_names) == 1:
-                filed += f" Original email kept; attached sheet saved as {eml_extracted_names[0]}."
-            else:
-                filed += (f" Original email kept; {len(eml_extracted_names)} attached file(s) saved "
-                          f"({', '.join(eml_extracted_names)}).")
-        _event(tracker, PipelineStage.FILING, "ok", filed)
-    except Exception as e:
-        storage_warn = f"Could not file on disk: {str(e)[:200]}"
-        _event(tracker, PipelineStage.FILING, "warn", storage_warn)
-
-    # ---- stage: record upsert ----
-    rec = existing or TimesheetRecord()
-    rec.extracted_employee_id = ext.employee_id
-    rec.extracted_employee_name = ext.employee_name
-    rec.matched_employee_pk = matched.id
-    rec.employee_id = matched.employee_id
-    rec.employee_name = employee_name
-    rec.account_manager = account_manager
-    rec.dco_number = matched.dco_number
-    rec.match_note = m.note
-    rec.month = period_month
-    rec.year = period_year
-    rec.calendar_days = cal_days
-    for bucket, field in BUCKET_FIELDS.items():
-        setattr(rec, field, cleaned[bucket])
-    rec.source_files = entries
-    rec.validation_status = validation_status
-    rec.llm_summary = summary
-    rec.hr_flags = flags
-    rec.approval_detected = bool(approval_detected or (existing and existing.approval_detected))
-    if approval_detected or not existing:
-        rec.approval_detail = approval_detail
-    if not existing:
-        # Manual uploads start pending; email flow auto-approves (per requirement).
-        is_upload = bool(source_id and source_id.startswith("upload:"))
-        rec.approval_status = ApprovalStatus.PENDING if is_upload else ApprovalStatus.APPROVED
-    rec.source_email_id = source_id
-    if folder_rel:
-        rec.storage_folder = folder_rel
-    if not existing:
-        db.add(rec)
-    await db.flush()
-
-    # ---- stage: recorded ----
-    tracker.record_id = rec.id
-    if storage_warn:
-        tracker.status = PipelineStatus.NEEDS_REVIEW
-        tracker.failure_code = FailureCode.STORAGE_ERROR
-        tracker.failure_detail = storage_warn
-    elif validation_status == ValidationStatus.MANUAL_REVIEW:
-        tracker.status = PipelineStatus.NEEDS_REVIEW
-        tracker.failure_code = FailureCode.VALIDATION_MISMATCH
-        tracker.failure_detail = "; ".join(flags[:6])
-    else:
-        tracker.status = PipelineStatus.SUCCESS
-        tracker.failure_code = None
-        tracker.failure_detail = None
-    _event(tracker, PipelineStage.RECORDED,
-           "ok" if tracker.status == PipelineStatus.SUCCESS else "warn",
-           f"Record {'updated' if existing else 'created'} for {employee_name} — "
-           f"{mname} {period_year} ({len(entries)} file(s) on this month).")
-    if manual_employee_pk and resolution_note:
-        tracker.resolution_note = resolution_note.strip()
-    # Success => the retry copy is no longer needed (re-upload if you ever must
-    # re-run a clean file). Only failed / needs-review files keep their original.
-    if tracker.status == PipelineStatus.SUCCESS:
-        purge_raw_copy(tracker)
-    return rec, tracker
-
-
-# ---------------------------------------------------------------------------
-# Entry points
-# ---------------------------------------------------------------------------
-async def _safe_approval(engine, data, source_id, attachment_id) -> ApprovalExtraction:
-    try:
-        return await engine.extract_approval(data, source_id or "", attachment_id or "")
-    except Exception as e:
-        return ApprovalExtraction(detected=False, detail=f"Could not read approval ({str(e)[:120]}).")
-
-
-class IngestSelectionError(ValueError):
-    """Invalid attachment selection for email ingestion."""
-
-
-def resolve_ingest_attachments(
-    attachments: list[dict],
-    *,
-    attachment_ids: list[str] | None,
-    approval_attachment_id: str | None,
-    extract_body: bool = False,
-) -> tuple[list[dict], dict | None]:
-    """Pick timesheet + optional approval attachments for extraction."""
-    by_id = {a["attachment_id"]: a for a in attachments if a.get("attachment_id")}
-
-    if attachment_ids is None:
-        timesheet_atts = [a for a in attachments if a.get("kind") == "timesheet"]
-        if approval_attachment_id:
-            approval_att = by_id.get(approval_attachment_id)
-            if not approval_att:
-                raise IngestSelectionError("Unknown approval attachment.")
-            if approval_att.get("kind") != "approval_screenshot":
-                raise IngestSelectionError("Approval selection must be a screenshot attachment.")
-        else:
-            approval_att = next((a for a in attachments if a.get("kind") == "approval_screenshot"), None)
-        return timesheet_atts, approval_att
-
-    if not attachment_ids:
-        if extract_body:
-            approval_att = None
-            if approval_attachment_id:
-                approval_att = by_id.get(approval_attachment_id)
-                if not approval_att:
-                    raise IngestSelectionError("Unknown approval attachment.")
-            return [], approval_att
-        raise IngestSelectionError("Select at least one timesheet attachment to extract.")
-
-    timesheet_atts: list[dict] = []
-    for aid in attachment_ids:
-        att = by_id.get(aid)
-        if not att:
-            raise IngestSelectionError(f"Unknown attachment id: {aid}")
-        if aid == approval_attachment_id:
-            raise IngestSelectionError("Same attachment cannot be timesheet and approval.")
-        timesheet_atts.append(att)
-
-    approval_att = None
-    if approval_attachment_id:
-        approval_att = by_id.get(approval_attachment_id)
-        if not approval_att:
-            raise IngestSelectionError("Unknown approval attachment.")
-        if approval_attachment_id in attachment_ids:
-            raise IngestSelectionError("Same attachment cannot be timesheet and approval.")
-
-    return timesheet_atts, approval_att
-
-
-async def ingest_email(
-    db: AsyncSession,
-    email: EmailMessage,
-    *,
-    attachment_ids: list[str] | None = None,
-    approval_attachment_id: str | None = None,
-    extract_body: bool = False,
-) -> list[TimesheetRecord]:
-    provider = get_email_provider()
-    engine = get_extraction_engine()
-    attachments = email.attachments or []
-    timesheet_atts, approval_att = resolve_ingest_attachments(
-        attachments,
-        attachment_ids=attachment_ids,
-        approval_attachment_id=approval_attachment_id,
-        extract_body=extract_body,
-    )
-
-    if not extract_body and not timesheet_atts:
-        raise IngestSelectionError("Select at least one timesheet attachment to extract.")
-
-    approval_detected, approval_detail = False, "No approval screenshot provided."
-    approval_bytes, approval_name = None, "manager_approval.png"
-    if approval_att:
-        try:
-            approval_bytes, approval_name, _ = await provider.get_attachment_bytes(
-                email.provider_message_id, approval_att["attachment_id"])
-            ap = await _safe_approval(
-                engine, approval_bytes, email.provider_message_id, approval_att["attachment_id"])
-            approval_detected, approval_detail = ap.detected, ap.detail
-        except Exception:
-            approval_bytes = None
-
-    from app.services.inbox.employee_match import match_sender
-
-    sm = await match_sender(db, sender_email=email.sender_email, body_text=email.body_text)
-    inbox_employee_pk: str | None = sm["employee_pk"] if sm else None
-
-    created: list[TimesheetRecord] = []
-
-    if extract_body:
-        try:
-            imgs = email_body_to_images(email.subject, email.body_text)
-        except Exception as e:
-            raise IngestSelectionError(f"Could not render email body as image: {str(e)[:120]}") from e
-        if not imgs:
-            raise IngestSelectionError("Could not render email body as image.")
-        rec, _t = await ingest_timesheet_bytes(
-            db, data=imgs[0], filename="email_body.jpg", content_type="image/jpeg",
-            approval_detected=approval_detected, approval_detail=approval_detail,
-            approval_bytes=approval_bytes, approval_name=approval_name,
-            source_id=email.provider_message_id, attachment_id="__body__",
-            source_kind="email", email_employee_pk=inbox_employee_pk)
-        if rec is not None:
-            created.append(rec)
-
-    for a in timesheet_atts:
-        try:
-            data, filename, content_type = await provider.get_attachment_bytes(
-                email.provider_message_id, a["attachment_id"])
-        except Exception as e:
-            t = PipelineFile(
-                filename=a.get("filename") or a["attachment_id"], content_type=a.get("content_type"),
-                size_bytes=a.get("size"), source_kind="email",
-                source_id=email.provider_message_id, attachment_id=a["attachment_id"])
-            db.add(t)
-            _fail(t, PipelineStage.RECEIVED, FailureCode.UNKNOWN,
-                  f"Could not fetch the attachment from the mailbox: {str(e)[:200]}")
-            continue
-        rec, _t = await ingest_timesheet_bytes(
-            db, data=data, filename=filename, content_type=content_type,
-            approval_detected=approval_detected, approval_detail=approval_detail,
-            approval_bytes=approval_bytes, approval_name=approval_name,
-            source_id=email.provider_message_id, attachment_id=a["attachment_id"],
-            source_kind="email", email_employee_pk=inbox_employee_pk)
-        if rec is not None:
-            created.append(rec)
-
-    email.status = EmailStatus.INGESTED
-    email.decided_at = datetime.now(timezone.utc)
-    await db.commit()
-    for r in created:
-        await db.refresh(r)
-    return created
-
-
-async def _stage_bytes_for_review(
-    db: AsyncSession,
-    *,
-    filename: str,
-    content_type: str,
-    data: bytes,
-    source_kind: str,
-    source_id: str,
-    attachment_id: str | None = None,
-) -> PipelineFile:
-    """Shared Run Extraction path — extract one file, stage for Compare & Fix."""
-    from app.services.agents.extract_service import extract_from_upload
-
-    tracker: PipelineFile | None = None
-    if attachment_id is not None:
-        tracker = (await db.execute(select(PipelineFile).where(
-            PipelineFile.source_kind == source_kind,
-            PipelineFile.source_id == source_id,
-            PipelineFile.attachment_id == attachment_id,
-            PipelineFile.failure_code == FailureCode.PENDING_REVIEW,
-        ))).scalars().first()
-    if tracker is None:
-        tracker = PipelineFile(
-            filename=filename, content_type=content_type, size_bytes=len(data or b""),
-            source_kind=source_kind, source_id=source_id, attachment_id=attachment_id)
-        db.add(tracker)
-        await db.flush()
-    if not tracker.raw_path:
-        _save_raw_copy(tracker, filename, data or b"")
-
-    result = await extract_from_upload(
-        db, filename=filename, content_type=content_type, data=data)
-    matched = result.get("matched_employee") or {}
-    tracker.employee_id = matched.get("employee_id") or result.get("extracted_employee_id")
-    tracker.employee_name = matched.get("name") or result.get("extracted_employee_name")
-    tracker.month = result.get("month")
-    tracker.year = result.get("year")
-    tracker.status = PipelineStatus.NEEDS_REVIEW
-    tracker.failure_code = FailureCode.PENDING_REVIEW
-    tracker.failure_detail = "AI-extracted — review the leaves and accept to file the record."
-    tracker.extraction_meta = {
-        "staged": {
-            "employee_pk": matched.get("employee_pk"),
-            "matched_name": matched.get("name"),
-            "matched_employee_id": matched.get("employee_id"),
-            "month": result.get("month"),
-            "year": result.get("year"),
-            "buckets": result.get("buckets") or {},
-            "validation_status": result.get("validation_status"),
-            "flags": result.get("flags") or [],
-            "summary": result.get("summary"),
-            "extraction_status": result.get("status"),
-        },
-        "source_kind": source_kind,
-    }
-    tracker.events = (tracker.events or []) + [{
-        "stage": PipelineStage.EXTRACTION, "status": "ok",
-        "detail": f"AI-extracted {result.get('total_leaves', 0)} leave day(s); awaiting review.",
-        "at": _now_iso(),
-    }]
-    return tracker
-
-
-async def stage_email_extraction(
-    db: AsyncSession, email, *, attachment_ids: list[str], extract_body: bool = False,
-) -> list[PipelineFile]:
-    """Extract the selected email sources and STAGE them in the pipeline for
-    review — without filing a record yet.
-
-    Each source becomes a needs-review PipelineFile carrying the AI-extracted
-    leave data (in extraction_meta["staged"]) plus a saved raw copy, so the
-    existing Compare & Fix overlay can pre-fill, let the reviewer edit, and
-    Accept → file the record + vault (via manual-fix). Rejecting simply leaves
-    the file in the pipeline to reprocess / modify / remove later."""
-    provider = get_email_provider()
-    att_by_id = {a.get("attachment_id"): a for a in (email.attachments or [])}
-    msg_id = email.provider_message_id
-    staged: list[PipelineFile] = []
-
-    for aid in attachment_ids or []:
-        meta = att_by_id.get(aid)
-        try:
-            data, fn, ct = await provider.get_attachment_bytes(msg_id, aid)
-        except FileNotFoundError:
-            continue
-        staged.append(await _stage_bytes_for_review(
-            db,
-            filename=fn or (meta.get("filename") if meta else aid) or aid,
-            content_type=ct or (meta.get("content_type") if meta else "application/octet-stream"),
-            data=data,
-            source_kind="email",
-            source_id=msg_id,
-            attachment_id=aid,
-        ))
-
-    if extract_body:
-        from app.services.extraction.file_processor import email_body_to_images
-        imgs = email_body_to_images(email.subject, email.body_text)
-        if imgs:
-            staged.append(await _stage_bytes_for_review(
-                db, filename="email_body.jpg", content_type="image/jpeg", data=imgs[0],
-                source_kind="email", source_id=msg_id, attachment_id=None,
-            ))
-
-    await db.commit()
-    for t in staged:
-        await db.refresh(t)
-    return staged
-
-
-async def stage_upload_extraction(
-    db: AsyncSession,
-    *,
-    files: list[tuple[str, str, bytes]],
-) -> list[PipelineFile]:
-    """Run Extraction for manual uploads — same staging path as inbox Run Extraction."""
-    staged: list[PipelineFile] = []
-    for filename, content_type, data in files:
-        staged.append(await _stage_bytes_for_review(
-            db,
-            filename=filename,
-            content_type=content_type,
-            data=data,
-            source_kind="upload",
-            source_id=f"upload:{filename}",
-            attachment_id=filename,
-        ))
-    await db.commit()
-    for t in staged:
-        await db.refresh(t)
-    return staged
-
-
-async def ingest_upload(
-    db: AsyncSession, *, filename: str, content_type: str, data: bytes,
-) -> tuple[TimesheetRecord | None, PipelineFile]:
-    """Direct file-and-record path — used by Agentic Chat store only."""
-    rec, tracker = await ingest_timesheet_bytes(
-        db, data=data, filename=filename, content_type=content_type,
-        approval_detected=False, approval_detail="Uploaded manually (no email approval screenshot).",
-        approval_bytes=None, approval_name="manager_approval.png",
-        source_id=f"upload:{filename}", source_kind="upload")
-    await db.commit()
-    if rec is not None:
-        await db.refresh(rec)
-    await db.refresh(tracker)
-    return rec, tracker
-
-
 async def ingest_manual_entry(
     db: AsyncSession, *, employee_pk: str, month: int, year: int,
     buckets: dict[str, list[str]],
@@ -936,15 +265,17 @@ async def ingest_manual_entry(
     try:
         for (fn, _ct, dat) in attachments:
             sp.save_file(account_manager, employee_name, month, year, fn, dat)
-        sp.save_text(account_manager, employee_name, month, year, "extraction_result.json", _json.dumps({
-            "employee": {"matched_id": matched.employee_id, "matched_name": matched.name,
-                         "location": matched.location, "dco_number": matched.dco_number,
-                         "account_manager": account_manager, "match_note": "Manual entry."},
-            "period": {"month": month, "year": year},
-            "leaves": {k: cleaned[k] for k in BUCKET_FIELDS},
-            "validation": {"status": validation_status, "summary": summary, "flags": flags},
-            "manual": {"note": note}, "approval": approval, "ingested_at": _now_iso(),
-        }, indent=2, default=str))
+            # An uploaded/forwarded .eml: also store each attached sheet
+            # separately so the vault holds the mail AND its attachments (the
+            # source PDF/XLSX is grabbable without opening the .eml).
+            if (fn or "").lower().endswith(".eml"):
+                from app.services.extraction.file_processor import eml_all_attachments
+                try:
+                    for a_name, a_bytes, _a_ft in eml_all_attachments(dat):
+                        if a_name and a_bytes:
+                            sp.save_file(account_manager, employee_name, month, year, a_name, a_bytes)
+                except Exception:
+                    pass
         folder_rel = sp.folder_rel(account_manager, employee_name, month, year)
         _event(tracker, PipelineStage.FILING, "ok", f"Filed under {folder_rel}.")
     except Exception as e:
@@ -1032,67 +363,78 @@ def can_resolve_assign(tracker: PipelineFile) -> bool:
     return bool(tracker.source_kind == "email" and tracker.source_id and tracker.attachment_id)
 
 
-async def resolve_pipeline_with_employee(
-    db: AsyncSession,
-    tracker: PipelineFile,
-    *,
-    employee_pk: str,
-    month: int,
-    year: int,
-    note: str | None = None,
-) -> tuple[TimesheetRecord | None, PipelineFile]:
-    """Re-run extraction and file the timesheet under a manually chosen employee."""
-    if not can_resolve_assign(tracker):
-        raise ValueError("This pipeline file cannot be completed with a manual employee assignment.")
+async def _tracker_bytes(tracker: PipelineFile) -> tuple[bytes, str]:
+    """The raw bytes for a tracker: the stored retry copy, else refetched from
+    the email provider when the item is a single provider attachment."""
     data = read_raw_copy(tracker)
-    filename, content_type = tracker.filename, tracker.content_type or "application/octet-stream"
-    if data is None and tracker.source_kind == "email" and tracker.source_id and tracker.attachment_id:
+    filename = tracker.filename or "file"
+    if (data is None and tracker.source_kind == "email" and tracker.source_id
+            and tracker.attachment_id and not str(tracker.attachment_id).startswith("__")):
         provider = get_email_provider()
-        data, filename, content_type = await provider.get_attachment_bytes(
+        data, filename, _ct = await provider.get_attachment_bytes(
             tracker.source_id, tracker.attachment_id)
     if data is None:
         raise FileNotFoundError("The original file is no longer available.")
-    tracker.events = []
-    rec, tracker = await ingest_timesheet_bytes(
-        db, data=data, filename=filename, content_type=content_type,
-        approval_detected=False,
-        approval_detail="Manually assigned by reviewer from the pipeline tracker.",
-        approval_bytes=None, approval_name="manager_approval.png",
-        source_id=tracker.source_id, attachment_id=tracker.attachment_id,
-        source_kind=tracker.source_kind, tracker=tracker,
-        manual_employee_pk=employee_pk, manual_month=month, manual_year=year,
-        resolution_note=note,
-    )
-    if rec is not None:
-        await mark_source_email_ingested(db, tracker)
-    await db.commit()
-    if rec is not None:
-        await db.refresh(rec)
-    await db.refresh(tracker)
-    return rec, tracker
+    return data, filename
 
 
 async def retry_pipeline_file(db: AsyncSession, tracker: PipelineFile) -> tuple[TimesheetRecord | None, PipelineFile]:
-    """Re-run the pipeline for a tracked file (after the cause was fixed)."""
-    data = read_raw_copy(tracker)
-    filename, content_type = tracker.filename, tracker.content_type or "application/octet-stream"
-    if data is None and tracker.source_kind == "email" and tracker.source_id and tracker.attachment_id:
-        provider = get_email_provider()
-        data, filename, content_type = await provider.get_attachment_bytes(
-            tracker.source_id, tracker.attachment_id)
-    if data is None:
-        raise FileNotFoundError("The original file is no longer available for retry.")
-    tracker.events = []
-    rec, tracker = await ingest_timesheet_bytes(
-        db, data=data, filename=filename, content_type=content_type,
-        approval_detected=False, approval_detail="Re-processed from the pipeline tracker.",
-        approval_bytes=None, approval_name="manager_approval.png",
-        source_id=tracker.source_id, attachment_id=tracker.attachment_id,
-        source_kind=tracker.source_kind, tracker=tracker)
-    if rec is not None:
-        await mark_source_email_ingested(db, tracker)
+    """Re-run the ANALYSIS for a tracked file and re-stage it for review —
+    retry never files a record directly (everything goes through Compare & Fix)."""
+    from app.services.agents import full_email_extract as fx
+    from app.services.extraction.validation import summarize as summarize_record
+    from app.services.extraction.validation import validate
+
+    data, filename = await _tracker_bytes(tracker)
+    analysis = await fx.analyse_upload(db, filename=filename, data=data)
+    groups = analysis["groups"]
+    tracker.events = (tracker.events or []) + [{
+        "stage": PipelineStage.EXTRACTION,
+        "status": "ok" if groups else "fail",
+        "detail": (f"Retry re-analysed the file: {len(groups)} group(s) found."
+                   if groups else "Retry re-analysed the file: no timesheet or certificate found."),
+        "at": _now_iso(),
+    }]
+    if not groups:
+        tracker.status = PipelineStatus.FAILED
+        tracker.failure_code = FailureCode.EXTRACTION_UNREADABLE
+        tracker.failure_detail = "No timesheet or certificate could be read from this file."
+        await db.commit()
+        await db.refresh(tracker)
+        return None, tracker
+
+    primary = max(groups, key=lambda g: sum(len(v) for v in g["buckets"].values()))
+    month, year = primary["month"], primary["year"]
+    if month and year:
+        cleaned, val_flags = validate(primary["buckets"], month, year)
+        summary = summarize_record(cleaned, val_flags, month, year, len(primary["sheets"]))
+    else:
+        cleaned, val_flags = primary["buckets"], ["No usable month/year — pick the period."]
+        summary = "Could not read a month/year — pick the period in Compare & Fix."
+    flags = list(dict.fromkeys(primary["overlap_flags"] + primary["fold_notes"] + val_flags))
+
+    tracker.employee_id = primary["employee_id"]
+    tracker.employee_name = primary["name"]
+    tracker.month, tracker.year = month, year
+    tracker.status = PipelineStatus.NEEDS_REVIEW
+    tracker.failure_code = FailureCode.PENDING_REVIEW
+    tracker.failure_detail = "Re-extracted — review the leaves and accept to file."
+    tracker.extraction_method = analysis["run_meta"].get("method")
+    tracker.extraction_model = analysis["run_meta"].get("model")
+    tracker.extraction_meta = {
+        **(tracker.extraction_meta or {}),
+        "staged": {
+            "employee_pk": primary["employee_pk"],
+            "matched_name": primary["name"],
+            "matched_employee_id": primary["employee_id"],
+            "month": month, "year": year,
+            "buckets": cleaned,
+            "validation_status": "manual_review" if flags else "verified",
+            "flags": flags,
+            "summary": f"{summary} {analysis['approval']['detail']}",
+            "extraction_status": "ok",
+        },
+    }
     await db.commit()
-    if rec is not None:
-        await db.refresh(rec)
     await db.refresh(tracker)
-    return rec, tracker
+    return None, tracker

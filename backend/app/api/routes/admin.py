@@ -250,25 +250,23 @@ async def config_status(db: AsyncSession = Depends(get_db)):
 
 @router.get("/config/prompts/defaults")
 async def prompt_defaults():
-    from app.services.extraction import parser
-    return {
-        "system_prompt": parser.SYSTEM_PROMPT,
-        "extraction_prompt": parser.EXTRACTION_PROMPT,
-        "summary_prompt": parser.SUMMARY_PROMPT,
-    }
+    """Built-in default for the one editable prompt (the shared extraction
+    system prompt used by EVERY entry point)."""
+    from app.services.agents import full_email_extract as fx
+    return {"extract_email_system_prompt": fx._SYSTEM_PROMPT}
 
 
 @router.get("/config/prompts/all")
 async def prompt_inventory():
     """Every LLM prompt in the backend, with where it is actually used.
 
-    All of these have live call paths (verified) — none are dead code. The
-    three engine prompts are the only ones editable (via the existing
-    system_prompt / extraction_prompt / summary_prompt config overrides);
+    After the unification there is ONE extraction pipeline
+    (full_email_extract) shared by Extract Email, selected attachments, the
+    Upload page and chat uploads — so there is one system prompt (editable),
+    one dynamically-built request prompt, and the chat assistant's prompt.
     `content` shows the ACTIVE text, i.e. the override when one is saved."""
     from app.services.agents import chat_agent
     from app.services.agents import full_email_extract as fx
-    from app.services.extraction import parser, vision_engine
 
     def item(key, title, used_by, content, editable=False,
              override_key=None, dynamic=False):
@@ -277,38 +275,18 @@ async def prompt_inventory():
                 "override_key": override_key, "dynamic": dynamic}
 
     return [
-        item("extract_email_system", "Extract Email — sheet analysis (system)",
-             "Extract Email button in the Inbox: reads every sheet in the email "
-             "(kinds, identity, leave dates, signatures, approval evidence).",
-             fx._SYSTEM_PROMPT),
-        item("extract_email_batch", "Extract Email — per-batch request",
-             "Built dynamically for each email: lists the sheets in the batch, the "
+        item("extract_email_system", "Extraction — system prompt (ALL flows)",
+             "The single extraction pipeline: Extract Email (full or selected "
+             "attachments), the Upload page, chat uploads, and retry. Reads every "
+             "sheet: kind, identity, period, leave dates, signatures, approval evidence.",
+             fx.system_prompt(), editable=True,
+             override_key="extract_email_system_prompt"),
+        item("extract_email_batch", "Extraction — per-batch request",
+             "Built dynamically for each run: lists the sheets in the batch, the "
              "JSON schema to fill, and each sheet's exact extracted text.",
-             "(dynamic — assembled per email from the sheet list, the JSON schema "
+             "(dynamic — assembled per run from the sheet list, the JSON schema "
              "and each sheet's exact text; see _batch_prompt in full_email_extract.py)",
              dynamic=True),
-        item("engine_system", "Per-file engine — system",
-             "Upload page, chat uploads, 'Run Extraction (selected)' in the Inbox, "
-             "and the per-sheet fallback when an Extract Email batch call fails.",
-             parser.get_prompt("system"), editable=True, override_key="system_prompt"),
-        item("engine_extraction", "Per-file engine — extraction rules",
-             "Same flows as the engine system prompt (Upload / chat / selected / fallback).",
-             parser.get_prompt("extraction"), editable=True, override_key="extraction_prompt"),
-        item("engine_summary", "Filed-record review note",
-             "Written when a record is filed: Upload page, email ingest, "
-             "resolve-with-employee and retry. Falls back to a deterministic note.",
-             parser.get_prompt("summary"), editable=True, override_key="summary_prompt"),
-        item("text_crosscheck_system", "Text cross-check — system",
-             "Second, text-only read that double-checks the vision result "
-             "(runs when text validation is enabled).",
-             parser.TEXT_EXTRACTION_SYSTEM),
-        item("text_crosscheck", "Text cross-check — request",
-             "Same cross-check step; the document text is inserted into it.",
-             parser.TEXT_EXTRACTION_PROMPT),
-        item("approval_screenshot", "Approval screenshot question",
-             "Asked about manager-approval screenshots during "
-             "'Run Extraction (selected)' email ingest.",
-             vision_engine.APPROVAL_QUESTION),
         item("chat_system", "Agentic chat — system",
              "The chat assistant on the Agentic Chat page (tools + grounding rules).",
              chat_agent.SYSTEM_PROMPT),

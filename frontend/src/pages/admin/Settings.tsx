@@ -65,16 +65,14 @@ export default function AdminSettings() {
 
   const loadPromptDefaults = async () => {
     const d = await adminPromptDefaults();
-    set("system_prompt", d.system_prompt);
-    set("extraction_prompt", d.extraction_prompt);
-    set("summary_prompt", d.summary_prompt);
+    set("extract_email_system_prompt", d.extract_email_system_prompt);
     toast("info", "Loaded built-in prompts", "Review and Save to apply.");
   };
 
   const SERVICES = useMemo(() => ([
     { kind: "extraction", field: "vision_provider",
       label: "Vision extraction",
-      desc: "Reads timesheets & approvals from page images — Extract Email, Upload, Run Extraction." },
+      desc: "Reads timesheets & approvals from page images — Extract Email, selected attachments, Upload and chat." },
     { kind: "validation", field: "validation_provider",
       label: "Validation & summaries (text)",
       desc: "Second, text-only read that cross-checks the vision result and writes review notes." },
@@ -153,9 +151,10 @@ export default function AdminSettings() {
           <Button size="sm" variant="ghost" onClick={loadPromptDefaults}><RotateCcw className="h-3.5 w-3.5" /> Load built-in defaults</Button>
         </div>
         <p className="mb-3 text-xs text-slate-500">
-          Every LLM prompt in the backend, with the exact flows that use it — all of them are
-          in active use. The three marked <span className="font-semibold">Editable</span> can be
-          overridden here (empty = built-in default); the rest are shown read-only.
+          Every LLM prompt in the backend, with the exact flows that use it. There is ONE
+          extraction pipeline shared by Extract Email, selected attachments, Upload and chat —
+          its system prompt is the one marked <span className="font-semibold">Editable</span>
+          (empty = built-in default); the rest are shown read-only.
         </p>
         <div className="space-y-2">
           {(prompts ?? []).map((p) => (
@@ -218,7 +217,7 @@ function PromptRow({
               <textarea
                 value={value ?? ""}
                 onChange={(e) => onChange(e.target.value)}
-                rows={info.override_key === "extraction_prompt" ? 10 : 5}
+                rows={10}
                 placeholder="(empty = use built-in default shown below)"
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-xs leading-5 focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100"
               />

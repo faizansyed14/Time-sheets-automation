@@ -1,8 +1,11 @@
 """
-Upload route — stage files through the same Run Extraction path as inbox:
-extract → pending_review → Compare & Fix → Accept files the record.
+Upload route — the SAME pipeline as Extract Email, for uploaded files:
+every sheet analysed (an uploaded .eml unpacks fully — attachments, forwarded
+emails, body grids), grouped per employee+month, staged NEEDS_REVIEW →
+Compare & Fix → Accept files the record. Nothing files without review.
 
-Manual entry (no LLM) still files immediately via ingest_manual_entry.
+Manual entry (no LLM, reviewer-entered data) still files immediately via
+ingest_manual_entry — it IS the human decision.
 """
 from __future__ import annotations
 
@@ -14,7 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import datacache
 from app.core.database import get_db
 from app.schemas import PipelineFileOut, UploadResult
-from app.services.pipeline.ingestion import ingest_manual_entry, stage_upload_extraction
+from app.services.agents.full_email_extract import extract_upload
+from app.services.pipeline.ingestion import ingest_manual_entry
 
 # Leave buckets a manual entry may carry (matches the extraction buckets).
 _MANUAL_BUCKETS = ("annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday")
@@ -42,8 +46,16 @@ async def upload_timesheets(
         raise HTTPException(400, "All uploaded files were empty.")
     from app.api.routes.pipeline import _out as _pipeline_out
 
-    staged = await stage_upload_extraction(db, files=batch)
+    staged = []
+    for filename, content_type, data in batch:
+        res = await extract_upload(
+            db, filename=filename, content_type=content_type, data=data)
+        staged.extend(res["staged"])
     await datacache.bust_pipeline()
+    if not staged:
+        raise HTTPException(
+            422, "Nothing to review — no timesheet or certificate was found in "
+                 "the uploaded file(s).")
     return [_pipeline_out(t) for t in staged]
 
 

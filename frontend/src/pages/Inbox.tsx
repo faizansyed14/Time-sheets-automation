@@ -6,7 +6,6 @@ import {
   BadgeCheck,
   Archive,
   CheckCircle2,
-  RotateCcw,
   FileText,
   FileX,
   FolderInput,
@@ -30,10 +29,8 @@ import {
   fetchEmployeeMatcher,
   fetchInbox,
   MONTHS_LONG,
-  rerunExtraction,
   restoreEmail,
   saveEmlToVault,
-  stageExtraction,
   type Attachment,
   type EmailListItem,
   type IngestSelection,
@@ -801,45 +798,20 @@ export default function InboxPage() {
   };
 
   const decide = useMutation({
-    mutationFn: ({ id, accepted, selection }: { id: string; accepted: boolean; selection?: IngestSelection }) =>
-      decideEmail(id, accepted, selection),
-    onSuccess: (res: any, { accepted }) => {
-      if (accepted)
-        toast(
-          res.records_created > 0 ? "success" : "warning",
-          res.records_created > 0
-            ? `Extraction complete — ${res.records_created} record(s)`
-            : "Extraction ran — no records created",
-          res.records_created > 0
-            ? "Weekly files for the same month are merged into one record."
-            : "Check the Pipeline page: each file's failure reason is listed there."
-        );
-      else toast("info", "Email archived");
+    mutationFn: ({ id, accepted }: { id: string; accepted: boolean }) =>
+      decideEmail(id, accepted),
+    onSuccess: () => {
+      toast("info", "Email archived");
       invalidate();
     },
     onError: (e: any) => toast("error", "Action failed", e?.response?.data?.detail ?? String(e)),
   });
 
-  // Run Extraction → stage selected sources into the pipeline, then review &
-  // accept each via the Compare & Fix overlay.
-  const stage = useMutation({
-    mutationFn: ({ id, selection }: { id: string; selection: IngestSelection }) =>
-      stageExtraction(id, { attachment_ids: selection.attachment_ids, extract_body: selection.extract_body }),
-    onSuccess: (files: PipelineFile[]) => {
-      qc.invalidateQueries({ queryKey: ["pipeline"] });
-      qc.invalidateQueries({ queryKey: ["pipeline-stats"] });
-      if (!files.length) {
-        toast("warning", "Nothing to extract", "No timesheet could be extracted from the selection.");
-        return;
-      }
-      setStagedQueue(files);
-    },
-    onError: (e: any) => toast("error", "Extraction failed", e?.response?.data?.detail ?? String(e)),
-  });
-
-  // Extract Email — whole .eml to vision, grouped per employee/month.
+  // Extract Email — whole .eml (or just the selected sheets) through the ONE
+  // extraction pipeline, grouped per employee/month, staged for review.
   const extractEmail = useMutation({
-    mutationFn: (id: string) => extractFullEmail(id),
+    mutationFn: ({ id, selection }: { id: string; selection?: IngestSelection }) =>
+      extractFullEmail(id, selection),
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["inbox"] });
       qc.invalidateQueries({ queryKey: ["email", selected] });
@@ -873,16 +845,6 @@ export default function InboxPage() {
       toast("info", "Email restored to New");
       invalidate();
     },
-  });
-
-  const rerun = useMutation({
-    mutationFn: ({ id, selection }: { id: string; selection: IngestSelection }) =>
-      rerunExtraction(id, selection),
-    onSuccess: (res: any) => {
-      toast("success", "Re-ran extraction", `${res.records_count} record(s) refreshed.`);
-      invalidate();
-    },
-    onError: (e: any) => toast("error", "Re-run failed", e?.response?.data?.detail ?? String(e)),
   });
 
   const isForwarded = isForwardedSubject(detail?.subject ?? null);
@@ -1078,7 +1040,7 @@ export default function InboxPage() {
                           <Button
                             size="sm"
                             disabled={extractEmail.isPending || loadingDetail}
-                            onClick={() => extractEmail.mutate(detail.provider_message_id)}
+                            onClick={() => extractEmail.mutate({ id: detail.provider_message_id })}
                             title={detail.extract_email_at
                               ? "Re-run Extract Email — replaces staged review items from the last run"
                               : "Whole .eml to vision — all attachments, approvals detected, grouped per employee/month for Compare & Fix"}
@@ -1095,17 +1057,15 @@ export default function InboxPage() {
                                 : "Extract Email"}
                           </Button>
                           <EmailMenu
-                            busy={stage.isPending || rerun.isPending || decide.isPending}
+                            busy={extractEmail.isPending || decide.isPending}
                             manualActions={[
-                              ...(detail.status === "new" && canExtract ? [{
-                                label: `Run Extraction (${extractCount} selected)`,
+                              ...(canExtract ? [{
+                                label: `Extract selected (${extractCount})`,
                                 icon: CheckCircle2,
-                                onClick: () => stage.mutate({ id: detail.provider_message_id, selection: buildSelection() }),
-                              }] : []),
-                              ...(detail.status === "ingested" && canExtract ? [{
-                                label: "Re-run extraction",
-                                icon: RotateCcw,
-                                onClick: () => rerun.mutate({ id: detail.provider_message_id, selection: buildSelection() }),
+                                onClick: () => extractEmail.mutate({
+                                  id: detail.provider_message_id,
+                                  selection: buildSelection(),
+                                }),
                               }] : []),
                               ...(detail.status === "new" ? [{
                                 label: "Archive email",

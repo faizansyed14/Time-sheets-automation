@@ -42,6 +42,15 @@ os.environ.update(
     TOTP_VERIFY_RATE_MAX="1000",
     CAPTCHA_RATE_MAX="1000",
     CAPTCHA_VERIFY_RATE_MAX="1000",
+    # Isolate tests from docker .env — OTP must not hit Graph; chat must not call LLMs.
+    GRAPH_TENANT_ID="",
+    GRAPH_CLIENT_ID="",
+    GRAPH_CLIENT_SECRET="",
+    GRAPH_MAILBOX="",
+    GRAPH_OTP_SENDER="",
+    OPENAI_API_KEY="",
+    DEEPSEEK_API_KEY="",
+    VLLM_API_KEY="",
 )
 
 from httpx import ASGITransport, AsyncClient  # noqa: E402

@@ -54,10 +54,9 @@ CONFIG_KEYS: dict[str, dict] = {
     "vision_json_mode":      {"category": ConfigCategory.MODEL, "secret": False, "env": "vision_json_mode", "default": True},
     "extraction_prefer_deterministic": {"category": ConfigCategory.MODEL, "secret": False, "env": "extraction_prefer_deterministic", "default": False},
     "ocr_provider":          {"category": ConfigCategory.MODEL, "secret": False, "env": "ocr_provider", "default": "none"},
-    # prompts (overlaid onto parser.* at read time)
-    "system_prompt":      {"category": ConfigCategory.PROMPT, "secret": False, "env": None, "default": ""},
-    "extraction_prompt":  {"category": ConfigCategory.PROMPT, "secret": False, "env": None, "default": ""},
-    "summary_prompt":     {"category": ConfigCategory.PROMPT, "secret": False, "env": None, "default": ""},
+    # prompts — the ONE extraction system prompt (full_email_extract), used by
+    # every entry point: Extract Email, selected attachments, Upload, chat.
+    "extract_email_system_prompt": {"category": ConfigCategory.PROMPT, "secret": False, "env": None, "default": ""},
 }
 
 SECRET_MASK = "••••••••"
@@ -131,17 +130,14 @@ async def set_settings(db: AsyncSession, values: dict, updated_by: str | None = 
 
 def apply_overlay_to_runtime(stored: dict) -> None:
     """Push stored overrides onto the live process so existing code that reads
-    `settings.*` and `parser.*` immediately reflects admin changes (no restart)."""
+    `settings.*` (and the extraction system prompt) immediately reflects admin
+    changes (no restart)."""
     for key, meta in CONFIG_KEYS.items():
         if meta["env"] and key in stored and stored[key] is not None:
             setattr(settings, meta["env"], stored[key])
     try:
-        from app.services.extraction import parser
-        parser.set_prompt_overrides({
-            "system": stored.get("system_prompt") or None,
-            "extraction": stored.get("extraction_prompt") or None,
-            "summary": stored.get("summary_prompt") or None,
-        })
+        from app.services.agents import full_email_extract as fx
+        fx.set_system_prompt_override(stored.get("extract_email_system_prompt"))
     except Exception:
         pass
 
@@ -169,7 +165,7 @@ async def sync_runtime_if_stale(db: AsyncSession) -> None:
 # in either direction.
 UI_EDITABLE_KEYS = frozenset({
     "vision_provider", "validation_provider", "ai_provider",
-    "system_prompt", "extraction_prompt", "summary_prompt",
+    "extract_email_system_prompt",
 })
 
 
