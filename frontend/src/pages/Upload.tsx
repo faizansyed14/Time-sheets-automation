@@ -96,7 +96,7 @@ export default function UploadPage() {
     <div className="mx-auto max-w-4xl animate-fade-up">
       <PageHeader
         title="Upload timesheets"
-        subtitle="Same flow as Run Extraction on inbox emails — AI extracts each file, you review in Compare & Fix, then Accept files the record."
+        subtitle="Same pipeline as Extract Email — every sheet is extracted, you review in Compare & Fix, then Accept files the record."
       />
 
       <div className="mb-5 inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">

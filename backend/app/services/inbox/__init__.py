@@ -1,1 +1,1 @@
-"""Inbox helpers — AI check and sender→employee matching."""
+"""Inbox helpers — attachment classification, inline images, timesheet detection."""

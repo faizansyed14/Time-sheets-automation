@@ -1,9 +1,9 @@
 """
 Extraction engine abstraction.
 
-The ingestion pipeline depends only on this interface. Today it resolves to the
-mock engine; later set extraction_engine="vision" and drop your real
-GPT-4o/vision parser behind the same two methods.
+Per-sheet fallback when the shared vision pipeline cannot read a file.
+Today resolves to the mock/deterministic engine; production uses
+full_email_extract + vision_client for the main path.
 """
 from __future__ import annotations
 
@@ -44,31 +44,13 @@ class TimesheetExtraction:
     extraction_meta: dict = field(default_factory=dict)
 
 
-@dataclass
-class ApprovalExtraction:
-    detected: bool
-    detail: str
-
-
 class ExtractionEngine(ABC):
+    """Deterministic per-sheet fallback interface. Approval detection and
+    summaries live in the shared pipeline (full_email_extract), not here."""
+
     @abstractmethod
     async def extract_timesheet(
         self, data: bytes, filename: str, content_type: str,
         message_id: str, attachment_id: str,
     ) -> TimesheetExtraction:
         ...
-
-    @abstractmethod
-    async def extract_approval(
-        self, data: bytes, message_id: str, attachment_id: str,
-    ) -> ApprovalExtraction:
-        ...
-
-    async def summarize(self, context: dict) -> str | None:
-        """Optional: produce a polished plain-English review summary for a whole
-        month's record (after files are merged and validated). Return None to
-        let the pipeline fall back to the deterministic summarizer.
-
-        context = {employee, month, year, leaves: {bucket: [iso dates]},
-                   issues: [str], n_files: int}"""
-        return None

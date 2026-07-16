@@ -2,7 +2,9 @@
 from tests.conftest import _login, auth_headers
 
 
-async def test_captcha_mode_login_completes_on_first_step(client, admin_token):
+async def test_captcha_mode_login_requires_captcha_challenge(client, admin_token):
+    from tests.conftest import _fetch_captcha
+
     r = await client.post("/api/v1/admin/users", headers=auth_headers(admin_token),
                           json={"username": "capuser", "password": "Password123",
                                 "email": "c@e.com", "role": "user", "auth_mode": "captcha"})
@@ -11,8 +13,14 @@ async def test_captcha_mode_login_completes_on_first_step(client, admin_token):
     login = await _login(client, "capuser", "Password123")
     assert login.status_code == 200
     data = login.json()
-    assert data["status"] == "authenticated"
-    assert data["access_token"]
+    assert data["status"] == "captcha_required"
+    assert data["login_token"] and not data.get("access_token")
+
+    cid, answer = await _fetch_captcha(client)
+    done = await client.post("/api/v1/auth/verify-captcha", json={
+        "login_token": data["login_token"], "captcha_id": cid, "answer": answer})
+    assert done.status_code == 200, done.text
+    assert done.json()["access_token"]
 
 
 async def test_admin_create_assign_email_and_switch_mode(client, admin_token):
@@ -43,7 +51,7 @@ async def test_config_api_exposes_only_providers_and_prompts(client, admin_token
     assert got.status_code == 200
     keys = {c["key"] for c in got.json()}
     assert keys == {"vision_provider", "validation_provider", "ai_provider",
-                    "system_prompt", "extraction_prompt", "summary_prompt"}
+                    "extract_email_system_prompt"}
     assert all(c["is_secret"] is False for c in got.json())
 
     # Provider switch works…
@@ -83,10 +91,12 @@ async def test_config_test_endpoint_handles_no_key(client, admin_token):
 
 
 async def test_prompt_override_applies(client, admin_token):
+    """The ONE editable prompt (shared extraction system prompt) overrides the
+    built-in default live, and clears back to it."""
+    from app.services.agents import full_email_extract as fx
     await client.put("/api/v1/admin/config", headers=auth_headers(admin_token),
-                     json={"values": {"system_prompt": "CUSTOM SYSTEM PROMPT"}})
-    from app.services.extraction import parser
-    assert parser.get_prompt("system") == "CUSTOM SYSTEM PROMPT"
+                     json={"values": {"extract_email_system_prompt": "CUSTOM SYSTEM PROMPT"}})
+    assert fx.system_prompt() == "CUSTOM SYSTEM PROMPT"
     await client.put("/api/v1/admin/config", headers=auth_headers(admin_token),
-                     json={"values": {"system_prompt": ""}})
-    assert parser.get_prompt("system") == parser.SYSTEM_PROMPT
+                     json={"values": {"extract_email_system_prompt": ""}})
+    assert fx.system_prompt() == fx._SYSTEM_PROMPT

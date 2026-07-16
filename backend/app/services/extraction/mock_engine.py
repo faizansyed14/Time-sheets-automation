@@ -21,7 +21,6 @@ from collections import Counter
 from app.seed import mock_data
 from app.services.extraction import file_processor as fp
 from app.services.extraction.base import (
-    ApprovalExtraction,
     ExtractionEngine,
     TimesheetExtraction,
 )
@@ -183,10 +182,4 @@ class MockExtractionEngine(ExtractionEngine):
             extraction_meta=meta,
         )
 
-    async def extract_approval(
-        self, data: bytes, message_id: str, attachment_id: str,
-    ) -> ApprovalExtraction:
-        ap = mock_data.approval_for_message(message_id)
-        if not ap:
-            return ApprovalExtraction(detected=False, detail="No approval screenshot in this email.")
-        return ApprovalExtraction(detected=bool(ap["detected"]), detail=ap["detail"])
+

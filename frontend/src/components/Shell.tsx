@@ -10,13 +10,14 @@ import {
   Activity,
   Users,
   FolderOpen,
+  FileSpreadsheet,
   Zap,
   CircleDot,
   Settings,
   ShieldCheck,
   LogOut,
-  PanelLeftClose,
-  PanelLeftOpen,
+  ChevronLeft,
+  ChevronRight,
   RefreshCw,
 } from "lucide-react";
 import { fetchHealth, fetchPipelineStats } from "../api/client";
@@ -36,6 +37,7 @@ const TOOLS_NAV = [
   { to: "/upload", label: "Upload", icon: UploadCloud },
   { to: "/pipeline", label: "Activity log", icon: Activity },
   { to: "/employees", label: "Employees", icon: Users },
+  { to: "/export", label: "Export", icon: FileSpreadsheet },
   { to: "/files", label: "File Vault", icon: FolderOpen },
 ];
 
@@ -52,6 +54,7 @@ const TITLES: Record<string, string> = {
   "/upload": "Upload timesheets",
   "/pipeline": "Activity log",
   "/employees": "Employee matcher",
+  "/export": "Export",
   "/files": "File vault",
 };
 
@@ -106,7 +109,7 @@ export default function Shell({ children }: { children: ReactNode }) {
       {/* ------------------------- Sidebar ------------------------- */}
       <aside
         className={cn(
-          "flex shrink-0 flex-col border-r border-slate-200/70 bg-white/80 backdrop-blur-xl transition-[width] duration-200",
+          "relative flex shrink-0 flex-col border-r border-slate-200/70 bg-white/80 backdrop-blur-xl transition-[width] duration-200",
           collapsed ? "w-[68px]" : "w-64"
         )}
       >
@@ -219,23 +222,28 @@ export default function Shell({ children }: { children: ReactNode }) {
             </div>
           </div>
         )}
+
+        <button
+          type="button"
+          onClick={toggleCollapsed}
+          className="absolute right-0 top-1/2 z-30 flex h-14 w-4 -translate-y-1/2 translate-x-1/2 items-center justify-center rounded-r-md border border-slate-200/90 bg-white text-slate-500 shadow-[0_2px_8px_-2px_rgb(15_23_42/0.2)] transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-slate-800"
+          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        >
+          {collapsed ? (
+            <ChevronRight className="h-3.5 w-3.5 shrink-0" strokeWidth={2.5} />
+          ) : (
+            <ChevronLeft className="h-3.5 w-3.5 shrink-0" strokeWidth={2.5} />
+          )}
+        </button>
       </aside>
 
       {/* ------------------------- Main ------------------------- */}
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-16 shrink-0 items-center justify-between border-b border-slate-200/70 surface-glass px-4 sm:px-6">
-          <div className="flex items-center gap-3">
-            <button
-              onClick={toggleCollapsed}
-              className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
-              title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-            >
-              {collapsed ? <PanelLeftOpen className="h-5 w-5" /> : <PanelLeftClose className="h-5 w-5" />}
-            </button>
-            <div className="leading-tight">
-              <p className="text-[11px] font-medium uppercase tracking-wider text-slate-400">Timesheets Automation</p>
-              <p className="text-[15px] font-bold tracking-tight text-slate-900">{title}</p>
-            </div>
+          <div className="leading-tight">
+            <p className="text-[11px] font-medium uppercase tracking-wider text-slate-400">Timesheets Automation</p>
+            <p className="text-[15px] font-bold tracking-tight text-slate-900">{title}</p>
           </div>
           <div className="flex items-center gap-3 text-xs text-slate-500">
             {stats && (

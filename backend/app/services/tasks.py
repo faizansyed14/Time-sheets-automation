@@ -49,25 +49,80 @@ def _reset_async_clients() -> None:
         # Drop all pooled DB connections (if any) so none cross loop boundaries.
         await engine.dispose()
 
-    try:
-        asyncio.run(_cleanup())
-    except Exception:
-        # Best-effort. Even if cleanup fails, ensure we don't keep a stale redis handle.
+    def _sync_reset() -> None:
         try:
-            from app.core.cache import cache
-
-            cache._redis = None
-            cache._checked = False
+            asyncio.run(_cleanup())
         except Exception:
-            pass
+            try:
+                from app.core.cache import cache
+
+                cache._redis = None
+                cache._checked = False
+            except Exception:
+                pass
+
+    try:
+        asyncio.get_running_loop()
+        in_loop = True
+    except RuntimeError:
+        in_loop = False
+
+    if not in_loop:
+        _sync_reset()
+        return
+
+    # pytest-asyncio (and other callers) may invoke eager Celery tasks while a
+    # loop is already running — run cleanup on a dedicated thread/loop instead.
+    import queue
+    import threading
+
+    q: queue.Queue = queue.Queue()
+
+    def _worker() -> None:
+        try:
+            _sync_reset()
+            q.put(None)
+        except Exception as exc:
+            q.put(exc)
+
+    threading.Thread(target=_worker, daemon=True).start()
+    err = q.get()
+    if err is not None:
+        raise err
 
 
 def _run_coro(coro_factory):
-    """Run async work to completion in a fresh event loop."""
+    """Run async work to completion — safe from sync Celery and pytest-asyncio."""
     try:
-        return asyncio.run(coro_factory())
-    finally:
-        _reset_async_clients()
+        asyncio.get_running_loop()
+        in_loop = True
+    except RuntimeError:
+        in_loop = False
+
+    if not in_loop:
+        try:
+            return asyncio.run(coro_factory())
+        finally:
+            _reset_async_clients()
+
+    import queue
+    import threading
+
+    q: queue.Queue = queue.Queue()
+
+    def _worker() -> None:
+        try:
+            q.put(asyncio.run(coro_factory()))
+        except Exception as exc:
+            q.put(exc)
+        finally:
+            _reset_async_clients()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    result = q.get()
+    if isinstance(result, BaseException):
+        raise result
+    return result
 
 
 @celery_app.task(name="maintenance.purge_pipeline_raw")
@@ -82,20 +137,21 @@ def purge_pipeline_raw_task():
 
 @celery_app.task(name="ingestion.process_upload")
 def process_upload_task(filename: str, content_type: str, data_b64: str):
-    """Stage an upload in a worker (same Run Extraction path as the Upload page)."""
+    """Stage an upload in a worker — the same Extract Email pipeline as the
+    Upload page (analyse every sheet, group, stage for review)."""
     import base64
 
     from app.core.database import SessionLocal
-    from app.services.pipeline.ingestion import stage_upload_extraction
+    from app.services.agents.full_email_extract import extract_upload
 
     data = base64.b64decode(data_b64)
 
     async def _run():
         async with SessionLocal() as db:
-            staged = await stage_upload_extraction(
-                db, files=[(filename, content_type, data)])
-            t = staged[0]
-            return {"pipeline_id": t.id, "record_id": t.record_id,
-                    "status": t.status}
+            res = await extract_upload(
+                db, filename=filename, content_type=content_type, data=data)
+            staged = res["staged"]
+            return {"staged": [t.id for t in staged],
+                    "groups": res["groups"], "message": res["message"]}
 
     return _run_coro(_run)

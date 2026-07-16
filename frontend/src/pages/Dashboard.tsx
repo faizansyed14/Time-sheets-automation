@@ -6,11 +6,10 @@ import {
   CalendarCheck,
   CalendarX,
   AlertTriangle,
-  XCircle,
-  ChevronDown,
-  ChevronRight,
+  Search,
+  CheckCircle2,
+  Clock,
   Eye,
-  MapPin,
   Check,
 } from "lucide-react";
 import {
@@ -21,9 +20,10 @@ import {
   MONTHS_LONG,
   type CoverageStatus,
   type DashboardRow,
+  type TimesheetRecord,
 } from "../api/client";
 import { avatarColor, cn, initials } from "../lib/utils";
-import { Badge, Card, EmptyState, PageHeader, Select, Skeleton, Spinner } from "../components/ui";
+import { Badge, Card, EmptyState, Input, Select, Skeleton, Spinner } from "../components/ui";
 import { ApprovalBadge, ValidationBadge } from "../components/status";
 import { useDebounced, useSentinel } from "../lib/useInfinite";
 
@@ -31,42 +31,42 @@ const NOW = new Date();
 const CUR_YEAR = NOW.getFullYear();
 const CUR_MONTH = NOW.getMonth() + 1;
 
-function Kpi({
+type QuickFilter = "all" | CoverageStatus;
+
+function StatCard({
   label,
   value,
   icon,
   tone,
-  hint,
-  accent,
 }: {
   label: string;
   value: number | string;
   icon: React.ReactNode;
   tone: string;
-  hint?: string;
-  accent?: string;
 }) {
   return (
-    <Card
-      className={cn(
-        "group relative flex items-center gap-3.5 overflow-hidden p-4 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-card-hover",
-        accent
-      )}
-    >
-      <div className={cn("flex h-12 w-12 shrink-0 items-center justify-center rounded-xl ring-1 ring-inset ring-black/[0.03] transition-transform duration-200 group-hover:scale-105", tone)}>
+    <div className={cn("flex items-center gap-3 rounded-xl border border-slate-200/80 bg-white p-4 shadow-card", tone)}>
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white/80 ring-1 ring-black/[0.04]">
         {icon}
       </div>
-      <div className="min-w-0">
-        <p className="text-[26px] font-bold leading-7 tracking-tight text-slate-900">{value}</p>
-        <p className="truncate text-xs font-semibold text-slate-500">{label}</p>
-        {hint && <p className="truncate text-[11px] text-slate-400">{hint}</p>}
+      <div>
+        <p className="text-2xl font-bold leading-none text-slate-900">{value}</p>
+        <p className="mt-1 text-xs font-medium text-slate-500">{label}</p>
       </div>
-    </Card>
+    </div>
   );
 }
 
-/** 12-month submission strip for one employee in the focus year. */
-function CoverageStrip({
+function monthStatus(row: DashboardRow, month: number, year: number) {
+  const future = year > CUR_YEAR || (year === CUR_YEAR && month > CUR_MONTH);
+  const submitted = row.submitted_months.includes(month);
+  if (submitted) return { label: "Submitted", tone: "green" as const };
+  if (future) return { label: "Not due", tone: "slate" as const };
+  if (row.in_matcher) return { label: "Missing", tone: "rose" as const };
+  return { label: "Unmatched", tone: "amber" as const };
+}
+
+function MonthStrip({
   submitted,
   year,
   focusMonth,
@@ -106,52 +106,84 @@ function CoverageStrip({
   );
 }
 
-function EmployeeRecords({ pk, year }: { pk: string; year: number }) {
+function resolveFocusRecord(
+  records: TimesheetRecord[] | undefined,
+  opts: { recordId?: string | null; month: number; year: number }
+) {
+  if (opts.recordId) {
+    const byId = records?.find((r) => r.id === opts.recordId);
+    if (byId) return byId;
+  }
+  return records?.find((r) => r.month === opts.month && r.year === opts.year) ?? null;
+}
+
+function ReviewStatCard({ count }: { count: number }) {
+  return (
+    <Link
+      to="/review"
+      title="Open Review to accept or fix extracted timesheets."
+      className="group flex items-center gap-3 rounded-xl border border-amber-200/80 bg-amber-50/30 p-4 shadow-card transition hover:border-amber-300 hover:bg-amber-50/50"
+    >
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white/80 ring-1 ring-black/[0.04]">
+        <AlertTriangle className="h-5 w-5 text-amber-600" />
+      </div>
+      <div>
+        <p className="text-2xl font-bold leading-none text-slate-900">{count}</p>
+        <p className="mt-1 text-xs font-medium text-slate-500">Waiting for review</p>
+      </div>
+    </Link>
+  );
+}
+
+function ViewRecordButton({
+  pk,
+  year,
+  month,
+  recordId,
+  needsReview,
+}: {
+  pk: string;
+  year: number;
+  month: number;
+  recordId: string | null;
+  needsReview: boolean;
+}) {
   const { data, isLoading } = useQuery({
     queryKey: ["employee-records", pk, year],
     queryFn: () => fetchEmployeeRecords(pk, year),
+    enabled: !!pk,
   });
-  if (isLoading) return <Skeleton className="m-4 h-16" />;
-  if (!data?.length)
-    return (
-      <p className="px-6 py-4 text-sm text-slate-500">
-        No timesheet records for {year}. This employee is showing as missing for every month.
-      </p>
-    );
+  const rec = resolveFocusRecord(data, { recordId, month, year });
+  if (isLoading && !recordId) {
+    return <span className="text-xs text-slate-400">…</span>;
+  }
+  if (!rec) return null;
   return (
-    <div className="divide-y divide-slate-100">
-      {data.map((r) => (
-        <Link
-          key={r.id}
-          to={`/records/${r.id}`}
-          className="flex items-center gap-4 px-6 py-3 transition-colors hover:bg-brand-50/50"
-        >
-          <p className="w-36 shrink-0 text-sm font-semibold text-slate-700">
-            {MONTHS_LONG[r.month] ?? r.month} {r.year}
-          </p>
-          <div className="flex flex-1 flex-wrap items-center gap-1.5">
-            <ValidationBadge status={r.validation_status} />
-            <ApprovalBadge status={r.approval_status} />
-            {r.source_file_count > 1 && <Badge tone="violet">{r.source_file_count} files merged</Badge>}
-          </div>
-          <p className="hidden max-w-md truncate text-xs text-slate-400 lg:block">{r.llm_summary}</p>
-          <Eye className="h-4 w-4 shrink-0 text-slate-400" />
-        </Link>
-      ))}
-    </div>
+    <Link
+      to={`/records/${rec.id}`}
+      className={cn(
+        "inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-white shadow-sm",
+        needsReview ? "bg-amber-500 hover:bg-amber-600" : "bg-brand-600 hover:bg-brand-700"
+      )}
+    >
+      <Eye className="h-3.5 w-3.5" />
+      View record
+    </Link>
   );
 }
 
 export default function Dashboard() {
-  const [year, setYear] = useState<number>(CUR_YEAR);
-  const [month, setMonth] = useState<number>(CUR_MONTH);
-  const [open, setOpen] = useState<string | null>(null);
+  const [year, setYear] = useState(CUR_YEAR);
+  const [month, setMonth] = useState(CUR_MONTH);
   const [q, setQ] = useState("");
   const [loc, setLoc] = useState("");
-  const [statusFilter, setStatusFilter] = useState<CoverageStatus | "">("");
-  const [onlyMissing, setOnlyMissing] = useState(false);
+  const [quickFilter, setQuickFilter] = useState<QuickFilter>("all");
 
-  const dq = useDebounced(q, 350);
+  const statusFilter: CoverageStatus | "" =
+    quickFilter === "all" ? "" : quickFilter;
+  const onlyMissing = quickFilter === "missing";
+
+  const dq = useDebounced(q, 300);
   const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
     queryKey: ["coverage", year, month, dq, loc, statusFilter, onlyMissing],
     queryFn: ({ pageParam }) =>
@@ -169,20 +201,16 @@ export default function Dashboard() {
   });
   const { data: stats } = useQuery({ queryKey: ["pipeline-stats"], queryFn: fetchPipelineStats });
 
-  // Headline counts come from the first page (computed globally on the server);
-  // rows accumulate across pages as you scroll.
   const cov = data?.pages[0];
-  const filtered = data?.pages.flatMap((p) => p.rows) ?? [];
-  const filteredTotal = cov?.filtered_total ?? filtered.length;
+  const rows = data?.pages.flatMap((p) => p.rows) ?? [];
+  const filteredTotal = cov?.filtered_total ?? rows.length;
+  const reviewCount = (stats?.needs_review ?? 0) + (stats?.failed ?? 0);
 
   const years = useMemo(() => {
     const ys = new Set<number>([CUR_YEAR, CUR_YEAR - 1, CUR_YEAR - 2, year]);
-    filtered.forEach((r) => r.years.forEach((y) => ys.add(y)));
+    rows.forEach((r) => r.years.forEach((y) => ys.add(y)));
     return [...ys].sort((a, b) => b - a);
-  }, [filtered, year]);
-
-  const isMissing = (r: DashboardRow) =>
-    r.in_matcher && !r.submitted_months.includes(month) && !(year > CUR_YEAR || (year === CUR_YEAR && month > CUR_MONTH));
+  }, [rows, year]);
 
   const rowKey = (r: DashboardRow) =>
     r.employee_pk ?? `unmatched::${(r.employee_name ?? "Unknown").toLowerCase()}`;
@@ -193,246 +221,236 @@ export default function Dashboard() {
   );
 
   const focusFuture = year > CUR_YEAR || (year === CUR_YEAR && month > CUR_MONTH);
+  const periodLabel = `${MONTHS_LONG[month]} ${year}`;
+
+  const chips: { id: QuickFilter; label: string }[] = [
+    { id: "all", label: "All" },
+    { id: "submitted", label: "Submitted" },
+    { id: "missing", label: "Missing" },
+    { id: "needs_review", label: "Needs review" },
+  ];
 
   return (
-    <div className="animate-fade-up">
-      <PageHeader
-        title="Dashboard"
-        actions={
-          <div className="flex items-center gap-2">
-            <Select value={month} onChange={(e) => setMonth(Number(e.target.value))}>
-              {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
-                <option key={m} value={m}>
-                  {MONTHS_LONG[m]}
-                </option>
-              ))}
-            </Select>
-            <Select value={year} onChange={(e) => setYear(Number(e.target.value))}>
-              {years.map((y) => (
-                <option key={y} value={y}>
-                  {y}
-                </option>
-              ))}
-            </Select>
-          </div>
-        }
-      />
-
-      {/* One glance, one click: everything waiting on a human. */}
-      {((stats?.needs_review ?? 0) + (stats?.failed ?? 0)) > 0 && (
-        <Link
-          to="/review"
-          className="mb-5 flex items-center gap-4 rounded-2xl border border-amber-200 bg-gradient-to-r from-amber-50 to-orange-50 p-4 shadow-card transition-all hover:-translate-y-0.5 hover:shadow-card-hover"
-        >
-          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-amber-100 text-amber-600">
-            <AlertTriangle className="h-5 w-5" />
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="block text-sm font-bold text-slate-900">
-              {(stats?.needs_review ?? 0) + (stats?.failed ?? 0)} item(s) need your review
-            </span>
-            <span className="block text-xs text-slate-600">
-              Extracted timesheets waiting to be checked and accepted — one click each.
-            </span>
-          </span>
-          <span className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-amber-500 px-3.5 py-2 text-sm font-semibold text-white shadow-sm">
-            Review now <ChevronRight className="h-4 w-4" />
-          </span>
-        </Link>
-      )}
-
-      <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-5">
-        <Kpi
-          label="Employees"
-          value={cov?.total_employees ?? "—"}
-          icon={<Users className="h-5 w-5 text-brand-600" />}
-          tone="bg-brand-50"
-          hint="in the matcher list"
-        />
-        <Kpi
-          label={`Submitted · ${MONTHS[month]}`}
-          value={cov?.submitted_this_month ?? "—"}
-          icon={<CalendarCheck className="h-5 w-5 text-emerald-600" />}
-          tone="bg-emerald-50"
-        />
-        <button onClick={() => setOnlyMissing((v) => !v)} className="text-left">
-          <Kpi
-            label={`Missing · ${MONTHS[month]} ${year}`}
+    <div className="animate-fade-up space-y-5">
+      <div
+        className={cn(
+          "grid gap-3",
+          reviewCount > 0 ? "sm:grid-cols-2 lg:grid-cols-4" : "sm:grid-cols-3"
+        )}
+      >
+          <StatCard
+            label="Employees in matcher"
+            value={cov?.total_employees ?? "—"}
+            icon={<Users className="h-5 w-5 text-brand-600" />}
+            tone=""
+          />
+          <StatCard
+            label={`Submitted · ${MONTHS[month]}`}
+            value={cov?.submitted_this_month ?? "—"}
+            icon={<CalendarCheck className="h-5 w-5 text-emerald-600" />}
+            tone="border-emerald-100 bg-emerald-50/30"
+          />
+          <StatCard
+            label={focusFuture ? `Missing · ${MONTHS[month]} (not due)` : `Missing · ${MONTHS[month]}`}
             value={focusFuture ? "—" : cov?.missing_this_month ?? "—"}
             icon={<CalendarX className="h-5 w-5 text-rose-600" />}
-            tone="bg-rose-50"
-            accent={onlyMissing ? "ring-2 ring-rose-300" : ""}
-            hint={focusFuture ? "month not due yet" : onlyMissing ? "filtering · click to clear" : "click to filter"}
+            tone="border-rose-100 bg-rose-50/30"
           />
-        </button>
-        <Kpi
-          label="Need review"
-          value={cov?.needs_review ?? "—"}
-          icon={<AlertTriangle className="h-5 w-5 text-amber-600" />}
-          tone="bg-amber-50"
-          hint="employees with flags"
-        />
-        <Kpi
-          label="Failed pipeline"
-          value={stats?.failed ?? "—"}
-          icon={<XCircle className="h-5 w-5 text-rose-600" />}
-          tone="bg-rose-50"
-          hint={stats?.failed ? "fix them in Review" : "all clear"}
-        />
-      </div>
-
-      <Card>
-        <div className="flex flex-wrap items-center gap-3 border-b border-slate-100 px-5 py-3.5">
-          <h2 className="text-sm font-bold text-slate-800">Employees</h2>
-          <div className="ml-auto flex flex-wrap items-center gap-2">
-            <label className="flex cursor-pointer items-center gap-1.5 text-xs font-medium text-slate-600">
-              <input
-                type="checkbox"
-                checked={onlyMissing}
-                onChange={(e) => setOnlyMissing(e.target.checked)}
-                className="h-3.5 w-3.5 rounded border-slate-300 text-rose-600 focus:ring-rose-400"
-              />
-              Only missing {MONTHS[month]}
-            </label>
-            <Select value={loc} onChange={(e) => setLoc(e.target.value)} className="py-1.5 text-xs">
-              <option value="">All locations</option>
-              <option value="DXB">DXB</option>
-              <option value="AUH">AUH</option>
-            </Select>
-            <Select
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value as CoverageStatus | "")}
-              className="py-1.5 text-xs"
-              title={`Status for ${MONTHS_LONG[month]} ${year}`}
-            >
-              <option value="">All statuses</option>
-              <option value="submitted">Submitted</option>
-              <option value="missing">Missing</option>
-              <option value="needs_review">Needs review</option>
-              <option value="approved">Approved</option>
-              <option value="not_approved">Not approved</option>
-              <option value="pending_approval">Pending approval</option>
-            </Select>
-            <input
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              placeholder="Search name or ID…"
-              className="w-56 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-sm placeholder:text-slate-400 focus:border-brand-400 focus:bg-white focus:outline-none"
-            />
-          </div>
+          {reviewCount > 0 && <ReviewStatCard count={reviewCount} />}
         </div>
 
-        <div className="flex items-center gap-4 border-b border-slate-100 bg-slate-50/60 px-6 py-2 text-[11px] font-medium text-slate-400">
-          <span className="flex items-center gap-1">
-            <span className="flex h-3.5 w-3.5 items-center justify-center rounded bg-emerald-500" />
-            submitted
-          </span>
-          <span className="flex items-center gap-1">
-            <span className="h-3.5 w-3.5 rounded bg-rose-100 ring-1 ring-rose-300" /> missing
-          </span>
-          <span className="flex items-center gap-1">
-            <span className="h-3.5 w-3.5 rounded bg-slate-50" /> not due yet
-          </span>
-          <span className="ml-auto hidden md:block">Jan → Dec {year}</span>
+      <Card className="overflow-hidden p-0">
+        <div className="flex flex-col gap-3 border-b border-slate-100 bg-slate-50/40 px-4 py-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-xs font-bold uppercase tracking-wide text-slate-400">Period</span>
+            <Select
+              value={month}
+              onChange={(e) => setMonth(Number(e.target.value))}
+              className="min-w-[140px] font-semibold"
+            >
+              {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
+                <option key={m} value={m}>{MONTHS_LONG[m]}</option>
+              ))}
+            </Select>
+            <Select
+              value={year}
+              onChange={(e) => setYear(Number(e.target.value))}
+              className="min-w-[100px] font-semibold"
+            >
+              {years.map((y) => (
+                <option key={y} value={y}>{y}</option>
+              ))}
+            </Select>
+          </div>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex flex-wrap gap-1.5">
+              {chips.map((c) => (
+              <button
+                key={c.id}
+                type="button"
+                onClick={() => setQuickFilter(c.id)}
+                className={cn(
+                  "rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors",
+                  quickFilter === c.id
+                    ? "bg-brand-600 text-white shadow-sm"
+                    : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                )}
+              >
+                {c.label}
+              </button>
+              ))}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex rounded-lg border border-slate-200 p-0.5">
+                {(["", "DXB", "AUH"] as const).map((l) => (
+                <button
+                  key={l || "all"}
+                  type="button"
+                  onClick={() => setLoc(l)}
+                  className={cn(
+                    "rounded-md px-2.5 py-1 text-xs font-semibold transition-colors",
+                    loc === l ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"
+                  )}
+                >
+                  {l || "All"}
+                </button>
+                ))}
+              </div>
+              <div className="relative min-w-[200px] flex-1 sm:w-56 sm:flex-none">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <Input
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  placeholder="Search name or ID…"
+                  className="pl-9 py-1.5 text-sm"
+                />
+              </div>
+            </div>
+          </div>
         </div>
 
         {isLoading ? (
-          <div className="space-y-2 p-6">
-            <Skeleton className="h-14" />
-            <Skeleton className="h-14" />
-            <Skeleton className="h-14" />
+          <div className="space-y-2 p-4">
+            <Skeleton className="h-11" />
+            <Skeleton className="h-11" />
+            <Skeleton className="h-11" />
           </div>
-        ) : filtered.length === 0 ? (
+        ) : rows.length === 0 ? (
           <EmptyState
-            title={onlyMissing ? "Nobody is missing 🎉" : "No employees"}
+            title={quickFilter === "missing" ? "Nobody missing" : "No employees found"}
             detail={
-              onlyMissing
-                ? `Everyone submitted their ${MONTHS_LONG[month]} ${year} timesheet.`
-                : "Import your employee matcher list, then accept emails or upload timesheets."
+              quickFilter === "missing"
+                ? `Everyone submitted for ${periodLabel}.`
+                : "Try a different search or filter."
             }
           />
         ) : (
-          <div className="divide-y divide-slate-100">
-            {filtered.map((r) => {
-              const key = rowKey(r);
-              const expanded = open === key;
-              const missing = isMissing(r);
-              return (
-                <div key={key}>
-                  <button
-                    onClick={() => setOpen(expanded ? null : key)}
-                    className="flex w-full items-center gap-4 px-6 py-3 text-left transition-colors hover:bg-slate-50"
-                  >
-                    {expanded ? (
-                      <ChevronDown className="h-4 w-4 shrink-0 text-slate-400" />
-                    ) : (
-                      <ChevronRight className="h-4 w-4 shrink-0 text-slate-400" />
-                    )}
-                    <span
-                      className={cn(
-                        "flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-bold",
-                        avatarColor(r.employee_name)
-                      )}
-                    >
-                      {initials(r.employee_name)}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="flex items-center gap-2">
-                        <span className="truncate text-sm font-semibold text-slate-800">
-                          {r.employee_name ?? "Unknown"}
-                        </span>
-                        <span className="font-mono text-[11px] text-slate-400">{r.employee_id}</span>
-                        {!r.in_matcher && <Badge tone="rose">unmatched</Badge>}
-                      </span>
-                      <span className="flex items-center gap-2 text-xs text-slate-400">
-                        {r.location && (
-                          <span className={cn("rounded px-1 text-[10px] font-semibold", r.location === "AUH" ? "bg-violet-50 text-violet-600" : "bg-sky-50 text-sky-600")}>
-                            {r.location}
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-left text-sm">
+              <thead>
+                <tr className="border-b border-slate-100 bg-slate-50/80 text-[11px] font-bold uppercase tracking-wide text-slate-400">
+                  <th className="px-4 py-2.5">Employee</th>
+                  <th className="hidden px-4 py-2.5 sm:table-cell">ID</th>
+                  <th className="hidden px-4 py-2.5 md:table-cell">Location</th>
+                  <th className="hidden px-4 py-2.5 lg:table-cell">Manager</th>
+                  <th className="px-4 py-2.5">{MONTHS[month]} {year}</th>
+                  <th className="px-4 py-2.5">{year}</th>
+                  <th className="sticky right-0 z-10 bg-slate-50/95 px-4 py-2.5 text-right shadow-[-8px_0_12px_-8px_rgba(0,0,0,0.08)]">
+                    View
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {rows.map((r) => {
+                  const key = rowKey(r);
+                  const status = monthStatus(r, month, year);
+                  const hasSubmittedMonth = r.submitted_months.includes(month);
+                  const needsReview =
+                    r.focus_validation_status === "manual_review" ||
+                    r.needs_review_count > 0;
+                  const showView = !!r.employee_pk && (hasSubmittedMonth || !!r.focus_record_id);
+                  return (
+                    <tr key={key} className="group hover:bg-slate-50/80">
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2.5">
+                          <span
+                            className={cn(
+                              "flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[11px] font-bold",
+                              avatarColor(r.employee_name)
+                            )}
+                          >
+                            {initials(r.employee_name)}
                           </span>
+                          <div className="min-w-0">
+                            <p className="truncate font-semibold text-slate-800">
+                              {r.employee_name ?? "Unknown"}
+                            </p>
+                            <p className="truncate text-xs text-slate-400 sm:hidden">{r.employee_id}</p>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="hidden px-4 py-3 font-mono text-xs text-slate-500 sm:table-cell">
+                        {r.employee_id ?? "—"}
+                      </td>
+                      <td className="hidden px-4 py-3 md:table-cell">
+                        {r.location ? (
+                          <Badge tone={r.location === "AUH" ? "violet" : "sky"}>{r.location}</Badge>
+                        ) : (
+                          <span className="text-slate-300">—</span>
                         )}
-                        {r.account_manager && (
-                          <span className="flex items-center gap-0.5">
-                            <MapPin className="h-3 w-3" /> {r.account_manager}
-                          </span>
+                      </td>
+                      <td className="hidden max-w-[140px] truncate px-4 py-3 text-slate-600 lg:table-cell">
+                        {r.account_manager ?? "—"}
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <Badge tone={status.tone}>
+                            {status.tone === "green" && <CheckCircle2 className="h-3 w-3" />}
+                            {status.tone === "rose" && <CalendarX className="h-3 w-3" />}
+                            {status.tone === "slate" && <Clock className="h-3 w-3" />}
+                            {status.label}
+                          </Badge>
+                          {hasSubmittedMonth && r.focus_validation_status && (
+                            <ValidationBadge status={r.focus_validation_status} />
+                          )}
+                          {hasSubmittedMonth && r.focus_approval_status && (
+                            <ApprovalBadge status={r.focus_approval_status} />
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3">
+                        <MonthStrip
+                          submitted={r.submitted_months}
+                          year={year}
+                          focusMonth={month}
+                        />
+                      </td>
+                      <td className="sticky right-0 z-10 bg-white px-4 py-3 text-right shadow-[-8px_0_12px_-8px_rgba(0,0,0,0.06)] group-hover:bg-slate-50/80">
+                        {showView ? (
+                          <ViewRecordButton
+                            pk={r.employee_pk!}
+                            year={year}
+                            month={month}
+                            recordId={r.focus_record_id}
+                            needsReview={needsReview}
+                          />
+                        ) : (
+                          <span className="text-slate-300">—</span>
                         )}
-                      </span>
-                    </span>
-
-                    <span className="hidden lg:block">
-                      <CoverageStrip submitted={r.submitted_months} year={year} focusMonth={month} />
-                    </span>
-
-                    <span className="flex w-44 shrink-0 justify-end gap-1.5">
-                      {missing ? (
-                        <Badge tone="rose">
-                          <CalendarX className="h-3 w-3" /> Missing {MONTHS[month]}
-                        </Badge>
-                      ) : r.in_matcher && r.submitted_months.includes(month) ? (
-                        <Badge tone="green">
-                          <Check className="h-3 w-3" /> Submitted
-                        </Badge>
-                      ) : null}
-                      {r.needs_review_count > 0 && (
-                        <Badge tone="amber">{r.needs_review_count} review</Badge>
-                      )}
-                    </span>
-                  </button>
-                  {expanded && (
-                    <div className="border-t border-slate-100 bg-slate-50/60">
-                      <EmployeeRecords pk={key} year={year} />
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
             <div ref={sentinelRef} />
             {isFetchingNextPage && (
               <div className="flex items-center justify-center gap-2 py-4 text-xs text-slate-400">
                 <Spinner className="h-4 w-4" /> Loading more…
               </div>
             )}
-            <p className="px-6 py-2 text-center text-[11px] text-slate-400">
-              Showing {filtered.length} of {filteredTotal}
+            <p className="border-t border-slate-100 px-4 py-2 text-center text-[11px] text-slate-400">
+              {rows.length} of {filteredTotal} employees
             </p>
           </div>
         )}

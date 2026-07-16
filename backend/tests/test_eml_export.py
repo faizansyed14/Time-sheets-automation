@@ -60,10 +60,11 @@ def test_eml_collect_keeps_outlook_style_pdf_with_content_id():
     msg = EmailMessage(policy=policy.SMTP)
     msg["Subject"] = "TIMESHEET for June"
     msg.set_content("Please find attached attendance report")
-    part = msg.add_attachment(
+    msg.add_attachment(
         pdf, maintype="application", subtype="pdf",
         filename="SGRP_SmartTime_Attendance_Report.PDF",
     )
+    part = next(msg.iter_attachments())
     part.add_header("Content-Id", "<19f4a826b7f7b94dd5b1>")
     part.replace_header(
         "Content-Disposition",
@@ -86,10 +87,11 @@ def test_eml_collect_keeps_approval_screenshot_with_content_id():
     payload = b"\x89PNG\r\n\x1a\n" + (b"\x00" * 60_000)
     msg = EmailMessage(policy=policy.SMTP)
     msg.set_content("Approval attached")
-    part = msg.add_attachment(
+    msg.add_attachment(
         payload, maintype="image", subtype="png",
         filename="Screenshot 2026-07-08 at 12.03.40 PM.png",
     )
+    part = next(msg.iter_attachments())
     part.add_header("Content-Id", "<19f4a8385f7fef9ca334>")
     part.replace_header("Content-Disposition", 'inline; filename="Screenshot.png"')
 

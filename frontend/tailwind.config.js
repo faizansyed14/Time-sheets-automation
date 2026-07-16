@@ -70,6 +70,15 @@ export default {
           "0%": { opacity: "0", transform: "translateY(8px) scale(.98)" },
           "100%": { opacity: "1", transform: "translateY(0) scale(1)" },
         },
+        "review-pop": {
+          "0%": { opacity: "0", transform: "translate(10px, -6px) scale(0.92)" },
+          "70%": { transform: "translate(-2px, 2px) scale(1.03)" },
+          "100%": { opacity: "1", transform: "translate(0, 0) scale(1)" },
+        },
+        "review-float": {
+          "0%, 100%": { transform: "translateY(0)" },
+          "50%": { transform: "translateY(-4px)" },
+        },
       },
       animation: {
         "fade-up": "fade-up .25s ease-out both",
@@ -81,6 +90,8 @@ export default {
         "gradient-pan": "gradient-pan 6s ease infinite",
         "pop-in": "pop-in .22s cubic-bezier(.16,1,.3,1) both",
         "bubble-in": "bubble-in .28s cubic-bezier(.16,1,.3,1) both",
+        "review-pop": "review-pop .45s cubic-bezier(.34,1.56,.64,1) both",
+        "review-float": "review-float 3s ease-in-out infinite",
       },
     },
   },

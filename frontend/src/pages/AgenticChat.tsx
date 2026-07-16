@@ -135,9 +135,9 @@ function StoreConfirm({
       {failed ? <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> : <Check className="h-3.5 w-3.5 shrink-0" />}
       <span>
         {failed
-          ? `Could not file it: ${r.failure_detail || r.failure_code || "unknown error"}.`
+          ? `Could not stage it: ${r.failure_detail || r.failure_code || "unknown error"}.`
           : review
-          ? "Stored, but flagged for review — check it on the Pipeline page."
+          ? "Staged for review — open the Pipeline page and Accept it in Compare & Fix to file the record."
           : "Stored as a timesheet record."}
       </span>
       {r.record_id && (

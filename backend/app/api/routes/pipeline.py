@@ -17,8 +17,8 @@ from app.core import datacache
 from app.core.http_headers import content_disposition
 from app.core.database import get_db
 from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
-from app.schemas import Page, PipelineFileOut, PipelineResolveAssignIn, PipelineResolveIn, PipelineStats
-from app.services.pipeline.ingestion import can_resolve_assign, resolve_pipeline_with_employee, retry_pipeline_file
+from app.schemas import Page, PipelineFileOut, PipelineResolveIn, PipelineStats
+from app.services.pipeline.ingestion import can_resolve_assign, retry_pipeline_file
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
@@ -121,14 +121,6 @@ async def pipeline_stats(db: AsyncSession = Depends(get_db)):
     return PipelineStats(**data)
 
 
-@router.get("/{pipeline_id}", response_model=PipelineFileOut)
-async def get_pipeline_file(pipeline_id: str, db: AsyncSession = Depends(get_db)):
-    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
-    if not t:
-        raise HTTPException(404, "Pipeline file not found")
-    return _out(t)
-
-
 @router.post("/{pipeline_id}/resolve", response_model=PipelineFileOut)
 async def resolve_pipeline_file(
     pipeline_id: str, body: PipelineResolveIn, db: AsyncSession = Depends(get_db),
@@ -152,30 +144,6 @@ async def resolve_pipeline_file(
     purge_raw_copy(t)
     await db.commit()
     await db.refresh(t)
-    await datacache.bust_pipeline()
-    return _out(t)
-
-
-@router.post("/{pipeline_id}/resolve-assign", response_model=PipelineFileOut)
-async def resolve_pipeline_assign(
-    pipeline_id: str, body: PipelineResolveAssignIn, db: AsyncSession = Depends(get_db),
-):
-    """Pick the correct employee + period, re-run extraction and file the timesheet."""
-    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
-    if not t:
-        raise HTTPException(404, "Pipeline file not found")
-    if not (1 <= body.month <= 12 and body.year >= 2000):
-        raise HTTPException(400, "Invalid month or year.")
-    try:
-        _rec, t = await resolve_pipeline_with_employee(
-            db, t, employee_pk=body.employee_pk, month=body.month, year=body.year, note=body.note,
-        )
-    except ValueError as e:
-        raise HTTPException(409, str(e))
-    except FileNotFoundError as e:
-        raise HTTPException(409, str(e))
-    if t.status == PipelineStatus.FAILED:
-        raise HTTPException(409, t.failure_detail or "Processing failed after manual assignment.")
     await datacache.bust_pipeline()
     return _out(t)
 

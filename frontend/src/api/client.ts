@@ -146,6 +146,16 @@ export interface TimesheetRecord {
   source_file_count: number;
 }
 
+export interface TimesheetExportRow extends Omit<TimesheetRecord, "validation_status" | "approval_status"> {
+  validation_status: TimesheetRecord["validation_status"] | "";
+  approval_status: TimesheetRecord["approval_status"] | "";
+  location: string | null;
+  project: string | null;
+  employee_email: string | null;
+  contact_no: string | null;
+  has_record: boolean;
+}
+
 export interface DashboardRow {
   employee_pk: string | null;
   employee_id: string | null;
@@ -161,6 +171,9 @@ export interface DashboardRow {
   submitted_months: number[];
   in_matcher: boolean;
   has_records: boolean;
+  focus_record_id: string | null;
+  focus_validation_status: "verified" | "manual_review" | null;
+  focus_approval_status: "pending" | "approved" | "not_approved" | null;
 }
 
 export interface DashboardSummary {
@@ -267,32 +280,12 @@ export interface IngestSelection {
 export const fetchEmail = (id: string) =>
   api.get<EmailDetail>(`/inbox/${id}`).then((r) => r.data);
 
-// Run Extraction → stage the selected attachments/body into the pipeline as
-// needs-review items (no record yet); the returned PipelineFiles are reviewed
-// and accepted via the Compare & Fix overlay.
-export const stageExtraction = (
-  id: string,
-  selection: { attachment_ids: string[]; extract_body?: boolean },
-) =>
-  api
-    .post<PipelineFile[]>(`/inbox/${id}/stage-extraction`, {
-      attachment_ids: selection.attachment_ids,
-      extract_body: selection.extract_body ?? false,
-    })
-    .then((r) => r.data);
-
-export const decideEmail = (id: string, accepted: boolean, selection?: IngestSelection) =>
-  api.post(`/inbox/${id}/decision`, {
-    accepted,
-    attachment_ids: selection?.attachment_ids,
-    approval_attachment_id: selection?.approval_attachment_id ?? null,
-    extract_body: selection?.extract_body ?? false,
-  }).then((r) => r.data);
+// Archive (accepted=false). Direct accept-and-ingest was removed — every
+// extraction goes through Extract Email + Compare & Fix review.
+export const decideEmail = (id: string, accepted: boolean) =>
+  api.post(`/inbox/${id}/decision`, { accepted }).then((r) => r.data);
 
 export const restoreEmail = (id: string) => api.post(`/inbox/${id}/restore`).then((r) => r.data);
-
-export const rerunExtraction = (id: string, selection: IngestSelection) =>
-  api.post(`/inbox/${id}/rerun`, selection).then((r) => r.data);
 
 export const attachmentUrl = (msgId: string, attId: string) =>
   withAuthParam(`/api/v1/inbox/${msgId}/attachments/${encodeURIComponent(attId)}`);
@@ -324,10 +317,14 @@ export interface FullEmailExtractOut {
   message: string;
 }
 
-export const extractFullEmail = (msgId: string) =>
+// With a selection, ONLY those sheets (and optionally the body) are analysed —
+// the stored raw copy stays the full .eml. Omit for the whole email.
+export const extractFullEmail = (msgId: string, selection?: IngestSelection) =>
   api.post<FullEmailExtractOut>(
     `/inbox/${encodeURIComponent(msgId)}/extract-full`,
-    undefined,
+    selection
+      ? { attachment_ids: selection.attachment_ids, extract_body: selection.extract_body ?? false }
+      : undefined,
     { timeout: 600_000 },
   ).then((r) => r.data);
 
@@ -469,6 +466,14 @@ export const fetchEmployeeRecords = (pk: string, year?: number) =>
 export const fetchRecord = (id: string) =>
   api.get<TimesheetRecord>(`/timesheets/${id}`).then((r) => r.data);
 
+export const fetchExportByPeriod = (month: number, year: number) =>
+  api
+    .get<TimesheetExportRow[]>("/timesheets/by-period", { params: { month, year } })
+    .then((r) => r.data);
+
+export const timesheetExportUrl = (month: number, year: number) =>
+  withAuthParam(`/api/v1/timesheets/export?month=${month}&year=${year}`);
+
 export const approveRecord = (id: string, approved: boolean) =>
   api.post<TimesheetRecord>(`/timesheets/${id}/approve`, { approved }).then((r) => r.data);
 
@@ -527,16 +532,8 @@ export const fetchPipeline = (params?: {
 export const fetchPipelineStats = () =>
   api.get<PipelineStats>("/pipeline/stats").then((r) => r.data);
 
-export const fetchPipelineFile = (id: string) =>
-  api.get<PipelineFile>(`/pipeline/${id}`).then((r) => r.data);
-
 export const resolvePipelineFile = (id: string, note: string) =>
   api.post<PipelineFile>(`/pipeline/${id}/resolve`, { note }).then((r) => r.data);
-
-export const resolvePipelineAssign = (
-  id: string,
-  body: { employee_pk: string; month: number; year: number; note?: string }
-) => api.post<PipelineFile>(`/pipeline/${id}/resolve-assign`, body).then((r) => r.data);
 
 export const retryPipelineFile = (id: string) =>
   api.post<PipelineFile>(`/pipeline/${id}/retry`).then((r) => r.data);

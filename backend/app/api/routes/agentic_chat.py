@@ -10,8 +10,8 @@ from app.core.database import get_db
 from app.schemas import ChatRequest, ChatResponse, ChatSuggestions, UploadResult
 from app.services.agents import chat_agent, upload_cache
 from app.services.agents.extract_service import extract_from_upload
+from app.services.agents.full_email_extract import extract_upload
 from app.services.llm import provider as llm_provider
-from app.services.pipeline.ingestion import ingest_upload
 
 router = APIRouter(prefix="/agentic-chat", tags=["agentic-chat"])
 
@@ -69,27 +69,32 @@ async def extract_uploaded_sheet(
 
 @router.post("/attachments/{token}/store", response_model=UploadResult)
 async def store_uploaded_sheet(token: str, db: AsyncSession = Depends(get_db)):
-    """Opt-in persistence: only called when the user explicitly confirms they
-    want this chat-uploaded sheet filed. Runs ingest_upload — extract, match,
-    validate, file — and creates a PipelineFile + TimesheetRecord.
-    The ephemeral chat copy is consumed (popped) so it can't be filed twice."""
+    """Opt-in staging: only called when the user explicitly confirms they want
+    this chat-uploaded sheet processed. Runs the SAME pipeline as Extract
+    Email / Upload — every sheet analysed, grouped, staged NEEDS_REVIEW for
+    Compare & Fix. Nothing files a record until a reviewer Accepts it there.
+    The ephemeral chat copy is consumed (popped) so it can't be staged twice."""
     entry = await upload_cache.pop(token)
     if not entry:
         raise HTTPException(404, "Attachment expired or not found. Please re-upload it.")
-    rec, tracker = await ingest_upload(
+    res = await extract_upload(
         db, filename=entry.filename, content_type=entry.content_type, data=entry.data)
     await datacache.bust_pipeline()
+    staged = res["staged"]
+    if not staged:
+        raise HTTPException(422, res["message"])
+    t = staged[0]
+    meta = (t.extraction_meta or {}).get("staged") or {}
     return UploadResult(
-        pipeline_id=tracker.id, filename=tracker.filename, status=tracker.status,
-        failure_code=tracker.failure_code, failure_detail=tracker.failure_detail,
-        record_id=rec.id if rec else None,
-        employee_name=rec.employee_name if rec else tracker.employee_name,
-        employee_id=rec.employee_id if rec else tracker.employee_id,
-        month=rec.month if rec else tracker.month,
-        year=rec.year if rec else tracker.year,
-        validation_status=rec.validation_status if rec else None,
-        llm_summary=rec.llm_summary if rec else None,
-        match_note=rec.match_note if rec else None,
+        pipeline_id=t.id, filename=t.filename, status=t.status,
+        failure_code=t.failure_code,
+        failure_detail=res["message"],
+        record_id=None,
+        employee_name=t.employee_name, employee_id=t.employee_id,
+        month=t.month, year=t.year,
+        validation_status=meta.get("validation_status"),
+        llm_summary=meta.get("summary"),
+        match_note="Staged for review — open the Pipeline page (or Compare & Fix) to accept.",
     )
 
 

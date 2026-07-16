@@ -143,6 +143,7 @@ async def coverage(
     for e in page_emps:
         items = by_pk.get(e.id, [])
         scoped = [r for r in items if r.year == focus_year]
+        focus_rec = next((r for r in scoped if r.month == focus_month), None)
         nrev = sum(1 for r in scoped if r.validation_status == ValidationStatus.MANUAL_REVIEW)
         pend = sum(1 for r in scoped if r.approval_status != ApprovalStatus.APPROVED)
         rows.append(DashboardRow(
@@ -153,6 +154,9 @@ async def coverage(
             years=sorted({r.year for r in items}),
             submitted_months=sorted({r.month for r in scoped}),
             in_matcher=True, has_records=bool(items),
+            focus_record_id=focus_rec.id if focus_rec else None,
+            focus_validation_status=focus_rec.validation_status if focus_rec else None,
+            focus_approval_status=focus_rec.approval_status if focus_rec else None,
         ))
 
     # missing_sample (for the KPI tooltip) is part of the cached aggregates above.
