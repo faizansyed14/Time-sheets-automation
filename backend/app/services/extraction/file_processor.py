@@ -1,7 +1,6 @@
 """
-Ported from your project's `file_processor.py`.
 Converts uploads to JPEG images for the vision model, and extracts plain text
-for the optional text cross-validation step.
+for grounding the model (and the deterministic leave/date checks).
 """
 from __future__ import annotations
 
@@ -21,18 +20,17 @@ PDF_DPI = 300          # text-extraction default; the LLM render uses settings.p
 PDF_MAX_PAGES = 10
 JPEG_QUALITY = 90
 IMAGE_MAX_SIDE = 2200
+# Tall stitched PDF/DOCX screenshots — keep text readable (don't crush to 2200).
+STITCH_MAX_WIDTH = 2200
+STITCH_MAX_HEIGHT = 8000
+# Outlook pastes attendance sheets into the HTML body as inline CID images.
+_INLINE_TIMESHEET_MIN_BYTES = 20_000   # keep — real pasted grids
+_INLINE_JUNK_MAX_BYTES = 12_000         # skip — signature logos/icons
+_CID_REF_RE = re.compile(r"cid:([^\"'\s>)]+)", re.IGNORECASE)
+_GENERIC_INLINE_NAME_RE = re.compile(
+    r"^(image\d{2,3}\.(png|jpe?g|gif)|outlook-.+\.(png|jpe?g|gif|bmp)"
+    r"|c2_signature_.+\.(png|jpe?g|gif))$", re.I)
 
-
-def has_text_layer(file_type: str, data: bytes, min_chars: int = 24) -> bool:
-    """True when the file is born-digital with a usable text layer (PDF/DOCX/
-    XLSX/EML), so its text can ground the model and the image only needs LOW
-    detail. Images/scans have no text layer → False."""
-    if file_type == "image":
-        return False
-    try:
-        return len((extract_document_text(file_type, data) or "").strip()) >= min_chars
-    except Exception:
-        return False
 
 # ---------------------------------------------------------------------------
 # Shared date / attendance-grid scanning (used by the mock + vision engines)
@@ -128,25 +126,6 @@ def detect_file_type(filename: str, data: bytes) -> str:
     if name.endswith((".png", ".jpg", ".jpeg")):
         return "image"
     return "unknown"
-
-
-def pdf_to_images(pdf_bytes: bytes, dpi: int | None = None, max_pages: int = PDF_MAX_PAGES) -> list[bytes]:
-    import fitz  # PyMuPDF
-    from PIL import Image
-
-    if dpi is None:
-        dpi = int(getattr(settings, "pdf_render_dpi", 150) or 150)
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    images: list[bytes] = []
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    for i in range(min(doc.page_count, max_pages)):
-        page = doc.load_page(i)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        images.append(_to_jpeg_bytes(img))
-    doc.close()
-    return images
 
 
 def image_to_images(image_bytes: bytes, max_side: int = IMAGE_MAX_SIDE) -> list[bytes]:
@@ -273,7 +252,7 @@ def docx_to_images(docx_bytes: bytes) -> list[bytes]:
 
     pdf = _office_to_pdf_bytes(docx_bytes, "docx")
     if pdf:
-        return pdf_to_images(pdf)
+        return [pdf_to_single_image(pdf)]
     # fallback: render extracted text
     from docx import Document
     doc = Document(io.BytesIO(docx_bytes))
@@ -298,7 +277,7 @@ def xlsx_to_images(xlsx_bytes: bytes) -> list[bytes]:
 
     pdf = _office_to_pdf_bytes(xlsx_bytes, "xlsx")
     if pdf:
-        return pdf_to_images(pdf)
+        return [pdf_to_single_image(pdf)]
     from openpyxl import load_workbook
     wb = load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
     ws = wb.active
@@ -493,26 +472,43 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
 
         if ftype == "image":
             fn = filename.lower()
-            # Approval screenshots and similar — keep even when inline + CID.
+            n = len(payload)
+            # Tiny inline logos/icons — never a timesheet.
+            if n < _INLINE_JUNK_MAX_BYTES and disposition != "attachment":
+                continue
+            # Pasted attendance grids in the body (Outlook inline CID) — keep even
+            # when the filename is generic (image001.png).
             if (
-                len(payload) >= 50_000
+                disposition == "attachment"
+                or n >= _INLINE_TIMESHEET_MIN_BYTES
                 or any(k in fn for k in (
                     "screenshot", "approval", "attendance", "timesheet",
                     "smarttime", "report", "capture",
                 ))
             ):
                 found.append((filename, payload, ftype))
-            # else: decorative inline image (logo, signature banner, etc.)
 
-    # De-duplicate (a nested message can surface the same bytes twice).
-    seen: set[tuple[str, int]] = set()
-    deduped: list[tuple[str, bytes, str]] = []
+    # De-duplicate by CONTENT, not name — Outlook/Graph commonly attach the
+    # exact same image twice: once inline (cid-referenced, generic name like
+    # "image005.png") and once as a plain attachment (its real name, e.g.
+    # "ATT00008.png"). Hashing the bytes catches this even though the two
+    # copies carry different filenames; when both names collide, keep the
+    # non-generic one so the sheet isn't shown to the model/vault as
+    # "body_timesheet.png" when a real name was available.
+    import hashlib
+
+    seen: dict[bytes, tuple[str, bytes, str]] = {}
+    order: list[bytes] = []
     for fn, payload, ftype in found:
-        key = (fn, len(payload))
-        if key in seen:
+        key = hashlib.sha256(payload).digest()
+        if key not in seen:
+            seen[key] = (fn, payload, ftype)
+            order.append(key)
             continue
-        seen.add(key)
-        deduped.append((fn, payload, ftype))
+        existing_fn, _existing_payload, _existing_ft = seen[key]
+        if _GENERIC_INLINE_NAME_RE.match(existing_fn or "") and not _GENERIC_INLINE_NAME_RE.match(fn or ""):
+            seen[key] = (fn, payload, ftype)
+    deduped = [seen[k] for k in order]
     return deduped
 
 
@@ -591,6 +587,110 @@ def _text_to_page_images(
     return images or [_to_jpeg_bytes(Image.new("RGB", (width, height), (255, 255, 255)))]
 
 
+def _likely_pasted_timesheet_image(payload: bytes) -> bool:
+    """Keep Outlook-pasted attendance grids; drop logos / marketing banners.
+
+    Thresholds match attachment junk policy: tiny CID parts are signature
+    chrome; very wide images are email footer banners (brand strips).
+    """
+    if not payload or len(payload) < _INLINE_TIMESHEET_MIN_BYTES:
+        return False
+    try:
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(payload))
+        w, h = im.size
+        if max(w, h) < 280:
+            return False
+        # UAE / corporate banner strips are wide and short.
+        if h > 0 and w >= h * 2:
+            return False
+        return True
+    except Exception:
+        return len(payload) >= 40_000
+
+
+_IMG_TAG_CID_RE = re.compile(
+    r"<img\b[^>]*\bsrc\s*=\s*[\"']cid:[^\"']+[\"'][^>]*/?>",
+    re.IGNORECASE,
+)
+
+
+def _resolve_eml_html_cids(eml_bytes: bytes, html_body: str) -> str:
+    """Replace cid: image refs in HTML with data: URIs from the same .eml.
+
+    Only pasted timesheet-sized images are inlined. Signature logos and wide
+    marketing banners stay out of the JPEG so OpenAI never sees brand chrome.
+    Without inlining real grids, body→PDF renders show empty boxes.
+    """
+    import base64
+
+    if not html_body or "cid:" not in html_body.lower():
+        return html_body
+    try:
+        msg = _parse_eml(eml_bytes)
+    except Exception:
+        return html_body
+    cid_map: dict[str, str] = {}
+    for part in msg.walk():
+        if part.get_content_maintype() != "image":
+            continue
+        cid = (part.get("Content-Id") or "").strip().strip("<>")
+        if not cid:
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload or not _likely_pasted_timesheet_image(payload):
+            continue
+        ctype = (part.get_content_type() or "image/png").split(";")[0]
+        uri = f"data:{ctype};base64,{base64.b64encode(payload).decode()}"
+        cid_map[cid.lower()] = uri
+        cid_map[cid.split("@")[0].lower()] = uri
+        fn = (part.get_filename() or "").strip().lower()
+        if fn:
+            cid_map[fn] = uri
+
+    def _cid_uri(ref: str) -> str | None:
+        return (cid_map.get(ref.lower())
+                or cid_map.get(ref.split("@")[0].lower()))
+
+    def _sub_ref(m: re.Match) -> str:
+        return _cid_uri(m.group(1)) or ""
+
+    # Drop whole <img cid:...> tags that are logos/banners (not in cid_map).
+    def _sub_img(m: re.Match) -> str:
+        ref_m = _CID_REF_RE.search(m.group(0))
+        if not ref_m:
+            return ""
+        return m.group(0) if _cid_uri(ref_m.group(1)) else ""
+
+    out = _IMG_TAG_CID_RE.sub(_sub_img, html_body)
+    return _CID_REF_RE.sub(_sub_ref, out)
+
+
+_SHEET_SIG_LABEL_HTML_RE = re.compile(
+    r"(?is)\b(?:EMPLOYEE|MANAGER)\s+SIGNATURE\b",
+)
+
+
+def _strip_html_after_sheet_signatures(html: str) -> str:
+    """Cut corporate contact cards / logo blocks after sheet signature labels.
+
+    Many DHRE sheets end with EMPLOYEE/MANAGER SIGNATURE then repeat brand
+    banners + phones — that chrome must not become vision pixels.
+    """
+    if not html:
+        return html
+    matches = list(_SHEET_SIG_LABEL_HTML_RE.finditer(html))
+    if not matches:
+        return html
+    end = matches[-1].end()
+    tail = html[end:]
+    tail_text = re.sub(r"<[^>]+>", "", tail).strip()
+    if len(tail_text) < 20 and "cid:" not in tail.lower() and "<img" not in tail.lower():
+        return html
+    return html[:end] + "<!-- signature-redacted -->"
+
+
 def _eml_subject_and_body_html(eml_bytes: bytes) -> tuple[str, str | None, str]:
     """Return (subject, html_body_or_None, plain_body) for an .eml."""
     msg = _parse_eml(eml_bytes)
@@ -626,7 +726,12 @@ def _trim_whitespace(img, bg=(255, 255, 255), pad: int = 16):
     return img.crop((l, t, r, b))
 
 
-def pdf_to_single_image(pdf_bytes: bytes, dpi: int = 200, gap: int = 12) -> bytes:
+def pdf_to_single_image(
+    pdf_bytes: bytes,
+    dpi: int | None = None,
+    gap: int = 12,
+    max_pages: int = PDF_MAX_PAGES,
+) -> bytes:
     """Render a (possibly multi-page) PDF into ONE continuous tall image, with
     each page's whitespace trimmed and the pages stacked vertically. Because
     table rows are kept whole (CSS break-inside:avoid), nothing is cut mid-row,
@@ -634,11 +739,13 @@ def pdf_to_single_image(pdf_bytes: bytes, dpi: int = 200, gap: int = 12) -> byte
     import fitz
     from PIL import Image
 
+    if dpi is None:
+        dpi = int(getattr(settings, "pdf_render_dpi", 150) or 150)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
     pages: list = []
-    for i in range(doc.page_count):
+    for i in range(min(doc.page_count, max_pages)):
         pix = doc.load_page(i).get_pixmap(matrix=mat, alpha=False)
         im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         pages.append(_trim_whitespace(im))
@@ -646,14 +753,21 @@ def pdf_to_single_image(pdf_bytes: bytes, dpi: int = 200, gap: int = 12) -> byte
     if not pages:
         raise ValueError("empty PDF")
     if len(pages) == 1:
-        return _to_jpeg_bytes(pages[0])
-    width = max(p.width for p in pages)
-    height = sum(p.height for p in pages) + gap * (len(pages) - 1)
-    canvas = Image.new("RGB", (width, height), (255, 255, 255))
-    y = 0
-    for p in pages:
-        canvas.paste(p, (0, y))
-        y += p.height + gap
+        canvas = pages[0]
+    else:
+        width = max(p.width for p in pages)
+        height = sum(p.height for p in pages) + gap * (len(pages) - 1)
+        canvas = Image.new("RGB", (width, height), (255, 255, 255))
+        y = 0
+        for p in pages:
+            canvas.paste(p, (0, y))
+            y += p.height + gap
+    scale = min(STITCH_MAX_WIDTH / canvas.width, STITCH_MAX_HEIGHT / canvas.height, 1.0)
+    if scale < 1.0:
+        canvas = canvas.resize(
+            (max(1, int(canvas.width * scale)), max(1, int(canvas.height * scale))),
+            Image.LANCZOS,
+        )
     return _to_jpeg_bytes(canvas)
 
 
@@ -663,18 +777,54 @@ def eml_body_to_images(eml_bytes: bytes) -> list[bytes]:
     full colours/borders, stitched into a single screenshot so nothing is split
     across a page break. Saved as evidence AND sent to the vision model. Falls
     back to a clean TrueType text render if no HTML engine is available."""
-    from app.core.pii import scrub_text
+    from app.core.pii import scrub_email_for_llm, scrub_text
 
     try:
         subject, html_body, plain_body = _eml_subject_and_body_html(eml_bytes)
     except Exception:
-        return [_stitch_text_images(scrub_text(_extract_eml_body_text(eml_bytes)))]
+        _, scrubbed = scrub_email_for_llm("", _extract_eml_body_text(eml_bytes))
+        return [_stitch_text_images(scrubbed)]
 
-    # Scrub BEFORE rendering — once addresses/phones are pixels in the JPEG the
-    # vision model reads them like any other text.
-    subject = scrub_text(subject)
-    html_body = scrub_text(html_body) if html_body else html_body
-    plain_body = scrub_text(plain_body)
+    # Scrub BEFORE rendering — once addresses/phones/secrets are pixels in the
+    # JPEG the vision model reads them like any other text. Signature footers
+    # are cut so "Password:" lines under Thanks never leave the server.
+    # CID logos / wide brand banners are not inlined (see _resolve_eml_html_cids).
+    subject, plain_body = scrub_email_for_llm(subject, plain_body)
+    if html_body:
+        from app.core.pii import strip_html_quoted_reply_thread
+
+        _, focused_plain = scrub_email_for_llm(subject, _extract_eml_body_text(eml_bytes))
+        html_body = scrub_text(html_body)
+        html_body = strip_html_quoted_reply_thread(html_body)
+        html_body = _strip_html_after_sheet_signatures(html_body)
+        html_body = _resolve_eml_html_cids(eml_bytes, html_body)
+        # Prefer focused plain when HTML is reply-chain chrome (no real grid).
+        # Do NOT treat the word "timesheet" in RE: subjects as an inline sheet —
+        # that kept full quoted threads in the body JPEG.
+        html_l = (html_body or "").lower()
+        has_inline_grid = any(
+            m in html_l
+            for m in (
+                "attendance sheet",
+                "emp no",
+                "empno",
+                "hours worked",
+                "daily total",
+            )
+        ) or (
+            "<table" in html_l
+            and any(m in html_l for m in ("public holiday", "leave", "regular", "in</", "out</"))
+        )
+        has_pasted_sheet_img = "data:image/" in html_l
+        plain_trimmed = (
+            "[signature-redacted]" in (focused_plain or "")
+            or "[quoted-thread-redacted]" in (focused_plain or "")
+        )
+        if focused_plain and plain_trimmed and not has_inline_grid and not has_pasted_sheet_img:
+            plain_body = focused_plain
+            html_body = None
+        else:
+            plain_body = scrub_text(plain_body)
     header = f"<p style='font-family:sans-serif'><b>Subject:</b> {unescape_safe(subject)}</p><hr/>"
     if html_body:
         doc = (
@@ -686,7 +836,8 @@ def eml_body_to_images(eml_bytes: bytes) -> list[bytes]:
         )
     else:
         from html import escape as _esc
-        doc = f"<html><body>{header}<pre style='font-family:monospace;font-size:11pt'>{_esc(plain_body)}</pre></body></html>"
+        focused = _focus_timesheet_text(plain_body)
+        doc = f"<html><body>{header}<pre style='font-family:monospace;font-size:11pt'>{_esc(focused)}</pre></body></html>"
 
     pdf = _html_to_pdf_bytes(doc)
     if pdf:
@@ -695,20 +846,21 @@ def eml_body_to_images(eml_bytes: bytes) -> list[bytes]:
         except Exception:
             pass
     # Fallback: legible text render (no HTML engine available)
-    text = f"Subject: {subject}\n\n" + _focus_timesheet_text(scrub_text(_extract_eml_body_text(eml_bytes)))
+    _, body_fb = scrub_email_for_llm(subject, _extract_eml_body_text(eml_bytes))
+    text = f"Subject: {subject}\n\n" + _focus_timesheet_text(body_fb)
     return [_stitch_text_images(text)]
 
 
 def email_body_to_images(subject: str | None, body_text: str | None) -> list[bytes]:
     """Render a Graph/inbox plain-text email (subject + body) to JPEG — same
     pipeline path as inline EML timesheets. PII is scrubbed before rendering
-    so addresses/phones never become pixels the vision model can read."""
+    so addresses/phones/secrets never become pixels the vision model can read."""
     from html import escape as _esc
 
-    from app.core.pii import scrub_text
+    from app.core.pii import scrub_email_for_llm
 
-    subject = scrub_text(subject)
-    focused = _focus_timesheet_text(scrub_text(body_text))
+    subject, body = scrub_email_for_llm(subject, body_text)
+    focused = _focus_timesheet_text(body)
     header = (
         f"<p style='font-family:sans-serif'><b>Subject:</b> "
         f"{_esc(subject or '')}</p><hr/>"
@@ -772,7 +924,7 @@ def eml_all_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
     out: list[tuple[str, bytes, str]] = []
     used: set[str] = set()
     for idx, (fname, payload, ftype) in enumerate(raw, 1):
-        name = eml_attachment_save_name(fname, ftype)
+        name = eml_attachment_save_name(fname, ftype, payload)
         if name in used:
             stem, dot, ext = name.rpartition(".")
             name = f"{stem}_{idx}{dot}{ext}" if dot else f"{name}_{idx}"
@@ -781,8 +933,13 @@ def eml_all_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
     return out
 
 
-def eml_attachment_save_name(filename: str, ftype: str) -> str:
+def eml_attachment_save_name(filename: str, ftype: str, payload: bytes | None = None) -> str:
     name = (filename or "").strip()
+    n = len(payload or b"")
+    if name and not _GENERIC_INLINE_NAME_RE.match(name):
+        return name
+    if ftype == "image" and n >= _INLINE_TIMESHEET_MIN_BYTES:
+        return "body_timesheet.png"
     if name:
         return name
     ext = {"pdf": ".pdf", "docx": ".docx", "xlsx": ".xlsx", "image": ".png"}.get(ftype, "")
@@ -813,8 +970,10 @@ def eml_to_images(eml_bytes: bytes) -> list[bytes]:
 
 
 def to_images(file_type: str, data: bytes) -> list[bytes]:
+    """One JPEG per document for vision. PDFs/Office docs are stitched into a
+    single tall screenshot (same idea as the email-body render)."""
     if file_type == "pdf":
-        return pdf_to_images(data)
+        return [pdf_to_single_image(data)]
     if file_type == "docx":
         return docx_to_images(data)
     if file_type == "xlsx":

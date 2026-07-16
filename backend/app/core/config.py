@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     # many seconds. Between syncs the inbox (and search) serve straight from
     # the DB — instant, no Graph round-trip.
     inbox_sync_min_interval_seconds: int = 60
+    # Image attachments smaller than this are signature logos/icons in
+    # practice: hidden from attachment lists/counts and never sent to the
+    # vision model. Applies ONLY to images — documents of any size still flow.
+    min_image_attachment_kb: int = 30
 
     # Which file store to use: "local" | "s3" | "onedrive".
     # Switch to AWS S3 by setting STORAGE_PROVIDER=s3 + the S3_* values below.
@@ -86,12 +90,12 @@ class Settings(BaseSettings):
     # Each AI service picks its OWN provider — the endpoint + key are resolved
     # from the provider, and the model name is sent as-is. This replaces the
     # old "guess the provider from whether the model starts with gpt-" rule.
-    #   vision_provider     -> Extract Email / per-file / approval reading
-    #   validation_provider -> text cross-check + summaries
-    #   ai_provider         -> Agentic Chat (OpenAI only: needs tool calling)
+    #   vision_provider -> Extract Email / Upload / chat-upload (images)
+    #   ai_provider     -> Agentic Chat (OpenAI-style tool calling)
     # Each is one of: "openai" | "deepseek" | "vllm".
+    # Leave/date flags + review summaries are deterministic (validation.py) —
+    # there is no second LLM "cross-check" pass.
     vision_provider: str = "openai"
-    validation_provider: str = "openai"
     ai_provider: str = "openai"
 
     # ----- Real vision LLM (used when extraction_engine="vision") -----
@@ -99,7 +103,7 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com"
     openai_timeout: int = 120
-    # Optional DeepSeek (text-only; used for validation/agent, not vision).
+    # Optional DeepSeek (text-only; usable for chat if AI_PROVIDER=deepseek).
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     # Optional vLLM (Qwen etc.) for non-GPT models.
@@ -110,9 +114,9 @@ class Settings(BaseSettings):
     vllm_temperature: float = 0.0
     vllm_timeout: int = 90
     # Some vLLM deployments cap how many images can go in ONE prompt (ours
-    # rejects a call with a 400 above 4). Full-email extraction batches
-    # several sheets per vision call for cost — this keeps each call under
-    # that cap by splitting into smaller calls instead of dropping images.
+    # rejects a call with a 400 above 4). Each sheet is already ONE stitched
+    # JPEG — this only limits how many sheets share one vision call (splits
+    # into smaller calls; never drops images / PDF pages).
     vllm_max_images_per_prompt: int = 4
     # TLS for the self-hosted vLLM endpoint. Prefer pinning the server's root
     # CA (VLLM_CA_BUNDLE=path/to/root.crt) — it survives the server's
@@ -120,30 +124,21 @@ class Settings(BaseSettings):
     # verification entirely and is a TEMPORARY test-phase escape hatch only.
     vllm_tls_verify: bool = True
     vllm_ca_bundle: str = ""
-    # Runtime model choices. EXTRACTION_MODEL/VALIDATION_MODEL name the
-    # self-hosted (vLLM) models; the OPENAI_* pair is what OpenAI gets when a
-    # service's provider is switched to it (see vision_client.model_for).
+    # Runtime model choices. EXTRACTION_MODEL / VLLM_MODEL = self-hosted vision;
+    # OPENAI_VISION_MODEL = OpenAI when VISION_PROVIDER=openai (see model_for).
     extraction_model: str = "gpt-4o"
     vision_image_detail: str = "high"   # low | high — used for SCANS/photos
-    validation_model: str = "gpt-4o-mini"
     openai_vision_model: str = "gpt-4o"
-    openai_validation_model: str = "gpt-4o-mini"
-    enable_text_validation: bool = True
 
-    # ----- Cost / accuracy tuning (all admin-editable) -----
+    # ----- Cost / accuracy tuning -----
     # Render PDFs at a lower DPI for the LLM: vision models gain nothing above
     # ~150 DPI, and a smaller image = fewer tokens (esp. at high detail).
     pdf_render_dpi: int = 150
-    # Born-digital files already provide an authoritative text layer, so the
-    # image is only layout context — send it at "low" detail (≈5–10× cheaper).
-    # Scans/photos (no text layer) keep `vision_image_detail`.
-    vision_adaptive_detail: bool = True
+    # Born-digital sheets (text present) always send images at "low" detail in
+    # full_email_extract; scans/photos keep `vision_image_detail`.
     # Force valid JSON from supported OpenAI models (response_format json_object)
     # so a stray markdown fence / trailing text can't break parsing.
     vision_json_mode: bool = True
-    # Skip the LLM entirely for clean digital sheets whose text layer parses
-    # confidently (deterministic parser) — biggest cost saver, opt-in.
-    extraction_prefer_deterministic: bool = False
     # Optional OCR "reader" to give scans/photos a text layer (none|tesseract).
     # tesseract runs locally (pytesseract + tesseract-ocr) and is completely free.
     ocr_provider: str = "none"

@@ -1,19 +1,18 @@
 QWEN (VLLM) INTEGRATION — SHORT GUIDE
 
 What we use Qwen for
-- Vision extraction (Extract Email / file extraction): Qwen via vLLM
-- Text validation (cross-check + summaries): Qwen via vLLM
+- Vision extraction (Extract Email / file extraction / Upload / chat-upload): Qwen via vLLM
+- Leave flags + review summaries: deterministic code (`validation.py`) — not an LLM
 - Accuracy: similar to GPT for our timesheet extraction use-case
 - Speed: slightly slower than GPT (depends on your vLLM host)
 
 What we do NOT switch (yet)
 Agentic Chat stays on GPT because it needs OpenAI-style tool calling (function calls).
-Vision/validation do not need tool calling.
+Vision extraction does not need tool calling.
 
 App config (our side)
 Set in root `.env`:
   VISION_PROVIDER=vllm
-  VALIDATION_PROVIDER=vllm
   AI_PROVIDER=openai
 
   VLLM_BASE_URL=https://<your-vllm-host>
@@ -21,7 +20,7 @@ Set in root `.env`:
   VLLM_MODEL=qwen3-vl-32b
 
   EXTRACTION_MODEL=qwen3-vl-32b
-  VALIDATION_MODEL=qwen3-vl-32b
+  OPENAI_VISION_MODEL=gpt-4o   (only used if VISION_PROVIDER=openai)
 
   VLLM_MAX_IMAGES_PER_PROMPT=4   (common server limit; prevents failures/fallbacks)
 
@@ -43,4 +42,3 @@ The One-Liner Problem
 Your vLLM server returns this error on tool calls because the flags aren't set:
 "auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set
 Fix: add the two flags above. Zero code changes needed.
-

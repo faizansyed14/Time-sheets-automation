@@ -5,15 +5,16 @@ import {
   Maximize2, Minimize2, Paperclip, X,
 } from "lucide-react";
 import { cn, formatBytes } from "../lib/utils";
+import { isTinyImage } from "../lib/attachmentFilters";
 import { downloadFile, isDocx, isEml, isPdf, isPreviewable, isXlsx, sanitizeEmailHtml, type PreviewFile } from "../lib/filePreview";
-import { fetchEmlPreview, type EmlParsed } from "../api/client";
+import { api, fetchEmlPreview, type EmlParsed } from "../api/client";
 import { Spinner } from "./ui";
 
 // ---------------------------------------------------------------------------
 // EML viewer — Outlook-style rendering of .eml files
 // ---------------------------------------------------------------------------
 
-type AttachmentBlob = { filename: string; contentType: string; size: number; url: string };
+type AttachmentBlob = { filename: string; contentType: string; size: number; url: string; dataB64?: string };
 
 export function EmlPreviewPane({ fileUrl, filename }: { fileUrl: string; filename: string }) {
   const [parsed, setParsed] = useState<EmlParsed | null>(null);
@@ -45,15 +46,17 @@ export function EmlPreviewPane({ fileUrl, filename }: { fileUrl: string; filenam
         }
 
         // Build blob URLs for each attachment so they can be previewed/downloaded.
+        // Tiny images (< MIN_IMAGE_KB) are signature logos/icons — hidden here
+        // like everywhere else; documents of any size always show.
         const blobs: AttachmentBlob[] = data.attachments
-          .filter((a) => a.data_b64)
+          .filter((a) => a.data_b64 && !isTinyImage(a.content_type, a.size))
           .map((a) => {
             const binary = atob(a.data_b64!);
             const bytes = new Uint8Array(binary.length);
             for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
             const u = URL.createObjectURL(new Blob([bytes], { type: a.content_type }));
             blobsRef.current.push(u);
-            return { filename: a.filename, contentType: a.content_type, size: a.size, url: u };
+            return { filename: a.filename, contentType: a.content_type, size: a.size, url: u, dataB64: a.data_b64 };
           });
         setAttBlobs(blobs);
       })
@@ -143,7 +146,16 @@ export function EmlPreviewPane({ fileUrl, filename }: { fileUrl: string; filenam
                 <button
                   key={i}
                   type="button"
-                  onClick={() => setAttPreview({ url: a.url, filename: a.filename, contentType: a.contentType })}
+                  onClick={() => setAttPreview({
+                    url: a.url,
+                    filename: a.filename,
+                    contentType: a.contentType,
+                    renderUpload: a.dataB64 ? {
+                      filename: a.filename,
+                      contentType: a.contentType,
+                      dataB64: a.dataB64,
+                    } : null,
+                  })}
                   className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] text-slate-700 transition-colors hover:border-brand-300 hover:bg-brand-50/40"
                 >
                   <FileText className="h-3.5 w-3.5 shrink-0 text-brand-500" />
@@ -230,22 +242,29 @@ export function DocxPreviewPane({ fileUrl }: { fileUrl: string }) {
 // ?page=N with the total in the X-Page-Count response header.
 // ---------------------------------------------------------------------------
 
-export function ServerRenderPane({ renderUrl }: { renderUrl: string }) {
+export function ServerRenderPane({
+  renderUrl,
+  renderUpload,
+}: {
+  renderUrl?: string | null;
+  renderUpload?: { filename: string; contentType: string; dataB64: string } | null;
+}) {
   const [page, setPage] = useState(1);
   const [pages, setPages] = useState(1);
   const [img, setImg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
-  useEffect(() => { setPage(1); }, [renderUrl]);
+  useEffect(() => { setPage(1); }, [renderUrl, renderUpload?.filename]);
 
   useEffect(() => {
     let alive = true;
     let blobUrl: string | null = null;
     setImg(null);
     setErr(null);
-    const sep = renderUrl.includes("?") ? "&" : "?";
-    fetch(`${renderUrl}${sep}page=${page}`)
-      .then(async (r) => {
+    const run = async () => {
+      if (renderUrl) {
+        const sep = renderUrl.includes("?") ? "&" : "?";
+        const r = await fetch(`${renderUrl}${sep}page=${page}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const count = Number(r.headers.get("X-Page-Count") || "1");
         const blob = await r.blob();
@@ -253,13 +272,37 @@ export function ServerRenderPane({ renderUrl }: { renderUrl: string }) {
         setPages(Number.isFinite(count) && count > 0 ? count : 1);
         blobUrl = URL.createObjectURL(blob);
         setImg(blobUrl);
-      })
-      .catch(() => alive && setErr("Could not render this file. Use Download to open the original."));
+        return;
+      }
+      if (renderUpload) {
+        const binary = atob(renderUpload.dataB64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const form = new FormData();
+        form.append(
+          "file",
+          new Blob([bytes], { type: renderUpload.contentType || "application/octet-stream" }),
+          renderUpload.filename
+        );
+        const r = await api.post("/files/render-upload", form, {
+          params: { page },
+          responseType: "blob",
+        });
+        const count = Number(r.headers["x-page-count"] || "1");
+        if (!alive) return;
+        setPages(Number.isFinite(count) && count > 0 ? count : 1);
+        blobUrl = URL.createObjectURL(r.data);
+        setImg(blobUrl);
+        return;
+      }
+      throw new Error("No render source");
+    };
+    run().catch(() => alive && setErr("Could not render this file. Use Download to open the original."));
     return () => {
       alive = false;
       if (blobUrl) URL.revokeObjectURL(blobUrl);
     };
-  }, [renderUrl, page]);
+  }, [renderUrl, renderUpload, page]);
 
   if (err) {
     return <div className="flex h-full items-center justify-center px-6 text-center text-sm text-rose-500">{err}</div>;
@@ -400,7 +443,8 @@ export function FilePreviewModal({
   const image = !pdf && !eml && !docx && !xlsx && isPreviewable(file.filename, file.contentType);
   // Server render-to-image for office docs when a render URL is available
   // (inbox attachments, pipeline raw copies). Original stays downloadable.
-  const serverRender = !!file.renderUrl && (docx || xlsx);
+  const effectiveRenderUrl = file.renderUrl ?? null;
+  const serverRender = !!effectiveRenderUrl && (docx || xlsx);
 
   // Images get a dedicated full-screen lightbox instead of the framed card.
   if (image) return <ImageLightbox file={file} onClose={onClose} />;
@@ -445,7 +489,7 @@ export function FilePreviewModal({
           {eml ? (
             <EmlPreviewPane fileUrl={file.url} filename={file.filename} />
           ) : serverRender ? (
-            <ServerRenderPane renderUrl={file.renderUrl!} />
+            <ServerRenderPane renderUrl={effectiveRenderUrl} renderUpload={file.renderUpload} />
           ) : docx ? (
             <DocxPreviewPane fileUrl={file.url} />
           ) : xlsx ? (
@@ -512,7 +556,7 @@ export function PreviewableFileRow({
       )}
     >
       {icon ?? (eml
-        ? <Mail className="h-5 w-5 shrink-0 text-violet-500" />
+        ? <Mail className="h-5 w-5 shrink-0 text-brand-500" />
         : <FileText className="h-5 w-5 shrink-0 text-brand-500" />
       )}
       <span className="min-w-0 flex-1">

@@ -124,7 +124,8 @@ _GENERIC_IMAGE_RE = re.compile(
     r"|c2_signature_.+\.(png|jpe?g|gif))$", re.I)
 
 
-def _classify(name: str, ctype: str, has_doc: bool, is_inline: bool = False) -> str:
+def _classify(name: str, ctype: str, has_doc: bool, is_inline: bool = False,
+              size: int = 0) -> str:
     n = (name or "").lower()
     # An .eml/message is a document container — classify it first so it can
     # never be mistaken for an approval screenshot or rendered as a flat image.
@@ -135,6 +136,10 @@ def _classify(name: str, ctype: str, has_doc: bool, is_inline: bool = False) -> 
     if ctype in _DOC_TYPES or n.endswith((".pdf", ".docx", ".xlsx")):
         return "timesheet"
     if (ctype or "").startswith("image/") or n.endswith((".png", ".jpg", ".jpeg")):
+        # Tiny images are signature logos/icons — a real screenshot of a sheet
+        # is far larger than MIN_IMAGE_ATTACHMENT_KB.
+        if 0 < size < settings.min_image_attachment_kb * 1024:
+            return "other"
         # Graph's own "this is embedded in the body" flag is authoritative —
         # never a real screenshot regardless of name. The filename pattern is
         # a fallback for providers/rows that predate this flag.
@@ -168,7 +173,8 @@ def _build(msg: dict) -> ProviderMessage:
             filename=a.get("name") or "attachment",
             content_type=a.get("contentType") or "application/octet-stream",
             size=size,
-            kind=_classify(a.get("name"), a.get("contentType"), has_doc, is_inline),
+            kind=_classify(a.get("name"), a.get("contentType"), has_doc, is_inline,
+                           size=int(size or 0)),
             cid=a.get("contentId") or None,
             is_inline=is_inline,
         ))

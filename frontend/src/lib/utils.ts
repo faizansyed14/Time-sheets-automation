@@ -1,3 +1,5 @@
+import { AVATAR_COLORS } from "./theme";
+
 export function cn(...classes: (string | false | null | undefined)[]): string {
   return classes.filter(Boolean).join(" ");
 }
@@ -39,18 +41,9 @@ export function initials(name: string | null | undefined): string {
     .join("");
 }
 
-const PALETTE = [
-  "bg-indigo-100 text-indigo-700",
-  "bg-emerald-100 text-emerald-700",
-  "bg-amber-100 text-amber-700",
-  "bg-rose-100 text-rose-700",
-  "bg-sky-100 text-sky-700",
-  "bg-violet-100 text-violet-700",
-  "bg-teal-100 text-teal-700",
-];
 export function avatarColor(name: string | null | undefined): string {
   const s = name || "?";
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  return PALETTE[h % PALETTE.length]!;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length]!;
 }

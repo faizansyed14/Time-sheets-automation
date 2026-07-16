@@ -1,0 +1,184 @@
+==========================================================================
+ GITHUB — clean workflow (local → dev → test → main)
+ Repo: https://github.com/faizansyed14/Time-sheets-automation
+
+ Branches:
+   dev  = daily work + what runs on the DEV server
+   main = last known-good / production snapshot
+
+ Rule of thumb:
+   - Code only on `dev`. Never commit directly on `main`.
+   - After every successful PR into `main`, make `dev` match `main` again.
+   - That keeps GitHub from showing "ahead / behind" forever.
+==========================================================================
+
+
+# ---- ONE-TIME repo settings (GitHub website) ----
+# Settings → General → Pull Requests:
+#   [x] Allow squash merging     ← use this for clean main history
+#   [ ] Allow merge commits      ← leave OFF (avoids spaghetti)
+#   [ ] Allow rebase merging     ← leave OFF (simpler)
+# Settings → Branches (optional):
+#   Protect `main`: require pull request, block direct pushes
+
+
+# =============================================================================
+# HAPPY PATH — every change
+# =============================================================================
+
+# ---- 1. Start clean on latest dev ----
+git checkout dev
+git fetch origin
+git pull origin dev
+git status
+# Working tree should be clean before you start (commit or stash first).
+
+
+# ---- 2. Make changes, commit ----
+git status
+git add .
+git commit -m "Short why (not a file list)"
+
+# Multiple small commits on dev are fine.
+
+
+# ---- 3. Push to remote `dev` (deploys / syncs with DEV server) ----
+git push origin dev
+
+
+# ---- 4. Test on DEV server ----
+# Restart / redeploy if needed (see commands/dev.txt).
+# Verify the feature end-to-end.
+
+
+# ---- 5a. PASS → promote to `main` via GitHub UI ----
+# Browser:
+#   https://github.com/faizansyed14/Time-sheets-automation/compare/main...dev
+#   base: main   ←   compare: dev
+# Create pull request → review → green button:
+#   **Squash and merge**  (one clean commit on main)
+# Confirm merge.
+
+
+# ---- 5b. After PR is merged — SYNC `dev` to `main` (do this EVERY time) ----
+# This clears "This branch is 1 commit behind main" and prevents
+# "N commits ahead" ghosts after squash merges.
+#
+# SAFE only when:
+#   - PR already merged
+#   - you have NO uncommitted local work you still need
+#   - you have NO extra commits on `dev` that were NOT in that PR
+#
+git checkout dev
+git fetch origin
+git pull origin main
+# Prefer making remote `dev` identical to `main` after a squash release:
+git reset --hard origin/main
+git push --force-with-lease origin dev
+#
+# `--force-with-lease` is OK here: you are intentionally resetting `dev`
+# to the just-merged `main`. Do NOT use plain `--force`.
+
+
+# ---- 6. Next feature ----
+git checkout dev
+git pull origin dev
+# back to step 2
+
+
+# =============================================================================
+# FAIL PATH — new changes broke DEV server
+# =============================================================================
+# Goal: throw away bad work on `dev` and restore last known-good from `main`.
+
+# ---- A. Save anything you might still want (optional) ----
+git stash push -u -m "broken wip — maybe reuse later"
+# or copy files aside manually
+
+# ---- B. Reset local + remote `dev` to `main` ----
+git checkout dev
+git fetch origin
+git reset --hard origin/main
+git push --force-with-lease origin dev
+
+# ---- C. Redeploy DEV server from `dev` (now = main) ----
+# see commands/dev.txt
+
+# ---- D. If you stashed and want pieces back ----
+git stash list
+git stash show -p stash@{0}
+# selectively re-apply, or: git stash pop
+
+
+# =============================================================================
+# UNCOMMITTED WORK (don't lose it)
+# =============================================================================
+# Before any reset / sync / checkout that might wipe files:
+git stash push -u -m "wip before sync"
+# ... do sync / reset ...
+git stash pop
+
+
+# =============================================================================
+# IF PUSH IS REJECTED
+# =============================================================================
+git fetch origin
+git pull --rebase origin dev
+# fix conflicts → git add <files> → git rebase --continue
+git push origin dev
+
+# Never: git push --force          (unsafe)
+# OK after intentional sync: git push --force-with-lease origin dev
+
+
+# =============================================================================
+# CHECK STATE
+# =============================================================================
+git status
+git branch -vv
+git fetch origin
+git rev-list --left-right --count origin/dev...origin/main
+#   left  = commits on dev not in main  (should be 0 after sync)
+#   right = commits on main not in dev  (should be 0 after sync)
+
+git log --oneline --graph --decorate -12
+# Commits on dev not yet on main:
+git log --oneline origin/main..origin/dev
+
+# Compare on GitHub:
+# https://github.com/faizansyed14/Time-sheets-automation/compare/main...dev
+
+
+# =============================================================================
+# CHEAT SHEET
+# =============================================================================
+# | Situation              | Action                                              |
+# |------------------------|-----------------------------------------------------|
+# | Code locally           | git checkout dev                                    |
+# | Save + ship to DEV     | commit → git push origin dev → test on DEV server   |
+# | Works                  | GitHub PR: main ← dev, Squash and merge             |
+# | After merge            | reset --hard origin/main → force-with-lease push    |
+# | Broke DEV              | reset --hard origin/main → force-with-lease push    |
+# | Uncommitted WIP        | git stash -u before reset; stash pop after          |
+
+
+# =============================================================================
+# DO NOT
+# =============================================================================
+# - Commit / push directly to `main`
+# - Squash-merge a PR and then SKIP syncing `dev` to `main`
+#   (that is why you kept seeing "ahead / behind")
+# - Open a PR main → dev (use reset/pull instead)
+# - `git push --force` without `--force-with-lease`
+# - Reset --hard while you still have uncommitted work you care about
+#   (stash first)
+
+
+# =============================================================================
+# WHY "ahead / behind" appeared before
+# =============================================================================
+# Squash merge creates a NEW commit on `main` with a different hash than your
+# commits on `dev`. GitHub then says `dev` is "ahead" (old commits) and
+# "behind" (the squash / merge tip on main).
+# Fix: after every successful squash into `main`, reset `dev` to `origin/main`
+# and push with --force-with-lease. Then both branches point at the same tip.

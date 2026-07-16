@@ -24,8 +24,6 @@ import { fetchHealth, fetchPipelineStats } from "../api/client";
 import { cn, avatarColor, initials } from "../lib/utils";
 import { useAuth } from "../lib/auth";
 
-// The everyday loop: read email → extract → review → done. Everything else
-// is a tool you reach for occasionally, so it lives in its own quieter group.
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/inbox", label: "Inbox", icon: Mail },
@@ -81,7 +79,6 @@ export default function Shell({ children }: { children: ReactNode }) {
     });
   };
 
-  // Global "reload data": refetch every active query on the current page.
   const [refreshing, setRefreshing] = useState(false);
   const reload = async () => {
     setRefreshing(true);
@@ -97,53 +94,45 @@ export default function Shell({ children }: { children: ReactNode }) {
 
   const navLinkClass = ({ isActive }: { isActive: boolean }) =>
     cn(
-      "group relative flex items-center rounded-xl py-2 text-sm font-medium transition-all duration-150",
+      "group relative flex items-center rounded-lg py-2.5 text-sm font-medium transition-colors duration-150",
       collapsed ? "justify-center px-2" : "gap-3 px-3",
       isActive
-        ? "bg-brand-50 text-brand-700 ring-1 ring-inset ring-brand-100"
-        : "text-slate-500 hover:bg-slate-100/80 hover:text-slate-900"
+        ? "bg-brand-600 text-white shadow-sm"
+        : "text-sidebar-muted hover:bg-sidebar-hover hover:text-sidebar-text"
     );
 
   return (
     <div className="flex h-screen overflow-hidden app-canvas">
-      {/* ------------------------- Sidebar ------------------------- */}
       <aside
         className={cn(
-          "relative flex shrink-0 flex-col border-r border-slate-200/70 bg-white/80 backdrop-blur-xl transition-[width] duration-200",
-          collapsed ? "w-[68px]" : "w-64"
+          "relative flex shrink-0 flex-col bg-sidebar text-sidebar-text shadow-sidebar transition-[width] duration-200",
+          collapsed ? "w-[72px]" : "w-60"
         )}
       >
-        <div className={cn("flex items-center pb-5 pt-6", collapsed ? "justify-center px-2" : "gap-2.5 px-5")}>
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-violet-600 shadow-[0_4px_14px_-4px_rgb(99_102_241/0.6)]">
+        <div className={cn("flex items-center border-b border-sidebar-border/60 py-5", collapsed ? "justify-center px-2" : "gap-3 px-4")}>
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-brand-600 shadow-sm">
             <Zap className="h-5 w-5 text-white" />
           </div>
           {!collapsed && (
             <div className="min-w-0">
-              <p className="truncate text-[15px] font-bold leading-tight tracking-tight text-slate-900">Timesheets</p>
-              <p className="text-[11px] font-medium leading-tight text-brand-500">Intelligence</p>
+              <p className="truncate text-sm font-bold leading-tight text-white">Timesheets</p>
+              <p className="text-[11px] font-medium text-sidebar-muted">Intelligence Portal</p>
             </div>
           )}
         </div>
 
-        <nav className="flex-1 space-y-1 overflow-y-auto px-3">
+        <nav className="flex-1 space-y-0.5 overflow-y-auto px-2 py-4">
           {NAV.map(({ to, label, icon: Icon, end, attention: showAttention }) => (
             <NavLink key={to} to={to} end={end} title={collapsed ? label : undefined} className={navLinkClass}>
               {({ isActive }) => (
                 <>
-                  {/* Active left accent bar */}
-                  <span
-                    className={cn(
-                      "absolute left-0 top-1/2 h-5 w-1 -translate-y-1/2 rounded-r-full bg-brand-600 transition-opacity",
-                      isActive ? "opacity-100" : "opacity-0"
-                    )}
-                  />
-                  <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive && "text-brand-600")} />
+                  <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive ? "text-white" : "text-sidebar-muted group-hover:text-sidebar-text")} />
                   {!collapsed && <span className="flex-1">{label}</span>}
                   {showAttention && attention > 0 && (
                     <span
                       className={cn(
-                        "rounded-full bg-rose-500 font-bold text-white shadow-sm",
-                        collapsed ? "absolute right-1 top-1 h-2 w-2" : "px-1.5 py-0.5 text-[10px]"
+                        "rounded-full bg-amber-500 font-bold text-white",
+                        collapsed ? "absolute right-1.5 top-1.5 h-2 w-2" : "px-1.5 py-0.5 text-[10px]"
                       )}
                     >
                       {collapsed ? "" : attention}
@@ -155,20 +144,14 @@ export default function Shell({ children }: { children: ReactNode }) {
           ))}
 
           {!collapsed && (
-            <p className="px-3 pb-1 pt-5 text-[10px] font-bold uppercase tracking-wider text-slate-400">Tools</p>
+            <p className="px-3 pb-1.5 pt-6 text-[10px] font-semibold uppercase tracking-widest text-slate-500">Tools</p>
           )}
-          {collapsed && <div className="my-2 border-t border-slate-200" />}
+          {collapsed && <div className="my-3 border-t border-sidebar-border/60" />}
           {TOOLS_NAV.filter((n) => canWrite || n.to !== "/upload").map(({ to, label, icon: Icon }) => (
             <NavLink key={to} to={to} title={collapsed ? label : undefined} className={navLinkClass}>
               {({ isActive }) => (
                 <>
-                  <span
-                    className={cn(
-                      "absolute left-0 top-1/2 h-5 w-1 -translate-y-1/2 rounded-r-full bg-brand-600 transition-opacity",
-                      isActive ? "opacity-100" : "opacity-0"
-                    )}
-                  />
-                  <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive && "text-brand-600")} />
+                  <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive ? "text-white" : "text-sidebar-muted group-hover:text-sidebar-text")} />
                   {!collapsed && <span className="flex-1">{label}</span>}
                 </>
               )}
@@ -178,20 +161,14 @@ export default function Shell({ children }: { children: ReactNode }) {
           {isAdmin && (
             <>
               {!collapsed && (
-                <p className="px-3 pb-1 pt-5 text-[10px] font-bold uppercase tracking-wider text-slate-400">Admin</p>
+                <p className="px-3 pb-1.5 pt-6 text-[10px] font-semibold uppercase tracking-widest text-slate-500">Admin</p>
               )}
-              {collapsed && <div className="my-2 border-t border-slate-200" />}
+              {collapsed && <div className="my-3 border-t border-sidebar-border/60" />}
               {ADMIN_NAV.map(({ to, label, icon: Icon }) => (
                 <NavLink key={to} to={to} title={collapsed ? label : undefined} className={navLinkClass}>
                   {({ isActive }) => (
                     <>
-                      <span
-                        className={cn(
-                          "absolute left-0 top-1/2 h-5 w-1 -translate-y-1/2 rounded-r-full bg-brand-600 transition-opacity",
-                          isActive ? "opacity-100" : "opacity-0"
-                        )}
-                      />
-                      <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive && "text-brand-600")} />
+                      <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive ? "text-white" : "text-sidebar-muted group-hover:text-sidebar-text")} />
                       {!collapsed && <span className="flex-1">{label}</span>}
                     </>
                   )}
@@ -202,20 +179,20 @@ export default function Shell({ children }: { children: ReactNode }) {
         </nav>
 
         {!collapsed && (
-          <div className="mx-3 mb-4 rounded-2xl border border-slate-200/80 bg-slate-50/80 p-3">
-            <p className="mb-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">System</p>
-            <div className="space-y-1.5 text-xs">
+          <div className="mx-2 mb-4 rounded-lg border border-sidebar-border/60 bg-sidebar-hover/50 p-3">
+            <p className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-slate-500">System</p>
+            <div className="space-y-2 text-xs">
               <div className="flex items-center justify-between">
-                <span className="text-slate-500">Email</span>
-                <span className="flex items-center gap-1 font-semibold text-slate-700">
-                  <CircleDot className="h-3 w-3 text-emerald-500" />
+                <span className="text-sidebar-muted">Email</span>
+                <span className="flex items-center gap-1.5 font-medium text-sidebar-text">
+                  <CircleDot className="h-3 w-3 text-emerald-400" />
                   {health?.email_provider ?? "…"}
                 </span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-slate-500">Extraction</span>
-                <span className="flex items-center gap-1 font-semibold text-slate-700">
-                  <CircleDot className="h-3 w-3 text-emerald-500" />
+                <span className="text-sidebar-muted">Extraction</span>
+                <span className="flex items-center gap-1.5 font-medium text-sidebar-text">
+                  <CircleDot className="h-3 w-3 text-emerald-400" />
                   {health?.extraction_engine ?? "…"}
                 </span>
               </div>
@@ -226,7 +203,7 @@ export default function Shell({ children }: { children: ReactNode }) {
         <button
           type="button"
           onClick={toggleCollapsed}
-          className="absolute right-0 top-1/2 z-30 flex h-14 w-4 -translate-y-1/2 translate-x-1/2 items-center justify-center rounded-r-md border border-slate-200/90 bg-white text-slate-500 shadow-[0_2px_8px_-2px_rgb(15_23_42/0.2)] transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-slate-800"
+          className="absolute right-0 top-1/2 z-30 flex h-12 w-4 -translate-y-1/2 translate-x-1/2 items-center justify-center rounded-r-md border border-slate-200 bg-white text-slate-500 shadow-card transition-colors hover:border-slate-300 hover:text-slate-800"
           title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
         >
@@ -238,42 +215,41 @@ export default function Shell({ children }: { children: ReactNode }) {
         </button>
       </aside>
 
-      {/* ------------------------- Main ------------------------- */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-16 shrink-0 items-center justify-between border-b border-slate-200/70 surface-glass px-4 sm:px-6">
-          <div className="leading-tight">
-            <p className="text-[11px] font-medium uppercase tracking-wider text-slate-400">Timesheets Automation</p>
-            <p className="text-[15px] font-bold tracking-tight text-slate-900">{title}</p>
+        <header className="flex h-14 shrink-0 items-center justify-between surface-glass px-5 sm:px-6">
+          <div>
+            <p className="text-[10px] font-semibold uppercase tracking-widest text-slate-400">Workspace</p>
+            <p className="text-base font-bold tracking-tight text-slate-900">{title}</p>
           </div>
-          <div className="flex items-center gap-3 text-xs text-slate-500">
+          <div className="flex items-center gap-2.5 text-xs text-slate-500">
             {stats && (
-              <span className="hidden items-center gap-2 rounded-full border border-slate-200/80 bg-white/70 px-3 py-1.5 lg:inline-flex">
-                <span className="font-semibold text-slate-700">{stats.total}</span> tracked
+              <span className="hidden items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-1.5 lg:inline-flex">
+                <span className="font-semibold text-slate-700">{stats.total}</span>
                 <span className="text-slate-300">·</span>
-                <span className="font-semibold text-emerald-600">{stats.success}</span> ok
+                <span className="font-semibold text-emerald-600">{stats.success} ok</span>
                 <span className="text-slate-300">·</span>
-                <span className={attention ? "font-semibold text-rose-600" : "font-semibold text-slate-500"}>
-                  {attention} need attention
+                <span className={attention ? "font-semibold text-amber-600" : "font-semibold text-slate-500"}>
+                  {attention} review
                 </span>
               </span>
             )}
             <button
               onClick={reload}
               disabled={refreshing}
-              className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white/70 px-2.5 py-1.5 font-medium text-slate-600 shadow-xs transition-colors hover:bg-white disabled:opacity-60"
+              className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-medium text-slate-600 shadow-xs transition-colors hover:bg-slate-50 disabled:opacity-60"
               title="Reload data on this page"
             >
               <RefreshCw className={cn("h-3.5 w-3.5", refreshing && "animate-spin")} />
               <span className="hidden sm:inline">Reload</span>
             </button>
             {user && (
-              <div className="flex items-center gap-2 border-l border-slate-200 pl-3">
+              <div className="flex items-center gap-2 border-l border-slate-200 pl-2.5">
                 {!canWrite && (
-                  <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700 ring-1 ring-inset ring-amber-200">
+                  <span className="rounded-md bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-800 ring-1 ring-inset ring-amber-200">
                     Read-only
                   </span>
                 )}
-                <span className={cn("flex h-8 w-8 items-center justify-center rounded-full text-[10px] font-bold ring-2 ring-white shadow-sm", avatarColor(user.username))}>
+                <span className={cn("flex h-8 w-8 items-center justify-center rounded-full text-[10px] font-bold ring-2 ring-white", avatarColor(user.username))}>
                   {initials(user.username)}
                 </span>
                 <div className="hidden text-right sm:block">
@@ -282,7 +258,7 @@ export default function Shell({ children }: { children: ReactNode }) {
                 </div>
                 <button
                   onClick={logout}
-                  className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-rose-50 hover:text-rose-500"
+                  className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-rose-50 hover:text-rose-600"
                   title="Sign out"
                 >
                   <LogOut className="h-4 w-4" />
@@ -291,7 +267,7 @@ export default function Shell({ children }: { children: ReactNode }) {
             )}
           </div>
         </header>
-        <main className="min-h-0 flex-1 overflow-y-auto p-6">{children}</main>
+        <main className="min-h-0 flex-1 overflow-y-auto p-5 sm:p-6">{children}</main>
       </div>
     </div>
   );

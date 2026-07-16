@@ -21,15 +21,14 @@ const ICONS: Record<ToastKind, ReactNode> = {
   success: <CheckCircle2 className="h-5 w-5 text-emerald-500" />,
   error: <XCircle className="h-5 w-5 text-rose-500" />,
   warning: <AlertTriangle className="h-5 w-5 text-amber-500" />,
-  info: <Info className="h-5 w-5 text-sky-500" />,
+  info: <Info className="h-5 w-5 text-brand-500" />,
 };
 
-// Colored left accent bar per kind (via a before: pseudo-element).
 const ACCENT: Record<ToastKind, string> = {
   success: "before:bg-emerald-500",
   error: "before:bg-rose-500",
   warning: "before:bg-amber-500",
-  info: "before:bg-sky-500",
+  info: "before:bg-brand-500",
 };
 
 let nextId = 1;

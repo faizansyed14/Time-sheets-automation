@@ -107,7 +107,7 @@ class PipelineFile(Base):
     extraction_method: Mapped[str | None] = mapped_column(String, nullable=True)
     used_ocr: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
     # render DPI, image detail, page count, OCR provider, text-layer presence,
-    # validation model, embedded .eml attachment — shown in the UI dropdown.
+    # embedded .eml attachment — shown in the UI dropdown.
     extraction_meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # copy of the original bytes (relative to storage root) so Retry works

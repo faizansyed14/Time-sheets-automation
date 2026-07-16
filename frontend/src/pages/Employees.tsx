@@ -11,6 +11,7 @@ import {
   type EmployeeInput,
   type ImportSummary,
 } from "../api/client";
+import { locationBadgeTone } from "../lib/theme";
 import { avatarColor, cn, initials } from "../lib/utils";
 import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton } from "../components/ui";
 import { useToast } from "../components/toast";
@@ -214,7 +215,7 @@ export default function EmployeesPage() {
                   </td>
                   <td className="px-3 py-2.5">
                     {r.location ? (
-                      <Badge tone={r.location === "AUH" ? "violet" : "sky"}>
+                      <Badge tone={locationBadgeTone(r.location)}>
                         <MapPin className="h-3 w-3" /> {r.location}
                       </Badge>
                     ) : (
@@ -344,9 +345,9 @@ export default function EmployeesPage() {
                 <p className="text-2xl font-bold text-emerald-600">{importResult.inserted}</p>
                 <p className="text-xs font-medium text-emerald-700">Inserted</p>
               </div>
-              <div className="rounded-xl bg-sky-50 p-3">
-                <p className="text-2xl font-bold text-sky-600">{importResult.updated}</p>
-                <p className="text-xs font-medium text-sky-700">Updated</p>
+              <div className="rounded-xl bg-brand-50 p-3 ring-1 ring-inset ring-brand-100">
+                <p className="text-2xl font-bold text-brand-700">{importResult.updated}</p>
+                <p className="text-xs font-medium text-brand-800">Updated</p>
               </div>
               <div className="rounded-xl bg-amber-50 p-3">
                 <p className="text-2xl font-bold text-amber-600">{importResult.skipped}</p>

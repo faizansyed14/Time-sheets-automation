@@ -264,18 +264,12 @@ async def ingest_manual_entry(
     storage_warn = None
     try:
         for (fn, _ct, dat) in attachments:
+            # Store exactly what was handed in — the .eml (or the uploaded
+            # sheet) as one file. Nested attachments/inline images inside an
+            # .eml are NOT filed separately: they already live inside the
+            # .eml itself, and filing them again duplicated real sheets and
+            # littered the vault with signature logos/banners.
             sp.save_file(account_manager, employee_name, month, year, fn, dat)
-            # An uploaded/forwarded .eml: also store each attached sheet
-            # separately so the vault holds the mail AND its attachments (the
-            # source PDF/XLSX is grabbable without opening the .eml).
-            if (fn or "").lower().endswith(".eml"):
-                from app.services.extraction.file_processor import eml_all_attachments
-                try:
-                    for a_name, a_bytes, _a_ft in eml_all_attachments(dat):
-                        if a_name and a_bytes:
-                            sp.save_file(account_manager, employee_name, month, year, a_name, a_bytes)
-                except Exception:
-                    pass
         folder_rel = sp.folder_rel(account_manager, employee_name, month, year)
         _event(tracker, PipelineStage.FILING, "ok", f"Filed under {folder_rel}.")
     except Exception as e:

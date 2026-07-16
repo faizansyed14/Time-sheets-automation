@@ -241,9 +241,7 @@ async def config_status(db: AsyncSession = Depends(get_db)):
     return [
         _item("extraction", "Vision extraction (Extract Email, per-file, approvals)",
               "vision_provider", "vision"),
-        _item("validation", "Validation / cross-check / summaries",
-              "validation_provider", "validation"),
-        _item("agent", "Agentic chat", "ai_provider", "validation", note=agent_note,
+        _item("agent", "Agentic chat", "ai_provider", "vision", note=agent_note,
               model=str(overlay.get("agent_chat_model") or "gpt-4o-mini")),
     ]
 

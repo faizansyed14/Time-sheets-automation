@@ -120,7 +120,7 @@ function ModelBadge({ file }: { file: PipelineFile }) {
       {file.used_ocr && (
         <span
           title="Local OCR (Tesseract) produced the text layer for this scan/photo"
-          className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-700"
+          className="inline-flex items-center gap-1 rounded-md border border-brand-200 bg-brand-50 px-2 py-0.5 text-[11px] font-semibold text-brand-700"
         >
           <ScanLine className="h-3 w-3" />
           OCR
@@ -165,7 +165,6 @@ function ExtractionDetails({ file }: { file: PipelineFile }) {
     ["Pages rendered", "page_count", meta["page_count"]],
     ["Has text layer", "has_text_layer", meta["has_text_layer"]],
     ["Document text (chars)", "doc_text_chars", meta["doc_text_chars"]],
-    ["Validation model", "validation_model", meta["validation_model"]],
     ["File type", "file_type", meta["file_type"]],
     ["Source", "source_kind", meta["source_kind"]],
     ["Content type", "content_type", meta["content_type"]],
@@ -343,8 +342,8 @@ export default function PipelinePage() {
         <StatCard
           label="Resolved"
           value={stats?.resolved ?? 0}
-          icon={<BadgeCheck className="h-5 w-5 text-sky-600" />}
-          tone="bg-sky-50"
+          icon={<BadgeCheck className="h-5 w-5 text-brand-600" />}
+          tone="bg-brand-50"
           active={statusFilter === "resolved"}
           onClick={() => setStatusFilter(statusFilter === "resolved" ? "" : "resolved")}
         />
@@ -473,7 +472,7 @@ export default function PipelinePage() {
                         </div>
                       )}
                       {f.resolution_note && (
-                        <div className="mb-4 rounded-lg border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">
+                        <div className="mb-4 rounded-lg border border-brand-200 bg-brand-50 p-3 text-sm text-brand-800">
                           <p className="font-semibold">Resolution</p>
                           <p className="mt-0.5 leading-5">{f.resolution_note}</p>
                         </div>

@@ -36,10 +36,6 @@ def ocr_status() -> str:
     return "unknown_provider"
 
 
-def ocr_available() -> bool:
-    return ocr_status() == "ready"
-
-
 def ocr_text(images_jpeg: list[bytes], data: bytes, file_type: str) -> str:
     provider = (getattr(settings, "ocr_provider", "none") or "none").strip().lower()
     if provider in ("", "none"):

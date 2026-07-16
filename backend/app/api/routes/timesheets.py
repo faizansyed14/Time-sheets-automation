@@ -20,6 +20,7 @@ router = APIRouter(prefix="/timesheets", tags=["timesheets"])
 def to_out(r: TimesheetRecord) -> TimesheetOut:
     return TimesheetOut(
         id=r.id,
+        matched_employee_pk=r.matched_employee_pk,
         employee_id=r.employee_id,
         employee_name=r.employee_name,
         account_manager=r.account_manager,

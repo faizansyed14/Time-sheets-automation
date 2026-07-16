@@ -8,25 +8,25 @@ export function PipelineStatusBadge({ status }: { status: PipelineStatus }) {
   switch (status) {
     case "success":
       return (
-        <Badge tone="green">
+        <Badge tone="success">
           <CheckCircle2 className="h-3 w-3" /> Success
         </Badge>
       );
     case "needs_review":
       return (
-        <Badge tone="amber">
+        <Badge tone="warning">
           <AlertTriangle className="h-3 w-3" /> Needs review
         </Badge>
       );
     case "failed":
       return (
-        <Badge tone="rose">
+        <Badge tone="danger">
           <XCircle className="h-3 w-3" /> Failed
         </Badge>
       );
     case "resolved":
       return (
-        <Badge tone="sky">
+        <Badge tone="brand">
           <BadgeCheck className="h-3 w-3" /> Resolved
         </Badge>
       );
@@ -50,7 +50,7 @@ export function FailureChip({ code, label }: { code: string | null; label: strin
       <XCircle className="h-3 w-3" />
     );
   return (
-    <Badge tone={code === "validation_mismatch" || code === "id_name_mismatch" || code === "storage_error" ? "amber" : "rose"}>
+    <Badge tone={code === "validation_mismatch" || code === "id_name_mismatch" || code === "storage_error" ? "warning" : "danger"}>
       {icon}
       {label && label !== code ? label : code.replace(/_/g, " ")}
     </Badge>
@@ -60,11 +60,11 @@ export function FailureChip({ code, label }: { code: string | null; label: strin
 /* ---------------- validation / approval pills ---------------- */
 export function ValidationBadge({ status }: { status: "verified" | "manual_review" }) {
   return status === "verified" ? (
-    <Badge tone="green">
+    <Badge tone="success">
       <CheckCircle2 className="h-3 w-3" /> Verified
     </Badge>
   ) : (
-    <Badge tone="amber">
+    <Badge tone="warning">
       <AlertTriangle className="h-3 w-3" /> Needs review
     </Badge>
   );
@@ -73,13 +73,13 @@ export function ValidationBadge({ status }: { status: "verified" | "manual_revie
 export function ApprovalBadge({ status }: { status: "pending" | "approved" | "not_approved" }) {
   if (status === "approved")
     return (
-      <Badge tone="green">
+      <Badge tone="success">
         <BadgeCheck className="h-3 w-3" /> Approved
       </Badge>
     );
   if (status === "not_approved")
     return (
-      <Badge tone="rose">
+      <Badge tone="danger">
         <XCircle className="h-3 w-3" /> Not approved
       </Badge>
     );

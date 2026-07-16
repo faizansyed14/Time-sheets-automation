@@ -17,6 +17,7 @@ import {
   Forward,
   Maximize2,
   MoreVertical,
+  Shield,
   Wand2,
 } from "lucide-react";
 import {
@@ -28,12 +29,15 @@ import {
   fetchEmail,
   fetchEmployeeMatcher,
   fetchInbox,
+  fetchLlmPreview,
   MONTHS_LONG,
   restoreEmail,
   saveEmlToVault,
   type Attachment,
+  type Employee,
   type EmailListItem,
   type IngestSelection,
+  type LlmEgressPreview,
   type PipelineFile,
 } from "../api/client";
 import { cn, formatDateTime, initials, avatarColor } from "../lib/utils";
@@ -53,7 +57,7 @@ import type { PreviewFile } from "../lib/filePreview";
 function StatusBadge({ status }: { status: EmailListItem["status"] }) {
   if (status === "ingested")
     return (
-      <Badge tone="green">
+      <Badge tone="success">
         <CheckCircle2 className="h-3 w-3" /> Ingested
       </Badge>
     );
@@ -63,14 +67,14 @@ function StatusBadge({ status }: { status: EmailListItem["status"] }) {
         <Archive className="h-3 w-3" /> Archived
       </Badge>
     );
-  return <Badge tone="indigo">New</Badge>;
+  return <Badge tone="brand">New</Badge>;
 }
 
 function ExtractedBadge({ at }: { at: string | null | undefined }) {
   if (!at) return null;
   return (
     <span title={`Extract Email last run ${formatDateTime(at)}`}>
-      <Badge tone="green">
+      <Badge tone="success">
         <Wand2 className="h-3 w-3" /> Extracted
       </Badge>
     </span>
@@ -160,6 +164,141 @@ function EmailMenu({
 }
 
 // Vault picker — choose Manager / Employee / Month for the .eml.
+function LlmEgressPreviewModal({
+  open,
+  onClose,
+  preview,
+  loading,
+  error,
+}: {
+  open: boolean;
+  onClose: () => void;
+  preview: LlmEgressPreview | null;
+  loading: boolean;
+  error: string | null;
+}) {
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="EML sent to LLM"
+      subtitle="Subject, body text, and the exact stitched JPEGs (after PII scrub) that Extract Email would send to the vision model."
+      wide
+    >
+      {loading && (
+        <div className="flex items-center justify-center gap-2 py-12 text-sm text-slate-500">
+          <Spinner /> Building redacted preview…
+        </div>
+      )}
+      {error && (
+        <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+          {error}
+        </div>
+      )}
+      {preview && !loading && (
+        <div className="space-y-4 text-sm">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge tone={preview.pii_redaction ? "success" : "danger"}>
+              PII redaction {preview.pii_redaction ? "on" : "OFF"}
+            </Badge>
+            <Badge tone="brand">{preview.scope}</Badge>
+            {preview.sender_omitted && <Badge tone="slate">Sender omitted</Badge>}
+          </div>
+          <p className="text-xs leading-relaxed text-slate-500">{preview.policy}</p>
+
+          <div>
+            <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              Redacted / omitted
+            </p>
+            <ul className="list-inside list-disc space-y-0.5 text-xs text-slate-600">
+              {preview.omitted.map((o) => (
+                <li key={o}>{o}</li>
+              ))}
+            </ul>
+          </div>
+
+          <div>
+            <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              Subject sent
+            </p>
+            <pre className="overflow-x-auto rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-800 whitespace-pre-wrap">
+              {preview.subject_sent || "(empty)"}
+            </pre>
+          </div>
+
+          <div>
+            <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              Body text sent (prompt text)
+            </p>
+            <pre className="max-h-48 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-800 whitespace-pre-wrap">
+              {preview.body_sent || "(empty — no body sheet)"}
+            </pre>
+          </div>
+
+          <div>
+            <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              Sheets ({preview.sheets.length}) — images OpenAI would see
+            </p>
+            <div className="space-y-2">
+              {preview.sheets.map((s) => (
+                <div
+                  key={s.name + s.file_type}
+                  className="rounded-lg border border-slate-200 bg-white p-3"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-semibold text-slate-800">{s.name}</span>
+                    <Badge tone="slate">{s.file_type}</Badge>
+                    <span className="text-[11px] text-slate-400">
+                      {s.image_pages ? "1 stitched image" : "no image"}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-[11px] text-slate-500">{s.note}</p>
+                  {s.image_jpeg_b64 ? (
+                    <div className="mt-2 overflow-auto rounded border border-slate-100 bg-slate-50 p-2">
+                      <img
+                        src={`data:image/jpeg;base64,${s.image_jpeg_b64}`}
+                        alt={`${s.name} — vision JPEG`}
+                        className="mx-auto block max-h-[480px] max-w-full object-contain"
+                      />
+                    </div>
+                  ) : (
+                    <p className="mt-2 text-[11px] italic text-slate-400">
+                      No JPEG for this sheet
+                    </p>
+                  )}
+                  {s.text_sent ? (
+                    <pre className="mt-2 max-h-32 overflow-auto rounded border border-slate-100 bg-slate-50 p-2 font-mono text-[11px] text-slate-700 whitespace-pre-wrap">
+                      {s.text_sent}
+                    </pre>
+                  ) : (
+                    <p className="mt-2 text-[11px] italic text-slate-400">
+                      No extracted text — images only
+                    </p>
+                  )}
+                </div>
+              ))}
+              {preview.sheets.length === 0 && (
+                <p className="text-xs text-slate-500">No readable sheets in this scope.</p>
+              )}
+            </div>
+          </div>
+
+          <div>
+            <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              Sample vision prompt (first batch, scrubbed)
+            </p>
+            <p className="mb-1 text-[11px] text-slate-500">{preview.system_prompt_note}</p>
+            <pre className="max-h-64 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] text-slate-800 whitespace-pre-wrap">
+              {preview.sample_prompt || "(no prompt — nothing to analyse)"}
+            </pre>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// Vault picker — choose Manager / Employee / Month for the .eml.
 function SaveEmlToVaultModal({
   emailId,
   subject,
@@ -170,8 +309,10 @@ function SaveEmlToVaultModal({
   onClose: () => void;
 }) {
   const { toast } = useToast();
-  const [manager, setManager] = useState("");
-  const [employee, setEmployee] = useState("");
+  const [employeeQuery, setEmployeeQuery] = useState("");
+  const [employee, setEmployee] = useState<Employee | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
   const now = new Date();
   const [month, setMonth] = useState(now.getMonth() + 1);
   const [year, setYear] = useState(now.getFullYear());
@@ -183,30 +324,41 @@ function SaveEmlToVaultModal({
     enabled: !!emailId,
   });
 
-  const managers = useMemo(
-    () => [...new Set((employees ?? []).map((e) => e.account_manager).filter(Boolean))].sort() as string[],
-    [employees]
-  );
-  const empOptions = useMemo(
-    () => (employees ?? [])
-      .filter((e) => !manager || e.account_manager === manager)
-      .map((e) => e.name)
-      .sort(),
-    [employees, manager]
-  );
+  const matches = useMemo(() => {
+    const q = employeeQuery.trim().toLowerCase();
+    const list = employees ?? [];
+    if (!q) return list.slice(0, 25);
+    return list.filter((e) =>
+      e.name.toLowerCase().includes(q)
+      || e.employee_id.toLowerCase().includes(q)
+      || (e.location ?? "").toLowerCase().includes(q)
+      || (e.account_manager ?? "").toLowerCase().includes(q)
+    ).slice(0, 25);
+  }, [employees, employeeQuery]);
+
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) setPickerOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [pickerOpen]);
 
   useEffect(() => {   // reset when opened for a new email
-    setManager(""); setEmployee(""); setSaving(false);
+    setEmployee(null); setEmployeeQuery(""); setPickerOpen(false); setSaving(false);
   }, [emailId]);
 
   const years = [year + 1, year, year - 1, year - 2].filter((v, i, a) => a.indexOf(v) === i);
 
   const save = async () => {
-    if (!emailId || !manager || !employee) return;
+    if (!emailId || !employee?.account_manager || !employee?.name) return;
     setSaving(true);
     try {
-      const res = await saveEmlToVault(emailId, { manager, employee, month, year });
-      toast("success", "Saved to File Vault", `${res.filename} → ${manager} / ${employee} / ${MONTHS_LONG[month]} ${year}`);
+      const manager = employee.account_manager;
+      const employeeName = employee.name;
+      const res = await saveEmlToVault(emailId, { manager, employee: employeeName, month, year });
+      toast("success", "Saved to File Vault", `${res.filename} → ${manager} / ${employeeName} / ${MONTHS_LONG[month]} ${year}`);
       onClose();
     } catch (e: any) {
       toast("error", "Could not save", e?.response?.data?.detail ?? String(e));
@@ -218,19 +370,59 @@ function SaveEmlToVaultModal({
     <Modal open={!!emailId} onClose={onClose} title="Save .eml to File Vault"
       subtitle={subject ? `“${subject}” — pick where to file the full email.` : undefined}>
       <div className="space-y-3">
+        <div className="block" ref={pickerRef}>
+          <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">Employee</span>
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+            <input
+              value={employeeQuery}
+              onChange={(e) => {
+                setEmployeeQuery(e.target.value);
+                setEmployee(null);
+                setPickerOpen(true);
+              }}
+              onFocus={() => setPickerOpen(true)}
+              placeholder="Search employee name or ID…"
+              className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm placeholder:text-slate-400 focus:border-brand-400 focus:outline-none"
+            />
+            {pickerOpen && (
+              <div className="absolute z-30 mt-1 max-h-56 w-full overflow-y-auto rounded-lg border border-slate-200 bg-white shadow-pop">
+                {matches.length === 0 ? (
+                  <p className="px-3 py-3 text-sm text-slate-400">No employees match.</p>
+                ) : (
+                  matches.map((e) => (
+                    <button
+                      key={e.id}
+                      type="button"
+                      onMouseDown={(ev) => ev.preventDefault()}
+                      onClick={() => {
+                        setEmployee(e);
+                        setEmployeeQuery(`${e.name} (${e.employee_id})`);
+                        setPickerOpen(false);
+                      }}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-brand-50"
+                    >
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate font-medium text-slate-800">{e.name}</span>
+                        <span className="block truncate text-xs text-slate-500">
+                          {e.employee_id}{e.location ? ` · ${e.location}` : ""}{e.account_manager ? ` · ${e.account_manager}` : ""}
+                        </span>
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+        </div>
         <label className="block">
           <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">Manager</span>
-          <Select value={manager} onChange={(e) => { setManager(e.target.value); setEmployee(""); }} className="w-full">
-            <option value="">Select manager…</option>
-            {managers.map((m) => <option key={m} value={m}>{m}</option>)}
-          </Select>
-        </label>
-        <label className="block">
-          <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">Employee</span>
-          <Select value={employee} onChange={(e) => setEmployee(e.target.value)} className="w-full" disabled={!manager}>
-            <option value="">Select employee…</option>
-            {empOptions.map((n) => <option key={n} value={n}>{n}</option>)}
-          </Select>
+          <input
+            value={employee?.account_manager ?? ""}
+            readOnly
+            placeholder="Auto-filled from employee"
+            className="w-full rounded-lg border border-slate-200 bg-slate-50 py-2 px-3 text-sm text-slate-700 placeholder:text-slate-400"
+          />
         </label>
         <div className="grid grid-cols-2 gap-3">
           <label className="block">
@@ -248,7 +440,7 @@ function SaveEmlToVaultModal({
         </div>
         <div className="flex justify-end gap-2 border-t border-slate-100 pt-3">
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={save} disabled={!manager || !employee || saving}>
+          <Button onClick={save} disabled={!employee?.account_manager || !employee?.name || saving}>
             {saving ? <Spinner className="border-white/40 border-t-white h-4 w-4" /> : <FolderInput className="h-4 w-4" />}
             Save to Vault
           </Button>
@@ -724,6 +916,48 @@ function AttachmentChips({
   );
 }
 
+function InboxListAttachmentPreview({
+  email,
+}: {
+  email: EmailListItem;
+}) {
+  const atts = email.attachments ?? [];
+  if (!atts.length) return null;
+  const shown = atts.slice(0, 2);
+  const extra = atts.length - shown.length;
+  return (
+    <span className="mt-2 flex flex-wrap items-end gap-1.5">
+      {shown.map((a) => {
+        const url = attachmentUrl(email.provider_message_id, a.attachment_id);
+        const isImg = isImageAttachment(a);
+        return isImg ? (
+          <span
+            key={a.attachment_id}
+            className="flex h-[44px] w-[96px] items-center justify-center overflow-hidden rounded border border-slate-200 bg-slate-50"
+            title={a.filename}
+          >
+            <img src={url} alt={a.filename} className="max-h-full max-w-full object-contain" loading="lazy" />
+          </span>
+        ) : (
+          <span
+            key={a.attachment_id}
+            className="inline-flex h-[44px] max-w-[122px] items-center gap-1.5 rounded border border-slate-200 bg-white px-2 text-[10px] text-slate-600"
+            title={a.filename}
+          >
+            <FileText className="h-3.5 w-3.5 shrink-0 text-brand-500" />
+            <span className="truncate font-medium">{a.filename}</span>
+          </span>
+        );
+      })}
+      {extra > 0 && (
+        <span className="inline-flex h-[44px] items-center rounded border border-slate-200 bg-white px-3 text-sm font-medium text-slate-500">
+          +{extra}
+        </span>
+      )}
+    </span>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------------
@@ -738,6 +972,10 @@ export default function InboxPage() {
   const [selectedTimesheetIds, setSelectedTimesheetIds] = useState<Set<string>>(new Set());
   const [extractBodyEnabled, setExtractBodyEnabled] = useState(false);
   const [stagedQueue, setStagedQueue] = useState<PipelineFile[]>([]);
+  const [llmPreviewOpen, setLlmPreviewOpen] = useState(false);
+  const [llmPreview, setLlmPreview] = useState<LlmEgressPreview | null>(null);
+  const [llmPreviewLoading, setLlmPreviewLoading] = useState(false);
+  const [llmPreviewError, setLlmPreviewError] = useState<string | null>(null);
 
   useEffect(() => setPreview(null), [selected]);
   useEffect(() => {
@@ -752,6 +990,22 @@ export default function InboxPage() {
 
   const extractCount = selectedTimesheetIds.size + (extractBodyEnabled ? 1 : 0);
   const canExtract = extractCount > 0;
+
+  const openLlmPreview = async (msgId: string) => {
+    setLlmPreviewOpen(true);
+    setLlmPreview(null);
+    setLlmPreviewError(null);
+    setLlmPreviewLoading(true);
+    try {
+      // Same scope as the main Extract Email button (whole email).
+      const data = await fetchLlmPreview(msgId);
+      setLlmPreview(data);
+    } catch (e: any) {
+      setLlmPreviewError(e?.response?.data?.detail ?? String(e));
+    } finally {
+      setLlmPreviewLoading(false);
+    }
+  };
 
   const dq = useDebounced(q, 350);
   const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
@@ -934,6 +1188,7 @@ export default function InboxPage() {
                       </span>
                       {m.has_approval_screenshot && <BadgeCheck className="h-3.5 w-3.5 text-emerald-500" />}
                     </span>
+                    <InboxListAttachmentPreview email={m} />
                   </span>
                 </button>
               ))
@@ -987,7 +1242,7 @@ export default function InboxPage() {
                             {detail.subject || "(no subject)"}
                           </h2>
                           {isForwarded && (
-                            <span className="inline-flex items-center gap-1 rounded-full bg-violet-50 px-2 py-0.5 text-[10px] font-semibold text-violet-600">
+                            <span className="inline-flex items-center gap-1 rounded-md bg-brand-50 px-2 py-0.5 text-[10px] font-semibold text-brand-700 ring-1 ring-inset ring-brand-200">
                               <Forward className="h-3 w-3" /> Forwarded
                             </span>
                           )}
@@ -1037,7 +1292,7 @@ export default function InboxPage() {
                         </div>
 
                         <div className="flex flex-wrap justify-end gap-1.5">
-                          <Button
+                    <Button
                             size="sm"
                             disabled={extractEmail.isPending || loadingDetail}
                             onClick={() => extractEmail.mutate({ id: detail.provider_message_id })}
@@ -1055,7 +1310,7 @@ export default function InboxPage() {
                               : detail.extract_email_at
                                 ? "Re-extract"
                                 : "Extract Email"}
-                          </Button>
+                    </Button>
                           <EmailMenu
                             busy={extractEmail.isPending || decide.isPending}
                             manualActions={[
@@ -1080,6 +1335,11 @@ export default function InboxPage() {
                             ]}
                             emlActions={[
                               {
+                                label: "EML sent to LLM",
+                                icon: Shield,
+                                onClick: () => openLlmPreview(detail.provider_message_id),
+                              },
+                              {
                                 label: "Preview .eml",
                                 icon: Eye,
                                 onClick: () => setPreview({
@@ -1102,8 +1362,8 @@ export default function InboxPage() {
                           />
                         </div>
                       </div>
-                    </div>
-                  </div>
+                </div>
+              </div>
 
                   {/* ── Attachments — Outlook chips, above body ──── */}
                   <AttachmentChips
@@ -1141,6 +1401,13 @@ export default function InboxPage() {
         emailId={vaultEmailId}
         subject={detail?.subject ?? null}
         onClose={() => setVaultEmailId(null)}
+      />
+      <LlmEgressPreviewModal
+        open={llmPreviewOpen}
+        onClose={() => setLlmPreviewOpen(false)}
+        preview={llmPreview}
+        loading={llmPreviewLoading}
+        error={llmPreviewError}
       />
 
       {/* Run Extraction → review each staged file in the Compare & Fix overlay:

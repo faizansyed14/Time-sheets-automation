@@ -22,6 +22,7 @@ import {
   type DashboardRow,
   type TimesheetRecord,
 } from "../api/client";
+import { locationBadgeTone, type BadgeTone } from "../lib/theme";
 import { avatarColor, cn, initials } from "../lib/utils";
 import { Badge, Card, EmptyState, Input, Select, Skeleton, Spinner } from "../components/ui";
 import { ApprovalBadge, ValidationBadge } from "../components/status";
@@ -37,20 +38,32 @@ function StatCard({
   label,
   value,
   icon,
-  tone,
+  accent = "brand",
 }: {
   label: string;
   value: number | string;
   icon: React.ReactNode;
-  tone: string;
+  accent?: "brand" | "success" | "danger" | "slate";
 }) {
+  const accents = {
+    brand: "border-slate-200/80 bg-white",
+    success: "border-emerald-200/60 bg-emerald-50/40",
+    danger: "border-rose-200/60 bg-rose-50/40",
+    slate: "border-slate-200/80 bg-slate-50/50",
+  };
+  const iconBg = {
+    brand: "bg-brand-50 text-brand-600 ring-brand-100",
+    success: "bg-emerald-50 text-emerald-600 ring-emerald-100",
+    danger: "bg-rose-50 text-rose-600 ring-rose-100",
+    slate: "bg-slate-100 text-slate-600 ring-slate-200",
+  };
   return (
-    <div className={cn("flex items-center gap-3 rounded-xl border border-slate-200/80 bg-white p-4 shadow-card", tone)}>
-      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white/80 ring-1 ring-black/[0.04]">
+    <div className={cn("flex items-center gap-3.5 rounded-xl border p-4 shadow-card", accents[accent])}>
+      <div className={cn("flex h-11 w-11 shrink-0 items-center justify-center rounded-lg ring-1 ring-inset", iconBg[accent])}>
         {icon}
       </div>
       <div>
-        <p className="text-2xl font-bold leading-none text-slate-900">{value}</p>
+        <p className="text-2xl font-bold leading-none tracking-tight text-slate-900">{value}</p>
         <p className="mt-1 text-xs font-medium text-slate-500">{label}</p>
       </div>
     </div>
@@ -60,10 +73,10 @@ function StatCard({
 function monthStatus(row: DashboardRow, month: number, year: number) {
   const future = year > CUR_YEAR || (year === CUR_YEAR && month > CUR_MONTH);
   const submitted = row.submitted_months.includes(month);
-  if (submitted) return { label: "Submitted", tone: "green" as const };
+  if (submitted) return { label: "Submitted", tone: "success" as const };
   if (future) return { label: "Not due", tone: "slate" as const };
-  if (row.in_matcher) return { label: "Missing", tone: "rose" as const };
-  return { label: "Unmatched", tone: "amber" as const };
+  if (row.in_matcher) return { label: "Missing", tone: "danger" as const };
+  return { label: "Unmatched", tone: "warning" as const };
 }
 
 function MonthStrip({
@@ -241,20 +254,20 @@ export default function Dashboard() {
           <StatCard
             label="Employees in matcher"
             value={cov?.total_employees ?? "—"}
-            icon={<Users className="h-5 w-5 text-brand-600" />}
-            tone=""
+            icon={<Users className="h-5 w-5" />}
+            accent="brand"
           />
           <StatCard
             label={`Submitted · ${MONTHS[month]}`}
             value={cov?.submitted_this_month ?? "—"}
-            icon={<CalendarCheck className="h-5 w-5 text-emerald-600" />}
-            tone="border-emerald-100 bg-emerald-50/30"
+            icon={<CalendarCheck className="h-5 w-5" />}
+            accent="success"
           />
           <StatCard
             label={focusFuture ? `Missing · ${MONTHS[month]} (not due)` : `Missing · ${MONTHS[month]}`}
             value={focusFuture ? "—" : cov?.missing_this_month ?? "—"}
-            icon={<CalendarX className="h-5 w-5 text-rose-600" />}
-            tone="border-rose-100 bg-rose-50/30"
+            icon={<CalendarX className="h-5 w-5" />}
+            accent="danger"
           />
           {reviewCount > 0 && <ReviewStatCard count={reviewCount} />}
         </div>
@@ -394,7 +407,7 @@ export default function Dashboard() {
                       </td>
                       <td className="hidden px-4 py-3 md:table-cell">
                         {r.location ? (
-                          <Badge tone={r.location === "AUH" ? "violet" : "sky"}>{r.location}</Badge>
+                          <Badge tone={locationBadgeTone(r.location)}>{r.location}</Badge>
                         ) : (
                           <span className="text-slate-300">—</span>
                         )}
@@ -404,9 +417,9 @@ export default function Dashboard() {
                       </td>
                       <td className="px-4 py-3">
                         <div className="flex flex-wrap items-center gap-1.5">
-                          <Badge tone={status.tone}>
-                            {status.tone === "green" && <CheckCircle2 className="h-3 w-3" />}
-                            {status.tone === "rose" && <CalendarX className="h-3 w-3" />}
+                          <Badge tone={status.tone as BadgeTone}>
+                            {status.tone === "success" && <CheckCircle2 className="h-3 w-3" />}
+                            {status.tone === "danger" && <CalendarX className="h-3 w-3" />}
                             {status.tone === "slate" && <Clock className="h-3 w-3" />}
                             {status.label}
                           </Badge>

@@ -19,7 +19,7 @@ from app.core.database import Base
 
 class ConfigCategory:
     PROVIDER = "provider"     # ai provider + api keys + base urls
-    MODEL = "model"           # extraction/validation model + toggles
+    MODEL = "model"           # extraction/chat models + tuning knobs
     PROMPT = "prompt"         # editable prompts
     GENERAL = "general"
 

@@ -15,11 +15,12 @@ import { Link } from "react-router-dom";
 import {
   Send, Sparkles, BookOpen, User, Loader2, AlertTriangle, Paperclip,
   ArrowRight, Plus, Minus, RotateCcw, Trash2, FileText, Eye, UserCheck, CalendarDays,
-  Save, Check, X, ShieldQuestion,
+  Save, Check, X, ShieldQuestion, Mail, Copy,
 } from "lucide-react";
 import {
-  fetchChatSuggestions, sendChat, extractChatSheet, chatAttachmentUrl, storeChatSheet,
-  type ChatMessage, type ChatChange, type ChatResponse, type ChatExtraction, type UploadResult,
+  fetchChatSuggestions, sendChatStream, extractChatSheet, chatAttachmentUrl, storeChatSheet,
+  type ChatMessage, type ChatChange, type ChatExtraction, type UploadResult,
+  type ChatCard, type ChatStreamEvent,
 } from "../api/client";
 import { Badge, Button, Card, Modal, PageHeader, Spinner } from "../components/ui";
 import { FilePreviewModal } from "../components/FilePreview";
@@ -27,15 +28,22 @@ import type { PreviewFile } from "../lib/filePreview";
 import { useToast } from "../components/toast";
 import { cn } from "../lib/utils";
 
+// A live tool-activity chip shown while the agent works.
+interface Activity { name: string; label: string; write?: boolean; done?: boolean; ok?: boolean }
+
 interface Turn extends ChatMessage {
   changes?: ChatChange[];
   error?: string | null;
   extraction?: ChatExtraction;   // a user turn that carried an uploaded sheet
+  cards?: ChatCard[];            // structured result cards streamed by the agent
+  activity?: Activity[];         // live tool-activity chips
+  suggestions?: string[];        // proactive follow-up chips
+  streaming?: boolean;           // true while tokens are still arriving
 }
 
 const ACTION_META: Record<ChatChange["action"], { label: string; icon: typeof Plus; tone: string }> = {
   add: { label: "Added", icon: Plus, tone: "text-emerald-600" },
-  set: { label: "Replaced", icon: RotateCcw, tone: "text-sky-600" },
+  set: { label: "Replaced", icon: RotateCcw, tone: "text-brand-600" },
   clear: { label: "Cleared", icon: Trash2, tone: "text-rose-600" },
 };
 
@@ -176,12 +184,12 @@ function ExtractionCard({
         <>
           <div className="mt-2 flex flex-wrap items-center gap-2">
             {e.matched_employee ? (
-              <Badge tone="green"><UserCheck className="h-3 w-3" />{e.matched_employee.name} · {e.matched_employee.employee_id}</Badge>
+              <Badge tone="success"><UserCheck className="h-3 w-3" />{e.matched_employee.name} · {e.matched_employee.employee_id}</Badge>
             ) : (
-              <Badge tone="amber">{e.extracted_employee_name || "Unknown"} (no match)</Badge>
+              <Badge tone="warning">{e.extracted_employee_name || "Unknown"} (no match)</Badge>
             )}
-            {e.month_name && <Badge tone="sky"><CalendarDays className="h-3 w-3" />{e.month_name} {e.year}</Badge>}
-            <Badge tone={e.validation_status === "verified" ? "slate" : "amber"}>{e.total_leaves ?? 0} leave day(s)</Badge>
+            {e.month_name && <Badge tone="brand"><CalendarDays className="h-3 w-3" />{e.month_name} {e.year}</Badge>}
+            <Badge tone={e.validation_status === "verified" ? "success" : "warning"}>{e.total_leaves ?? 0} leave day(s)</Badge>
           </div>
           {e.matched_employee?.email && (
             <p className="mt-1 text-[11px] text-slate-400">{e.matched_employee.email}</p>
@@ -237,24 +245,261 @@ function Typewriter({ text, onTick }: { text: string; onTick?: () => void }) {
   );
 }
 
+// --------------------------------------------------------------------------- //
+// Structured result cards streamed by the agent
+// --------------------------------------------------------------------------- //
+function Stat({ label, value, tone }: { label: string; value: number | string; tone?: string }) {
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-center">
+      <div className={cn("text-base font-bold", tone ?? "text-slate-800")}>{value}</div>
+      <div className="text-[10px] font-medium uppercase tracking-wide text-slate-400">{label}</div>
+    </div>
+  );
+}
+
+function ApprovalChangeCard({ c }: { c: any }) {
+  const approved = c.after === "approved";
+  return (
+    <div className={cn("mt-1 rounded-lg border p-3 text-xs",
+      approved ? "border-emerald-200 bg-emerald-50" : "border-rose-200 bg-rose-50")}>
+      <div className="flex items-center gap-2 font-semibold">
+        <UserCheck className={cn("h-3.5 w-3.5", approved ? "text-emerald-600" : "text-rose-600")} />
+        <span className={approved ? "text-emerald-700" : "text-rose-700"}>
+          {approved ? "Approved" : "Marked not approved"}
+        </span>
+        <span className="text-slate-400">·</span>
+        <span className="text-slate-600">{c.employee_name}</span>
+        <span className="text-slate-400">·</span>
+        <span className="text-slate-500">{c.month_name} {c.year}</span>
+        <Link to={`/records/${c.record_id}`} className="ml-auto inline-flex items-center gap-0.5 text-brand-600 hover:underline">
+          <FileText className="h-3 w-3" /> Record
+        </Link>
+      </div>
+      <p className="mt-1 text-[11px] text-slate-500">Manager approval: {c.before} → {c.after}</p>
+    </div>
+  );
+}
+
+function DraftEmailCard({ c }: { c: any }) {
+  const { toast } = useToast();
+  const copy = () => {
+    navigator.clipboard?.writeText(`Subject: ${c.subject}\n\n${c.body}`);
+    toast("success", "Copied", "Draft copied to clipboard — paste it into your mail client.");
+  };
+  return (
+    <div className="mt-1 w-full max-w-lg rounded-lg border border-slate-200 bg-white p-3 text-xs">
+      <div className="mb-2 flex items-center gap-2 font-semibold text-slate-700">
+        <Mail className="h-3.5 w-3.5 text-brand-500" />
+        Draft {c.kind === "approval" ? "approval request" : "reminder"} · {c.count} recipient{c.count === 1 ? "" : "s"}
+        <button onClick={copy} className="ml-auto inline-flex items-center gap-1 rounded-md border border-slate-200 px-1.5 py-0.5 font-semibold text-brand-600 hover:bg-brand-50">
+          <Copy className="h-3 w-3" /> Copy
+        </button>
+      </div>
+      <div className="rounded-md bg-slate-50 p-2.5">
+        <p className="font-semibold text-slate-700">Subject: {c.subject}</p>
+        <p className="mt-1.5 whitespace-pre-wrap text-slate-600">{c.body}</p>
+      </div>
+      {(c.recipients ?? []).length > 0 && (
+        <p className="mt-2 flex flex-wrap gap-1 text-[11px] text-slate-500">
+          {(c.recipients as any[]).slice(0, 12).map((r, i) => (
+            <span key={i} className="rounded bg-slate-100 px-1.5 py-0.5">{r.name}{r.email ? ` · ${r.email}` : ""}</span>
+          ))}
+        </p>
+      )}
+      <p className="mt-1.5 text-[10px] text-slate-400">This is a draft — nothing was sent. Copy it into your mail client to send.</p>
+    </div>
+  );
+}
+
+function DashboardCard({ c }: { c: any }) {
+  return (
+    <div className="mt-1 w-full max-w-lg rounded-lg border border-slate-200 bg-white p-3 text-xs">
+      <div className="mb-2 flex items-center gap-2 font-semibold text-slate-700">
+        <CalendarDays className="h-3.5 w-3.5 text-brand-500" /> {c.month_name} {c.year} — status
+      </div>
+      <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-6">
+        <Stat label="Total" value={c.total_employees} />
+        <Stat label="Submitted" value={c.submitted} tone="text-emerald-600" />
+        <Stat label="Missing" value={c.missing_count} tone={c.missing_count ? "text-rose-600" : "text-slate-800"} />
+        <Stat label="Approved" value={c.approved_count} tone="text-emerald-600" />
+        <Stat label="Awaiting" value={c.awaiting_approval_count} tone={c.awaiting_approval_count ? "text-amber-600" : "text-slate-800"} />
+        <Stat label="Review" value={c.needs_review_count} tone={c.needs_review_count ? "text-amber-600" : "text-slate-800"} />
+      </div>
+    </div>
+  );
+}
+
+function EmployeeListCard({ title, icon: Icon, tone, items }: {
+  title: string; icon: typeof Mail; tone: string; items: { name: string; label?: string }[];
+}) {
+  return (
+    <div className="mt-1 w-full max-w-lg rounded-lg border border-slate-200 bg-white p-3 text-xs">
+      <div className="mb-2 flex items-center gap-2 font-semibold text-slate-700">
+        <Icon className={cn("h-3.5 w-3.5", tone)} /> {title}
+      </div>
+      {items.length === 0 ? (
+        <p className="text-slate-400">None 🎉</p>
+      ) : (
+        <div className="flex flex-wrap gap-1">
+          {items.slice(0, 40).map((r, i) => (
+            <span key={i} className="rounded bg-slate-100 px-1.5 py-0.5 text-slate-600">
+              {r.name}{r.label ? ` · ${r.label}` : ""}
+            </span>
+          ))}
+          {items.length > 40 && <span className="text-slate-400">+{items.length - 40} more</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TeamCard({ c }: { c: any }) {
+  return (
+    <div className="mt-1 w-full max-w-lg overflow-hidden rounded-lg border border-slate-200 bg-white text-xs">
+      <div className="flex items-center gap-2 border-b border-slate-100 px-3 py-2 font-semibold text-slate-700">
+        <CalendarDays className="h-3.5 w-3.5 text-brand-500" /> {c.month_name ?? `${c.month}/${c.year}`} by {c.group_by === "location" ? "location" : "manager"}
+      </div>
+      <table className="w-full">
+        <thead className="text-[10px] uppercase tracking-wide text-slate-400">
+          <tr><th className="px-3 py-1 text-left">Team</th><th className="px-2 py-1">Sub</th><th className="px-2 py-1">Appr</th><th className="px-2 py-1">Pend</th><th className="px-2 py-1">Miss</th></tr>
+        </thead>
+        <tbody>
+          {(c.groups as any[]).slice(0, 20).map((g, i) => (
+            <tr key={i} className="border-t border-slate-50">
+              <td className="px-3 py-1 text-slate-700">{g.group}</td>
+              <td className="px-2 py-1 text-center text-slate-600">{g.submitted}/{g.total}</td>
+              <td className="px-2 py-1 text-center text-emerald-600">{g.approved}</td>
+              <td className="px-2 py-1 text-center text-amber-600">{g.pending}</td>
+              <td className={cn("px-2 py-1 text-center", g.missing ? "text-rose-600 font-semibold" : "text-slate-400")}>{g.missing}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AnomaliesCard({ c }: { c: any }) {
+  return (
+    <div className="mt-1 w-full max-w-lg rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-xs">
+      <div className="mb-2 flex items-center gap-2 font-semibold text-amber-800">
+        <AlertTriangle className="h-3.5 w-3.5" /> {c.count} record{c.count === 1 ? "" : "s"} to review — {c.month_name} {c.year}
+      </div>
+      <div className="space-y-1">
+        {(c.anomalies as any[]).slice(0, 12).map((a, i) => (
+          <div key={i} className="flex items-center gap-2">
+            <Link to={`/records/${a.record_id}`} className="font-medium text-slate-700 hover:underline">{a.employee_name}</Link>
+            <span className="text-slate-400">·</span>
+            <span className="text-slate-500">{(a.reasons ?? []).join(", ")}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CompareCard({ c }: { c: any }) {
+  const a = c.period_a, b = c.period_b;
+  const deltas = Object.entries(c.deltas ?? {}) as [string, number][];
+  return (
+    <div className="mt-1 w-full max-w-lg rounded-lg border border-slate-200 bg-white p-3 text-xs">
+      <div className="mb-2 flex items-center gap-2 font-semibold text-slate-700">
+        <CalendarDays className="h-3.5 w-3.5 text-brand-500" /> {c.employee?.name} — {a.month_name} vs {b.month_name}
+      </div>
+      {deltas.length === 0 ? (
+        <p className="text-slate-500">No difference in leave totals between the two months.</p>
+      ) : (
+        <div className="flex flex-wrap gap-1.5">
+          {deltas.map(([label, d]) => (
+            <span key={label} className={cn("rounded px-1.5 py-0.5",
+              d > 0 ? "bg-rose-50 text-rose-700" : "bg-emerald-50 text-emerald-700")}>
+              {label}: {d > 0 ? `+${d}` : d}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CardRenderer({ card }: { card: ChatCard }) {
+  const c = card as any;
+  switch (card.type) {
+    case "leave_change": return <ChangeCard c={c as ChatChange} />;
+    case "approval_change": return <ApprovalChangeCard c={c} />;
+    case "draft_email": return <DraftEmailCard c={c} />;
+    case "dashboard": return <DashboardCard c={c} />;
+    case "missing":
+      return <EmployeeListCard title={`Missing — ${c.month_name} ${c.year} (${c.missing_count})`}
+        icon={AlertTriangle} tone="text-rose-500"
+        items={(c.missing ?? []).map((e: any) => ({ name: e.name, label: e.employee_id }))} />;
+    case "submitted":
+      return <EmployeeListCard title={`Submitted — ${c.month_name} ${c.year} (${c.count})`}
+        icon={Check} tone="text-emerald-500"
+        items={(c.submitted ?? []).map((r: any) => ({
+          name: r.employee_name,
+          label: r.approval_status === "approved" ? "approved" : "pending approval",
+        }))} />;
+    case "pending":
+      return <EmployeeListCard title={`Awaiting approval (${c.count})`} icon={UserCheck} tone="text-amber-500"
+        items={(c.records ?? []).map((r: any) => ({
+          name: r.employee_name,
+          label: `${r.month_name} ${r.year} · ${r.approval_status === "not_approved" ? "not approved" : "pending"}`,
+        }))} />;
+    case "team": return <TeamCard c={c} />;
+    case "anomalies": return <AnomaliesCard c={c} />;
+    case "compare": return <CompareCard c={c} />;
+    default: return null;
+  }
+}
+
 function Bubble({
-  turn, onPreview, onTick, storeState, onStoreYes, onStoreNo,
+  turn, onPreview, onTick, storeState, onStoreYes, onStoreNo, onSuggestion,
 }: {
   turn: Turn; onPreview: (e: ChatExtraction) => void; onTick?: () => void;
   storeState: Record<string, StoreState>;
   onStoreYes: (token: string) => void; onStoreNo: (token: string) => void;
+  onSuggestion: (s: string) => void;
 }) {
   const isUser = turn.role === "user";
+  const streaming = !!turn.streaming;
+  const activity = turn.activity ?? [];
+  const thinking = !isUser && streaming && !turn.content && activity.length === 0;
   return (
     <div className={cn("flex animate-bubble-in gap-3", isUser && "flex-row-reverse")}>
       <span className={cn(
         "mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full shadow-sm",
         isUser
           ? "bg-slate-200 text-slate-600"
-          : "bg-gradient-to-br from-brand-500 to-violet-600 text-white ring-2 ring-white")}>
+          : "bg-brand-600 text-white ring-2 ring-white")}>
         {isUser ? <User className="h-4 w-4" /> : <Sparkles className="h-4 w-4" />}
       </span>
-      <div className={cn("flex min-w-0 max-w-[82%] flex-col", isUser && "items-end")}>
+      <div className={cn("flex min-w-0 max-w-[82%] flex-col gap-1.5", isUser && "items-end")}>
+        {/* live tool-activity chips */}
+        {!isUser && activity.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {activity.map((a, i) => (
+              <span key={a.name + i} className={cn(
+                "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium",
+                a.done
+                  ? (a.ok === false ? "border-rose-200 bg-rose-50 text-rose-600" : "border-emerald-200 bg-emerald-50 text-emerald-700")
+                  : "border-brand-200 bg-brand-50 text-brand-700")}>
+                {a.done
+                  ? (a.ok === false ? <X className="h-3 w-3" /> : <Check className="h-3 w-3" />)
+                  : <Loader2 className="h-3 w-3 animate-spin" />}
+                {a.label}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {thinking && (
+          <div className="flex items-center gap-2 rounded-2xl rounded-tl-sm bg-white px-4 py-3 text-xs text-slate-400 shadow-xs ring-1 ring-slate-200/80">
+            <span className="typing-dots flex items-center gap-1"><span /><span /><span /></span>
+            Thinking…
+          </div>
+        )}
+
         {turn.content && (
           <div className={cn(
             "rounded-2xl px-4 py-2.5 text-sm leading-6 shadow-xs",
@@ -263,11 +508,21 @@ function Bubble({
               : "rounded-tl-sm bg-white text-slate-800 ring-1 ring-slate-200/80")}>
             {isUser ? (
               <p className="whitespace-pre-wrap">{turn.content}</p>
+            ) : streaming ? (
+              <p className="whitespace-pre-wrap">
+                {turn.content}
+                <span className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] animate-blink rounded-full bg-brand-500 align-middle" />
+              </p>
             ) : (
               <Typewriter text={turn.content} onTick={onTick} />
             )}
           </div>
         )}
+
+        {/* structured result cards — held until the text finishes so they
+            appear after the answer, not mid-stream */}
+        {!streaming && (turn.cards ?? []).map((c, i) => <CardRenderer key={i} card={c} />)}
+
         {turn.extraction && (
           <ExtractionCard
             e={turn.extraction}
@@ -278,6 +533,18 @@ function Bubble({
           />
         )}
         {turn.changes?.map((c) => <ChangeCard key={c.record_id + c.leave_type + c.action} c={c} />)}
+
+        {/* proactive follow-up chips */}
+        {!streaming && (turn.suggestions ?? []).length > 0 && (
+          <div className="mt-1 flex flex-wrap gap-1.5">
+            {turn.suggestions!.map((s) => (
+              <button key={s} onClick={() => onSuggestion(s)}
+                className="inline-flex items-center gap-1 rounded-full border border-brand-200 bg-brand-50/70 px-2.5 py-1 text-[11px] font-semibold text-brand-700 transition hover:bg-brand-100">
+                <Sparkles className="h-3 w-3" /> {s}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -309,22 +576,52 @@ export default function AgenticChatPage() {
     const msg = text.trim();
     if (!msg || sending) return;
     const history: Turn[] = [...turns, { role: "user", content: msg }];
-    setTurns(history);
+    // Add the user turn + an empty streaming assistant turn we fill as events arrive.
+    setTurns([...history, { role: "assistant", content: "", streaming: true, activity: [], cards: [] }]);
     setInput("");
     setSending(true);
+
+    // Mutate the LAST turn (the streaming assistant) in place.
+    const patch = (fn: (t: Turn) => Turn) =>
+      setTurns((prev) => prev.map((t, i) => (i === prev.length - 1 ? fn(t) : t)));
+
     try {
-      const res: ChatResponse = await sendChat(
+      await sendChatStream(
         history.filter((t) => t.content).map((t) => ({ role: t.role, content: t.content })),
         extractions,
+        (ev: ChatStreamEvent) => {
+          if (ev.type === "token") {
+            patch((t) => ({ ...t, content: t.content + ev.text }));
+          } else if (ev.type === "tool" && ev.phase === "start") {
+            patch((t) => ({
+              ...t,
+              activity: [...(t.activity ?? []), { name: ev.name, label: ev.label ?? "Working", write: ev.write }],
+            }));
+          } else if (ev.type === "tool" && ev.phase === "end") {
+            patch((t) => ({
+              ...t,
+              activity: (t.activity ?? []).map((a, i, arr) =>
+                i === arr.map((x) => x.name).lastIndexOf(ev.name) && !a.done
+                  ? { ...a, done: true, ok: ev.ok } : a),
+            }));
+          } else if (ev.type === "card") {
+            patch((t) => ({ ...t, cards: [...(t.cards ?? []), ev.card] }));
+          } else if (ev.type === "suggestions") {
+            patch((t) => ({ ...t, suggestions: ev.items }));
+          } else if (ev.type === "done") {
+            patch((t) => ({ ...t, streaming: false, changes: ev.changes ?? t.changes, error: ev.error ?? null }));
+          }
+          scrollToBottom();
+        },
       );
-      setTurns((prev) => [...prev, {
-        role: "assistant", content: res.answer, changes: res.changes, error: res.error,
-      }]);
     } catch {
-      setTurns((prev) => [...prev, {
-        role: "assistant", content: "Sorry — I couldn't reach the assistant. Please try again.", error: "network",
-      }]);
+      patch((t) => ({
+        ...t, streaming: false,
+        content: t.content || "Sorry — I couldn't reach the assistant. Please try again.",
+        error: "network",
+      }));
     } finally {
+      patch((t) => ({ ...t, streaming: false }));
       setSending(false);
     }
   };
@@ -417,7 +714,7 @@ export default function AgenticChatPage() {
         <div ref={scrollRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
           {empty ? (
             <div className="mx-auto max-w-xl py-8 text-center">
-              <div className="mx-auto mb-4 flex h-14 w-14 animate-pop-in items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-violet-600 text-white shadow-[0_8px_24px_-8px_rgb(99_102_241/0.7)]">
+              <div className="mx-auto mb-4 flex h-14 w-14 animate-scale-in items-center justify-center rounded-2xl bg-brand-600 text-white shadow-card">
                 <Sparkles className="h-7 w-7" />
               </div>
               <h3 className="text-xl font-bold">
@@ -446,19 +743,20 @@ export default function AgenticChatPage() {
               <Bubble
                 key={i} turn={t} onPreview={openPreview} onTick={scrollToBottom}
                 storeState={storeState} onStoreYes={handleStoreYes} onStoreNo={handleStoreNo}
+                onSuggestion={send}
               />
             ))
           )}
-          {(sending || uploading) && (
+          {uploading && (
             <div className="flex animate-bubble-in items-center gap-3 text-sm text-slate-400">
-              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-brand-500 to-violet-600 text-white shadow-sm ring-2 ring-white">
+              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-brand-600 text-white shadow-sm ring-2 ring-white">
                 <Sparkles className="h-4 w-4" />
               </span>
               <span className="flex items-center gap-2 rounded-2xl rounded-tl-sm bg-white px-4 py-3 shadow-xs ring-1 ring-slate-200/80">
                 <span className="typing-dots flex items-center gap-1">
                   <span /><span /><span />
                 </span>
-                <span className="text-xs font-medium text-slate-400">{uploading ? "Extracting sheet…" : "Thinking…"}</span>
+                <span className="text-xs font-medium text-slate-400">Extracting sheet…</span>
               </span>
             </div>
           )}

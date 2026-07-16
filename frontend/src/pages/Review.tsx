@@ -61,9 +61,9 @@ function ReviewCard({
         <div className="flex flex-wrap items-center gap-2">
           <p className="truncate text-sm font-semibold text-slate-800">{f.filename}</p>
           {isFailed ? (
-            <Badge tone="rose">Failed — {f.failure_label ?? "needs fixing"}</Badge>
+            <Badge tone="danger">Failed — {f.failure_label ?? "needs fixing"}</Badge>
           ) : (
-            <Badge tone="amber">Awaiting your review</Badge>
+            <Badge tone="warning">Awaiting your review</Badge>
           )}
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">

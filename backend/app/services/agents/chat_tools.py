@@ -20,7 +20,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.employee import Employee
-from app.models.timesheet_record import TimesheetRecord, ValidationStatus
+from app.models.timesheet_record import ApprovalStatus, TimesheetRecord, ValidationStatus
 
 # User-facing leave name (and common aliases) -> TimesheetRecord field.
 LEAVE_FIELDS: dict[str, str] = {
@@ -256,6 +256,26 @@ async def employee_overview(
     }
 
 
+async def list_submitted(db: AsyncSession, month: int, year: int) -> dict[str, Any]:
+    """List employees who DID submit a timesheet for the given month/year, with
+    each one's approval status. Use for 'who submitted / who sent their sheet'.
+    (This is the opposite of list_missing — never infer one from the other.)"""
+    recs = list((await db.execute(select(TimesheetRecord).where(
+        TimesheetRecord.month == month, TimesheetRecord.year == year).order_by(
+        TimesheetRecord.employee_name))).scalars().all())
+    submitted = [{
+        "record_id": r.id,
+        "employee_name": r.employee_name,
+        "employee_id": r.employee_id,
+        "approval_status": r.approval_status,
+        "validation_status": r.validation_status,
+        "total_leaves": sum(len(getattr(r, f) or []) for f in _FIELD_LABELS),
+    } for r in recs]
+    return {"status": "ok", "month": month, "year": year,
+            "month_name": _MONTHS[month] if 0 < month < 13 else str(month),
+            "count": len(submitted), "submitted": submitted}
+
+
 async def list_missing(db: AsyncSession, month: int, year: int) -> dict[str, Any]:
     """List employees with NO timesheet record for the given month/year."""
     emps = list((await db.execute(select(Employee).order_by(Employee.name))).scalars().all())
@@ -400,3 +420,253 @@ async def update_leaves(
         "validation_status": rec.validation_status,
         "summary": rec.llm_summary,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Approval tool — set a record's MANAGER-approval verdict (never deletes).
+# --------------------------------------------------------------------------- #
+async def set_approval(
+    db: AsyncSession, employee: str, month: int, year: int,
+    approved: bool, detail: str | None = None,
+) -> dict[str, Any]:
+    """Mark an employee-month timesheet as manager-approved or not-approved.
+
+    This only flips the approval verdict on an existing record — it never
+    deletes or alters leave data. Use when the user says "approve X's timesheet
+    for May" or "mark it not approved".
+    """
+    one, rows = await _resolve_one(db, employee)
+    if not one:
+        return {"status": "ambiguous" if rows else "not_found",
+                "matches": [_emp_summary(e) for e in rows]}
+    rec = (await db.execute(select(TimesheetRecord).where(
+        or_(TimesheetRecord.matched_employee_pk == one.id,
+            func.lower(TimesheetRecord.employee_name) == one.name.lower()),
+        TimesheetRecord.month == month, TimesheetRecord.year == year,
+    ).limit(1))).scalar_one_or_none()
+    if not rec:
+        return {"status": "no_record", "employee": _emp_summary(one),
+                "month": month, "year": year,
+                "message": f"{one.name} has no timesheet for {_MONTHS[month]} {year} to approve."}
+    before = rec.approval_status
+    rec.approval_status = ApprovalStatus.APPROVED if approved else ApprovalStatus.NOT_APPROVED
+    if detail:
+        rec.approval_detail = str(detail)[:500]
+    await db.commit()
+    await db.refresh(rec)
+    from app.core import datacache
+    await datacache.bust_coverage()
+    return {
+        "status": "ok",
+        "employee": _emp_summary(one),
+        "approval_change": {
+            "record_id": rec.id,
+            "employee_name": rec.employee_name,
+            "month": rec.month, "year": rec.year,
+            "month_name": _MONTHS[rec.month] if 0 < rec.month < 13 else str(rec.month),
+            "before": before,
+            "after": rec.approval_status,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Analytics / insight tools (org-wide, proactive)
+# --------------------------------------------------------------------------- #
+async def _all_records_for(db: AsyncSession, month: int, year: int) -> list[TimesheetRecord]:
+    return list((await db.execute(select(TimesheetRecord).where(
+        TimesheetRecord.month == month, TimesheetRecord.year == year))).scalars().all())
+
+
+async def dashboard_summary(db: AsyncSession, month: int, year: int) -> dict[str, Any]:
+    """Org-wide roll-up for a month: totals submitted / missing, pending manager
+    approval, and records flagged for review. Use for 'how are we doing for
+    May', status overviews, or as a proactive health check."""
+    emps = list((await db.execute(select(Employee))).scalars().all())
+    recs = await _all_records_for(db, month, year)
+    submitted_pks = {r.matched_employee_pk for r in recs if r.matched_employee_pk}
+    submitted_names = {(r.employee_name or "").lower() for r in recs}
+    missing = [e for e in emps
+               if e.id not in submitted_pks and e.name.lower() not in submitted_names]
+    approved = [r for r in recs if r.approval_status == ApprovalStatus.APPROVED]
+    # "Awaiting approval" = anything submitted but not yet approved (pending OR
+    # not_approved — the pipeline files un-approved sheets as not_approved).
+    awaiting = [r for r in recs if r.approval_status != ApprovalStatus.APPROVED]
+    needs_review = [r for r in recs if r.validation_status == ValidationStatus.MANUAL_REVIEW]
+    return {
+        "status": "ok", "month": month, "year": year,
+        "month_name": _MONTHS[month] if 0 < month < 13 else str(month),
+        "total_employees": len(emps),
+        "submitted": len(emps) - len(missing),
+        "missing_count": len(missing),
+        "approved_count": len(approved),
+        "awaiting_approval_count": len(awaiting),
+        "needs_review_count": len(needs_review),
+        "missing": [_emp_summary(e) for e in missing[:50]],
+        "awaiting_approval": [_record_summary(r) for r in awaiting[:50]],
+        "needs_review": [_record_summary(r) for r in needs_review[:50]],
+    }
+
+
+async def pending_approvals(
+    db: AsyncSession, month: int | None = None, year: int | None = None,
+) -> dict[str, Any]:
+    """List timesheets that are NOT YET manager-approved — i.e. still need
+    sign-off. This is EVERYTHING whose approval status is not 'approved', which
+    covers both 'pending' (no decision recorded) and 'not_approved' (filed
+    without a detected approval). Use for 'what's pending / awaiting approval'
+    or 'who still needs sign-off'. Optionally scope to a month/year."""
+    stmt = select(TimesheetRecord).where(
+        TimesheetRecord.approval_status != ApprovalStatus.APPROVED)
+    if month:
+        stmt = stmt.where(TimesheetRecord.month == month)
+    if year:
+        stmt = stmt.where(TimesheetRecord.year == year)
+    recs = list((await db.execute(stmt.order_by(
+        TimesheetRecord.year.desc(), TimesheetRecord.month.desc(),
+        TimesheetRecord.employee_name))).scalars().all())
+    return {"status": "ok", "month": month, "year": year,
+            "count": len(recs), "records": [_record_summary(r) for r in recs[:100]]}
+
+
+async def team_overview(
+    db: AsyncSession, month: int, year: int,
+    group_by: str = "account_manager",
+) -> dict[str, Any]:
+    """Group the month's submission/approval status by team (account_manager or
+    location). Use for 'how is <manager>'s team doing' or 'break down May by
+    location'."""
+    field = "location" if str(group_by).lower().startswith("loc") else "account_manager"
+    emps = list((await db.execute(select(Employee))).scalars().all())
+    recs = await _all_records_for(db, month, year)
+    rec_by_pk = {r.matched_employee_pk: r for r in recs if r.matched_employee_pk}
+    rec_by_name = {(r.employee_name or "").lower(): r for r in recs}
+    groups: dict[str, dict[str, Any]] = {}
+    for e in emps:
+        key = getattr(e, field) or "—"
+        g = groups.setdefault(key, {"group": key, "total": 0, "submitted": 0,
+                                    "approved": 0, "pending": 0, "missing": 0})
+        g["total"] += 1
+        r = rec_by_pk.get(e.id) or rec_by_name.get(e.name.lower())
+        if r:
+            g["submitted"] += 1
+            if r.approval_status == ApprovalStatus.APPROVED:
+                g["approved"] += 1
+            elif r.approval_status == ApprovalStatus.PENDING:
+                g["pending"] += 1
+        else:
+            g["missing"] += 1
+    return {"status": "ok", "month": month, "year": year, "group_by": field,
+            "month_name": _MONTHS[month] if 0 < month < 13 else str(month),
+            "groups": sorted(groups.values(), key=lambda g: -g["missing"])}
+
+
+async def compare_months(
+    db: AsyncSession, employee: str,
+    month_a: int, year_a: int, month_b: int, year_b: int,
+) -> dict[str, Any]:
+    """Compare one employee's leave totals between two months. Use for trend
+    questions like 'did X take more sick leave in June than May'."""
+    a = await get_employee_timesheets(db, employee, month_a, year_a)
+    if a["status"] != "ok":
+        return a
+    b = await get_employee_timesheets(db, employee, month_b, year_b)
+
+    def _totals(ts: dict) -> dict[str, int]:
+        out = {label: 0 for label in _FIELD_LABELS.values()}
+        for r in ts.get("records", []):
+            for label, n in r["leaves"].items():
+                out[label] += n
+        return out
+
+    ta, tb = _totals(a), _totals(b)
+    deltas = {label: tb[label] - ta[label] for label in _FIELD_LABELS.values()}
+    return {"status": "ok", "employee": a["employee"],
+            "period_a": {"month": month_a, "year": year_a,
+                         "month_name": _MONTHS[month_a], "totals": ta},
+            "period_b": {"month": month_b, "year": year_b,
+                         "month_name": _MONTHS[month_b], "totals": tb},
+            "deltas": {k: v for k, v in deltas.items() if v}}
+
+
+async def find_anomalies(db: AsyncSession, month: int, year: int) -> dict[str, Any]:
+    """Flag records whose leave looks unusual for THIS month — high sick/absent
+    counts or records still flagged for review. Use proactively for 'anything
+    that needs my attention this month'."""
+    recs = await _all_records_for(db, month, year)
+    anomalies: list[dict[str, Any]] = []
+    for r in recs:
+        reasons = []
+        sick = len(r.sick_leave_dates or [])
+        absent = len(r.absent_dates or [])
+        unpaid = len(r.unpaid_leave_dates or [])
+        if sick >= 5:
+            reasons.append(f"{sick} sick days")
+        if absent >= 3:
+            reasons.append(f"{absent} absent days")
+        if unpaid >= 3:
+            reasons.append(f"{unpaid} unpaid days")
+        if r.validation_status == ValidationStatus.MANUAL_REVIEW:
+            reasons.append("flagged for review")
+        if reasons:
+            anomalies.append({**_record_summary(r), "reasons": reasons})
+    return {"status": "ok", "month": month, "year": year,
+            "month_name": _MONTHS[month] if 0 < month < 13 else str(month),
+            "count": len(anomalies), "anomalies": anomalies[:50]}
+
+
+# --------------------------------------------------------------------------- #
+# Draft tool — composes a reminder/approval email. It NEVER sends; the user
+# copies it or opens it to send. No outward side effect.
+# --------------------------------------------------------------------------- #
+async def draft_reminder_email(
+    db: AsyncSession, month: int, year: int,
+    kind: str = "missing", employee: str | None = None,
+) -> dict[str, Any]:
+    """Compose (do NOT send) a reminder or approval-request email.
+
+    kind='missing'  → a submission reminder addressed to everyone who hasn't
+                      submitted for the month (or one employee if given).
+    kind='approval' → an approval-request note for pending records.
+    Returns {subject, body, recipients} for the user to review and send.
+    """
+    mname = _MONTHS[month] if 0 < month < 13 else str(month)
+    recipients: list[dict[str, Any]] = []
+
+    def _email(e: Employee) -> str | None:
+        return (e.employee_email_id or (e.all_emails or "").split(";")[0] or "").strip() or None
+
+    if str(kind).lower().startswith("appr"):
+        recs = (await pending_approvals(db, month, year))["records"]
+        names = ", ".join(r["employee_name"] for r in recs[:20]) or "the pending employees"
+        subject = f"Approval needed — {mname} {year} timesheets"
+        body = (
+            f"Dear Manager,\n\nThe following {mname} {year} timesheets are awaiting your "
+            f"approval:\n\n{names}\n\nPlease review and approve at your earliest "
+            f"convenience.\n\nThank you,\nTimesheet Team"
+        )
+        return {"status": "ok", "kind": "approval", "month": month, "year": year,
+                "subject": subject, "body": body,
+                "recipients": [{"name": r["employee_name"]} for r in recs[:20]],
+                "count": len(recs)}
+
+    # missing-submission reminder
+    if employee:
+        one, rows = await _resolve_one(db, employee)
+        targets = [one] if one else []
+    else:
+        miss = await list_missing(db, month, year)
+        pks = {m["employee_pk"] for m in miss["missing"]}
+        targets = list((await db.execute(select(Employee).where(
+            Employee.id.in_(pks)))).scalars().all()) if pks else []
+    for e in targets[:50]:
+        recipients.append({"name": e.name, "employee_id": e.employee_id, "email": _email(e)})
+    subject = f"Reminder — please submit your {mname} {year} timesheet"
+    body = (
+        f"Dear {{name}},\n\nWe have not yet received your approved timesheet for "
+        f"{mname} {year}. Kindly submit it, signed/approved by your line manager, "
+        f"at your earliest convenience.\n\nThank you,\nTimesheet Team"
+    )
+    return {"status": "ok", "kind": "missing", "month": month, "year": year,
+            "subject": subject, "body": body,
+            "recipients": recipients, "count": len(recipients)}
