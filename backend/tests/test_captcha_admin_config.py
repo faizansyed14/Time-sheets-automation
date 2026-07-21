@@ -1,4 +1,4 @@
-"""CAPTCHA on login, admin user management, and config get/set/test."""
+"""CAPTCHA on login, admin user management, and read-only AI config status."""
 from tests.conftest import _login, auth_headers
 
 
@@ -44,59 +44,27 @@ async def test_otp_user_requires_email(client, admin_token):
     assert r.status_code == 400
 
 
-async def test_config_api_exposes_only_providers_and_prompts(client, admin_token):
-    """Keys/URLs/models are .env-only: the API neither returns nor accepts them."""
+async def test_config_write_endpoints_removed(client, admin_token):
+    """AI config is .env-only — admin API is read-only."""
     h = auth_headers(admin_token)
-    got = await client.get("/api/v1/admin/config", headers=h)
-    assert got.status_code == 200
-    keys = {c["key"] for c in got.json()}
-    assert keys == {"vision_provider", "ai_provider",
-                    "extract_email_system_prompt"}
-    assert all(c["is_secret"] is False for c in got.json())
-
-    # Provider switch works…
-    put = await client.put("/api/v1/admin/config", headers=h,
-                           json={"values": {"ai_provider": "deepseek"}})
-    assert put.status_code == 200, put.text
-    cfg = {c["key"]: c for c in put.json()}
-    assert cfg["ai_provider"]["value"] == "deepseek"
-    # …restore
-    await client.put("/api/v1/admin/config", headers=h,
-                     json={"values": {"ai_provider": "openai"}})
+    assert (await client.get("/api/v1/admin/config", headers=h)).status_code == 404
+    assert (await client.put("/api/v1/admin/config", headers=h,
+                             json={"values": {"ai_provider": "openai"}})).status_code == 404
+    assert (await client.get("/api/v1/admin/config/prompts/all", headers=h)).status_code == 404
 
 
-async def test_config_rejects_key_material_and_models(client, admin_token):
+async def test_config_status_read_only(client, admin_token):
     h = auth_headers(admin_token)
-    for blocked in ("openai_api_key", "vllm_api_key", "vllm_base_url",
-                    "extraction_model", "vision_image_detail"):
-        r = await client.put("/api/v1/admin/config", headers=h,
-                             json={"values": {blocked: "x"}})
-        assert r.status_code == 400, f"{blocked} must not be settable via API"
+    r = await client.get("/api/v1/admin/config/status", headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 2
+    kinds = {item["kind"] for item in body}
+    assert kinds == {"extraction", "agent"}
+    assert all(item["provider"] == "openai" for item in body)
 
 
 async def test_config_reveal_endpoint_removed(client, admin_token):
     r = await client.post("/api/v1/admin/config/reveal/openai_api_key",
                           headers=auth_headers(admin_token), json={"password": "admin"})
     assert r.status_code in (404, 405)
-
-
-async def test_config_test_endpoint_handles_no_key(client, admin_token):
-    # DeepSeek has no key in the test env — the live-test reports that cleanly.
-    r = await client.post("/api/v1/admin/config/test", headers=auth_headers(admin_token),
-                          json={"provider": "deepseek", "prompt": "ping"})
-    assert r.status_code == 200
-    body = r.json()
-    assert body["ok"] is False
-    assert "key" in (body["error"] or "").lower()
-
-
-async def test_prompt_override_applies(client, admin_token):
-    """The ONE editable prompt (shared extraction system prompt) overrides the
-    built-in default live, and clears back to it."""
-    from app.services.agents import full_email_extract as fx
-    await client.put("/api/v1/admin/config", headers=auth_headers(admin_token),
-                     json={"values": {"extract_email_system_prompt": "CUSTOM SYSTEM PROMPT"}})
-    assert fx.system_prompt() == "CUSTOM SYSTEM PROMPT"
-    await client.put("/api/v1/admin/config", headers=auth_headers(admin_token),
-                     json={"values": {"extract_email_system_prompt": ""}})
-    assert fx.system_prompt() == fx._SYSTEM_PROMPT

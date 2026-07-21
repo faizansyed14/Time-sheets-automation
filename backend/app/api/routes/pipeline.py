@@ -53,6 +53,7 @@ def _out(t: PipelineFile) -> PipelineFileOut:
         month=t.month, year=t.year, record_id=t.record_id,
         extraction_model=t.extraction_model, extraction_method=t.extraction_method,
         used_ocr=bool(t.used_ocr), extraction_meta=t.extraction_meta,
+        auto_accepted=bool((t.extraction_meta or {}).get("auto_accept", {}).get("accepted")),
         can_retry=bool(t.raw_path or (t.source_kind == "email" and t.attachment_id)),
         can_resolve_assign=can_resolve_assign(t),
         resolved_at=t.resolved_at, resolution_note=t.resolution_note,
@@ -65,6 +66,9 @@ async def list_pipeline_files(
     status: str | None = Query(default=None, description="processing|success|needs_review|failed|resolved"),
     failure_code: str | None = Query(default=None),
     source_kind: str | None = Query(default=None, description="upload|email"),
+    source_id: str | None = Query(default=None, description="Filter by PipelineFile.source_id"),
+    auto_accepted: bool | None = Query(
+        default=None, description="true = only records the AI filed on its own"),
     q: str | None = Query(default=None, description="search filename / employee (whole table)"),
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -79,6 +83,14 @@ async def list_pipeline_files(
         base = base.where(PipelineFile.failure_code == failure_code)
     if source_kind:
         base = base.where(PipelineFile.source_kind == source_kind)
+    if source_id:
+        base = base.where(PipelineFile.source_id == source_id)
+    if auto_accepted is not None:
+        # Filter in SQL, not on the page: successes are mostly human accepts,
+        # so client-side filtering would drop auto-accepts past the first page.
+        flag = PipelineFile.extraction_meta["auto_accept"]["accepted"].as_boolean()
+        base = base.where(flag.is_(True) if auto_accepted else
+                          or_(flag.is_(False), flag.is_(None)))
     if q and q.strip():
         like = f"%{q.strip().lower()}%"
         base = base.where(or_(
@@ -298,11 +310,13 @@ async def pipeline_raw_preview(pipeline_id: str, db: AsyncSession = Depends(get_
     data = read_raw_copy(t)
     if not data:
         raise HTTPException(404, "Raw file copy is no longer available")
-    ctype = t.content_type or "application/octet-stream"
+    from app.services.extraction.file_processor import content_type_for, detect_file_type
     fname = t.filename or "file"
-    inline_types = ("image/", "application/pdf", "message/", "text/")
-    disp = "inline" if any(ctype.startswith(p) for p in inline_types) else "attachment"
-    return _Response(content=data, media_type=ctype,
+    media = content_type_for(fname, data, t.content_type)
+    ftype = detect_file_type(fname, data)
+    inline = ftype in ("pdf", "image", "eml") or media.startswith(("image/", "application/pdf", "message/", "text/"))
+    disp = "inline" if inline else "attachment"
+    return _Response(content=data, media_type=media,
                      headers={"Content-Disposition": content_disposition(disp, fname)})
 
 
@@ -315,7 +329,7 @@ async def pipeline_raw_render(
     """Server-side render of the raw DOCX/XLSX/PDF copy to a page image —
     previews that work in every browser; the original stays downloadable."""
     from fastapi import Response as _Response
-    from app.services.extraction.file_processor import detect_file_type, to_images
+    from app.services.extraction.file_processor import detect_file_type, to_page_images
     t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
     if not t:
         raise HTTPException(404, "Pipeline file not found")
@@ -326,7 +340,10 @@ async def pipeline_raw_render(
     ftype = detect_file_type(t.filename or "", data)
     if ftype not in ("docx", "xlsx", "pdf"):
         raise HTTPException(400, f"No server render for type '{ftype}'")
-    imgs = to_images(ftype, data)
+    try:
+        imgs = to_page_images(ftype, data)
+    except Exception:
+        raise HTTPException(422, "Could not render this file")
     if not imgs:
         raise HTTPException(422, "Could not render this file")
     idx = min(page, len(imgs)) - 1

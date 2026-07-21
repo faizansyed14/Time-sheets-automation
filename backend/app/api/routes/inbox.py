@@ -22,9 +22,10 @@ from app.schemas import (
     DecisionIn,
     EmailDetail,
     EmailListItem,
-    ExtractFullIn,
     Page,
     PipelineFileOut,
+    ThreadDetail,
+    ThreadListItem,
 )
 from app.services.email_provider import get_email_provider
 
@@ -49,30 +50,40 @@ async def _sync_message(db: AsyncSession, msg) -> EmailMessage:
     ]
     has_approval = any(a["kind"] == "approval_screenshot" for a in atts)
 
+    insert_stmt = pg_insert(EmailMessage).values(
+        provider_message_id=msg.message_id,
+        conversation_id=msg.conversation_id,
+        sender_name=msg.sender_name,
+        sender_email=msg.sender_email,
+        to_recipients=msg.to_recipients or [],
+        cc_recipients=msg.cc_recipients or [],
+        subject=msg.subject,
+        received_at=msg.received_at,
+        body_text=msg.body_text,
+        body_html=msg.body_html,
+        attachments=atts,
+        has_approval_screenshot=has_approval,
+        status=EmailStatus.NEW,
+    )
     stmt = (
-        pg_insert(EmailMessage)
-        .values(
-            provider_message_id=msg.message_id,
-            sender_name=msg.sender_name,
-            sender_email=msg.sender_email,
-            subject=msg.subject,
-            received_at=msg.received_at,
-            body_text=msg.body_text,
-            body_html=msg.body_html,
-            attachments=atts,
-            has_approval_screenshot=has_approval,
-            status=EmailStatus.NEW,
-        )
+        insert_stmt
         .on_conflict_do_update(
             index_elements=["provider_message_id"],
             set_={
                 # Preserve workflow fields (status/decided_at). Only refresh message data.
+                # COALESCE: never let a resync null out a previously-known
+                # conversation_id if this particular call somehow has none.
+                "conversation_id": func.coalesce(
+                    insert_stmt.excluded.conversation_id, EmailMessage.conversation_id),
                 "sender_name": msg.sender_name,
                 "sender_email": msg.sender_email,
+                "to_recipients": msg.to_recipients or [],
+                "cc_recipients": msg.cc_recipients or [],
                 "subject": msg.subject,
                 "received_at": msg.received_at,
                 "body_text": msg.body_text,
-                "body_html": msg.body_html,
+                "body_html": func.coalesce(
+                    insert_stmt.excluded.body_html, EmailMessage.body_html),
                 "attachments": atts,
                 "has_approval_screenshot": has_approval,
             },
@@ -223,7 +234,10 @@ async def _extract_email_times(db: AsyncSession, msg_ids: list[str]) -> dict[str
     return {sid: at for sid, at in rows if sid}
 
 
-def _to_list_item(row: EmailMessage, extract_email_at: datetime | None = None) -> EmailListItem:
+def _to_list_item(
+    row: EmailMessage, extract_email_at: datetime | None = None,
+    thread_message_count: int = 1,
+) -> EmailListItem:
     visible_atts = [
         AttachmentOut(
             attachment_id=a["attachment_id"], filename=a["filename"],
@@ -250,25 +264,14 @@ def _to_list_item(row: EmailMessage, extract_email_at: datetime | None = None) -
         no_sheets_found_at=row.no_sheets_found_at,
         no_sheets_note=row.no_sheets_note,
         attachments=visible_atts,
+        conversation_id=row.conversation_id,
+        thread_id=row.conversation_id or row.id,
+        thread_message_count=thread_message_count,
     )
 
 
-@router.get("", response_model=Page[EmailListItem])
-async def list_inbox(
-    q: str | None = Query(default=None, description="search the sender's name or email address — every word must match (any order)"),
-    status: str | None = Query(default=None, description="new | archived | ingested | extracted | no_sheets"),
-    limit: int = Query(default=200, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
-    db: AsyncSession = Depends(get_db),
-):
-    """Paginated, server-side searched inbox. The search matches the SENDER
-    (name or email address) across the whole table, not just the current page.
-    Provider sync is throttled + incremental so typing in the search box never
-    waits on Microsoft Graph."""
-    if offset == 0:
-        await _sync_inbox(db)
-
-    base = select(EmailMessage)
+def _apply_inbox_filters(base, q: str | None, status: str | None):
+    """Shared status/search filtering for both the flat and threaded list."""
     if status == "extracted":
         # Not a lifecycle status — "Extract Email has been run on this email",
         # the same condition that shows the green Extracted badge. Matches any
@@ -297,7 +300,24 @@ async def list_inbox(
                 func.lower(EmailMessage.sender_name).like(like, escape="\\"),
                 func.lower(EmailMessage.sender_email).like(like, escape="\\"),
             ))
+    return base
 
+
+@router.get("", response_model=Page[EmailListItem])
+async def list_inbox(
+    q: str | None = Query(default=None, description="search the sender's name or email address — every word must match (any order)"),
+    status: str | None = Query(default=None, description="new | archived | ingested | extracted | no_sheets"),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """Paginated, server-side searched inbox — one row per MESSAGE. Kept for
+    any caller that wants the flat view; the Inbox page itself uses
+    GET /inbox/threads (one row per Outlook-style conversation)."""
+    if offset == 0:
+        await _sync_inbox(db)
+
+    base = _apply_inbox_filters(select(EmailMessage), q, status)
     total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
     rows = (await db.execute(
         base.order_by(EmailMessage.received_at.desc()).limit(limit).offset(offset)
@@ -308,21 +328,78 @@ async def list_inbox(
                 has_more=offset + len(items) < total)
 
 
-@router.get("/{provider_message_id}", response_model=EmailDetail)
-async def get_email(
-    provider_message_id: str,
+@router.get("/threads", response_model=Page[ThreadListItem])
+async def list_threads(
+    q: str | None = Query(default=None, description="search the sender's name or email address — every word must match (any order)"),
+    status: str | None = Query(default=None, description="new | archived | ingested | extracted | no_sheets"),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    provider = get_email_provider()
-    msg = await provider.get_message(provider_message_id)
-    if not msg:
-        raise HTTPException(404, "Email not found")
-    row = await _sync_message(db, msg)
-    await db.commit()
-    await db.refresh(row)
+    """Outlook-style conversation view: one row per THREAD (grouped by Graph
+    conversationId; a message with none is its own singleton thread), showing
+    the newest message's summary + how many messages the thread has. Same
+    search/status semantics as GET /inbox, but matching ANY message in the
+    thread — e.g. searching a manager's name finds the thread even when the
+    newest message is from the employee."""
+    if offset == 0:
+        await _sync_inbox(db)
 
-    # Resolve inline cid: images (logos, signatures, pasted screenshots) to
-    # self-contained data URIs so the HTML body renders exactly like Outlook.
+    thread_key = func.coalesce(EmailMessage.conversation_id, EmailMessage.id)
+
+    # Every message that matches the filters, tagged with its thread key —
+    # this is what decides WHICH threads qualify (any matching message pulls
+    # the whole thread in).
+    matching = _apply_inbox_filters(
+        select(EmailMessage.id, thread_key.label("thread_key")), q, status
+    ).subquery()
+
+    # Total message count per thread — over ALL messages in the conversation,
+    # not just the ones that matched the filter (a search hit on an old reply
+    # should still show the thread's true message count).
+    counts = (
+        select(thread_key.label("thread_key"), func.count(EmailMessage.id).label("message_count"))
+        .group_by(thread_key)
+        .subquery()
+    )
+
+    # One row per qualifying thread = its newest message (Postgres DISTINCT ON).
+    newest = (
+        select(EmailMessage)
+        .where(thread_key.in_(select(matching.c.thread_key)))
+        .distinct(thread_key)
+        .order_by(thread_key, EmailMessage.received_at.desc())
+        .subquery()
+    )
+    newest_orm = select(EmailMessage).select_from(
+        newest.join(EmailMessage, EmailMessage.id == newest.c.id)
+    )
+
+    total = (await db.execute(
+        select(func.count()).select_from(select(matching.c.thread_key).distinct().subquery())
+    )).scalar_one()
+
+    rows_with_counts = (await db.execute(
+        newest_orm.add_columns(counts.c.message_count)
+        .join(counts, counts.c.thread_key == func.coalesce(EmailMessage.conversation_id, EmailMessage.id))
+        .order_by(EmailMessage.received_at.desc())
+        .limit(limit).offset(offset)
+    )).all()
+
+    rows = [r[0] for r in rows_with_counts]
+    times = await _extract_email_times(db, [r.provider_message_id for r in rows])
+    items = [
+        _to_list_item(row, times.get(row.provider_message_id), thread_message_count=count)
+        for row, count in rows_with_counts
+    ]
+    return Page(items=items, total=total, limit=limit, offset=offset,
+                has_more=offset + len(items) < total)
+
+
+async def _build_email_detail(db: AsyncSession, provider, row: EmailMessage) -> EmailDetail:
+    """EmailDetail for an ALREADY-SYNCED row — resolves inline cid: images to
+    data URIs so the body renders exactly like Outlook. Shared by the single-
+    message detail endpoint and the thread view (one call per message)."""
     from app.services.inbox.inline_images import inline_cid_images
     body_html, inline_ids = await inline_cid_images(
         provider, row.provider_message_id, row.body_html, row.attachments or [])
@@ -338,9 +415,72 @@ async def get_email(
         **base.model_dump(exclude={"attachments"}),
         body_text=row.body_text,
         body_html=body_html,
+        to_recipients=row.to_recipients or [],
+        cc_recipients=row.cc_recipients or [],
         inline_attachment_ids=inline_ids,
         attachments=base.attachments,
     )
+
+
+@router.get("/{provider_message_id}", response_model=EmailDetail)
+async def get_email(
+    provider_message_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    provider = get_email_provider()
+    msg = await provider.get_message(provider_message_id)
+    if not msg:
+        raise HTTPException(404, "Email not found")
+    row = await _sync_message(db, msg)
+    await db.commit()
+    await db.refresh(row)
+    return await _build_email_detail(db, provider, row)
+
+
+@router.get("/{provider_message_id}/thread", response_model=ThreadDetail)
+async def get_thread(
+    provider_message_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Outlook-style conversation view: every message in this email's thread,
+    oldest first. Fetches live from the provider (not just the local DB) so a
+    message outside the incremental-sync window — e.g. the original message
+    with the timesheet attachment, replied to weeks later — is never silently
+    missing from the history."""
+    provider = get_email_provider()
+    anchor_msg = await provider.get_message(provider_message_id)
+    if not anchor_msg:
+        raise HTTPException(404, "Email not found")
+    anchor_row = await _sync_message(db, anchor_msg)
+    await db.commit()
+    await db.refresh(anchor_row)
+
+    thread_id = anchor_row.conversation_id or anchor_row.id
+    if anchor_row.conversation_id:
+        thread_msgs = await provider.list_thread_messages(anchor_row.conversation_id)
+    else:
+        thread_msgs = []
+    if not thread_msgs:
+        # No conversation_id, or the provider doesn't support thread lookup —
+        # the anchor message is the whole "thread".
+        rows = [anchor_row]
+    else:
+        rows = []
+        for m in thread_msgs:
+            # Incremental inbox sync stores plain text only — re-fetch any
+            # thread message that still lacks HTML so signatures/fonts render.
+            if not m.body_html:
+                full = await provider.get_message(m.message_id)
+                if full:
+                    m = full
+            rows.append(await _sync_message(db, m))
+        await db.commit()
+        for r in rows:
+            await db.refresh(r)
+        rows.sort(key=lambda r: r.received_at or anchor_row.received_at)
+
+    messages = [await _build_email_detail(db, provider, r) for r in rows]
+    return ThreadDetail(thread_id=thread_id, messages=messages)
 
 
 async def _email_row_or_404(db: AsyncSession, provider_message_id: str) -> EmailMessage:
@@ -387,41 +527,48 @@ async def preview_as_eml(provider_message_id: str, db: AsyncSession = Depends(ge
 async def preview_llm_payload(
     provider_message_id: str,
     db: AsyncSession = Depends(get_db),
-    attachment_ids: str | None = None,
-    extract_body: bool = False,
 ):
     """Audit view: subject/body/prompt text that Extract Email would send to
-    the vision model AFTER PII redaction. Does not call the LLM. Optional
-    ``attachment_ids`` (comma-separated) mirrors Extract selected scope."""
+    the vision model AFTER PII redaction. Does not call the LLM. When the
+    selected message has its own attachments, only that message is shown;
+    otherwise the prior thread message is merged (approval-only reply)."""
     from app.services.agents.full_email_extract import preview_llm_egress
+    from app.services.extract_email.thread_scope import prior_message_for_merge
     row = await _email_row_or_404(db, provider_message_id)
-    ids = None
-    if attachment_ids is not None:
-        ids = [a.strip() for a in attachment_ids.split(",") if a.strip()]
-    return await preview_llm_egress(
-        row, attachment_ids=ids, extract_body=extract_body)
+    prior_row = await prior_message_for_merge(db, row)
+    return await preview_llm_egress(row, prior_email=prior_row)
+
+
+async def _resolve_thread_anchor_and_prior(
+    db: AsyncSession, row: EmailMessage,
+) -> tuple[EmailMessage, EmailMessage | None]:
+    """Deprecated — kept for any external callers. Prefer prior_message_for_merge."""
+    from app.services.extract_email.thread_scope import prior_message_for_merge
+    prior = await prior_message_for_merge(db, row)
+    return row, prior
 
 
 @router.post("/{provider_message_id}/extract-full")
 async def extract_full(provider_message_id: str,
-                       body: ExtractFullIn | None = None,
                        db: AsyncSession = Depends(get_db)):
     """Extract Email — the one-button flow: convert the whole email to a full
     .eml, analyse EVERY sheet inside it (attachments, forwarded emails and
-    their attachments, pasted body grids) with the vision model in batches,
-    detect manager signatures / approval screenshots, group the results per
-    employee + month, and stage one pending-review pipeline item per group.
-    With a body carrying `attachment_ids`, ONLY the selected sheets (and
-    optionally the email body) are analysed — the stored raw copy stays the
-    full .eml. Nothing is filed until Accept in Compare & Fix."""
+    their attachments, pasted body grids) with the vision model (one call per
+    sheet), detect manager signatures / approval screenshots, group the results
+    per employee + month, and stage one pending-review pipeline item per group.
+
+    Thread-aware (narrow): when the selected message has no document
+    attachments (e.g. an "Approved." reply), the message immediately before
+    it in the same conversation is merged too — so approval can match the
+    original timesheet. Messages with their own PDFs/DOCX are extracted alone.
+    Nothing is filed until Accept in Compare & Fix."""
     from app.api.routes.pipeline import _out as _pipeline_out
     from app.services.agents.full_email_extract import extract_full_email
+    from app.services.extract_email.thread_scope import prior_message_for_merge
     row = await _email_row_or_404(db, provider_message_id)
+    prior_row = await prior_message_for_merge(db, row)
     try:
-        res = await extract_full_email(
-            db, row,
-            attachment_ids=(body.attachment_ids if body else None),
-            extract_body=bool(body.extract_body) if body else False)
+        res = await extract_full_email(db, row, prior_email=prior_row)
     except HTTPException:
         raise
     except Exception as e:
@@ -435,6 +582,39 @@ async def extract_full(provider_message_id: str,
         "approval": res["approval"],
         "message": res["message"],
     }
+
+
+@router.post("/{provider_message_id}/extract-full/stream")
+async def extract_full_streamed(provider_message_id: str):
+    """Same as extract-full, but streams live progress (Server-Sent Events):
+    one frame per pipeline stage — unpack, format detected, each LLM call,
+    approval, grouping, and the auto-accept decision per employee — then a
+    final `done` frame with the same result payload as extract-full."""
+    from fastapi.responses import StreamingResponse
+
+    from app.api.routes.pipeline import _out as _pipeline_out
+    from app.core.database import SessionLocal
+    from app.services.agents.full_email_extract import extract_full_email
+    from app.services.extract_email.streaming import sse_events
+    from app.services.extract_email.thread_scope import prior_message_for_merge
+
+    async def run() -> dict:
+        # Own DB session — the request one closes before the stream finishes.
+        async with SessionLocal() as db:
+            row = await _email_row_or_404(db, provider_message_id)
+            prior_row = await prior_message_for_merge(db, row)
+            res = await extract_full_email(db, row, prior_email=prior_row)
+            await datacache.bust_pipeline()
+            return {
+                "staged": [_pipeline_out(t).model_dump(mode="json") for t in res["staged"]],
+                "groups": res["groups"],
+                "employees": res["employees"],
+                "approval": res["approval"],
+                "message": res["message"],
+            }
+
+    return StreamingResponse(sse_events(run), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 class SaveEmlToVaultIn(BaseModel):
@@ -469,7 +649,7 @@ async def render_attachment(
     provider_message_id: str, attachment_id: str,
     page: int = Query(default=1, ge=1, le=50),
 ):
-    from app.services.extraction.file_processor import detect_file_type, to_images
+    from app.services.extraction.file_processor import detect_file_type, to_page_images
     provider = get_email_provider()
     try:
         data, filename, _ct = await provider.get_attachment_bytes(
@@ -479,7 +659,10 @@ async def render_attachment(
     ftype = detect_file_type(filename or "", data)
     if ftype not in ("docx", "xlsx", "pdf"):
         raise HTTPException(400, f"No server render for type '{ftype}'")
-    imgs = to_images(ftype, data)
+    try:
+        imgs = to_page_images(ftype, data)
+    except Exception:
+        raise HTTPException(422, "Could not render this file")
     if not imgs:
         raise HTTPException(422, "Could not render this file")
     idx = min(page, len(imgs)) - 1
@@ -496,10 +679,16 @@ async def get_attachment(provider_message_id: str, attachment_id: str):
         )
     except FileNotFoundError:
         raise HTTPException(404, "Attachment not found")
-    disposition = "inline" if content_type.startswith(("image/", "application/pdf", "message/")) else "attachment"
+    from app.services.extraction.file_processor import content_type_for, detect_file_type
+    # Graph often sends application/octet-stream — browsers then download
+    # instead of previewing PDFs in an iframe. Sniff the real type.
+    media = content_type_for(filename or "", data, content_type)
+    ftype = detect_file_type(filename or "", data)
+    inline = ftype in ("pdf", "image", "eml") or media.startswith(("image/", "application/pdf", "message/"))
+    disposition = "inline" if inline else "attachment"
     return Response(
         content=data,
-        media_type=content_type,
+        media_type=media,
         headers={"Content-Disposition": content_disposition(disposition, filename)},
     )
 

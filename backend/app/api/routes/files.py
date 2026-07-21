@@ -92,6 +92,25 @@ def eml_preview(rel_path: str = Query(...)):
     return parse_eml(data)
 
 
+@router.post("/eml-preview-upload")
+async def eml_preview_upload(file: UploadFile = File(...)):
+    """Parse raw EML bytes → structured content.
+
+    The GET form needs a stored file. An email attached INSIDE another email
+    only exists as bytes in the parent's preview payload, so nesting could not
+    be opened at all. Posting the bytes back makes a forwarded email open like
+    any other — at any depth.
+    """
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Empty file")
+    from app.services.extraction.eml_parser import parse_eml
+    try:
+        return parse_eml(data)
+    except Exception:
+        raise HTTPException(422, "Could not parse this email file")
+
+
 @router.get("/render")
 def render_file(
     rel_path: str = Query(...),
@@ -103,11 +122,14 @@ def render_file(
         data, name, _ctype = sp.get_storage_provider().read_file(rel_path)
     except FileNotFoundError:
         raise HTTPException(404, "File not found")
-    from app.services.extraction.file_processor import detect_file_type, to_images
+    from app.services.extraction.file_processor import detect_file_type, to_page_images
     ftype = detect_file_type(name or "", data)
     if ftype not in ("docx", "xlsx", "pdf"):
         raise HTTPException(400, f"No server render for type '{ftype}'")
-    imgs = to_images(ftype, data)
+    try:
+        imgs = to_page_images(ftype, data)
+    except Exception:
+        raise HTTPException(422, "Could not render this file")
     if not imgs:
         raise HTTPException(422, "Could not render this file")
     idx = min(page, len(imgs)) - 1
@@ -129,11 +151,14 @@ async def render_uploaded_file(
     preview JSON (so there is no existing URL/attachment-id render route)."""
     data = await file.read()
     name = file.filename or "file"
-    from app.services.extraction.file_processor import detect_file_type, to_images
+    from app.services.extraction.file_processor import detect_file_type, to_page_images
     ftype = detect_file_type(name, data)
     if ftype not in ("docx", "xlsx", "pdf"):
         raise HTTPException(400, f"No server render for type '{ftype}'")
-    imgs = to_images(ftype, data)
+    try:
+        imgs = to_page_images(ftype, data)
+    except Exception:
+        raise HTTPException(422, "Could not render this file")
     if not imgs:
         raise HTTPException(422, "Could not render this file")
     idx = min(page, len(imgs)) - 1

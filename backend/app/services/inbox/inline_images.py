@@ -20,6 +20,14 @@ import re
 
 # Matches the cid token inside src="cid:..." / src='cid:...' / url(cid:...).
 _CID_REF_RE = re.compile(r"cid:([^\"'\s>)]+)", re.IGNORECASE)
+_IMG_TAG_CID_RE = re.compile(
+    r"<img\b[^>]*\bsrc\s*=\s*[\"']cid:[^\"']+[\"'][^>]*/?>",
+    re.IGNORECASE,
+)
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
 
 
 def _norm_cid(value: str | None) -> str:
@@ -27,23 +35,60 @@ def _norm_cid(value: str | None) -> str:
     return (value or "").strip().strip("<>").lower()
 
 
-def _find_attachment(ref: str, attachments: list[dict]) -> dict | None:
-    """Resolve a `cid:` reference to its attachment.
+def _uuids(value: str | None) -> set[str]:
+    return {m.group(0).lower() for m in _UUID_RE.finditer(value or "")}
 
-    Match on the attachment's Content-ID first (Graph/EML populate this), then
-    fall back to the filename — Outlook often names the part `cid:image001.png`
-    where the attachment filename is `image001.png`.
+
+def cid_ref_matches(
+    ref: str,
+    *,
+    cid: str | None,
+    filename: str | None,
+) -> bool:
+    """True when a MIME part (cid / filename) satisfies an HTML ``cid:`` ref.
+
+    Outlook / signature add-ins often disagree between the HTML token
+    (``cid:facebook_32x32_<uuid>.png``) and the attachment filename
+    (``C2_signature_facebook2_<uuid>.png``) — UUID overlap catches those.
     """
     ref_full = _norm_cid(ref)
     ref_name = ref_full.split("@")[0]
+    ref_uuids = _uuids(ref_full)
+
+    ac = _norm_cid(cid)
+    if ac and ac in (ref_full, ref_name):
+        return True
+    if ac and (ref_name in ac or ac in ref_full or ref_full in ac):
+        return True
+
+    fn = (filename or "").lower()
+    if fn:
+        if fn == ref_name or ref_name in fn or fn in ref_full:
+            return True
+        fn_stem = fn.rsplit(".", 1)[0]
+        if fn_stem and (fn_stem in ref_full or fn_stem in ref_name):
+            return True
+
+    for blob in (ac, fn, ref_full, ref_name):
+        if ref_uuids & _uuids(blob):
+            return True
+    return False
+
+
+def _find_attachment(ref: str, attachments: list[dict]) -> dict | None:
+    """Resolve a `cid:` reference to its attachment."""
     for a in attachments:
-        ac = _norm_cid(a.get("cid"))
-        if ac and ac in (ref_full, ref_name):
-            return a
-    for a in attachments:
-        if (a.get("filename") or "").lower() == ref_name:
+        if cid_ref_matches(ref, cid=a.get("cid"), filename=a.get("filename")):
             return a
     return None
+
+
+def strip_unresolved_cids(html: str) -> str:
+    """Remove ``cid:`` image refs the browser cannot load (CSP blocks them)."""
+    if not html or "cid:" not in html.lower():
+        return html
+    html = _IMG_TAG_CID_RE.sub("", html)
+    return _CID_REF_RE.sub("", html)
 
 
 async def inline_cid_images(
@@ -95,10 +140,8 @@ async def inline_cid_images(
         data_uris[ref] = uri
         inlined_ids.add(att["attachment_id"])
 
-    if not data_uris:
-        return body_html, []
-
     def _sub(m: re.Match) -> str:
         return data_uris.get(m.group(1), m.group(0))
 
-    return _CID_REF_RE.sub(_sub, body_html), sorted(inlined_ids)
+    out = _CID_REF_RE.sub(_sub, body_html) if data_uris else body_html
+    return strip_unresolved_cids(out), sorted(inlined_ids)

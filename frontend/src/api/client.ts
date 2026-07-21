@@ -1,4 +1,5 @@
 import axios from "axios";
+import { b64ToBytes } from "../lib/filePreview";
 
 export const api = axios.create({ baseURL: "/api/v1" });
 
@@ -73,7 +74,16 @@ export interface EmailListItem {
   no_sheets_found_at: string | null;
   no_sheets_note: string | null;
   attachments: Attachment[];
+  // Outlook-style conversation grouping. thread_id is the row's own id when
+  // the provider gave no conversation_id (a singleton thread of 1 message).
+  conversation_id: string | null;
+  thread_id: string | null;
+  thread_message_count: number;
 }
+
+/** One row per Outlook-style conversation in the threaded inbox list —
+ *  same shape as EmailListItem, showing the newest message's summary. */
+export type ThreadListItem = EmailListItem;
 
 export interface Attachment {
   attachment_id: string;
@@ -85,11 +95,25 @@ export interface Attachment {
   size?: number | null;
 }
 
+export interface EmailRecipient {
+  name: string | null;
+  email: string;
+}
+
 export interface EmailDetail extends EmailListItem {
   body_text: string | null;
   body_html: string | null;
+  to_recipients?: EmailRecipient[];
+  cc_recipients?: EmailRecipient[];
   attachments: Attachment[];
   inline_attachment_ids: string[];
+}
+
+/** Every message in a conversation, oldest first — the Outlook-style
+ *  "see the full history" view. */
+export interface ThreadDetail {
+  thread_id: string;
+  messages: EmailDetail[];
 }
 
 export interface MatchedEmployee {
@@ -228,6 +252,9 @@ export interface PipelineFile {
   extraction_method: string | null;
   used_ocr: boolean;
   extraction_meta: Record<string, unknown> | null;
+  // True when the AI filed this record automatically (high confidence + full
+  // verification), with no human review. Details in extraction_meta.auto_accept.
+  auto_accepted: boolean;
   can_retry: boolean;
   can_resolve_assign: boolean;
   resolved_at: string | null;
@@ -262,23 +289,23 @@ export const PAGE_SIZE = 200;
 // ---------------------------------------------------------------------------
 // Inbox
 // ---------------------------------------------------------------------------
-export const fetchInbox = (
+/** Outlook-style conversation list: one row per thread (grouped by Graph
+ *  conversationId), newest message shown, with a message count. */
+export const fetchThreads = (
   q: string,
   status: string,
   offset = 0,
   limit = PAGE_SIZE
 ) =>
   api
-    .get<Page<EmailListItem>>("/inbox", {
+    .get<Page<ThreadListItem>>("/inbox/threads", {
       params: { q: q || undefined, status: status || undefined, offset, limit },
     })
     .then((r) => r.data);
 
-export interface IngestSelection {
-  attachment_ids: string[];
-  approval_attachment_id?: string | null;
-  extract_body?: boolean;
-}
+/** Every message in this email's conversation, oldest first. */
+export const fetchThread = (msgId: string) =>
+  api.get<ThreadDetail>(`/inbox/${encodeURIComponent(msgId)}/thread`).then((r) => r.data);
 
 export const fetchEmail = (id: string) =>
   api.get<EmailDetail>(`/inbox/${id}`).then((r) => r.data);
@@ -310,6 +337,9 @@ export interface LlmEgressPreview {
   subject_sent: string;
   body_sent: string;
   sender_omitted: boolean;
+  // Present when this email is part of a thread: the 2 messages (newest +
+  // the one before it) whose sheets were merged into this preview/run.
+  thread_sources: { provider_message_id: string; subject: string | null }[] | null;
   sheets: {
     name: string;
     file_type: string;
@@ -325,22 +355,10 @@ export interface LlmEgressPreview {
 }
 
 /** Audit: what Extract Email would send to the vision model after PII scrub. */
-export const fetchLlmPreview = (
-  msgId: string,
-  selection?: IngestSelection,
-) => {
-  const params = new URLSearchParams();
-  if (selection) {
-    params.set("attachment_ids", selection.attachment_ids.join(","));
-    params.set("extract_body", selection.extract_body ? "true" : "false");
-  }
-  const q = params.toString();
-  return api
-    .get<LlmEgressPreview>(
-      `/inbox/${encodeURIComponent(msgId)}/llm-preview${q ? `?${q}` : ""}`,
-    )
+export const fetchLlmPreview = (msgId: string) =>
+  api
+    .get<LlmEgressPreview>(`/inbox/${encodeURIComponent(msgId)}/llm-preview`)
     .then((r) => r.data);
-};
 
 export const saveEmlToVault = (
   msgId: string, body: { manager: string; employee: string; month: number; year: number },
@@ -348,26 +366,87 @@ export const saveEmlToVault = (
   api.post<{ saved: boolean; path: string; filename: string }>(
     `/inbox/${encodeURIComponent(msgId)}/as-eml/save-to-vault`, body).then((r) => r.data);
 
-// ---- Extract Email (one button: full .eml → batch vision → grouped review items) ----
-export interface FullEmailExtractOut {
-  staged: PipelineFile[];
-  groups: number;
-  sheets: { filename: string; kind: string; employee: string | null }[];
-  employees: string[];
-  approval: { detected: boolean; detail: string };
+// ---------------------------------------------------------------------------
+// Live extraction progress (Server-Sent Events)
+// ---------------------------------------------------------------------------
+/** One progress frame emitted by the streaming extraction endpoints. */
+export interface ExtractionEvent {
+  stage: "start" | "plan" | "agent" | "unpack" | "format" | "extract" | "approval"
+       | "group" | "autoaccept" | "file" | "done" | "error";
+  status: "start" | "spin" | "ok" | "warn" | "fail" | "skip";
   message: string;
+  llm_calls: number;
+  elapsed_ms: number;
+  data: Record<string, unknown>;
 }
 
-// With a selection, ONLY those sheets (and optionally the body) are analysed —
-// the stored raw copy stays the full .eml. Omit for the whole email.
-export const extractFullEmail = (msgId: string, selection?: IngestSelection) =>
-  api.post<FullEmailExtractOut>(
-    `/inbox/${encodeURIComponent(msgId)}/extract-full`,
-    selection
-      ? { attachment_ids: selection.attachment_ids, extract_body: selection.extract_body ?? false }
-      : undefined,
-    { timeout: 600_000 },
-  ).then((r) => r.data);
+/** POST to an SSE endpoint and invoke `onEvent` for every progress frame.
+ *  Resolves with the final `done` event's `data.result` (the same payload the
+ *  non-streamed endpoint returns), or rejects on an `error` frame. Uses fetch
+ *  (not axios) so we can read the streamed body incrementally. */
+export async function streamExtraction(
+  path: string,
+  body: BodyInit | undefined,
+  onEvent: (ev: ExtractionEvent) => void,
+): Promise<any> {
+  const token = getToken();
+  const resp = await fetch(`/api/v1${path}`, {
+    method: "POST",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body,
+  });
+  if (!resp.ok || !resp.body) {
+    throw new Error(`Extraction failed (${resp.status})`);
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result: any = undefined;
+  let errored: string | null = null;
+
+  const handle = (frame: string) => {
+    const line = frame.split("\n").find((l) => l.startsWith("data:"));
+    if (!line) return;
+    let ev: ExtractionEvent;
+    try {
+      ev = JSON.parse(line.slice(5).trim());
+    } catch {
+      return;
+    }
+    onEvent(ev);
+    if (ev.stage === "done") result = ev.data?.result;
+    if (ev.stage === "error") errored = ev.message || "Extraction error";
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx: number;
+    while ((idx = buffer.indexOf("\n\n")) >= 0) {
+      handle(buffer.slice(0, idx));
+      buffer = buffer.slice(idx + 2);
+    }
+  }
+  if (buffer.trim()) handle(buffer);
+  if (errored) throw new Error(errored);
+  return result;
+}
+
+/** Extract Email with live progress. */
+export const extractFullEmailStream = (
+  msgId: string, onEvent: (ev: ExtractionEvent) => void,
+) => streamExtraction(
+  `/inbox/${encodeURIComponent(msgId)}/extract-full/stream`, undefined, onEvent);
+
+/** Upload page extraction with live progress. */
+export const uploadTimesheetsStream = (
+  files: File[], onEvent: (ev: ExtractionEvent) => void,
+) => {
+  const fd = new FormData();
+  files.forEach((f) => fd.append("files", f));
+  return streamExtraction("/upload/stream", fd, onEvent);
+};
 
 // ---------------------------------------------------------------------------
 // Agentic chat (timesheet assistant)
@@ -391,13 +470,6 @@ export interface ChatChange {
   removed: string[];
 }
 
-export interface ChatResponse {
-  answer: string;
-  changes: ChatChange[];
-  tools_used: string[];
-  error: string | null;
-}
-
 export interface ChatPromptGroup {
   group: string;
   prompts: string[];
@@ -410,41 +482,8 @@ export interface ChatSuggestions {
   model: string | null;
 }
 
-export interface MatchedChatEmployee {
-  employee_pk: string;
-  employee_id: string;
-  name: string;
-  email: string | null;
-  location: string | null;
-}
-
-export interface ChatExtraction {
-  status: string;                // "ok" | "unsupported_type" | "extraction_failed" | ...
-  filename: string;
-  token?: string;                // ephemeral preview token (only when ok)
-  content_type?: string;
-  extracted_employee_name?: string | null;
-  extracted_employee_id?: string | null;
-  matched_employee?: MatchedChatEmployee | null;
-  match_note?: string | null;
-  month?: number | null;
-  year?: number | null;
-  month_name?: string | null;
-  leaves?: Record<string, string[]>;
-  counts?: Record<string, number>;
-  total_leaves?: number;
-  validation_status?: string;
-  flags?: string[];
-  summary?: string;
-  message?: string;
-  error?: string;
-}
-
 export const fetchChatSuggestions = () =>
   api.get<ChatSuggestions>("/agentic-chat/suggestions").then((r) => r.data);
-
-export const sendChat = (messages: ChatMessage[], extractions: ChatExtraction[] = []) =>
-  api.post<ChatResponse>("/agentic-chat", { messages, extractions }).then((r) => r.data);
 
 // ---- streaming chat (Server-Sent Events) ----------------------------------
 // A structured result card the assistant streams back (rendered visually).
@@ -467,7 +506,6 @@ export type ChatStreamEvent =
  *  Resolves when the stream ends. Uses fetch (axios can't stream in-browser). */
 export async function sendChatStream(
   messages: ChatMessage[],
-  extractions: ChatExtraction[],
   onEvent: (ev: ChatStreamEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -479,7 +517,7 @@ export async function sendChatStream(
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       "X-Fingerprint": deviceFingerprint(),
     },
-    body: JSON.stringify({ messages, extractions }),
+    body: JSON.stringify({ messages }),
     signal,
   });
   if (!res.ok || !res.body) {
@@ -505,20 +543,6 @@ export async function sendChatStream(
     }
   }
 }
-
-export const extractChatSheet = (file: File) => {
-  const form = new FormData();
-  form.append("file", file);
-  return api.post<ChatExtraction>("/agentic-chat/extract", form).then((r) => r.data);
-};
-
-export const chatAttachmentUrl = (token: string) =>
-  withAuthParam(`/api/v1/agentic-chat/attachments/${encodeURIComponent(token)}`);
-
-// Opt-in only: files the chat-uploaded sheet through ingest_upload. Never
-// called unless the user explicitly confirms.
-export const storeChatSheet = (token: string) =>
-  api.post<UploadResult>(`/agentic-chat/attachments/${encodeURIComponent(token)}/store`).then((r) => r.data);
 
 // ---------------------------------------------------------------------------
 // Dashboard / employees
@@ -613,6 +637,9 @@ export const fetchPipeline = (params?: {
   status?: string;
   failure_code?: string;
   source_kind?: string;
+  source_id?: string;
+  /** true = only records the AI filed on its own (no human review). */
+  auto_accepted?: boolean;
   q?: string;
   offset?: number;
   limit?: number;
@@ -623,6 +650,8 @@ export const fetchPipeline = (params?: {
         status: params?.status || undefined,
         failure_code: params?.failure_code || undefined,
         source_kind: params?.source_kind || undefined,
+        source_id: params?.source_id || undefined,
+        auto_accepted: params?.auto_accepted ?? undefined,
         q: params?.q || undefined,
         offset: params?.offset ?? 0,
         limit: params?.limit ?? PAGE_SIZE,
@@ -670,8 +699,6 @@ export const fileContentUrl = (relPath: string) =>
   withAuthParam(`/api/v1/files/content?rel_path=${encodeURIComponent(relPath)}`);
 export const fileRenderUrl = (relPath: string) =>
   withAuthParam(`/api/v1/files/render?rel_path=${encodeURIComponent(relPath)}`);
-export const downloadZipUrl = (manager?: string) =>
-  withAuthParam(`/api/v1/files/download-zip${manager ? `?manager=${encodeURIComponent(manager)}` : ""}`);
 // Scoped ZIP of any subtree (one employee or one month) by vault-relative path.
 export const downloadScopedZipUrl = (relPath: string) =>
   withAuthParam(`/api/v1/files/download-zip?rel_path=${encodeURIComponent(relPath)}`);
@@ -744,14 +771,26 @@ export function fetchEmlPreview(fileUrl: string): Promise<EmlParsed> {
     // Pipeline raw copy: /api/v1/pipeline/{id}/raw-preview
     const pip = u.pathname.match(/\/pipeline\/([^/]+)\/raw-preview$/);
     if (pip) return api.get<EmlParsed>(`/pipeline/${pip[1]}/raw-eml-preview`).then((r) => r.data);
-    // Agentic-chat ephemeral upload: /api/v1/agentic-chat/attachments/{token}
-    const chat = u.pathname.match(/\/agentic-chat\/attachments\/([^/]+)$/);
-    if (chat) return api.get<EmlParsed>(`/agentic-chat/attachments/${encodeURIComponent(chat[1])}/eml-preview`).then((r) => r.data);
     // Full-email export: /api/v1/inbox/{msgId}/as-eml
     const full = u.pathname.match(/\/inbox\/([^/]+)\/as-eml$/);
     if (full) return api.get<EmlParsed>(`/inbox/${full[1]}/as-eml/preview`).then((r) => r.data);
   } catch { /* fall through */ }
   return Promise.reject(new Error("Cannot derive EML preview URL from: " + fileUrl));
+}
+
+/** Parse EML bytes we already hold in the page — an email attached INSIDE
+ *  another email has no URL of its own, so its bytes are posted back to be
+ *  parsed. Lets forwarded mail be opened at any nesting depth. */
+export function fetchEmlPreviewFromBytes(
+  filename: string, dataB64: string,
+): Promise<EmlParsed> {
+  const form = new FormData();
+  form.append(
+    "file",
+    new Blob([b64ToBytes(dataB64)], { type: "message/rfc822" }),
+    filename || "message.eml",
+  );
+  return api.post<EmlParsed>("/files/eml-preview-upload", form).then((r) => r.data);
 }
 
 /** Authenticated URL for the stored raw pipeline file (for inline preview). */
@@ -868,18 +907,6 @@ export interface UploadResult {
   llm_summary: string | null;
   match_note: string | null;
 }
-export const uploadTimesheets = (files: File[], onProgress?: (pct: number) => void) => {
-  const form = new FormData();
-  files.forEach((f) => form.append("files", f, f.name));
-  return api
-    .post<PipelineFile[]>("/upload", form, {
-      headers: { "Content-Type": "multipart/form-data" },
-      onUploadProgress: (e) =>
-        onProgress && e.total ? onProgress(Math.round((e.loaded / e.total) * 100)) : undefined,
-    })
-    .then((r) => r.data);
-};
-
 export const uploadManual = (body: {
   employee_pk: string;
   month: number;
@@ -983,43 +1010,17 @@ export const adminCreateUser = (body: {
 export const adminUpdateUser = (id: string, body: Partial<{
   email: string | null; role: AuthRole; auth_mode: AuthModeT; is_active: boolean; password: string;
 }>) => api.patch<AuthUser>(`/admin/users/${id}`, body).then((r) => r.data);
-export const adminSwitchAuthMode = (id: string, mode: AuthModeT) =>
-  api.post<AuthUser>(`/admin/users/${id}/auth-mode`, null, { params: { mode } }).then((r) => r.data);
 export const adminTotpSetup = (id: string) =>
   api.post<TotpSetupResult>(`/admin/users/${id}/totp-setup`).then((r) => r.data);
 export const adminDeleteUser = (id: string) => api.delete(`/admin/users/${id}`).then((r) => r.data);
 
 // ===========================================================================
-// Admin — config
+// Admin — read-only AI status (.env source of truth)
 // ===========================================================================
-export interface ConfigItem {
-  key: string;
-  value: unknown;
-  category: "provider" | "model" | "prompt" | "general";
-  is_secret: boolean;
-}
-export const adminGetConfig = () => api.get<ConfigItem[]>("/admin/config").then((r) => r.data);
-export const adminUpdateConfig = (values: Record<string, unknown>) =>
-  api.put<ConfigItem[]>("/admin/config", { values }).then((r) => r.data);
-export const adminPromptDefaults = () =>
-  api.get<Record<string, string>>("/admin/config/prompts/defaults").then((r) => r.data);
-
-export interface PromptInfo {
-  key: string;
-  title: string;
-  used_by: string;
-  content: string;
-  editable: boolean;
-  override_key: string | null;
-  dynamic: boolean;
-}
-export const adminPromptsAll = () =>
-  api.get<PromptInfo[]>("/admin/config/prompts/all").then((r) => r.data);
-
 export interface AiStatusItem {
   kind: "extraction" | "agent";
   label: string;
-  provider: "openai" | "vllm" | "deepseek";
+  provider: "openai";
   model: string;
   has_key: boolean;
   note: string | null;

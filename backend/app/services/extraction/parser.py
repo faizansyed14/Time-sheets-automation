@@ -1,14 +1,7 @@
 """
-LLM response parsing utilities for the shared extraction pipeline
-(services/agents/full_email_extract.py):
+LLM response parsing for Extract Email (app.services.extract_email).
 
-  - extract_json_from_vllm_response: pull the JSON object out of any supported
-    chat/response shape (OpenAI chat completions, Responses API, vLLM,
-    reasoning models that answer in `reasoning_content`).
-  - _parse_one_leave_date: tolerant DMY/name/ISO date parsing.
-
-The extraction PROMPTS live in full_email_extract; the legacy per-file engine
-prompts were removed when every entry point moved onto the shared pipeline.
+The extraction PROMPTS live in app.services.extract_email.prompts.
 """
 from __future__ import annotations
 
@@ -65,8 +58,8 @@ def _collect_text(raw: Any) -> str:
             parts = [p.get("text", "") for p in c if isinstance(p, dict)]
             if any(parts):
                 return "".join(parts)
-        # Qwen3.x reasoning models may put the answer in `reasoning` when
-        # `content` is null (common on vLLM with thinking enabled).
+        # Reasoning models may put the answer in `reasoning` when
+        # `content` is null.
         for alt in ("reasoning", "reasoning_content"):
             r = msg.get(alt)
             if isinstance(r, str) and r.strip():
@@ -94,7 +87,7 @@ def _collect_text(raw: Any) -> str:
     return ""
 
 
-def extract_json_from_vllm_response(raw: dict[str, Any]) -> dict[str, Any]:
+def extract_json_from_llm_response(raw: dict[str, Any]) -> dict[str, Any]:
     # Already a parsed extraction object?
     if isinstance(raw, dict) and ("employee_name" in raw or "annual_leaves" in raw):
         return raw

@@ -18,6 +18,7 @@ import {
   Trash2,
   Cpu,
   ScanLine,
+  Sparkles,
 } from "lucide-react";
 import {
   deletePipelineFile,
@@ -38,6 +39,7 @@ import { useDebounced, useSentinel } from "../lib/useInfinite";
 import { Spinner } from "../components/ui";
 
 type Filter = "" | "failed" | "needs_review" | "success" | "resolved" | "processing";
+type OutcomeFilter = "" | "auto_accepted" | "held" | "rejected";
 
 function StatCard({
   label,
@@ -73,10 +75,8 @@ function StatCard({
   );
 }
 
-/** Per-file cost/provenance badge: which model handled the file (OpenAI or a
- * self-hosted vLLM model — whichever EXTRACTION_MODEL routed to for this
- * file), or whether a no-LLM path read it, plus an OCR chip. Lets reviewers
- * see — and control — extraction cost at a glance. */
+/** Per-file cost/provenance badge: which OpenAI model handled the file,
+ * or whether a no-LLM path read it, plus an OCR chip. */
 function ModelBadge({ file }: { file: PipelineFile }) {
   const method = file.extraction_method;
   if (!method) return null;
@@ -131,10 +131,8 @@ function ModelBadge({ file }: { file: PipelineFile }) {
 }
 
 /** Collapsible "Extraction details" panel: the full metadata for a file —
- * model (OpenAI or vLLM, whichever it actually used), method, OCR
- * provider/status, render DPI, image detail, pages, text-layer presence,
- * validation model, embedded .eml attachment, etc. Lets a reviewer audit
- * exactly how (and how expensively) each file was read. */
+ * OpenAI model, method, OCR provider/status, render DPI, image detail, pages,
+ * text-layer presence, validation model, embedded .eml attachment, etc. */
 function ExtractionDetails({ file }: { file: PipelineFile }) {
   const [open, setOpen] = useState(false);
   const meta = (file.extraction_meta ?? {}) as Record<string, unknown>;
@@ -173,7 +171,11 @@ function ExtractionDetails({ file }: { file: PipelineFile }) {
     ["Embedded type", "embedded_type", meta["embedded_type"]],
   ];
   const shownKeys = new Set(known.map(([, k]) => k));
-  const extras = Object.entries(meta).filter(([k]) => !shownKeys.has(k));
+  // Rendered in its own panel below, not as a raw [object Object] row.
+  const auto = (meta["auto_accept"] ?? null) as
+    | { accepted?: boolean; confidence?: string; reasons?: string[]; blockers?: string[] }
+    | null;
+  const extras = Object.entries(meta).filter(([k]) => !shownKeys.has(k) && k !== "auto_accept");
   const rows = known.filter(([, , v]) => v !== undefined && v !== null && v !== "");
 
   return (
@@ -187,6 +189,30 @@ function ExtractionDetails({ file }: { file: PipelineFile }) {
         Extraction details
         <span className="ml-2"><ModelBadge file={file} /></span>
       </button>
+      {open && auto && (
+        <div className={cn(
+          "border-t px-5 py-3 text-sm",
+          auto.accepted ? "border-emerald-100 bg-emerald-50/40" : "border-amber-100 bg-amber-50/40",
+        )}>
+          <p className={cn("mb-1.5 flex items-center gap-1.5 font-semibold",
+            auto.accepted ? "text-emerald-700" : "text-amber-700")}>
+            <Sparkles className="h-4 w-4" />
+            {auto.accepted
+              ? "Auto-accepted by AI — filed automatically (high confidence)"
+              : "AI held this for human review"}
+          </p>
+          {auto.accepted && (auto.reasons?.length ?? 0) > 0 && (
+            <ul className="list-inside list-disc space-y-0.5 text-xs text-emerald-800/90">
+              {auto.reasons!.map((r, i) => <li key={i}>{r}</li>)}
+            </ul>
+          )}
+          {!auto.accepted && (auto.blockers?.length ?? 0) > 0 && (
+            <ul className="list-inside list-disc space-y-0.5 text-xs text-amber-800/90">
+              {auto.blockers!.map((b, i) => <li key={i}>{b}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
       {open && (
         <dl className="grid grid-cols-1 gap-x-6 gap-y-1.5 border-t border-slate-100 px-5 py-3 text-sm sm:grid-cols-2">
           {rows.map(([label, key, value]) => (
@@ -214,6 +240,7 @@ export default function PipelinePage() {
   const qc = useQueryClient();
   const { toast } = useToast();
   const [statusFilter, setStatusFilter] = useState<Filter>("");
+  const [outcomeFilter, setOutcomeFilter] = useState<OutcomeFilter>("");
   const [codeFilter, setCodeFilter] = useState("");
   const [sourceFilter, setSourceFilter] = useState("");
   const [q, setQ] = useState("");
@@ -244,6 +271,17 @@ export default function PipelinePage() {
   });
   const items = data?.pages.flatMap((p) => p.items) ?? [];
   const total = data?.pages[0]?.total ?? 0;
+  const outcomeCounts = {
+    auto_accepted: items.filter((f) => f.auto_accepted).length,
+    held: items.filter((f) => f.status === "needs_review" && !f.auto_accepted).length,
+    rejected: items.filter((f) => f.status === "failed").length,
+  };
+  const visibleItems = items.filter((f) => {
+    if (outcomeFilter === "auto_accepted") return f.auto_accepted;
+    if (outcomeFilter === "held") return f.status === "needs_review" && !f.auto_accepted;
+    if (outcomeFilter === "rejected") return f.status === "failed";
+    return true;
+  });
   const sentinelRef = useSentinel(
     () => hasNextPage && !isFetchingNextPage && fetchNextPage(),
     !!hasNextPage
@@ -349,6 +387,41 @@ export default function PipelinePage() {
         />
       </div>
 
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+          AI outcome
+        </span>
+        {([
+          ["auto_accepted", "Auto-accepted", Sparkles, "border-emerald-200 bg-emerald-50 text-emerald-700"],
+          ["held", "Held for review", AlertTriangle, "border-amber-200 bg-amber-50 text-amber-700"],
+          ["rejected", "Rejected / failed", XCircle, "border-rose-200 bg-rose-50 text-rose-700"],
+        ] as const).map(([key, label, Icon, tone]) => (
+          <button
+            key={key}
+            onClick={() => setOutcomeFilter(outcomeFilter === key ? "" : key)}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors",
+              outcomeFilter === key ? tone : "border-slate-200 bg-white text-slate-600 hover:border-slate-300",
+            )}
+          >
+            <Icon className="h-3.5 w-3.5" />
+            {label}
+            <span className="rounded-full bg-white/80 px-1.5 font-bold text-slate-500">
+              {outcomeCounts[key]}
+            </span>
+          </button>
+        ))}
+        {outcomeFilter && (
+          <button
+            type="button"
+            onClick={() => setOutcomeFilter("")}
+            className="text-xs font-semibold text-slate-500 hover:text-slate-700"
+          >
+            Clear outcome filter
+          </button>
+        )}
+      </div>
+
       {failureCodes.length > 0 && (
         <div className="mb-4 flex flex-wrap items-center gap-2">
           <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
@@ -387,7 +460,8 @@ export default function PipelinePage() {
             <option value="upload">Upload</option>
           </Select>
           <p className="ml-auto text-xs text-slate-400">
-            {items.length} of {total} file{total !== 1 && "s"}
+            {visibleItems.length} of {total} file{total !== 1 && "s"}
+            {outcomeFilter ? " (filtered)" : ""}
           </p>
         </div>
 
@@ -397,15 +471,17 @@ export default function PipelinePage() {
             <Skeleton className="h-12" />
             <Skeleton className="h-12" />
           </div>
-        ) : items.length === 0 ? (
+        ) : visibleItems.length === 0 ? (
           <EmptyState
             icon={<Activity className="h-6 w-6" />}
             title="Nothing here"
-            detail="Files appear the moment they enter the pipeline — from an accepted email or an upload."
+            detail={outcomeFilter
+              ? "No files match this AI outcome filter in the loaded page — try clearing the filter or load more."
+              : "Files appear the moment they enter the pipeline — from an accepted email or an upload."}
           />
         ) : (
           <div className="divide-y divide-slate-100">
-            {items.map((f) => {
+            {visibleItems.map((f) => {
               const expanded = open === f.id;
               return (
                 <div key={f.id}>
@@ -433,6 +509,30 @@ export default function PipelinePage() {
                         {formatBytes(f.size_bytes)} · {formatDateTime(f.created_at)}
                       </span>
                     </span>
+                    {f.auto_accepted && (
+                      <span
+                        title="Filed automatically by the AI — high confidence, fully verified"
+                        className="hidden shrink-0 items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-emerald-700 sm:inline-flex"
+                      >
+                        <Sparkles className="h-3 w-3" /> Auto-accepted
+                      </span>
+                    )}
+                    {f.status === "needs_review" && !f.auto_accepted && (
+                      <span
+                        title="AI held this for human review — open Compare & Fix"
+                        className="hidden shrink-0 items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-amber-700 sm:inline-flex"
+                      >
+                        <AlertTriangle className="h-3 w-3" /> Held
+                      </span>
+                    )}
+                    {f.status === "failed" && (
+                      <span
+                        title="Extraction failed or was rejected"
+                        className="hidden shrink-0 items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-rose-700 sm:inline-flex"
+                      >
+                        <XCircle className="h-3 w-3" /> Failed
+                      </span>
+                    )}
                     <span className="hidden md:block">
                       <FailureChip code={f.failure_code} label={f.failure_label} />
                     </span>

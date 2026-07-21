@@ -38,8 +38,16 @@ class EmailMessage(Base):
     # Stable id from the provider (Graph messageId, or mock id).
     provider_message_id: Mapped[str] = mapped_column(String, index=True, unique=True)
 
+    # Groups this message with its replies/forwards (Graph conversationId).
+    # Null on rows synced before this column existed, or when the provider
+    # can't supply one — the message then renders as its own singleton thread.
+    conversation_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+
     sender_name: Mapped[str | None] = mapped_column(String, nullable=True)
     sender_email: Mapped[str | None] = mapped_column(String, nullable=True)
+    # [{ "name": str | None, "email": str }]
+    to_recipients: Mapped[list] = mapped_column(JSON, default=list)
+    cc_recipients: Mapped[list] = mapped_column(JSON, default=list)
     subject: Mapped[str | None] = mapped_column(String, nullable=True)
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     body_text: Mapped[str | None] = mapped_column(Text, nullable=True)

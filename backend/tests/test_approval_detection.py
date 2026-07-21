@@ -86,3 +86,24 @@ def test_model_signature_is_approval():
                               [_sheet(name="sheet.pdf", kind="timesheet", signature=True)],
                               used_vision=True)
     assert res["detected"] is True
+
+
+def test_approval_kind_attachment_without_body():
+    """Screenshot/PDF classified as approval detects without body keywords."""
+    res = fx._detect_approval(
+        _Email("Please see attached."),
+        [_sheet(name="screenshot.jpg", kind="approval", evidence="Approved")],
+        used_vision=True,
+    )
+    assert res["detected"] is True
+    assert "screenshot" in res["detail"].lower() or "approval" in res["detail"].lower()
+
+
+def test_vision_path_prefers_sheet_evidence_over_request_body():
+    """Request wording in the body is not approval when sheets have no evidence."""
+    res = fx._detect_approval(
+        _Email("Please approve the timesheet."),
+        [_sheet(evidence="")],
+        used_vision=True,
+    )
+    assert res["detected"] is False

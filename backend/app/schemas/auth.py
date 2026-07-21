@@ -95,39 +95,15 @@ class TotpSetupOut(BaseModel):
     enrolled: bool
 
 
-# ---------------- admin: config ----------------
-class ConfigItem(BaseModel):
-    key: str
-    value: object | None = None
-    category: str
-    is_secret: bool
 
-
-class ConfigUpdate(BaseModel):
-    values: dict[str, object] = Field(default_factory=dict)
-
-
-class ProviderTestIn(BaseModel):
-    provider: str | None = None   # openai | deepseek | vllm; default = configured
-    prompt: str = "Reply with the single word: OK"
-
-
-class ProviderTestResult(BaseModel):
-    ok: bool
-    provider: str
-    model: str
-    latency_ms: int | None = None
-    reply: str | None = None
-    error: str | None = None
-
-
+# ---------------- admin: config (legacy schemas — API is read-only) ----------------
 class AiStatusItem(BaseModel):
     """Live, resolved (not just configured) provider + model for one AI call
     site — computed the same way the actual call routes, so this can never
     drift from reality the way a static label could."""
     kind: str            # "extraction" | "agent"
     label: str
-    provider: str         # "openai" | "vllm" | "deepseek"
+    provider: str         # "openai"
     model: str
     has_key: bool
     note: str | None = None

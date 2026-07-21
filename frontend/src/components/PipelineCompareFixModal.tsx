@@ -40,11 +40,11 @@ import {
   type Employee,
   type PipelineFile,
 } from "../api/client";
-import { isDocx, isEml, isPdf, isPreviewable, isXlsx } from "../lib/filePreview";
+import { ATTACHABLE_FILE_RE, attachmentRenderUrlIfSupported } from "../lib/filePreview";
 import { isBodyJunkImage } from "../lib/attachmentFilters";
-import { DocxPreviewPane, EmlPreviewPane, ServerRenderPane } from "./FilePreview";
+import { SourcePreview } from "./FilePreview";
 import { Button, Input, Select, Spinner } from "./ui";
-import { cn, formatBytes } from "../lib/utils";
+import { cn, filterEmployees, formatBytes } from "../lib/utils";
 import { useToast } from "./toast";
 
 // ---------------------------------------------------------------------------
@@ -53,8 +53,6 @@ import { useToast } from "./toast";
 import { leaveBucketDefs } from "../lib/theme";
 
 const BUCKETS = leaveBucketDefs() as readonly { key: string; label: string; tone: string }[];
-
-const FILE_RE = /\.(pdf|docx|xlsx|png|jpe?g|eml)$/i;
 
 // ---------------------------------------------------------------------------
 // Month day-picker — a calendar that shows ONLY the record's month, so a date
@@ -162,20 +160,10 @@ function EmployeePicker({
 }) {
   const [open, setOpen] = useState(false);
 
-  const matches = useMemo(() => {
-    const q = value.toLowerCase().trim();
-    const list = employees ?? [];
-    const filtered = q
-      ? list.filter(
-          (e) =>
-            e.name.toLowerCase().includes(q) ||
-            e.employee_id.toLowerCase().includes(q) ||
-            (e.location ?? "").toLowerCase().includes(q) ||
-            (e.account_manager ?? "").toLowerCase().includes(q)
-        )
-      : list;
-    return filtered.slice(0, 25);
-  }, [employees, value]);
+  const matches = useMemo(
+    () => filterEmployees(employees, value).slice(0, 25),
+    [employees, value]
+  );
 
   return (
     <div className="relative">
@@ -225,61 +213,6 @@ function EmployeePicker({
 
 // ---------------------------------------------------------------------------
 // Right-side preview panes
-// ---------------------------------------------------------------------------
-// Generic preview by type: EML pane, PDF iframe, DOCX/XLSX server-rendered
-// page images, plain <img> for pictures, download card otherwise.
-function SourcePreview({ url, renderUrl, name, ct }: {
-  url: string; renderUrl?: string | null; name: string; ct: string;
-}) {
-  if (isEml(name, ct)) {
-    return (
-      <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
-        <EmlPreviewPane fileUrl={url} filename={name} />
-      </div>
-    );
-  }
-  if (isPdf(name, ct)) {
-    return <iframe src={url} title={name} className="h-full w-full rounded-lg bg-white" />;
-  }
-  if ((isDocx(name, ct) || isXlsx(name, ct)) && renderUrl) {
-    // Server render-to-image — same preview path for DOCX and XLSX.
-    return (
-      <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
-        <ServerRenderPane renderUrl={renderUrl} />
-      </div>
-    );
-  }
-  if (isDocx(name, ct)) {
-    return (
-      <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
-        <DocxPreviewPane fileUrl={url} />
-      </div>
-    );
-  }
-  if (isPreviewable(name, ct)) {
-    return (
-      <img
-        src={url}
-        alt={name}
-        className="mx-auto block max-h-full max-w-full rounded-lg object-contain"
-      />
-    );
-  }
-  return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 text-slate-500">
-      <FileText className="h-10 w-10 text-slate-300" />
-      <p className="text-sm">{name} cannot be previewed inline.</p>
-      <a
-        href={url}
-        download={name}
-        className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
-      >
-        <Download className="h-4 w-4" /> Download
-      </a>
-    </div>
-  );
-}
-
 function RawFilePreview({ file }: { file: PipelineFile }) {
   return (
     <SourcePreview
@@ -340,7 +273,7 @@ export default function PipelineCompareFixModal({
   });
   const relatedSources = useMemo(() => {
     if (!sourceEmail || !emailSourceId) return [] as {
-      id: string; filename: string; ct: string; url: string; renderUrl: string;
+      id: string; filename: string; ct: string; url: string; renderUrl?: string;
     }[];
     const inlineIds = sourceEmail.inline_attachment_ids ?? [];
     return (sourceEmail.attachments ?? [])
@@ -351,7 +284,8 @@ export default function PipelineCompareFixModal({
         filename: a.filename,
         ct: a.content_type,
         url: attachmentUrl(emailSourceId, a.attachment_id),
-        renderUrl: attachmentRenderUrl(emailSourceId, a.attachment_id),
+        renderUrl: attachmentRenderUrlIfSupported(
+          a.filename, a.content_type, attachmentRenderUrl(emailSourceId, a.attachment_id)),
       }));
   }, [sourceEmail, emailSourceId, file?.attachment_id]);
   const activeSource = relatedSources.find((s) => s.id === activeSourceId) ?? null;
@@ -431,7 +365,7 @@ export default function PipelineCompareFixModal({
 
   const addFiles = (list: FileList | null) => {
     if (!list) return;
-    const valid = Array.from(list).filter((f) => FILE_RE.test(f.name));
+    const valid = Array.from(list).filter((f) => ATTACHABLE_FILE_RE.test(f.name));
     setAttachments((prev) => {
       const names = new Set(prev.map((f) => f.name));
       return [...prev, ...valid.filter((f) => !names.has(f.name))];

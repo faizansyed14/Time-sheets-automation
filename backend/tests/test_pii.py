@@ -9,6 +9,7 @@ from app.core.pii import (
     PHONE_TOKEN,
     SECRET_TOKEN,
     SIGNATURE_NOTE,
+    THREAD_QUOTE_NOTE,
     assert_no_plaintext_pii,
     pseudonymize_email,
     scrub_email_for_llm,
@@ -52,7 +53,9 @@ def test_password_in_signature_is_secret_redacted():
     assert "Summer2026!" not in scrubbed
     assert "john.smith@acme.com" not in scrubbed
     assert "050 123 4567" not in scrubbed
-    assert SIGNATURE_NOTE.strip() in scrubbed
+    assert SIGNATURE_NOTE.strip() not in scrubbed
+    assert "Thanks" in scrubbed
+    assert "John Smith" in scrubbed
     assert "Please find my timesheet attached." in scrubbed
     assert "June 2026" in subj
     # Secrets mid-body (not only in signature) are still tokenised.
@@ -78,7 +81,7 @@ def test_international_and_labelled_phones_masked():
     assert "8:30 AM" in scrub_text("1-Jun-26\n8:30 AM\n5:30 PM\n9")
 
 
-def test_sheet_signature_footer_cut():
+def test_sheet_signature_footer_scrubbed_not_cut():
     body = (
         "ATTENDANCE SHEET\nEMP NO: E2406601\n"
         "1-Jun-26 8:30 AM 5:30 PM 9\n\n"
@@ -91,15 +94,15 @@ def test_sheet_signature_footer_cut():
     _, scrubbed = scrub_email_for_llm("TIMESHEET June 2026", body)
     assert "ATTENDANCE SHEET" in scrubbed
     assert "EMPLOYEE SIGNATURE" in scrubbed
-    assert SIGNATURE_NOTE.strip() in scrubbed
-    assert "DUBAI HOLDING" not in scrubbed
+    assert "DUBAI HOLDING" in scrubbed
+    assert SIGNATURE_NOTE.strip() not in scrubbed
     assert "+971" not in scrubbed
     assert "050000000" not in scrubbed
 
 
-def test_quoted_reply_thread_cut():
-    """Latest note kept; Outlook reply chain (Cc lists, phones) dropped."""
-    from app.core.pii import THREAD_QUOTE_NOTE, scrub_email_for_llm
+def test_quoted_reply_thread_scrubbed_not_cut():
+    """Whole thread kept; PII inside signatures and quoted history tokenised."""
+    from app.core.pii import scrub_email_for_llm
 
     body = (
         "Dear Maria , team ,\n\n"
@@ -118,13 +121,34 @@ def test_quoted_reply_thread_cut():
     )
     _, scrubbed = scrub_email_for_llm("RE: June Timesheet", body)
     assert "Kindly find the time sheet in attachment" in scrubbed
-    assert "Maria Lourdes" not in scrubbed
+    assert "Please print your timesheet." in scrubbed
+    assert HEADER_VALUE_TOKEN in scrubbed
     assert "zainab.khan@alpha.ae" not in scrubbed
+    assert "mb.mohamed@adnic.ae" not in scrubbed
     assert "+971" not in scrubbed
-    assert (
-        SIGNATURE_NOTE.strip() in scrubbed
-        or THREAD_QUOTE_NOTE.strip() in scrubbed
+    assert THREAD_QUOTE_NOTE.strip() not in scrubbed
+    assert SIGNATURE_NOTE.strip() not in scrubbed
+
+
+def test_legacy_cut_modes_still_available():
+    body_sig = (
+        "Please find my timesheet attached.\n\n"
+        "Thanks\n"
+        "john.smith@acme.com\n"
     )
+    _, cut_sig = scrub_email_for_llm("S", body_sig, cut_signature=True)
+    assert SIGNATURE_NOTE.strip() in cut_sig
+    assert "john.smith@acme.com" not in cut_sig
+
+    body_thread = (
+        "Latest note only — please see below.\n\n"
+        "From: Other <other@x.com>\n"
+        "Sent: yesterday\n"
+        "Prior message body\n"
+    )
+    _, cut_thread = scrub_email_for_llm("S", body_thread, cut_quoted_thread=True)
+    assert THREAD_QUOTE_NOTE.strip() in cut_thread
+    assert "Prior message body" not in cut_thread
 
 
 def test_extraction_targets_are_byte_identical():
@@ -153,7 +177,7 @@ def test_none_and_disabled_passthrough(monkeypatch):
     assert scrub_email_for_llm("S", "Thanks\nPassword: x") == ("S", "Thanks\nPassword: x")
 
 
-def test_batch_prompt_has_no_sender_address():
+def test_extract_prompt_has_no_sender_address():
     from app.models.email_message import EmailMessage
     from app.services.agents import full_email_extract as fx
 
@@ -163,7 +187,7 @@ def test_batch_prompt_has_no_sender_address():
         subject="TIMESHEET June 2026 | Kevin Dsouza | E2507067",
         body_text="", attachments=[])
     unit = fx.SheetUnit(name="sheet.pdf", ftype="pdf", payload=b"", images=[b"x"], text="")
-    prompt = fx._batch_prompt(mail, [unit])
+    prompt = fx._extract_prompt(mail, unit)
     assert "kevin.dsouza@acme.com" not in prompt
     assert "EMAIL FROM" not in prompt
     assert "E2507067" in prompt and "June 2026" in prompt

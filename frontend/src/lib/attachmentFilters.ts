@@ -2,8 +2,8 @@ import type { Attachment } from "../api/client";
 
 // Images under this are signature logos/icons in practice — real screenshots
 // of timesheets are far larger. Keep in sync with the backend's
-// MIN_IMAGE_ATTACHMENT_KB (default 30).
-export const MIN_IMAGE_KB = 30;
+// MIN_IMAGE_ATTACHMENT_KB (default 70).
+const MIN_IMAGE_KB = 70;
 
 export function isImageAttachment(a: Attachment): boolean {
   return (a.content_type || "").toLowerCase().startsWith("image/");

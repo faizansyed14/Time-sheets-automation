@@ -193,47 +193,6 @@ export function Modal({
   );
 }
 
-/* ----------------------------- Drawer ----------------------------- */
-export function Drawer({
-  open,
-  onClose,
-  children,
-  width = "max-w-2xl",
-}: {
-  open: boolean;
-  onClose: () => void;
-  children: ReactNode;
-  width?: string;
-}) {
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    const prevOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    window.addEventListener("keydown", onKey);
-    return () => {
-      document.body.style.overflow = prevOverflow;
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [open, onClose]);
-
-  if (!open) return null;
-  return createPortal(
-    <div className="fixed inset-0 z-50">
-      <div className="absolute inset-0 bg-slate-900/50 backdrop-blur-sm animate-overlay-in" onClick={onClose} />
-      <div
-        className={cn(
-          "absolute inset-y-0 right-0 w-full overflow-y-auto border-l border-slate-200 bg-white shadow-pop animate-slide-in",
-          width
-        )}
-      >
-        {children}
-      </div>
-    </div>,
-    document.body
-  );
-}
-
 /* ----------------------------- Misc ----------------------------- */
 export function Spinner({ className }: { className?: string }) {
   return (

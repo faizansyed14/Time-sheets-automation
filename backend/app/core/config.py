@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     # Image attachments smaller than this are signature logos/icons in
     # practice: hidden from attachment lists/counts and never sent to the
     # vision model. Applies ONLY to images — documents of any size still flow.
-    min_image_attachment_kb: int = 30
+    min_image_attachment_kb: int = 70
 
     # Which file store to use: "local" | "s3" | "onedrive".
     # Switch to AWS S3 by setting STORAGE_PROVIDER=s3 + the S3_* values below.
@@ -87,48 +87,15 @@ class Settings(BaseSettings):
     # Which extraction engine to use: "mock" now, "vision" for your real LLM.
     extraction_engine: str = "mock"
 
-    # Each AI service picks its OWN provider — the endpoint + key are resolved
-    # from the provider, and the model name is sent as-is. This replaces the
-    # old "guess the provider from whether the model starts with gpt-" rule.
-    #   vision_provider -> Extract Email / Upload / chat-upload (images)
-    #   ai_provider     -> Agentic Chat (OpenAI-style tool calling)
-    # Each is one of: "openai" | "deepseek" | "vllm".
-    # Leave/date flags + review summaries are deterministic (validation.py) —
-    # there is no second LLM "cross-check" pass.
-    vision_provider: str = "openai"
-    ai_provider: str = "openai"
-
-    # ----- Real vision LLM (used when extraction_engine="vision") -----
-    # OpenAI-compatible vision (GPT-4o / GPT-5.4 / GPT-4.1).
+    # ----- OpenAI (vision extraction + agentic chat) -----
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com"
     openai_timeout: int = 120
-    # Optional DeepSeek (text-only; usable for chat if AI_PROVIDER=deepseek).
-    deepseek_api_key: str | None = None
-    deepseek_base_url: str = "https://api.deepseek.com/v1"
-    # Optional vLLM (Qwen etc.) for non-GPT models.
-    vllm_api_key: str | None = None
-    vllm_base_url: str = "https://myvllmserver.duckdns.org"
-    vllm_model: str = "Qwen3.6-35B-A3B"
-    vllm_max_tokens: int = 4096
-    vllm_temperature: float = 0.0
-    vllm_timeout: int = 90
-    # Some vLLM deployments cap how many images can go in ONE prompt (ours
-    # rejects a call with a 400 above 4). Each sheet is already ONE stitched
-    # JPEG — this only limits how many sheets share one vision call (splits
-    # into smaller calls; never drops images / PDF pages).
-    vllm_max_images_per_prompt: int = 4
-    # TLS for the self-hosted vLLM endpoint. Prefer pinning the server's root
-    # CA (VLLM_CA_BUNDLE=path/to/root.crt) — it survives the server's
-    # short-lived leaf-cert rotation. VLLM_TLS_VERIFY=false disables
-    # verification entirely and is a TEMPORARY test-phase escape hatch only.
-    vllm_tls_verify: bool = True
-    vllm_ca_bundle: str = ""
-    # Runtime model choices. EXTRACTION_MODEL / VLLM_MODEL = self-hosted vision;
-    # OPENAI_VISION_MODEL = OpenAI when VISION_PROVIDER=openai (see model_for).
+    openai_vision_model: str = "gpt-4o"
+    # First-pass sheet type + date-completeness classifier (cheap / fast).
+    openai_classify_model: str = "gpt-4o-mini"
     extraction_model: str = "gpt-4o"
     vision_image_detail: str = "high"   # low | high — used for SCANS/photos
-    openai_vision_model: str = "gpt-4o"
 
     # ----- Cost / accuracy tuning -----
     # Render PDFs at a lower DPI for the LLM: vision models gain nothing above

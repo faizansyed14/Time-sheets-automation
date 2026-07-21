@@ -338,6 +338,46 @@ MESSAGES = [
         ],
         "approval": {"slot": "ap", "detected": True, "detail": "Approved by Omar Farouk"},
     },
+    {
+        # Thread showcase: the ORIGINAL message carries the timesheet; the
+        # approval comes as a SEPARATE reply with no re-attached file. Same
+        # conversation_id groups them — proves thread-aware extraction can
+        # combine "sheet from message 1" + "approval from message 2".
+        "message_id": "MSG-0011",
+        "conversation_id": "CONV-THREAD-0011",
+        "sender_name": "Layla Hassan",
+        "sender_email": "layla.hassan@company.com",
+        "subject": "TIMESHEET for June 2026 - Layla Hassan",
+        "received_at": _dt("2026-07-01T09:00:00"),
+        "body_text": "Hi HR,\n\nPlease find attached my timesheet for June 2026.\n\nThanks,\nLayla",
+        "cases": [
+            {
+                "slot": "ts",
+                "doc": "pdf",
+                "emp_id": "EMP-1011",
+                "emp_name": "Layla Hassan",
+                "month": 6, "year": 2026,
+                "annual": ["2026-06-15", "2026-06-16"],
+                "public_holiday": [],
+                "issues": [],
+            },
+        ],
+        "approval": None,
+    },
+    {
+        "message_id": "MSG-0012",
+        "conversation_id": "CONV-THREAD-0011",
+        "sender_name": "Sarah Khan",
+        "sender_email": "sarah.khan@company.com",
+        "subject": "RE: TIMESHEET for June 2026 - Layla Hassan",
+        "received_at": _dt("2026-07-01T14:30:00"),
+        "body_text": "Approved.\n\nThanks,\nSarah\n\n"
+                     "From: Layla Hassan\nSent: 01 July 2026 09:00\n"
+                     "Subject: TIMESHEET for June 2026 - Layla Hassan\n\n"
+                     "Hi HR,\n\nPlease find attached my timesheet for June 2026.\n\nThanks,\nLayla",
+        "cases": [],
+        "approval": None,
+    },
 ]
 
 

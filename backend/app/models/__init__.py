@@ -1,4 +1,3 @@
-from app.models.app_config import AppConfig, ConfigCategory
 from app.models.auth import AuthMode, Role, User
 from app.models.email_message import EmailMessage, EmailStatus
 from app.models.employee import Employee
@@ -28,6 +27,4 @@ __all__ = [
     "User",
     "Role",
     "AuthMode",
-    "AppConfig",
-    "ConfigCategory",
 ]

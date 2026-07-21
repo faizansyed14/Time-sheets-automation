@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
-  ChevronLeft, ChevronRight, Download, ExternalLink, FileText, Mail,
+  Download, ExternalLink, FileText, Mail,
   Maximize2, Minimize2, Paperclip, X,
 } from "lucide-react";
 import { cn, formatBytes } from "../lib/utils";
 import { isTinyImage } from "../lib/attachmentFilters";
-import { downloadFile, isDocx, isEml, isPdf, isPreviewable, isXlsx, sanitizeEmailHtml, type PreviewFile } from "../lib/filePreview";
-import { api, fetchEmlPreview, type EmlParsed } from "../api/client";
+import { b64ToBytes, buildEmailHtmlDocument, downloadFile, isDocx, isEml, isPdf, isPreviewable, isXlsx, mimeFor, type PreviewFile } from "../lib/filePreview";
+import { api, fetchEmlPreview, fetchEmlPreviewFromBytes, type EmlParsed } from "../api/client";
 import { Spinner } from "./ui";
+import { XlsxPreviewPane } from "./XlsxPreview";
 
 // ---------------------------------------------------------------------------
 // EML viewer — Outlook-style rendering of .eml files
@@ -16,7 +17,16 @@ import { Spinner } from "./ui";
 
 type AttachmentBlob = { filename: string; contentType: string; size: number; url: string; dataB64?: string };
 
-export function EmlPreviewPane({ fileUrl, filename }: { fileUrl: string; filename: string }) {
+export function EmlPreviewPane({
+  fileUrl, filename, dataB64,
+}: {
+  fileUrl: string;
+  filename: string;
+  /** Raw bytes for an email nested INSIDE another email, which has no URL of
+   *  its own. When present it is parsed directly, so forwarded mail opens at
+   *  any depth. */
+  dataB64?: string | null;
+}) {
   const [parsed, setParsed] = useState<EmlParsed | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [attPreview, setAttPreview] = useState<PreviewFile | null>(null);
@@ -31,16 +41,18 @@ export function EmlPreviewPane({ fileUrl, filename }: { fileUrl: string; filenam
     setParsed(null);
     setErr(null);
 
-    fetchEmlPreview(fileUrl)
+    (dataB64
+      ? fetchEmlPreviewFromBytes(filename, dataB64)
+      : fetchEmlPreview(fileUrl))
       .then((data) => {
         if (!alive) return;
         setParsed(data);
 
-        // Build HTML body blob URL.
+        // Build HTML body blob URL (data: URIs from the server — no cid: refs).
         if (data.body_html) {
           if (bodyBlobRef.current) URL.revokeObjectURL(bodyBlobRef.current);
-          const safe = sanitizeEmailHtml(data.body_html);
-          const b = URL.createObjectURL(new Blob([safe], { type: "text/html" }));
+          const doc = buildEmailHtmlDocument(data.body_html);
+          const b = URL.createObjectURL(new Blob([doc], { type: "text/html" }));
           bodyBlobRef.current = b;
           blobsRef.current.push(b);
         }
@@ -51,12 +63,17 @@ export function EmlPreviewPane({ fileUrl, filename }: { fileUrl: string; filenam
         const blobs: AttachmentBlob[] = data.attachments
           .filter((a) => a.data_b64 && !isTinyImage(a.content_type, a.size))
           .map((a) => {
-            const binary = atob(a.data_b64!);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-            const u = URL.createObjectURL(new Blob([bytes], { type: a.content_type }));
+            const bytes = b64ToBytes(a.data_b64!);
+            const mime = mimeFor(a.filename, a.content_type);
+            const u = URL.createObjectURL(new Blob([bytes], { type: mime }));
             blobsRef.current.push(u);
-            return { filename: a.filename, contentType: a.content_type, size: a.size, url: u, dataB64: a.data_b64 };
+            return {
+              filename: a.filename,
+              contentType: mime,
+              size: a.size,
+              url: u,
+              dataB64: a.data_b64,
+            };
           });
         setAttBlobs(blobs);
       })
@@ -65,16 +82,16 @@ export function EmlPreviewPane({ fileUrl, filename }: { fileUrl: string; filenam
     return () => {
       alive = false;
     };
-  }, [fileUrl]);
+  }, [fileUrl, filename, dataB64]);
 
-  // Revoke all blob URLs when the component unmounts or fileUrl changes.
+  // Revoke all blob URLs when the component unmounts or the source changes.
   useEffect(() => {
     return () => {
       blobsRef.current.forEach((u) => URL.revokeObjectURL(u));
       blobsRef.current = [];
       bodyBlobRef.current = null;
     };
-  }, [fileUrl]);
+  }, [fileUrl, dataB64]);
 
   if (err) {
     return (
@@ -178,65 +195,6 @@ export function EmlPreviewPane({ fileUrl, filename }: { fileUrl: string; filenam
 }
 
 // ---------------------------------------------------------------------------
-// DOCX viewer — renders .docx in-browser via docx-preview
-// ---------------------------------------------------------------------------
-
-export function DocxPreviewPane({ fileUrl }: { fileUrl: string }) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [err, setErr] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let alive = true;
-    setErr(null);
-    setLoading(true);
-    if (!containerRef.current) return;
-    const target = containerRef.current;
-
-    Promise.all([
-      import("docx-preview"),
-      fetch(fileUrl).then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.blob();
-      }),
-    ])
-      .then(([{ renderAsync }, blob]) => {
-        if (!alive) return;
-        return renderAsync(blob, target, undefined, {
-          inWrapper: true,
-          ignoreWidth: false,
-          ignoreHeight: false,
-          useBase64URL: true,
-        });
-      })
-      .then(() => { if (alive) setLoading(false); })
-      .catch(() => { if (alive) setErr("Could not render DOCX file."); });
-
-    return () => { alive = false; };
-  }, [fileUrl]);
-
-  if (err) {
-    return (
-      <div className="flex h-full items-center justify-center text-sm text-rose-500">{err}</div>
-    );
-  }
-
-  return (
-    <div className="relative h-full overflow-auto bg-slate-100">
-      {loading && (
-        <div className="absolute inset-0 flex items-center justify-center bg-slate-100">
-          <Spinner className="h-6 w-6" />
-        </div>
-      )}
-      <div
-        ref={containerRef}
-        className="docx-preview-container mx-auto max-w-4xl bg-white shadow-sm"
-      />
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Server render pane — DOCX/XLSX rendered to page images on the backend.
 // Works in every browser; the original file stays downloadable. Pages via
 // ?page=N with the total in the X-Page-Count response header.
@@ -245,64 +203,113 @@ export function DocxPreviewPane({ fileUrl }: { fileUrl: string }) {
 export function ServerRenderPane({
   renderUrl,
   renderUpload,
+  sourceUrl,
+  filename,
+  contentType,
 }: {
   renderUrl?: string | null;
   renderUpload?: { filename: string; contentType: string; dataB64: string } | null;
+  /** When no renderUrl/renderUpload — fetch this URL and POST /files/render-upload. */
+  sourceUrl?: string | null;
+  filename?: string;
+  contentType?: string | null;
 }) {
-  const [page, setPage] = useState(1);
-  const [pages, setPages] = useState(1);
-  const [img, setImg] = useState<string | null>(null);
+  const blobsRef = useRef<string[]>([]);
+  const [imgs, setImgs] = useState<string[]>([]);
+  const [pageCount, setPageCount] = useState<number>(1);
   const [err, setErr] = useState<string | null>(null);
-
-  useEffect(() => { setPage(1); }, [renderUrl, renderUpload?.filename]);
 
   useEffect(() => {
     let alive = true;
-    let blobUrl: string | null = null;
-    setImg(null);
+    setImgs([]);
+    setPageCount(1);
     setErr(null);
-    const run = async () => {
+
+    // Revoke any old blobs from the previous render.
+    blobsRef.current.forEach((u) => URL.revokeObjectURL(u));
+    blobsRef.current = [];
+
+    const uploadBytes = renderUpload ? b64ToBytes(renderUpload.dataB64) : null;
+    const uploadBlob = uploadBytes
+      ? new Blob([uploadBytes], { type: renderUpload?.contentType || "application/octet-stream" })
+      : null;
+    let sourcePreparedBlob: Blob | null = null;
+
+    const fetchPage = async (p: number) => {
       if (renderUrl) {
         const sep = renderUrl.includes("?") ? "&" : "?";
-        const r = await fetch(`${renderUrl}${sep}page=${page}`);
+        const r = await fetch(`${renderUrl}${sep}page=${p}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const count = Number(r.headers.get("X-Page-Count") || "1");
         const blob = await r.blob();
-        if (!alive) return;
-        setPages(Number.isFinite(count) && count > 0 ? count : 1);
-        blobUrl = URL.createObjectURL(blob);
-        setImg(blobUrl);
-        return;
+        const c = p === 1 ? Number(r.headers.get("X-Page-Count") || "1") : null;
+        return { blobUrl: URL.createObjectURL(blob), count: c };
       }
-      if (renderUpload) {
-        const binary = atob(renderUpload.dataB64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        const form = new FormData();
-        form.append(
-          "file",
-          new Blob([bytes], { type: renderUpload.contentType || "application/octet-stream" }),
-          renderUpload.filename
-        );
+
+      const postForm = async (form: FormData) => {
         const r = await api.post("/files/render-upload", form, {
-          params: { page },
+          params: { page: p },
           responseType: "blob",
         });
-        const count = Number(r.headers["x-page-count"] || "1");
-        if (!alive) return;
-        setPages(Number.isFinite(count) && count > 0 ? count : 1);
-        blobUrl = URL.createObjectURL(r.data);
-        setImg(blobUrl);
-        return;
+        const c = p === 1 ? Number(r.headers["x-page-count"] || "1") : null;
+        return { blobUrl: URL.createObjectURL(r.data), count: c };
+      };
+
+      if (renderUpload) {
+        const form = new FormData();
+        form.append("file", uploadBlob || new Blob([], { type: renderUpload.contentType || "application/octet-stream" }), renderUpload.filename);
+        return postForm(form);
       }
+
+      if (sourceUrl) {
+        if (!sourcePreparedBlob) {
+          const r = await fetch(sourceUrl);
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const blob = await r.blob();
+          // Prefer declared content type when the blob type is empty/octet-stream.
+          sourcePreparedBlob = (contentType && (!blob.type || blob.type === "application/octet-stream"))
+            ? new Blob([blob], { type: contentType })
+            : blob;
+        }
+        const form = new FormData();
+        form.append("file", sourcePreparedBlob, filename || "file");
+        return postForm(form);
+      }
+
       throw new Error("No render source");
     };
+
+    const run = async () => {
+      const first = await fetchPage(1);
+      if (!alive) return;
+
+      const count = Number.isFinite(first.count as number) && (first.count as number) > 0
+        ? (first.count as number)
+        : 1;
+      setPageCount(count);
+
+      const out: string[] = [];
+      blobsRef.current.push(first.blobUrl);
+      out.push(first.blobUrl);
+      setImgs([...out]);
+
+      for (let p = 2; p <= count; p++) {
+        const res = await fetchPage(p);
+        if (!alive) return;
+        blobsRef.current.push(res.blobUrl);
+        out.push(res.blobUrl);
+        // Progressive render while pages arrive.
+        setImgs([...out]);
+      }
+    };
+
     run().catch(() => alive && setErr("Could not render this file. Use Download to open the original."));
+
     return () => {
       alive = false;
-      if (blobUrl) URL.revokeObjectURL(blobUrl);
+      blobsRef.current.forEach((u) => URL.revokeObjectURL(u));
+      blobsRef.current = [];
     };
-  }, [renderUrl, renderUpload, page]);
+  }, [renderUrl, renderUpload, sourceUrl, filename, contentType]);
 
   if (err) {
     return <div className="flex h-full items-center justify-center px-6 text-center text-sm text-rose-500">{err}</div>;
@@ -311,33 +318,149 @@ export function ServerRenderPane({
   return (
     <div className="flex h-full flex-col">
       <div className="min-h-0 flex-1 overflow-auto bg-slate-100 p-3">
-        {img ? (
-          <img src={img} alt={`page ${page}`} className="mx-auto block max-w-full rounded-lg bg-white shadow-sm" />
+        {imgs.length ? (
+          <div className="space-y-3">
+            {imgs.map((u, i) => (
+              <img
+                key={u}
+                src={u}
+                alt={`page ${i + 1} / ${pageCount}`}
+                className="mx-auto block w-full rounded-lg bg-white shadow-sm object-contain"
+              />
+            ))}
+          </div>
         ) : (
           <div className="flex h-full items-center justify-center"><Spinner className="h-6 w-6" /></div>
         )}
       </div>
-      {pages > 1 && (
-        <div className="flex shrink-0 items-center justify-center gap-3 border-t border-slate-200 bg-white py-2">
-          <button
-            type="button"
-            disabled={page <= 1}
-            onClick={() => setPage((p) => Math.max(1, p - 1))}
-            className="rounded-lg border border-slate-200 p-1.5 text-slate-500 hover:bg-slate-50 disabled:opacity-40"
-          >
-            <ChevronLeft className="h-4 w-4" />
-          </button>
-          <span className="text-xs font-semibold text-slate-600">Page {page} / {pages}</span>
-          <button
-            type="button"
-            disabled={page >= pages}
-            onClick={() => setPage((p) => Math.min(pages, p + 1))}
-            className="rounded-lg border border-slate-200 p-1.5 text-slate-500 hover:bg-slate-50 disabled:opacity-40"
-          >
-            <ChevronRight className="h-4 w-4" />
-          </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Generic preview-by-type: EML pane, PDF iframe, DOCX/XLSX server page
+// images, plain <img> for pictures, download card otherwise.
+//
+// Shared by every "preview a file I already have a source for" call site —
+// Inbox attachments, the vault, pipeline raw copies, and a File picked in a
+// form but not yet uploaded (Manual Entry / Compare & Fix's own attach
+// picker). Those call sites used to carry two near-identical
+// implementations that only differed in how the DOCX/XLSX bytes reached the
+// server (a hosted renderUrl vs local File bytes) and in what happens for an
+// EML that has no server-side parser to call yet.
+// ---------------------------------------------------------------------------
+
+export function SourcePreview({
+  url, renderUrl, renderUpload, name, ct, emlUnavailable,
+}: {
+  url: string;
+  renderUrl?: string | null;
+  /** DOCX/XLSX bytes not yet uploaded anywhere (e.g. a File picked in a form) —
+   *  passed straight through to ServerRenderPane. */
+  renderUpload?: { filename: string; contentType: string; dataB64: string } | null;
+  name: string;
+  ct: string;
+  /** True for a local file with no server copy yet — .eml can't be parsed
+   *  until it exists somewhere the server can read it, so show a
+   *  "preview after save" placeholder instead of trying EmlPreviewPane. */
+  emlUnavailable?: boolean;
+}) {
+  if (isEml(name, ct)) {
+    if (emlUnavailable) {
+      return (
+        <div className="flex h-full flex-col items-center justify-center gap-3 rounded-lg border border-slate-200 bg-white p-8 text-center">
+          <FileText className="h-10 w-10 text-slate-300" />
+          <p className="font-medium text-slate-700">{name}</p>
+          <p className="text-xs text-slate-400">
+            EML preview is available after the record is saved.
+          </p>
         </div>
-      )}
+      );
+    }
+    return (
+      <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
+        <EmlPreviewPane fileUrl={url} filename={name} />
+      </div>
+    );
+  }
+  if (isPdf(name, ct)) {
+    const useServerPages = !!renderUrl || !!renderUpload;
+    if (useServerPages) {
+      return (
+        <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
+          <ServerRenderPane
+            renderUrl={renderUrl}
+            renderUpload={renderUpload}
+            sourceUrl={!renderUrl && !renderUpload ? url : null}
+            filename={name}
+            contentType={ct}
+          />
+        </div>
+      );
+    }
+    return (
+      <iframe
+        src={url}
+        title={name}
+        className="h-full w-full rounded-lg border border-slate-200 bg-white"
+      />
+    );
+  }
+  if (isXlsx(name, ct)) {
+    const useServerPages = !!renderUrl || !!renderUpload;
+    if (useServerPages) {
+      return (
+        <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
+          <ServerRenderPane
+            renderUrl={renderUrl}
+            renderUpload={renderUpload}
+            sourceUrl={!renderUrl && !renderUpload ? url : null}
+            filename={name}
+            contentType={ct}
+          />
+        </div>
+      );
+    }
+    // Fallback: real spreadsheet grid (only when server render source missing).
+    return (
+      <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
+        <XlsxPreviewPane url={url} />
+      </div>
+    );
+  }
+  if (isDocx(name, ct)) {
+    return (
+      <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
+        <ServerRenderPane
+          renderUrl={renderUrl}
+          renderUpload={renderUpload}
+          sourceUrl={!renderUrl && !renderUpload ? url : null}
+          filename={name}
+          contentType={ct}
+        />
+      </div>
+    );
+  }
+  if (isPreviewable(name, ct)) {
+    return (
+      <img
+        src={url}
+        alt={name}
+        className="mx-auto block max-h-full max-w-full rounded-lg object-contain"
+      />
+    );
+  }
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-3 text-slate-500">
+      <FileText className="h-10 w-10 text-slate-300" />
+      <p className="text-sm">{name} cannot be previewed inline.</p>
+      <a
+        href={url}
+        download={name}
+        className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+      >
+        <Download className="h-4 w-4" /> Download
+      </a>
     </div>
   );
 }
@@ -438,13 +561,17 @@ export function FilePreviewModal({
 
   const pdf = isPdf(file.filename, file.contentType);
   const eml = isEml(file.filename, file.contentType);
-  const docx = isDocx(file.filename, file.contentType);
   const xlsx = isXlsx(file.filename, file.contentType);
-  const image = !pdf && !eml && !docx && !xlsx && isPreviewable(file.filename, file.contentType);
-  // Server render-to-image for office docs when a render URL is available
-  // (inbox attachments, pipeline raw copies). Original stays downloadable.
-  const effectiveRenderUrl = file.renderUrl ?? null;
-  const serverRender = !!effectiveRenderUrl && (docx || xlsx);
+  // DOCX only — XLSX has its own dedicated grid renderer below, not the
+  // server page-image path (which is what stitched a whole workbook into one
+  // unreadable strip before it got its own component).
+  const office = isDocx(file.filename, file.contentType);
+  const image = !pdf && !eml && !xlsx && !office && isPreviewable(file.filename, file.contentType);
+  // Nested EML embeds + inbox render URLs → server page images for PDF/DOCX.
+  const useServerPages = (office || pdf || xlsx) && (!!file.renderUrl || !!file.renderUpload);
+  // DOCX without a dedicated render source: fetch blob/url → render-upload.
+  const useOfficeFetch = office && !useServerPages && !!file.url;
+  const usePdfIframe = pdf && !useServerPages;
 
   // Images get a dedicated full-screen lightbox instead of the framed card.
   if (image) return <ImageLightbox file={file} onClose={onClose} />;
@@ -468,6 +595,7 @@ export function FilePreviewModal({
             download={file.filename}
             className="rounded-lg p-1.5 text-slate-400 hover:bg-white hover:text-brand-600"
             title="Download"
+            onClick={(e) => e.stopPropagation()}
           >
             <Download className="h-4 w-4" />
           </a>
@@ -484,32 +612,30 @@ export function FilePreviewModal({
         {/* Body */}
         <div className={cn(
           "min-h-0 flex-1 overflow-auto",
-          eml || docx || serverRender ? "bg-white" : "bg-slate-100 p-2",
+          eml || xlsx || useServerPages || useOfficeFetch ? "bg-white" : "bg-slate-100 p-2",
         )}>
           {eml ? (
-            <EmlPreviewPane fileUrl={file.url} filename={file.filename} />
-          ) : serverRender ? (
-            <ServerRenderPane renderUrl={effectiveRenderUrl} renderUpload={file.renderUpload} />
-          ) : docx ? (
-            <DocxPreviewPane fileUrl={file.url} />
-          ) : xlsx ? (
-            <div className="flex h-full min-h-[40vh] flex-col items-center justify-center gap-3 text-slate-500">
-              <FileText className="h-10 w-10 text-slate-300" />
-              <p className="text-sm">No inline preview for this spreadsheet here.</p>
-              <a
-                href={file.url}
-                download={file.filename}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
-              >
-                <Download className="h-4 w-4" /> Download original
-              </a>
-            </div>
-          ) : pdf ? (
+            <EmlPreviewPane
+              fileUrl={file.url}
+              filename={file.filename}
+              dataB64={file.renderUpload?.dataB64}
+            />
+          ) : useServerPages || useOfficeFetch ? (
+            <ServerRenderPane
+              renderUrl={file.renderUrl}
+              renderUpload={file.renderUpload}
+              sourceUrl={!file.renderUrl && !file.renderUpload ? file.url : null}
+              filename={file.filename}
+              contentType={mimeFor(file.filename, file.contentType)}
+            />
+          ) : usePdfIframe ? (
             <iframe
               src={file.url}
               title={file.filename}
               className="h-full min-h-[70vh] w-full rounded-lg bg-white"
             />
+          ) : xlsx ? (
+            <XlsxPreviewPane url={file.url} />
           ) : (
             <img
               src={file.url}

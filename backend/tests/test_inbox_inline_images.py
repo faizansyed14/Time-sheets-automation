@@ -2,8 +2,35 @@
 import pytest
 
 from app.services.email_provider import get_email_provider
-from app.services.inbox.inline_images import inline_cid_images
+from app.services.inbox.inline_images import (
+    cid_ref_matches,
+    inline_cid_images,
+    strip_unresolved_cids,
+)
 from tests.conftest import auth_headers
+
+
+def test_cid_ref_matches_signature_addin_uuid():
+    """C2_signature filenames vs shorter cid tokens in HTML."""
+    uuid = "c49b4de2-8e6a-4bc7-97f4-dd5ac159184a"
+    assert cid_ref_matches(
+        f"facebook_32x32_{uuid}.png",
+        cid=None,
+        filename=f"C2_signature_facebook2_{uuid}.png",
+    )
+    assert cid_ref_matches(
+        f"logo_{uuid}.png",
+        cid=f"logo_{uuid}",
+        filename=f"C2_signature_logo_{uuid}.png",
+    )
+
+
+def test_strip_unresolved_cids_removes_img_tags():
+    html = '<p>x</p><img src="cid:missing@x.png" alt="logo"/><p>y</p>'
+    out = strip_unresolved_cids(html)
+    assert "cid:" not in out.lower()
+    assert "<img" not in out
+    assert "<p>x</p>" in out
 
 
 async def test_inline_cid_images_resolves_to_data_uri():
@@ -43,8 +70,11 @@ async def test_email_detail_endpoint_inlines_logo(client, admin_token):
     # The inline logo is hidden from the downloadable attachment list.
     assert len(body["inline_attachment_ids"]) == 1
     inlined = set(body["inline_attachment_ids"])
-    logo = next(a for a in body["attachments"] if a.get("cid") == "alphalogo")
-    assert logo["attachment_id"] in inlined
+    provider = get_email_provider()
+    msg = await provider.get_message("MSG-0001")
+    logo = next(a for a in msg.attachments if a.cid == "alphalogo")
+    assert logo.attachment_id in inlined
+    assert not any(a.get("cid") == "alphalogo" for a in body["attachments"])
 
 
 def test_attachment_count_counts_docs_and_real_images_but_not_signature_junk():

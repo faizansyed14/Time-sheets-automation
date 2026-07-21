@@ -100,16 +100,18 @@ async def test_chat_without_api_key_degrades_gracefully(client, admin_token):
     assert "AI provider" in body["answer"]
 
 
-async def test_chat_eml_preview_endpoint(client, admin_token):
-    """A chat-uploaded .eml can be parsed for inline preview (item 3 fix)."""
-    from app.services.agents import upload_cache
-    eml = (b"From: mgr@alpha.ae\r\nTo: timesheet@alpha.ae\r\n"
-           b"Subject: Re: TIMESHEET May 2026\r\nContent-Type: text/plain\r\n\r\n"
-           b"Please find the approval attached.\r\n")
-    tok = await upload_cache.put(eml, "approval.eml", "message/rfc822")
+async def test_chat_has_no_upload_endpoints(client, admin_token):
+    """Ask AI is a query/update agent — file ingestion belongs to Extract
+    Email, Upload and Manual Entry only. The old chat attachment surface
+    must stay gone."""
     h = auth_headers(admin_token)
-    r = await client.get(f"/api/v1/agentic-chat/attachments/{tok}/eml-preview", headers=h)
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["subject"].startswith("Re: TIMESHEET")
-    assert "mgr@alpha.ae" in body["from_"]
+    for method, path in (
+        ("post", "/api/v1/agentic-chat/extract"),
+        ("post", "/api/v1/agentic-chat/extract/stream"),
+        ("post", "/api/v1/agentic-chat/attachments/tok/store"),
+        ("get", "/api/v1/agentic-chat/attachments/tok"),
+        ("get", "/api/v1/agentic-chat/attachments/tok/render"),
+        ("get", "/api/v1/agentic-chat/attachments/tok/eml-preview"),
+    ):
+        r = await getattr(client, method)(path, headers=h)
+        assert r.status_code == 404, f"{method.upper()} {path} still routed: {r.status_code}"
