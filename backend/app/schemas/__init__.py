@@ -26,6 +26,7 @@ class AttachmentOut(BaseModel):
     kind: str
     cid: str | None = None
     is_inline: bool | None = None
+    size: int | None = None
 
 
 class MatchedEmployeeOut(BaseModel):
@@ -52,12 +53,12 @@ class EmailListItem(BaseModel):
     extract_email_at: datetime | None = None  # last Extract Email run (any pipeline item)
     no_sheets_found_at: datetime | None = None  # last run found NOTHING to stage
     no_sheets_note: str | None = None
+    attachments: list[AttachmentOut] = []
 
 
 class EmailDetail(EmailListItem):
     body_text: str | None
     body_html: str | None = None
-    attachments: list[AttachmentOut]
     # Attachment ids embedded inline in body_html (resolved to data URIs) —
     # hidden from the separate attachment list, as Outlook does.
     inline_attachment_ids: list[str] = []
@@ -135,6 +136,7 @@ class SourceFileEntry(BaseModel):
 
 class TimesheetOut(BaseModel):
     id: str
+    matched_employee_pk: str | None = None
     employee_id: str | None
     employee_name: str | None
     account_manager: str | None

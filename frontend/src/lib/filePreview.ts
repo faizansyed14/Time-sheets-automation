@@ -5,6 +5,13 @@ export type PreviewFile = {
   /** Server render-to-image endpoint (DOCX/XLSX) — the preview works in any
    *  browser while `url` stays the downloadable original. */
   renderUrl?: string | null;
+  /** Raw embedded bytes for cases like attachments inside an .eml preview,
+   *  where no standalone render URL exists yet. */
+  renderUpload?: {
+    filename: string;
+    contentType: string;
+    dataB64: string;
+  } | null;
 };
 
 const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"]);

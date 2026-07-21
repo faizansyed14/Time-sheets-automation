@@ -23,8 +23,10 @@ import { isEml, isPdf, isPreviewable } from "../lib/filePreview";
 import {
   approveRecord,
   deleteRecord,
+  fetchEmployeeRecords,
   fetchRecord,
   fileContentUrl,
+  fileRenderUrl,
   recordSources,
   updateRecord,
   verifyRecord,
@@ -38,14 +40,16 @@ import type { PreviewFile } from "../lib/filePreview";
 import { ApprovalBadge, ValidationBadge } from "../components/status";
 import { useToast } from "../components/toast";
 
+import { LEAVE_BUCKET_LABELS, LEAVE_BUCKET_TONE } from "../lib/theme";
+
 const BUCKETS: { key: keyof TimesheetRecord & string; field: string; label: string; tone: string }[] = [
-  { key: "annual_leave_dates", field: "annual_leave_dates", label: "Annual leave", tone: "bg-indigo-50 text-indigo-700 ring-indigo-200" },
-  { key: "remote_work_dates", field: "remote_work_dates", label: "Remote / WFH", tone: "bg-sky-50 text-sky-700 ring-sky-200" },
-  { key: "sick_leave_dates", field: "sick_leave_dates", label: "Sick leave", tone: "bg-rose-50 text-rose-700 ring-rose-200" },
-  { key: "maternity_leave_dates", field: "maternity_leave_dates", label: "Maternity leave", tone: "bg-fuchsia-50 text-fuchsia-700 ring-fuchsia-200" },
-  { key: "unpaid_leave_dates", field: "unpaid_leave_dates", label: "Unpaid leave", tone: "bg-slate-100 text-slate-700 ring-slate-200" },
-  { key: "absent_dates", field: "absent_dates", label: "Absent", tone: "bg-amber-50 text-amber-700 ring-amber-200" },
-  { key: "public_holiday_dates", field: "public_holiday_dates", label: "Public holiday", tone: "bg-emerald-50 text-emerald-700 ring-emerald-200" },
+  { key: "annual_leave_dates", field: "annual_leave_dates", label: LEAVE_BUCKET_LABELS.annual!, tone: LEAVE_BUCKET_TONE.annual! },
+  { key: "remote_work_dates", field: "remote_work_dates", label: LEAVE_BUCKET_LABELS.remote!, tone: LEAVE_BUCKET_TONE.remote! },
+  { key: "sick_leave_dates", field: "sick_leave_dates", label: LEAVE_BUCKET_LABELS.sick!, tone: LEAVE_BUCKET_TONE.sick! },
+  { key: "maternity_leave_dates", field: "maternity_leave_dates", label: LEAVE_BUCKET_LABELS.maternity!, tone: LEAVE_BUCKET_TONE.maternity! },
+  { key: "unpaid_leave_dates", field: "unpaid_leave_dates", label: LEAVE_BUCKET_LABELS.unpaid!, tone: LEAVE_BUCKET_TONE.unpaid! },
+  { key: "absent_dates", field: "absent_dates", label: LEAVE_BUCKET_LABELS.absent!, tone: LEAVE_BUCKET_TONE.absent! },
+  { key: "public_holiday_dates", field: "public_holiday_dates", label: LEAVE_BUCKET_LABELS.public_holiday!, tone: LEAVE_BUCKET_TONE.public_holiday! },
 ];
 
 export default function RecordPage() {
@@ -63,6 +67,13 @@ export default function RecordPage() {
     queryKey: ["record-sources", id],
     queryFn: () => recordSources(id!),
     enabled: !!id,
+  });
+  const employeePk = rec?.matched_employee_pk
+    || (rec?.employee_name ? `unmatched::${rec.employee_name.toLowerCase()}` : null);
+  const { data: siblingRecords } = useQuery({
+    queryKey: ["employee-records", employeePk],
+    queryFn: () => fetchEmployeeRecords(employeePk!),
+    enabled: !!employeePk,
   });
 
   const [editing, setEditing] = useState(false);
@@ -180,16 +191,40 @@ export default function RecordPage() {
         }
       />
 
+      {!!siblingRecords?.length && (
+        <div className="mb-4 flex flex-wrap gap-2">
+          {siblingRecords.map((r) => {
+            const active = r.id === rec.id;
+            return (
+              <button
+                key={r.id}
+                type="button"
+                onClick={() => navigate(`/records/${r.id}`)}
+                className={cn(
+                  "rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors",
+                  active
+                    ? "border-brand-300 bg-brand-50 text-brand-700"
+                    : "border-slate-200 bg-white text-slate-600 hover:border-brand-200 hover:bg-brand-50/40"
+                )}
+                title={`${MONTHS_LONG[r.month]} ${r.year}`}
+              >
+                {MONTHS_LONG[r.month].slice(0, 3)} {r.year}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       <div className="mb-5 flex flex-wrap items-center gap-2">
         <ValidationBadge status={rec.validation_status} />
         <ApprovalBadge status={rec.approval_status} />
         {rec.source_file_count > 1 && (
-          <Badge tone="violet">
+          <Badge tone="brand">
             <Layers className="h-3 w-3" /> {rec.source_file_count} files merged into this month
           </Badge>
         )}
         {rec.approval_detected && (
-          <Badge tone="green">
+          <Badge tone="success">
             <BadgeCheck className="h-3 w-3" /> Approval screenshot detected
           </Badge>
         )}
@@ -368,6 +403,7 @@ export default function RecordPage() {
                   url: fileContentUrl(s.rel_path),
                   filename: s.name,
                   contentType: s.content_type,
+                  renderUrl: fileRenderUrl(s.rel_path),
                 };
                 return (
                   <PreviewableFileRow

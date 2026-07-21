@@ -175,7 +175,9 @@ def _is_body_junk_image(a, body_html: str | None) -> bool:
     """Signature/logo images living in the body — Outlook doesn't count these
     as attachments, and neither do we (list count + detail chips agree).
 
-    Three signals, checked in order of trust:
+    Four signals, checked in order of trust:
+      - the image is smaller than MIN_IMAGE_ATTACHMENT_KB (logos/icons —
+        real screenshots of sheets are far larger);
       - Graph's own `isInline` flag (authoritative — set at sync time from
         the provider, not guessed from a filename);
       - a CID that's actually referenced in the HTML body (only available
@@ -185,6 +187,9 @@ def _is_body_junk_image(a, body_html: str | None) -> bool:
         rows synced before `is_inline` existed."""
     if not _is_image_attachment(a):
         return False
+    size = a.get("size")
+    if isinstance(size, (int, float)) and 0 < size < settings.min_image_attachment_kb * 1024:
+        return True
     if a.get("is_inline") is True:
         return True
     cid = (a.get("cid") or "").strip().strip("<>")
@@ -219,6 +224,18 @@ async def _extract_email_times(db: AsyncSession, msg_ids: list[str]) -> dict[str
 
 
 def _to_list_item(row: EmailMessage, extract_email_at: datetime | None = None) -> EmailListItem:
+    visible_atts = [
+        AttachmentOut(
+            attachment_id=a["attachment_id"], filename=a["filename"],
+            content_type=a["content_type"], kind=a["kind"],
+            cid=a.get("cid"), is_inline=a.get("is_inline"), size=a.get("size"),
+        )
+        for a in (row.attachments or [])
+        if (
+            is_doc_attachment(a)
+            or (_is_image_attachment(a) and not _is_body_junk_image(a, row.body_html))
+        )
+    ]
     return EmailListItem(
         id=row.id,
         provider_message_id=row.provider_message_id,
@@ -232,6 +249,7 @@ def _to_list_item(row: EmailMessage, extract_email_at: datetime | None = None) -
         extract_email_at=extract_email_at,
         no_sheets_found_at=row.no_sheets_found_at,
         no_sheets_note=row.no_sheets_note,
+        attachments=visible_atts,
     )
 
 
@@ -313,19 +331,15 @@ async def get_email(
         row,
         (await _extract_email_times(db, [row.provider_message_id])).get(row.provider_message_id),
     )
+    # Same visible set as the list row (docs + real images; logos/tiny
+    # images already stripped by `_is_body_junk_image`). Always include size
+    # so the frontend can re-apply the threshold if needed.
     return EmailDetail(
-        **base.model_dump(),
+        **base.model_dump(exclude={"attachments"}),
         body_text=row.body_text,
         body_html=body_html,
         inline_attachment_ids=inline_ids,
-        attachments=[
-            AttachmentOut(
-                attachment_id=a["attachment_id"], filename=a["filename"],
-                content_type=a["content_type"], kind=a["kind"],
-                cid=a.get("cid"), is_inline=a.get("is_inline"),
-            )
-            for a in (row.attachments or [])
-        ],
+        attachments=base.attachments,
     )
 
 
@@ -367,6 +381,25 @@ async def preview_as_eml(provider_message_id: str, db: AsyncSession = Depends(ge
     row = await _email_row_or_404(db, provider_message_id)
     data, _ = await build_full_eml(get_email_provider(), row)
     return parse_eml(data)
+
+
+@router.get("/{provider_message_id}/llm-preview")
+async def preview_llm_payload(
+    provider_message_id: str,
+    db: AsyncSession = Depends(get_db),
+    attachment_ids: str | None = None,
+    extract_body: bool = False,
+):
+    """Audit view: subject/body/prompt text that Extract Email would send to
+    the vision model AFTER PII redaction. Does not call the LLM. Optional
+    ``attachment_ids`` (comma-separated) mirrors Extract selected scope."""
+    from app.services.agents.full_email_extract import preview_llm_egress
+    row = await _email_row_or_404(db, provider_message_id)
+    ids = None
+    if attachment_ids is not None:
+        ids = [a.strip() for a in attachment_ids.split(",") if a.strip()]
+    return await preview_llm_egress(
+        row, attachment_ids=ids, extract_body=extract_body)
 
 
 @router.post("/{provider_message_id}/extract-full")

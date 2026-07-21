@@ -81,3 +81,18 @@ def test_generic_body_image_name_is_junk_even_without_is_inline_flag():
     assert _classify(
         "C2_signature_facebook2_8163aee3-593b-481f-aecf-3f004bf0d8bf.png",
         "image/png", has_doc=True, is_inline=False) == "other"
+
+
+def test_tiny_image_is_junk_but_documents_of_any_size_are_not():
+    """Images under MIN_IMAGE_ATTACHMENT_KB are logos/icons → 'other', even
+    with a real-looking name. The size rule must NEVER touch documents."""
+    tiny = 10 * 1024   # 10 KB
+    big = 200 * 1024   # 200 KB
+    assert _classify("Screenshot 2026-07-07.png", "image/png",
+                     has_doc=True, size=tiny) == "other"
+    assert _classify("Screenshot 2026-07-07.png", "image/png",
+                     has_doc=True, size=big) == "approval_screenshot"
+    # A small PDF/DOCX is still a timesheet — size only applies to images.
+    assert _classify("sheet.pdf", "application/pdf", has_doc=False, size=tiny) == "timesheet"
+    # size=0 (unknown) must not trigger the rule.
+    assert _classify("Screenshot real.png", "image/png", has_doc=True, size=0) == "approval_screenshot"

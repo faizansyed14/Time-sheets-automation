@@ -92,6 +92,58 @@ def eml_preview(rel_path: str = Query(...)):
     return parse_eml(data)
 
 
+@router.get("/render")
+def render_file(
+    rel_path: str = Query(...),
+    page: int = Query(default=1, ge=1, le=50),
+):
+    """Server-render a stored PDF/DOCX/XLSX file to page images so vault preview
+    works in every browser, same as inbox/pipeline previews."""
+    try:
+        data, name, _ctype = sp.get_storage_provider().read_file(rel_path)
+    except FileNotFoundError:
+        raise HTTPException(404, "File not found")
+    from app.services.extraction.file_processor import detect_file_type, to_images
+    ftype = detect_file_type(name or "", data)
+    if ftype not in ("docx", "xlsx", "pdf"):
+        raise HTTPException(400, f"No server render for type '{ftype}'")
+    imgs = to_images(ftype, data)
+    if not imgs:
+        raise HTTPException(422, "Could not render this file")
+    idx = min(page, len(imgs)) - 1
+    return Response(
+        content=imgs[idx],
+        media_type="image/jpeg",
+        headers={"X-Page-Count": str(len(imgs))},
+    )
+
+
+@router.post("/render-upload")
+async def render_uploaded_file(
+    file: UploadFile = File(...),
+    page: int = Query(default=1, ge=1, le=50),
+):
+    """Server-render raw uploaded PDF/DOCX/XLSX bytes to page images.
+
+    Used by the EML previewer when an attachment is embedded inside the .eml
+    preview JSON (so there is no existing URL/attachment-id render route)."""
+    data = await file.read()
+    name = file.filename or "file"
+    from app.services.extraction.file_processor import detect_file_type, to_images
+    ftype = detect_file_type(name, data)
+    if ftype not in ("docx", "xlsx", "pdf"):
+        raise HTTPException(400, f"No server render for type '{ftype}'")
+    imgs = to_images(ftype, data)
+    if not imgs:
+        raise HTTPException(422, "Could not render this file")
+    idx = min(page, len(imgs)) - 1
+    return Response(
+        content=imgs[idx],
+        media_type="image/jpeg",
+        headers={"X-Page-Count": str(len(imgs))},
+    )
+
+
 # ---- ZIP download ----
 
 @router.get("/years")

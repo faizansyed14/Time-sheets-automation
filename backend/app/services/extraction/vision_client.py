@@ -2,12 +2,14 @@
 Provider plumbing for the shared extraction pipeline
 (services/agents/full_email_extract.py):
 
-  - vision_provider / validation_provider: which provider each service uses.
-  - model_for(provider, purpose): the model to send to THAT provider.
+  - vision_provider: which provider Extract Email / Upload / chat-upload use.
+  - model_for(provider): the model to send to THAT provider.
   - _openai_by_images / _chat_compatible: the two chat-completions callers
     (OpenAI native, and any OpenAI-compatible server such as vLLM/DeepSeek).
 
 Prompts are PII-scrubbed (core/pii.py) before every call.
+Leave/date flags and review summaries are deterministic (validation.py) —
+there is no second LLM cross-check.
 """
 from __future__ import annotations
 
@@ -21,34 +23,30 @@ from app.core.openai_url import openai_urls
 from app.core.pii import scrub_text
 
 VISION_PROVIDERS = ("openai", "vllm")          # deepseek has no vision model
-VALIDATION_PROVIDERS = ("openai", "deepseek", "vllm")
 
 
 def vision_provider() -> str:
     return (settings.vision_provider or "openai").strip().lower()
 
 
-def validation_provider() -> str:
-    return (settings.validation_provider or "openai").strip().lower()
-
-
 def model_for(provider: str, purpose: str = "vision") -> str:
     """The model to send to THIS provider -- never a global one.
 
-    EXTRACTION_MODEL/VALIDATION_MODEL name the self-hosted (vLLM) models;
-    OpenAI gets its own OPENAI_VISION_MODEL / OPENAI_VALIDATION_MODEL. This is
-    what lets the admin flip a service's provider without touching models:
-    sending a vLLM model name to OpenAI just 404s ("model does not exist")."""
+    EXTRACTION_MODEL / VLLM_MODEL name the self-hosted (vLLM) models;
+    OpenAI gets OPENAI_VISION_MODEL. This lets the admin flip a service's
+    provider without touching models: sending a vLLM model name to OpenAI
+    just 404s ("model does not exist").
+
+    `purpose` is unused (kept for call-site compatibility).
+    """
+    del purpose
     p = (provider or "openai").strip().lower()
     if p == "vllm":
-        base = settings.vllm_model or (
-            settings.extraction_model if purpose == "vision" else settings.validation_model)
+        base = settings.vllm_model or settings.extraction_model
         return (base or "").strip()
     if p == "deepseek":
         return "deepseek-chat"
-    if purpose == "vision":
-        return (settings.openai_vision_model or "gpt-4o").strip()
-    return (settings.openai_validation_model or "gpt-4o-mini").strip()
+    return (settings.openai_vision_model or "gpt-4o").strip()
 
 
 def _vllm_verify():

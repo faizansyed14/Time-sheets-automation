@@ -344,7 +344,7 @@ export default function ExportPage() {
                           "group",
                           idx % 2 === 0 ? "bg-white" : "bg-slate-50/90",
                           !row.has_record && "opacity-80",
-                          "hover:bg-sky-50/60"
+                          "hover:bg-brand-50/60"
                         )}
                       >
                         {COLUMNS.map((col) => {
@@ -361,7 +361,7 @@ export default function ExportPage() {
                                 col.width,
                                 isCount && "text-center font-semibold tabular-nums",
                                 isDates && "font-mono text-[11px] leading-relaxed whitespace-normal",
-                                col.sticky && cn("sticky z-20", rowBg, "group-hover:bg-sky-50"),
+                                col.sticky && cn("sticky z-20", rowBg, "group-hover:bg-brand-50"),
                                 empty && !col.sticky && col.key !== "row" && "text-slate-300"
                               )}
                               style={col.sticky ? { left: STICKY_LEFT[col.key] } : undefined}

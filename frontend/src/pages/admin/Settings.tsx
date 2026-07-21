@@ -73,9 +73,6 @@ export default function AdminSettings() {
     { kind: "extraction", field: "vision_provider",
       label: "Vision extraction",
       desc: "Reads timesheets & approvals from page images — Extract Email, selected attachments, Upload and chat." },
-    { kind: "validation", field: "validation_provider",
-      label: "Validation & summaries (text)",
-      desc: "Second, text-only read that cross-checks the vision result and writes review notes." },
     { kind: "agent", field: "ai_provider",
       label: "Agentic chat",
       desc: "The assistant on the chat page. Needs OpenAI-style tool calling — vLLM only works if the server enables it." },
@@ -114,7 +111,7 @@ export default function AdminSettings() {
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-semibold text-slate-800">{svc.label}</p>
                   <p className="mt-0.5 text-xs text-slate-500">{svc.desc}</p>
-                  {live?.note && <p className="mt-1 text-[11px] text-sky-700">{live.note}</p>}
+                  {live?.note && <p className="mt-1 text-[11px] text-brand-700">{live.note}</p>}
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
                   <Select
@@ -144,7 +141,7 @@ export default function AdminSettings() {
         </div>
       </Card>
 
-      {/* prompts: full inventory; only the engine trio is editable */}
+      {/* prompts inventory; only the extraction system prompt is editable */}
       <Card className="p-5">
         <div className="mb-1 flex items-center justify-between">
           <h2 className="flex items-center gap-2 text-sm font-bold text-slate-800"><FileText className="h-4 w-4 text-slate-400" /> Prompts</h2>
@@ -175,8 +172,8 @@ export default function AdminSettings() {
 const PROVIDER_LABEL: Record<string, string> = { openai: "OpenAI", vllm: "vLLM (self-hosted)", deepseek: "DeepSeek" };
 const PROVIDER_TONE: Record<string, string> = {
   openai: "border-emerald-200 bg-emerald-50 text-emerald-700",
-  vllm: "border-sky-200 bg-sky-50 text-sky-700",
-  deepseek: "border-violet-200 bg-violet-50 text-violet-700",
+  vllm: "border-brand-200 bg-brand-50 text-brand-700",
+  deepseek: "border-slate-200 bg-slate-100 text-slate-700",
 };
 
 /** One prompt in the inventory: header row with badges + expandable body.

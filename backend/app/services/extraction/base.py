@@ -40,7 +40,7 @@ class TimesheetExtraction:
     used_ocr: bool = False
     # Free-form provenance shown in the tracker's "Extraction details" dropdown:
     # render DPI, image detail, page count, OCR provider, text-layer presence,
-    # validation model, embedded .eml attachment, etc.
+    # embedded .eml attachment, etc.
     extraction_meta: dict = field(default_factory=dict)
 
 

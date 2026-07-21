@@ -50,7 +50,7 @@ async def test_config_api_exposes_only_providers_and_prompts(client, admin_token
     got = await client.get("/api/v1/admin/config", headers=h)
     assert got.status_code == 200
     keys = {c["key"] for c in got.json()}
-    assert keys == {"vision_provider", "validation_provider", "ai_provider",
+    assert keys == {"vision_provider", "ai_provider",
                     "extract_email_system_prompt"}
     assert all(c["is_secret"] is False for c in got.json())
 

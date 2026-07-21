@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { FileText } from "lucide-react";
-import { fileContentUrl, recordSources } from "../api/client";
+import { fileContentUrl, fileRenderUrl, recordSources } from "../api/client";
 import { formatBytes } from "../lib/utils";
 import type { PreviewFile } from "../lib/filePreview";
 import { FilePreviewModal, PreviewableFileRow } from "./FilePreview";
@@ -28,6 +28,7 @@ export default function StoredFilesPreview({ recordId }: { recordId: string }) {
               url: fileContentUrl(s.rel_path),
               filename: s.name,
               contentType: s.content_type,
+              renderUrl: fileRenderUrl(s.rel_path),
             };
             return (
               <PreviewableFileRow

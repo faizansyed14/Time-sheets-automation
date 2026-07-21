@@ -72,6 +72,7 @@ export interface EmailListItem {
   extract_email_at: string | null;
   no_sheets_found_at: string | null;
   no_sheets_note: string | null;
+  attachments: Attachment[];
 }
 
 export interface Attachment {
@@ -81,6 +82,7 @@ export interface Attachment {
   kind: "timesheet" | "approval_screenshot" | "other";
   cid?: string | null;
   is_inline?: boolean | null;
+  size?: number | null;
 }
 
 export interface EmailDetail extends EmailListItem {
@@ -112,6 +114,7 @@ export interface SourceFileEntry {
 
 export interface TimesheetRecord {
   id: string;
+  matched_employee_pk: string | null;
   employee_id: string | null;
   employee_name: string | null;
   account_manager: string | null;
@@ -301,6 +304,44 @@ export const pipelineRawRenderUrl = (pipelineId: string) =>
 export const emlUrl = (msgId: string) =>
   withAuthParam(`/api/v1/inbox/${encodeURIComponent(msgId)}/as-eml`);
 
+export interface LlmEgressPreview {
+  pii_redaction: boolean;
+  scope: string;
+  subject_sent: string;
+  body_sent: string;
+  sender_omitted: boolean;
+  sheets: {
+    name: string;
+    file_type: string;
+    image_pages: number;
+    image_jpeg_b64?: string;
+    text_sent: string;
+    note: string;
+  }[];
+  sample_prompt: string;
+  system_prompt_note: string;
+  omitted: string[];
+  policy: string;
+}
+
+/** Audit: what Extract Email would send to the vision model after PII scrub. */
+export const fetchLlmPreview = (
+  msgId: string,
+  selection?: IngestSelection,
+) => {
+  const params = new URLSearchParams();
+  if (selection) {
+    params.set("attachment_ids", selection.attachment_ids.join(","));
+    params.set("extract_body", selection.extract_body ? "true" : "false");
+  }
+  const q = params.toString();
+  return api
+    .get<LlmEgressPreview>(
+      `/inbox/${encodeURIComponent(msgId)}/llm-preview${q ? `?${q}` : ""}`,
+    )
+    .then((r) => r.data);
+};
+
 export const saveEmlToVault = (
   msgId: string, body: { manager: string; employee: string; month: number; year: number },
 ) =>
@@ -404,6 +445,66 @@ export const fetchChatSuggestions = () =>
 
 export const sendChat = (messages: ChatMessage[], extractions: ChatExtraction[] = []) =>
   api.post<ChatResponse>("/agentic-chat", { messages, extractions }).then((r) => r.data);
+
+// ---- streaming chat (Server-Sent Events) ----------------------------------
+// A structured result card the assistant streams back (rendered visually).
+export interface ChatCard {
+  type:
+    | "leave_change" | "approval_change" | "draft_email" | "dashboard"
+    | "missing" | "submitted" | "pending" | "team" | "compare" | "anomalies";
+  // union payload — fields depend on `type`; read defensively in the UI.
+  [k: string]: unknown;
+}
+
+export type ChatStreamEvent =
+  | { type: "token"; text: string }
+  | { type: "tool"; phase: "start" | "end"; name: string; label?: string; write?: boolean; ok?: boolean }
+  | { type: "card"; card: ChatCard }
+  | { type: "suggestions"; items: string[] }
+  | { type: "done"; tools_used?: string[]; changes?: ChatChange[]; error?: string | null };
+
+/** POST the conversation and stream SSE events back through `onEvent`.
+ *  Resolves when the stream ends. Uses fetch (axios can't stream in-browser). */
+export async function sendChatStream(
+  messages: ChatMessage[],
+  extractions: ChatExtraction[],
+  onEvent: (ev: ChatStreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const token = getToken();
+  const res = await fetch("/api/v1/agentic-chat/stream", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      "X-Fingerprint": deviceFingerprint(),
+    },
+    body: JSON.stringify({ messages, extractions }),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    if (res.status === 401) { setToken(null); onUnauthorized?.(); }
+    throw new Error(`Chat stream failed (${res.status})`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // SSE frames are separated by a blank line.
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      const line = frame.split("\n").find((l) => l.startsWith("data:"));
+      if (!line) continue;
+      const data = line.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      try { onEvent(JSON.parse(data) as ChatStreamEvent); } catch { /* ignore partial */ }
+    }
+  }
+}
 
 export const extractChatSheet = (file: File) => {
   const form = new FormData();
@@ -567,6 +668,8 @@ export const listFileItems = (manager: string, emp: string, month: string) =>
 
 export const fileContentUrl = (relPath: string) =>
   withAuthParam(`/api/v1/files/content?rel_path=${encodeURIComponent(relPath)}`);
+export const fileRenderUrl = (relPath: string) =>
+  withAuthParam(`/api/v1/files/render?rel_path=${encodeURIComponent(relPath)}`);
 export const downloadZipUrl = (manager?: string) =>
   withAuthParam(`/api/v1/files/download-zip${manager ? `?manager=${encodeURIComponent(manager)}` : ""}`);
 // Scoped ZIP of any subtree (one employee or one month) by vault-relative path.
@@ -914,7 +1017,7 @@ export const adminPromptsAll = () =>
   api.get<PromptInfo[]>("/admin/config/prompts/all").then((r) => r.data);
 
 export interface AiStatusItem {
-  kind: "extraction" | "validation" | "agent";
+  kind: "extraction" | "agent";
   label: string;
   provider: "openai" | "vllm" | "deepseek";
   model: string;

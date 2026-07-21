@@ -7,9 +7,9 @@ all. The active provider + keys + model come from the runtime config overlay
 (admin-editable), so switching from OpenAI to DeepSeek is a settings change, not
 a code change.
 
-  get_chat_model(db, kind="extraction"|"validation") -> a LangChain chat model
-  chat(db, prompt, system=...) -> str            (provider-agnostic one-shot)
-  test_provider(db, provider, prompt) -> dict     (used by the admin "Test" btn)
+  get_chat_model(db, kind="agent"|"extraction") -> a LangChain chat model
+  active_config(db, kind=...) -> dict             (provider/model/has_key)
+  test_provider(db, provider, prompt) -> dict     (admin connectivity test)
 
 LangChain extras wired in: a ChatPromptTemplate + StrOutputParser chain (clean,
 reusable prompt handling) and an in-memory LRU on model construction.
@@ -71,14 +71,12 @@ async def _resolve(db: AsyncSession, kind: str, provider_override: str | None = 
     meta = PROVIDERS.get(provider, PROVIDERS["openai"])
     base_url = cfg.get(meta["base"]) or ""
     api_key = cfg.get(meta["key"]) or ""
-    if kind == "validation":
-        model = cfg.get("validation_model") or "gpt-4o-mini"
-    elif kind == "agent":
+    if kind == "agent":
         model = cfg.get("agent_chat_model") or "gpt-4o-mini"
     else:
         model = cfg.get("extraction_model") or meta["model"]
     # A vLLM server only serves its own model — a leftover gpt-* model name
-    # (e.g. an old validation_model setting) would 404, so fall back.
+    # would 404, so fall back.
     if provider == "vllm" and str(model).lower().startswith("gpt-"):
         model = meta["model"]
     return provider, model, base_url, api_key
@@ -87,17 +85,6 @@ async def _resolve(db: AsyncSession, kind: str, provider_override: str | None = 
 async def get_chat_model(db: AsyncSession, kind: str = "extraction", provider: str | None = None):
     p, model, base_url, api_key = await _resolve(db, kind, provider)
     return _build_model(p, model, base_url, api_key, 0.0)
-
-
-async def chat(db: AsyncSession, prompt: str, system: str | None = None, kind: str = "extraction") -> str:
-    """Provider-agnostic one-shot completion using a LangChain prompt chain."""
-    from langchain_core.output_parsers import StrOutputParser
-    from langchain_core.prompts import ChatPromptTemplate
-
-    model = await get_chat_model(db, kind)
-    msgs = ([("system", system)] if system else []) + [("human", "{input}")]
-    chain = ChatPromptTemplate.from_messages(msgs) | model | StrOutputParser()
-    return await chain.ainvoke({"input": prompt})
 
 
 async def active_config(db: AsyncSession, kind: str = "extraction") -> dict:

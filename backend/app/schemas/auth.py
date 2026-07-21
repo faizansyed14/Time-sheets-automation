@@ -125,7 +125,7 @@ class AiStatusItem(BaseModel):
     """Live, resolved (not just configured) provider + model for one AI call
     site — computed the same way the actual call routes, so this can never
     drift from reality the way a static label could."""
-    kind: str            # "extraction" | "validation" | "agent"
+    kind: str            # "extraction" | "agent"
     label: str
     provider: str         # "openai" | "vllm" | "deepseek"
     model: str

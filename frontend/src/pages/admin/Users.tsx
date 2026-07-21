@@ -27,8 +27,8 @@ function authModeLabel(mode: AuthModeT) {
 }
 
 function RoleBadge({ role }: { role: AuthRole }) {
-  if (role === "admin") return <Badge tone="violet"><Shield className="h-3 w-3" /> admin</Badge>;
-  if (role === "viewer") return <Badge tone="amber"><Eye className="h-3 w-3" /> viewer</Badge>;
+  if (role === "admin") return <Badge tone="brand"><Shield className="h-3 w-3" /> admin</Badge>;
+  if (role === "viewer") return <Badge tone="warning"><Eye className="h-3 w-3" /> viewer</Badge>;
   return <Badge tone="slate">user</Badge>;
 }
 
@@ -144,7 +144,7 @@ export default function AdminUsers() {
                     <span className="text-xs font-medium text-slate-600">{authModeLabel(u.auth_mode)}</span>
                   </td>
                   <td className="px-3 py-2.5">
-                    {u.is_active ? <Badge tone="green">active</Badge> : <Badge tone="rose">disabled</Badge>}
+                    {u.is_active ? <Badge tone="success">active</Badge> : <Badge tone="danger">disabled</Badge>}
                   </td>
                   <td className="px-3 py-2.5">
                     <div className="flex justify-end gap-1">

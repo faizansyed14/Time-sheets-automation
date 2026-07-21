@@ -53,7 +53,9 @@ def parse_eml(raw: bytes) -> dict[str, Any]:
 
     body_text = ""
     body_html = ""
-    inline_images: dict[str, str] = {}   # content-id → data URI
+    # content-id → data + metadata (sometimes providers set Content-Id on real
+    # attachments; we only treat it as inline if HTML actually references it)
+    inline_images: dict[str, dict[str, Any]] = {}
     attachments: list[dict[str, Any]] = []
 
     for part in msg.walk():
@@ -62,6 +64,7 @@ def parse_eml(raw: bytes) -> dict[str, Any]:
         cid = (part.get("Content-Id") or "").strip().strip("<>")
         is_attachment = "attachment" in disp
         is_multipart = ct.startswith("multipart/")
+        fn = part.get_filename() or ""
 
         if is_multipart:
             continue
@@ -70,13 +73,25 @@ def parse_eml(raw: bytes) -> dict[str, Any]:
             body_text = _decode_text(part)
         elif ct == "text/html" and not is_attachment and not body_html:
             body_html = _decode_text(part)
-        elif cid and ct.startswith("image/"):
+        # Content-Id images are usually inline (cid:...) but some providers
+        # also set Content-Id on real attachments. If disposition is
+        # attachment, keep it as an attachment so the UI can show it in
+        # "Attachments (N)".
+        elif cid and ct.startswith("image/") and not is_attachment:
             # Inline image (Content-Id present) — embed as data URI.
             data = part.get_payload(decode=True) or b""
             b64 = base64.b64encode(data).decode()
-            inline_images[cid] = f"data:{ct};base64,{b64}"
-        elif is_attachment:
-            fn = part.get_filename() or "attachment"
+            inline_images[cid] = {
+                "content_type": ct,
+                "data_b64": b64,
+                "data_uri": f"data:{ct};base64,{b64}",
+                "size": len(data),
+                "filename": fn or f"inline_{cid}.png",
+            }
+        # Some providers export real document images with a filename but without a
+        # reliable `Content-Disposition: attachment` value (sometimes `inline`,
+        # sometimes empty). For vault preview, prefer the filename + content-type.
+        elif is_attachment or (fn and not cid and ct.startswith("image/")):
             raw_att = part.get_payload(decode=True) or b""
             attachments.append({
                 "filename": fn,
@@ -86,9 +101,23 @@ def parse_eml(raw: bytes) -> dict[str, Any]:
             })
 
     # Replace cid: references in the HTML body so it renders self-contained.
-    if body_html and inline_images:
-        for cid_val, data_uri in inline_images.items():
-            body_html = body_html.replace(f"cid:{cid_val}", data_uri)
+    # If provider set Content-Id but HTML does not reference it, treat as a
+    # normal attachment so the UI still shows it.
+    if inline_images:
+        html = body_html or ""
+        for cid_val, info in inline_images.items():
+            ref = f"cid:{cid_val}"
+            if html and ref in html:
+                body_html = (body_html or "").replace(ref, info["data_uri"])
+            else:
+                # CID existed but HTML never used it => must be a real
+                # attachment mislabeled as inline.
+                attachments.append({
+                    "filename": info["filename"],
+                    "content_type": info["content_type"],
+                    "size": info["size"],
+                    "data_b64": info["data_b64"],
+                })
 
     return {
         "subject": subject,

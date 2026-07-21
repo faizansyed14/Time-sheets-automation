@@ -31,16 +31,17 @@ backend/app/
   models/                   auth_users, app_config, timesheet_records, pipeline_files, …
   schemas/                  pydantic request/response models
   seed/                     default admin + demo data
-  migrations/               idempotent startup upgrade (Alembic for real prod)
   services/
     auth/                   passwords, otp, captcha, rate_limit, email_otp
     config/                 runtime config overlay (admin-editable AI settings)
     employee/               Excel matcher import
-    extraction/             mock + vision engines, parser, validation, file rendering
+    extraction/             mock engine, vision client, parser, validation, file rendering
     llm/                    LangChain provider factory
-    pipeline/               ingestion + employee matching   (the extraction pipeline)
+    agents/                 full_email_extract + agentic chat
+    pipeline/               ingestion + employee matching
     storage_provider/       local · s3 · onedrive + archive (zip)
     tasks.py                Celery task registry
+backend/alembic/            schema migrations
 backend/tests/              end-to-end pytest suite (auth, admin, infra, pipeline, s3)
 ```
 
@@ -57,7 +58,7 @@ saved until you accept.
     (in the browser)                (subject, body, every attachment, and any
                                      forwarded emails inside it)
 
- 2. The .eml is opened up         →  each attachment is turned into page images
+ 2. The .eml is opened up         →  each attachment becomes ONE stitched JPEG
     ON THE SERVER                    + its text; the email body becomes an image
     (nothing sent anywhere yet)      too. These are the "sheets".
 
@@ -117,9 +118,9 @@ Only the vision reads in step 4 — **nothing else calls the AI**:
 - If the AI is unavailable, each sheet falls back to a local, no-AI reader so
   the button still works.
 
-(The per-file upload path and the agentic chat are separate features that *do*
-make their own validation/summary AI calls — but the Extract Email button does
-not.)
+(Upload and chat-upload share the **same** vision extraction pipeline. Agentic
+chat is a separate text model with tools. Neither uses a second validation LLM —
+summaries/flags stay in `validation.py`.)
 
 ### Key guarantees
 
@@ -163,10 +164,11 @@ Default admin (`admin`/`admin`) is seeded from `.env` and configurable.
 ## Admin panel
 - **Users & access** (`/admin/users`): create users, assign OTP emails, switch a
   user between **OTP** and **CAPTCHA**, enable/disable, set roles.
-- **AI Settings** (`/admin/settings`): edit prompts, choose provider
-  (OpenAI / DeepSeek / …) + API keys, and the controls `EXTRACTION_ENGINE`,
-  `VISION_IMAGE_DETAIL`, `VALIDATION_MODEL`, `ENABLE_TEXT_VALIDATION`. **Update &
-  Test** from the UI; changes apply **live** (overlaid on `.env`, no redeploy).
+- **AI Settings** (`/admin/settings`): pick provider per service (vision /
+  agentic chat) and edit the extraction system prompt. Models, keys and URLs
+  live in `.env` only (`VISION_PROVIDER`, `OPENAI_VISION_MODEL` /
+  `VLLM_MODEL`, `AGENT_CHAT_MODEL`, …). Changes to providers/prompts apply
+  live from the UI; model/key changes need a backend restart.
 - Stored in a dedicated, isolated **`app_config`** table; secret values
   (API keys) are **encrypted at rest** (`core/crypto.py`) and masked in the API.
 

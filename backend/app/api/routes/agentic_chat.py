@@ -1,12 +1,15 @@
 """Agentic chat routes — a timesheet-scoped assistant (text → safe DB actions)."""
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import datacache
 from app.core.http_headers import content_disposition
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.schemas import ChatRequest, ChatResponse, ChatSuggestions, UploadResult
 from app.services.agents import chat_agent, upload_cache
 from app.services.agents.extract_service import extract_from_upload
@@ -30,11 +33,36 @@ async def suggestions(db: AsyncSession = Depends(get_db)):
 
 @router.post("", response_model=ChatResponse)
 async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
-    """Run one assistant turn. The agent may call read/edit tools, ask a
-    clarifying question, or refuse off-topic requests."""
+    """Run one assistant turn (non-streaming). The agent may call read/edit
+    tools, ask a clarifying question, or refuse off-topic requests."""
     history = [{"role": m.role, "content": m.content} for m in body.messages]
     result = await chat_agent.run_chat(db, history, extractions=body.extractions)
     return ChatResponse(**result)
+
+
+@router.post("/stream")
+async def chat_stream(body: ChatRequest):
+    """Streaming turn (Server-Sent Events). Emits token / tool-activity / card /
+    suggestion / done events so the UI shows the answer and the agent's work
+    live. Owns its own DB session for the whole stream lifetime."""
+    history = [{"role": m.role, "content": m.content} for m in body.messages]
+    extractions = body.extractions
+
+    async def _gen():
+        # A fresh session bound to the stream (the request-scoped one closes when
+        # the handler returns, before the generator finishes).
+        async with SessionLocal() as db:
+            try:
+                async for ev in chat_agent.run_chat_stream(db, history, extractions):
+                    yield f"data: {json.dumps(ev, default=str)}\n\n"
+            except Exception as e:  # never leave the stream hanging
+                yield f"data: {json.dumps({'type': 'done', 'error': str(e)[:200]})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",   # disable nginx proxy buffering for SSE
+    })
 
 
 # Accepted upload types for chat extraction.

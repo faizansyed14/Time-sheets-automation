@@ -50,15 +50,9 @@ import { useToast } from "./toast";
 // ---------------------------------------------------------------------------
 // Leave bucket definitions
 // ---------------------------------------------------------------------------
-const BUCKETS = [
-  { key: "annual",         label: "Annual leave",   tone: "bg-indigo-50 text-indigo-700 ring-indigo-200" },
-  { key: "remote",         label: "Remote / WFH",   tone: "bg-sky-50 text-sky-700 ring-sky-200" },
-  { key: "sick",           label: "Sick leave",     tone: "bg-rose-50 text-rose-700 ring-rose-200" },
-  { key: "maternity",      label: "Maternity leave", tone: "bg-fuchsia-50 text-fuchsia-700 ring-fuchsia-200" },
-  { key: "unpaid",         label: "Unpaid leave",   tone: "bg-slate-100 text-slate-700 ring-slate-200" },
-  { key: "absent",         label: "Absent",         tone: "bg-amber-50 text-amber-700 ring-amber-200" },
-  { key: "public_holiday", label: "Public holiday", tone: "bg-emerald-50 text-emerald-700 ring-emerald-200" },
-] as const;
+import { leaveBucketDefs } from "../lib/theme";
+
+const BUCKETS = leaveBucketDefs() as readonly { key: string; label: string; tone: string }[];
 
 const FILE_RE = /\.(pdf|docx|xlsx|png|jpe?g|eml)$/i;
 

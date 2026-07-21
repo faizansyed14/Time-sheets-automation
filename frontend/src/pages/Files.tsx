@@ -21,6 +21,7 @@ import {
   deleteVaultFile,
   downloadScopedZipUrl,
   fileContentUrl,
+  fileRenderUrl,
   listFileEmployees,
   listFileItems,
   listFileManagers,
@@ -322,6 +323,7 @@ export default function FilesPage() {
                       url: fileContentUrl(f.rel_path),
                       filename: f.name,
                       contentType: f.content_type,
+                      renderUrl: fileRenderUrl(f.rel_path),
                     };
                     return (
                       <div key={f.rel_path} className="flex items-center gap-1">

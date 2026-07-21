@@ -5,8 +5,9 @@ heuristic pre-filtering deciding what gets analysed.
 
   email ──► full .eml (native MIME — every attachment, forwarded emails and
             THEIR attachments, nothing missing)
-        ──► EVERY attachment inside + the email body is rendered to page
-            images (plus the file's own text, when it has one, as grounding)
+        ──► EVERY attachment inside + the email body is rendered to ONE
+            stitched JPEG each (plus the file's own text, when it has one,
+            as grounding)
         ──► vision model, up to 2 sheets per call (batched, fewer when a
             provider's per-prompt image cap requires it — a heavy sheet
             never gets truncated, it just gets its own call), ONE clean
@@ -56,7 +57,6 @@ from app.models.email_message import EmailMessage
 from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
 
 _BATCH_SIZE = 2            # sheets per vision call (batching requirement)
-_MAX_PAGES_PER_SHEET = 4   # page images sent per sheet
 _MAX_SHEETS = 12           # hard cap of sheets analysed per email
 _TAG_PREFIX = "__email_extract__"
 
@@ -80,7 +80,7 @@ _POS_APPROVAL_RE = re.compile(
     r"looks\s+good|lgtm|sign(?:ed)?\s*[- ]?off)\b", re.I)
 
 _SYSTEM_PROMPT = """You read documents from ONE email sent to an HR timesheet portal.
-You receive one or more sheets as page images, and — when a file has one — its exact extracted text.
+You receive one or more sheets as images (one stitched JPEG per document), and — when a file has one — its exact extracted text.
 
 For EVERY sheet, independently, report:
 
@@ -127,16 +127,31 @@ approval_evidence — fill this ONLY when a manager has ALREADY approved the
   A rejection ("not approved", "rejected") is NOT approval — leave it "".
   When in doubt, treat it as NOT approved and leave it "".
 
+Sheet names are just labels, not evidence — "body_timesheet.png" is a generic
+  placeholder WE assign to any unlabeled inline image pasted in the body (it could
+  be a genuine pasted grid, or just a signature logo/banner); judge kind purely
+  from what the image actually shows, never from its name.
+
 Special case — the sheet named "(email body)" is the message text itself:
-  it IS a timesheet when a day-by-day attendance grid is pasted anywhere in the text —
-  including inside a quoted or forwarded email lower in the thread (very common: the
-  employee pastes the grid with IN/OUT hours, the manager replies "Approved" on top —
-  read the grid rows for identity, period and leave; rows marked Holiday/Leave/Sick
-  are leave dates, worked days and weekend rows are not). It is "other" ONLY when the
-  text merely refers to an ATTACHED file and contains no grid itself. Record wording
-  in approval_evidence ONLY if it GRANTS approval (e.g. the manager replies "Approved"
-  on top of the thread); an employee ASKING for approval ("please approve", "need your
-  approval") is NOT approval and must leave approval_evidence "".
+  it IS a timesheet ONLY when an actual day-by-day attendance/leave grid — several
+  rows each naming a date (or a date range) — is pasted as TEXT somewhere in the
+  thread (including quoted/forwarded text below a manager's "Approved." reply).
+  When the grid is a PASTED IMAGE instead (a separate sheet like body_timesheet.png
+  or image001.png), read identity, period and leave dates from THAT image sheet — the
+  body sheet is then "other" (approval wording only) or a text-only cover note; do
+  NOT also mark the body sheet "timesheet".
+  Body is "other" (not "timesheet") when it is ordinary correspondence: a request,
+  a cover note, a forwarded thread, or a manager's "Approved." — even when it
+  mentions the word "timesheet", names an employee/ID, states a month/year, or
+  quotes a Subject line like "TIMESHEET for June 2026 | Name | E12345" — UNLESS
+  actual per-day rows/dates are visibly listed. Mentioning a period or an ID is
+  NOT a grid.
+  Record approval_evidence ONLY when wording GRANTS approval (e.g. manager "Approved.");
+  employee requests ("please approve") are NOT approval — leave approval_evidence "".
+  A body with approval wording but no grid is kind "other" (or "approval" only if it
+  is itself an approval screenshot/note) — never "timesheet" — and carries no
+  month/year/employee/leave-date values (leave them null/empty); approval_evidence
+  still records the granting words on that sheet.
 
 Never invent values — when unsure, use null / empty. Reply with ONLY the requested JSON."""
 
@@ -178,14 +193,13 @@ class SheetUnit:
 #    so Upload / chat / selected-attachments behave exactly like Extract Email.
 # --------------------------------------------------------------------------- #
 def _unit_from_bytes(name: str, ftype: str, payload: bytes) -> SheetUnit | None:
-    """One document → one analysable unit: page images (capped), the digital
-    text layer, and an OCR fallback for scans/photos so the model is always
-    grounded by text when any can be produced."""
+    """One document → one stitched JPEG + digital text (OCR fallback for scans)."""
     from app.services.extraction import ocr
     from app.services.extraction.file_processor import extract_document_text, to_images
 
     try:
-        images = to_images(ftype, payload)[:_MAX_PAGES_PER_SHEET]
+        # Always one image per sheet (multi-page PDFs are stitched upstream).
+        images = (to_images(ftype, payload) or [])[:1]
     except Exception:
         images = []
     text = ""
@@ -203,35 +217,70 @@ def _unit_from_bytes(name: str, ftype: str, payload: bytes) -> SheetUnit | None:
     return None
 
 
-def _body_unit(subject: str | None, body_text: str | None) -> SheetUnit | None:
-    """The email body rendered as its own sheet (pasted grids are common)."""
-    from app.services.extraction.file_processor import email_body_to_images
+def _body_unit(
+    eml_bytes: bytes,
+    subject: str | None,
+    body_text: str | None,
+) -> SheetUnit | None:
+    """The email body as its own sheet — HTML with inline CID images when present.
+
+    Uses the full .eml so pasted attendance screenshots in the body render into
+    the JPEG (not plain-text-only). Prompt text is scrubbed — never raw footers.
+    """
+    from app.core.pii import scrub_email_for_llm
+    from app.services.extraction.file_processor import (
+        _extract_eml_body_text,
+        email_body_to_images,
+        eml_body_to_images,
+    )
 
     body = (body_text or "").strip()
-    if not body:
+    if not body and not eml_bytes:
         return None
+    _subj, scrubbed_body = scrub_email_for_llm(subject, body_text)
+    if eml_bytes:
+        try:
+            eml_plain = _extract_eml_body_text(eml_bytes)
+            if eml_plain.strip():
+                _subj, scrubbed_from_eml = scrub_email_for_llm(subject, eml_plain)
+                if len(scrubbed_from_eml.strip()) >= len(scrubbed_body.strip()):
+                    scrubbed_body = scrubbed_from_eml
+        except Exception:
+            pass
     try:
-        imgs = email_body_to_images(subject, body_text)
+        if eml_bytes:
+            imgs = (eml_body_to_images(eml_bytes) or [])[:1]
+            if not imgs and body:
+                imgs = (email_body_to_images(subject, body_text) or [])[:1]
+        elif body:
+            imgs = (email_body_to_images(subject, body_text) or [])[:1]
+        else:
+            imgs = []
     except Exception:
         imgs = []
     if imgs:
         return SheetUnit("(email body)", "image", imgs[0],
-                         imgs[:_MAX_PAGES_PER_SHEET], body[:12000])
+                         imgs, scrubbed_body[:12000])
     return None
 
 
 def _collect_units(email, eml_bytes: bytes) -> list[SheetUnit]:
     """EVERY document inside the .eml (attachments, forwarded emails and their
-    attachments) plus the email body — no heuristic filtering; the vision
-    model decides what each sheet is."""
+    attachments) plus the email body — the vision model decides what each
+    sheet is. The ONE exception: images under MIN_IMAGE_ATTACHMENT_KB are
+    skipped — those are signature logos/icons in practice, and each one would
+    cost a vision call. Documents of any size always flow."""
     from app.services.extraction.file_processor import eml_all_attachments
 
+    min_img = settings.min_image_attachment_kb * 1024
     units: list[SheetUnit] = []
     for name, payload, ftype in eml_all_attachments(eml_bytes)[:_MAX_SHEETS]:
+        if ftype == "image" and 0 < len(payload or b"") < min_img:
+            continue
         u = _unit_from_bytes(name, ftype, payload)
         if u:
             units.append(u)
-    bu = _body_unit(email.subject, email.body_text)
+    bu = _body_unit(eml_bytes, email.subject, email.body_text)
     if bu:
         units.append(bu)
     return units
@@ -327,10 +376,18 @@ _SUBJECT_TS_RE = re.compile(
 )
 
 
+# Placeholder names WE invent for anonymous inline images/attachments that
+# carried no real filename (see eml_attachment_save_name) — these carry no
+# genuine signal, so "body_timesheet.png" must NEVER force kind=timesheet
+# just because we happened to pick that word for an unlabeled sheet. Only the
+# vision model (or the deterministic engine reading actual content) may decide.
+_SYNTHETIC_SHEET_NAME_RE = re.compile(r"(?i)^(?:body_timesheet\.png|extracted_timesheet\.\w+)$")
+
+
 def _infer_from_filename(filename: str, subject: str | None = None) -> dict:
     """Best-effort kind / identity / period from attachment name (+ subject)."""
     name = (filename or "").strip()
-    if not name or name == "(email body)":
+    if not name or name == "(email body)" or _SYNTHETIC_SHEET_NAME_RE.match(name):
         return {}
     low = name.lower()
     out: dict = {}
@@ -388,6 +445,41 @@ def _boost_sheet_from_hints(sheet: dict, unit: SheetUnit, subject: str | None) -
     return out
 
 
+def _sanitize_body_sheet(sheet: dict, unit: SheetUnit) -> dict:
+    """Stop quoted Subject lines / logos / approval replies from staging as
+    empty timesheets.
+
+    Applies only to sheets with NO real name to trust — the body text itself,
+    or a placeholder we invented for an unlabeled inline image/attachment
+    (e.g. "body_timesheet.png" — could just as easily be a signature logo).
+    A REAL attachment filename (e.g. "June_Timesheet.pdf") is trusted even
+    when it reads as a clean/empty grid — that is legitimate zero-leave data.
+    For ambiguous/unlabeled sheets, kind=timesheet only sticks when leave
+    dates or an actual text grid back it up; otherwise it demotes to "other"
+    so a logo/signature/quoted-subject-line can't stage as a blank record.
+    """
+    if (unit.name != "(email body)" and not _SYNTHETIC_SHEET_NAME_RE.match(unit.name)) \
+            or sheet.get("kind") != "timesheet":
+        return sheet
+    buckets = sheet.get("buckets") or {}
+    if any(buckets.get(b) for b in _BUCKETS):
+        return sheet
+    from app.services.extraction.file_processor import find_dates_in_text, scan_attendance_grid
+
+    present, _ = scan_attendance_grid(unit.text or "")
+    if len(present) >= 5:
+        return sheet
+    if len(find_dates_in_text(unit.text or "")) >= 5:
+        return sheet
+    out = dict(sheet)
+    out["kind"] = "other"
+    out["month"] = None
+    out["year"] = None
+    out["employee_name"] = None
+    out["employee_id"] = None
+    return out
+
+
 def _normalize_sheet(unit: SheetUnit, raw: dict) -> dict:
     kind = str(raw.get("kind") or "other").lower()
     if kind not in ("timesheet", "leave_certificate", "approval", "other"):
@@ -425,7 +517,14 @@ async def _engine_sheet(unit: SheetUnit) -> dict:
         "absent": ext.absent_dates or [], "public_holiday": ext.public_holiday_dates or [],
     }
     has_period = bool(1 <= (ext.month or 0) <= 12 and (ext.year or 0) >= 2000)
-    has_data = any(buckets.values()) or has_period or ext.employee_id or ext.employee_name
+    has_leave_data = any(buckets.values())
+    if unit.name == "(email body)":
+        # The body is prose/quoted thread, not a document template — a period,
+        # name or ID here is usually just a quoted Subject line, not a real
+        # grid. Only actual leave dates justify "timesheet" for this sheet.
+        has_data = has_leave_data
+    else:
+        has_data = has_leave_data or has_period or ext.employee_id or ext.employee_name
     return _normalize_sheet(unit, {
         "kind": "timesheet" if has_data else "other",
         "employee_name": ext.employee_name, "employee_id": ext.employee_id,
@@ -439,21 +538,23 @@ def _batch_prompt(email: EmailMessage, batch: list[SheetUnit]) -> str:
     # No sender line: the prompt forbids using the address as identity, and
     # sender matching runs locally after the model call — so it never needs to
     # reach the provider at all. The subject stays (it often names the employee
-    # and period); any address/phone in it is scrubbed at the client boundary.
+    # and period); scrub_email_for_llm strips addresses/secrets from it here
+    # and vision_client.scrub_text runs again at the HTTP boundary.
+    from app.core.pii import scrub_email_for_llm
+
+    subject, _ = scrub_email_for_llm(email.subject, "")
     lines = [
-        f"EMAIL SUBJECT: {email.subject or ''}",
+        f"EMAIL SUBJECT: {subject}",
         "",
-        f"This batch contains {len(batch)} sheet(s), as page images in order:",
+        f"This batch contains {len(batch)} sheet(s), each as ONE stitched image:",
     ]
     img_no = 1
     for i, u in enumerate(batch, 1):
-        n = len(u.images)
-        if n == 0:
+        if not u.images:
             lines.append(f'  SHEET {i} "{u.name}" -> no image; read its exact text below')
             continue
-        rng = f"image {img_no}" if n == 1 else f"images {img_no}-{img_no + n - 1}"
-        lines.append(f'  SHEET {i} "{u.name}" -> {rng}')
-        img_no += n
+        lines.append(f'  SHEET {i} "{u.name}" -> image {img_no}')
+        img_no += 1
     lines.append(
         "\nAnalyse every sheet and reply with ONLY this JSON object "
         "(one entry per sheet, in the same order):\n"
@@ -475,9 +576,11 @@ def _batch_prompt(email: EmailMessage, batch: list[SheetUnit]) -> str:
         "}")
     for i, u in enumerate(batch, 1):
         if u.text:
+            from app.core.pii import scrub_text
+            sheet_text = scrub_text(u.text)[:8000]
             lines.append(
                 f'\n--- EXACT TEXT OF SHEET {i} "{u.name}" (extracted from the file; '
-                "trust it over the image for names, IDs and dates) ---\n" + u.text[:8000])
+                "trust it over the image for names, IDs and dates) ---\n" + sheet_text)
     return "\n".join(lines)
 
 
@@ -578,7 +681,10 @@ async def _analyse_units(email: EmailMessage, units: list[SheetUnit]) -> tuple[l
         "errors": errors[:4],
     }
     boosted = [
-        _boost_sheet_from_hints(sheets[i], units[i], email.subject)
+        _sanitize_body_sheet(
+            _boost_sheet_from_hints(sheets[i], units[i], email.subject),
+            units[i],
+        )
         for i in range(len(units))
         if sheets[i] is not None
     ]
@@ -898,7 +1004,8 @@ def _staged_message(groups: list[dict], approval: dict) -> str:
 
 
 async def _selected_units(email: EmailMessage, attachment_ids: list[str],
-                          extract_body: bool) -> list[SheetUnit]:
+                          extract_body: bool,
+                          eml_bytes: bytes = b"") -> list[SheetUnit]:
     """Units for ONLY the selected attachments (and optionally the body) —
     the 'process just these sheets' variant of Extract Email."""
     from app.services.email_provider import get_email_provider
@@ -906,6 +1013,7 @@ async def _selected_units(email: EmailMessage, attachment_ids: list[str],
     provider = get_email_provider()
     from app.services.extraction.file_processor import detect_file_type
 
+    min_img = settings.min_image_attachment_kb * 1024
     units: list[SheetUnit] = []
     for aid in attachment_ids[:_MAX_SHEETS]:
         try:
@@ -918,11 +1026,15 @@ async def _selected_units(email: EmailMessage, attachment_ids: list[str],
         ftype = detect_file_type(fn or "", data)
         if not ftype:
             continue
+        # Same rule as `_collect_units`: never spend a vision call on a
+        # sub-threshold image (logo/icon). Documents of any size still flow.
+        if ftype == "image" and 0 < len(data) < min_img:
+            continue
         u = _unit_from_bytes(fn or aid, ftype, data)
         if u:
             units.append(u)
     if extract_body:
-        bu = _body_unit(email.subject, email.body_text)
+        bu = _body_unit(eml_bytes, email.subject, email.body_text)
         if bu:
             units.append(bu)
     return units
@@ -941,7 +1053,7 @@ async def extract_full_email(
 
     selected = attachment_ids is not None
     eml_bytes, eml_name = await build_full_eml(get_email_provider(), email)
-    units = (await _selected_units(email, attachment_ids, extract_body)
+    units = (await _selected_units(email, attachment_ids, extract_body, eml_bytes)
              if selected else _collect_units(email, eml_bytes))
     if not units:
         message = ("No readable sheets in the selection." if selected
@@ -1043,3 +1155,86 @@ async def extract_upload(
         groups=groups, approval=approval, run_meta=res["run_meta"])
     return _result(staged, groups, sheets, approval,
                    _staged_message(groups, approval))
+
+
+async def preview_llm_egress(
+    email: EmailMessage,
+    *,
+    attachment_ids: list[str] | None = None,
+    extract_body: bool = False,
+) -> dict:
+    """What Extract Email would send to the vision model AFTER PII redaction.
+
+    Used by the Inbox "EML sent to LLM" preview — operators can audit
+    subject/body/prompt text AND the exact stitched JPEGs (base64) that would
+    be attached to the vision call. Body images are rendered after PII scrub.
+    """
+    import base64
+
+    from app.core.config import settings as _settings
+    from app.core.pii import scrub_email_for_llm, scrub_text
+    from app.services.email_provider import get_email_provider
+    from app.services.inbox.eml_export import build_full_eml
+
+    selected = attachment_ids is not None
+    eml_bytes, _ = await build_full_eml(get_email_provider(), email)
+    units = (await _selected_units(email, attachment_ids, extract_body, eml_bytes)
+             if selected else _collect_units(email, eml_bytes))
+
+    subj_sent, body_sent = scrub_email_for_llm(email.subject, email.body_text)
+    sheets_out: list[dict] = []
+    for u in units:
+        is_body = u.name == "(email body)"
+        # First (only) stitched JPEG that would go on the vision call.
+        img_b64 = ""
+        if u.images:
+            img_b64 = base64.b64encode(u.images[0]).decode("ascii")
+        sheets_out.append({
+            "name": u.name,
+            "file_type": u.ftype,
+            "image_pages": min(1, len(u.images or [])),
+            "image_jpeg_b64": img_b64,
+            "text_sent": (u.text or "")[:12000],
+            "note": (
+                "Email body sheet — addresses, phones, secrets and signature "
+                "footers are redacted BEFORE this JPEG is rendered and before "
+                "prompt text. This is the exact image OpenAI would see."
+                if is_body else
+                "One stitched JPEG of the full attachment (same bytes as the "
+                "vision call). Emp name/ID on timesheet sheets are intentional; "
+                "emails/phones in extracted text are scrubbed in the prompt."
+            ),
+        })
+
+    sample_prompt = ""
+    if units:
+        sample_prompt = scrub_text(_batch_prompt(email, units[:_BATCH_SIZE]))
+
+    return {
+        "pii_redaction": bool(_settings.pii_redaction),
+        "scope": "selection" if selected else "full_email",
+        "subject_sent": subj_sent,
+        "body_sent": body_sent[:20000],
+        "sender_omitted": True,
+        "sheets": sheets_out,
+        "sample_prompt": sample_prompt[:24000],
+        "system_prompt_note": "System prompt is scrubbed at the HTTP boundary; "
+                             "it contains no mailbox addresses by default.",
+        "omitted": [
+            "Raw From / To / Cc header values (replaced with [header-redacted])",
+            "Email addresses → person-******@redacted.invalid",
+            "Phones (international / labelled T:/M:) → [phone-redacted]",
+            "Password / secret lines → [secret-redacted]",
+            "Signature block after Thanks / Regards → [signature-redacted]",
+            "Quoted reply history (From:/Sent: thread) → [quoted-thread-redacted]",
+            "Contact cards after EMPLOYEE/MANAGER SIGNATURE → cut",
+            "CID signature logos & wide marketing banners (not inlined into JPEG)",
+            "Sender email (matched locally after the model call)",
+            "Raw .eml bytes (never uploaded; only 1 stitched image per sheet + text)",
+        ],
+        "policy": (
+            "Emp name and employee ID printed on timesheet PDFs/DOCX are "
+            "allowed. Mailbox addresses, phones, credentials and signature "
+            "footers must not appear in subject/body/prompt text."
+        ),
+    }

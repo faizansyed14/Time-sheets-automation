@@ -194,23 +194,19 @@ Everything below is config-only; **no caller code changes**.
    (uncomment `msal` + `httpx` in requirements.txt)
 
 ### Activate your real LLM (already ported in)
-Your prompts, vision client, and file conversion are ported into
-`app/services/extraction/` (`parser.py`, `vision_client.py`, `file_processor.py`,
-`vision_engine.py`). To turn them on:
+Your prompts, vision client, and file conversion live in
+`app/services/extraction/` (`parser.py`, `vision_client.py`, `file_processor.py`)
+and the shared pipeline in `app/services/agents/full_email_extract.py`. To turn them on:
 ```
 EXTRACTION_ENGINE=vision
 OPENAI_API_KEY=sk-...
-EXTRACTION_MODEL=gpt-4o        # or gpt-4.1 / gpt-5.4
-VALIDATION_MODEL=gpt-4o-mini
+OPENAI_VISION_MODEL=gpt-4o        # or gpt-4.1 / gpt-5.4
 ```
-The engine renders the file to images (PDF via PyMuPDF; DOCX/XLSX via LibreOffice
-`soffice` if installed, else a text render), sends `SYSTEM_PROMPT` + `EXTRACTION_PROMPT`
-to your vision model (OpenAI file_id path for PDF/DOCX/XLSX, base64 images otherwise),
-parses the JSON, runs deterministic validation plus the optional gpt-4o-mini text
-cross-check, and reads the approval screenshot with a small vision call.
-*If you want byte-identical behaviour, paste your current `parser.py` /
-`vision_client.py` / `file_processor.py` over the ported copies — the engine calls the
-same function names.*
+The engine renders each document to ONE stitched JPEG (PDF via PyMuPDF;
+DOCX/XLSX via LibreOffice `soffice` if installed, else a text render), sends
+the extraction system prompt + per-batch request to your vision model, parses
+the JSON, then runs **deterministic** leave/date validation + summary
+(`validation.py` — no second LLM).
 
 ### Use your Postgres
 ```
@@ -223,10 +219,10 @@ The schema uses JSON columns + string PKs on PostgreSQL (asyncpg); point DATABAS
 For production use Alembic migrations instead of `create_all`.
 
 ### Other production notes
-- Add auth (the original app used JWT + a bootstrap admin) before exposing this.
-- For large mailboxes, move ingestion to a Celery worker and use Graph **delta**
-  queries so each poll pulls only new mail.
-- Storage swaps to S3/MinIO by changing `services/storage.py` only.
+- Auth is built in (JWT + OTP / CAPTCHA / RBAC) — configure before exposing publicly.
+- For large mailboxes, ingestion already runs via Celery; Graph **delta** sync
+  pulls only new mail between polls.
+- Storage swaps to S3/MinIO via `STORAGE_PROVIDER=s3` and `services/storage_provider/`.
 
 ---
 
