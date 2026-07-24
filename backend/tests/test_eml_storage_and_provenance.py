@@ -63,8 +63,8 @@ def _eml_with_pdf_and_inline_logo(
     pdf_bytes: bytes, attachment_name: str, subject: str,
 ) -> bytes:
     """A real timesheet PDF attachment PLUS a large inline CID logo in the
-    HTML body (signature banner) — the logo must reach the vision model but
-    must NOT be filed into the vault as its own document."""
+    HTML body (signature banner) — the logo must NOT reach OpenAI and must
+    NOT be filed into the vault as its own document."""
     import io
     import random
 
@@ -103,10 +103,7 @@ def _eml_with_pdf_and_inline_logo(
 
 
 async def test_inline_signature_logo_not_filed_to_vault(client, admin_token):
-    """The .eml's inline signature logo reaches extraction (as a sheet the
-    vision/mock model can classify) but must NOT be saved as its own file in
-    the vault — only the .eml itself is filed (the real PDF attachment is
-    not filed separately either; it already lives inside the .eml)."""
+    """Inline signature logo must not be filed to the vault — only the .eml."""
     h = auth_headers(admin_token)
     emp = await client.post("/api/v1/employee-matcher", headers=h,
                             json={"employee_id": "E9911001", "name": "Logo Test Person",
@@ -148,6 +145,62 @@ async def test_inline_signature_logo_not_filed_to_vault(client, admin_token):
     assert "body_timesheet.png" not in files, (
         f"synthetic placeholder for the inline logo must not be filed: {files}")
     assert "image001.png" not in files, f"inline logo must not be filed separately: {files}"
+
+
+def test_inline_logo_never_collected_for_openai():
+    """PDF + large generic CID image → only the PDF becomes an extract unit."""
+    from app.models.email_message import EmailMessage
+    from app.services.extract_email.collector import collect_units
+    from app.services.extraction import file_processor as fp
+
+    pdf = _timesheet_pdf("Logo Test Person", "E9911001", "May 2026")
+    eml = _eml_with_pdf_and_inline_logo(pdf, "sheet.pdf", "TIMESHEET May 2026")
+    atts = fp.eml_all_attachments(eml)
+    assert all(ft != "image" for _, _, ft in atts), atts
+    assert any(ft == "pdf" for _, _, ft in atts)
+
+    mail = EmailMessage(
+        provider_message_id="LOGO-STRIP-1",
+        sender_name="Client",
+        sender_email="c@example.com",
+        subject="TIMESHEET May 2026",
+        body_text="Please find attached.",
+        attachments=[],
+    )
+    units = collect_units(mail, eml)
+    assert not any(u.ftype == "image" and u.name != "(email body)" for u in units), [
+        (u.name, u.ftype) for u in units
+    ]
+
+
+def test_named_logo_attachment_never_collected():
+    """Filename containing 'logo' / 'footer' is dropped even as disposition=attachment."""
+    import io
+    import random
+    from email.message import EmailMessage
+    from PIL import Image
+
+    from app.services.extraction import file_processor as fp
+
+    random.seed(3)
+    img = Image.new("RGB", (600, 600))
+    img.putdata([
+        (random.randrange(256), random.randrange(256), random.randrange(256))
+        for _ in range(600 * 600)
+    ])
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    logo = buf.getvalue()
+
+    msg = EmailMessage()
+    msg["Subject"] = "Hi"
+    msg.set_content("see logo")
+    msg.add_attachment(logo, maintype="image", subtype="png",
+                       filename="alpha_data_footer_gradient1.png")
+    eml = msg.as_bytes()
+    assert fp.eml_all_attachments(eml) == []
+    assert fp.is_decorative_image("alpha_data_footer_gradient1.png", logo) is True
+    assert fp.is_decorative_image("company_logo.png", logo) is True
 
 
 def _vault_files() -> list[str]:

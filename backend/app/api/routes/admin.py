@@ -8,12 +8,8 @@ Users:
   POST   /admin/users/{id}/auth-mode switch OTP <-> CAPTCHA
   DELETE /admin/users/{id}
 
-Config (prompts, AI provider + keys, model controls):
-  GET    /admin/config               current values (secrets masked)
-  PUT    /admin/config               update a batch of values
-  GET    /admin/config/reveal/{key}  plaintext of one secret (password re-check)
-  POST   /admin/config/test          live-test the configured provider
-  GET    /admin/config/prompts/defaults  built-in prompt text (to pre-fill the editor)
+Config (read-only status from .env):
+  GET    /admin/config/status        resolved models + key status
 """
 from __future__ import annotations
 
@@ -29,16 +25,10 @@ from app.schemas.auth import (
     AdminUserCreate,
     AdminUserUpdate,
     AiStatusItem,
-    ConfigItem,
-    ConfigUpdate,
-    ProviderTestIn,
-    ProviderTestResult,
     TotpSetupOut,
     UserOut,
 )
 from app.services.auth import totp as totp_svc
-from app.services.config import service as config_service
-from app.services.llm import provider as llm_provider
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -183,109 +173,55 @@ async def delete_user(user_id: str, admin: User = Depends(require_admin), db: As
     return {"deleted": user_id}
 
 
-# ----------------------------- config -----------------------------
-@router.get("/config", response_model=list[ConfigItem])
-async def get_config(db: AsyncSession = Depends(get_db)):
-    return [ConfigItem(**c) for c in await config_service.public_view(db)]
-
-
-@router.put("/config", response_model=list[ConfigItem])
-async def update_config(body: ConfigUpdate, admin: User = Depends(require_admin),
-                        db: AsyncSession = Depends(get_db)):
-    # Only the per-service provider switch and prompt overrides are writable
-    # over the API; keys, URLs and models are .env-only by design.
-    bad = [k for k in body.values if k not in config_service.UI_EDITABLE_KEYS]
-    if bad:
-        raise HTTPException(400, f"Not editable via the API (set in .env): {bad}")
-    await config_service.set_settings(db, body.values, updated_by=admin.username)
-    return [ConfigItem(**c) for c in await config_service.public_view(db)]
-
-
-@router.post("/config/test", response_model=ProviderTestResult)
-async def test_config(body: ProviderTestIn, db: AsyncSession = Depends(get_db)):
-    res = await llm_provider.test_provider(db, body.provider, body.prompt)
-    return ProviderTestResult(**res)
-
-
+# ----------------------------- config (read-only — .env is source of truth) -----
 @router.get("/config/status", response_model=list[AiStatusItem])
 async def config_status(db: AsyncSession = Depends(get_db)):
-    """The ACTUAL resolved provider + model for every AI call site, read the
-    same way each call routes — each service picks its own provider, and the
-    endpoint + key come from that provider."""
-    overlay = await config_service.get_overlay(db)
-
-    def _key_configured(provider: str) -> bool:
-        key = ((overlay.get("openai_api_key") if provider == "openai"
-                else overlay.get("vllm_api_key") if provider == "vllm"
-                else overlay.get("deepseek_api_key")) or "").strip().lower()
-        return bool(key) and key not in ("change-me", "missing")
-
+    """Resolved OpenAI models and key status from .env (read-only)."""
+    del db
+    from app.core.config import settings
     from app.services.extraction.vision_client import model_for
 
-    def _item(kind: str, label: str, provider_key: str, purpose: str,
-              note: str | None = None, model: str | None = None) -> AiStatusItem:
-        provider = str(overlay.get(provider_key) or "openai").lower()
-        # The model FOLLOWS the provider (model_for) — showing a global model
-        # here once masked a real bug: OpenAI being sent a vLLM model name.
-        return AiStatusItem(kind=kind, label=label, provider=provider,
-                            model=model if model is not None else model_for(provider, purpose),
-                            has_key=_key_configured(provider), note=note)
-
-    agent_provider = str(overlay.get("ai_provider") or "openai").lower()
-    agent_note = None
-    if agent_provider != "openai":
-        agent_note = ("Agentic chat needs OpenAI-style tool calling; self-hosted "
-                      "servers must run with --enable-auto-tool-choice and a "
-                      "matching --tool-call-parser or chat will fail.")
+    key = (settings.openai_api_key or "").strip().lower()
+    has_key = bool(key) and key not in ("change-me", "missing")
+    engine = (settings.extraction_engine or "mock").strip().lower()
+    extraction_note = None
+    if engine != "vision":
+        extraction_note = f"EXTRACTION_ENGINE={engine} — vision LLM disabled; using mock/deterministic engine."
 
     return [
-        _item("extraction", "Vision extraction (Extract Email, per-file, approvals)",
-              "vision_provider", "vision"),
-        _item("agent", "Agentic chat", "ai_provider", "vision", note=agent_note,
-              model=str(overlay.get("agent_chat_model") or "gpt-4o-mini")),
+        AiStatusItem(
+            kind="extraction",
+            label="Vision extraction (Extract Email, Upload, chat uploads)",
+            provider="openai",
+            model=model_for("openai"),
+            has_key=has_key,
+            note=extraction_note,
+        ),
+        AiStatusItem(
+            kind="agent",
+            label="Agentic chat",
+            provider="openai",
+            model=settings.agent_chat_model or "gpt-4o-mini",
+            has_key=has_key,
+            note=None,
+        ),
     ]
 
 
-@router.get("/config/prompts/defaults")
-async def prompt_defaults():
-    """Built-in default for the one editable prompt (the shared extraction
-    system prompt used by EVERY entry point)."""
-    from app.services.agents import full_email_extract as fx
-    return {"extract_email_system_prompt": fx._SYSTEM_PROMPT}
-
-
-@router.get("/config/prompts/all")
-async def prompt_inventory():
-    """Every LLM prompt in the backend, with where it is actually used.
-
-    After the unification there is ONE extraction pipeline
-    (full_email_extract) shared by Extract Email, selected attachments, the
-    Upload page and chat uploads — so there is one system prompt (editable),
-    one dynamically-built request prompt, and the chat assistant's prompt.
-    `content` shows the ACTIVE text, i.e. the override when one is saved."""
-    from app.services.agents import chat_agent
-    from app.services.agents import full_email_extract as fx
-
-    def item(key, title, used_by, content, editable=False,
-             override_key=None, dynamic=False):
-        return {"key": key, "title": title, "used_by": used_by,
-                "content": content, "editable": editable,
-                "override_key": override_key, "dynamic": dynamic}
+@router.get("/extraction/formats")
+async def extraction_formats():
+    """The per-client timesheet templates the extractor recognises (req 7).
+    Detection is deterministic from text markers; each known format routes its
+    own extraction hint. 'generic' is the always-present fallback."""
+    from app.services.extract_email.formats import all_formats
 
     return [
-        item("extract_email_system", "Extraction — system prompt (ALL flows)",
-             "The single extraction pipeline: Extract Email (full or selected "
-             "attachments), the Upload page, chat uploads, and retry. Reads every "
-             "sheet: kind, identity, period, leave dates, signatures, approval evidence.",
-             fx.system_prompt(), editable=True,
-             override_key="extract_email_system_prompt"),
-        item("extract_email_batch", "Extraction — per-batch request",
-             "Built dynamically for each run: lists the sheets in the batch, the "
-             "JSON schema to fill, and each sheet's exact extracted text.",
-             "(dynamic — assembled per run from the sheet list, the JSON schema "
-             "and each sheet's exact text; see _batch_prompt in full_email_extract.py)",
-             dynamic=True),
-        item("chat_system", "Agentic chat — system",
-             "The chat assistant on the Agentic Chat page (tools + grounding rules).",
-             chat_agent.SYSTEM_PROMPT),
+        {
+            "id": f.id,
+            "label": f.label,
+            "marker_count": len(f.markers),
+            "has_extraction_hint": bool(f.extraction_hint),
+            "has_validator": f.validator is not None,
+        }
+        for f in all_formats()
     ]

@@ -151,6 +151,18 @@ def _classify(name: str, ctype: str, has_doc: bool, is_inline: bool = False,
     return "other"
 
 
+def _parse_recipients(raw: list | None) -> list[dict]:
+    out: list[dict] = []
+    for r in raw or []:
+        ea = (r.get("emailAddress") or {})
+        email = (ea.get("address") or "").strip()
+        if not email:
+            continue
+        name = (ea.get("name") or "").strip() or None
+        out.append({"name": name, "email": email})
+    return out
+
+
 def _build(msg: dict) -> ProviderMessage:
     frm = (msg.get("from") or {}).get("emailAddress") or {}
     raw = msg.get("attachments") or []
@@ -210,10 +222,16 @@ def _build(msg: dict) -> ProviderMessage:
         body_text=body_text,
         body_html=body_html,
         attachments=atts,
+        to_recipients=_parse_recipients(msg.get("toRecipients")),
+        cc_recipients=_parse_recipients(msg.get("ccRecipients")),
+        conversation_id=msg.get("conversationId") or None,
     )
 
 
-_SELECT = "id,subject,from,receivedDateTime,bodyPreview,body,hasAttachments"
+_SELECT = (
+    "id,subject,from,toRecipients,ccRecipients,receivedDateTime,"
+    "bodyPreview,body,hasAttachments,conversationId"
+)
 # List view: base attachment type only supports these fields in $select.
 # contentId is NOT selectable on the base type — Graph 400s
 # ("Could not find a property named 'contentId' on type
@@ -300,6 +318,46 @@ class GraphEmailProvider(EmailProvider):
             if r.status_code != 200 or not r.content:
                 return None
             return r.content
+
+    async def list_thread_messages(self, conversation_id: str) -> list[ProviderMessage]:
+        """Every message in this conversation, straight from Graph (not the
+        local DB) — so a thread never appears missing its original attachment
+        just because that message predates the incremental-sync window.
+
+        Mailbox-wide (NOT scoped to mailFolders/{_folder()}) — a reply or
+        forward YOU sent lives in Sent Items, not Inbox, and Outlook's own
+        conversation view shows it too. Scoping this to Inbox only would
+        silently drop your own replies from the history."""
+        cid_escaped = conversation_id.replace("'", "''")  # OData literal escaping
+        url = f"{GRAPH}/users/{settings.graph_mailbox}/messages"
+        params = {
+            # NO $orderby here — combined with a mailbox-wide (non-folder)
+            # conversationId filter, Graph 400s with "InefficientFilter" even
+            # with ConsistencyLevel: eventual (verified against the live API).
+            # Sorted client-side below instead.
+            "$select": _SELECT,
+            "$expand": _EXPAND_DETAIL,
+            "$filter": f"conversationId eq '{cid_escaped}'",
+            "$count": "true",
+        }
+        # Mailbox-wide filter needs Graph's "advanced query capabilities"
+        # opt-in — folder-scoped queries (list_messages) don't need this.
+        headers = await _headers(text_body=False)
+        headers["ConsistencyLevel"] = "eventual"
+        msgs: list[ProviderMessage] = []
+        next_url: str | None = url
+        next_params: dict | None = params
+        async with httpx.AsyncClient(timeout=60) as c:
+            while next_url and len(msgs) < 200:  # a runaway thread still can't hang the UI
+                r = await c.get(next_url, params=next_params, headers=headers)
+                if r.status_code != 200:
+                    raise RuntimeError(f"Graph thread error {r.status_code}: {r.text[:400]}")
+                body = r.json()
+                msgs.extend(_build(m) for m in body.get("value", []))
+                next_url = body.get("@odata.nextLink")
+                next_params = None
+        msgs.sort(key=lambda m: m.received_at)
+        return msgs
 
     async def get_attachment_bytes(self, message_id: str, attachment_id: str) -> tuple[bytes, str, str]:
         url = f"{GRAPH}/users/{settings.graph_mailbox}/messages/{message_id}/attachments/{attachment_id}"

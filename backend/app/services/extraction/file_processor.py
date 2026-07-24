@@ -24,12 +24,25 @@ IMAGE_MAX_SIDE = 2200
 STITCH_MAX_WIDTH = 2200
 STITCH_MAX_HEIGHT = 8000
 # Outlook pastes attendance sheets into the HTML body as inline CID images.
-_INLINE_TIMESHEET_MIN_BYTES = 20_000   # keep — real pasted grids
-_INLINE_JUNK_MAX_BYTES = 12_000         # skip — signature logos/icons
+# Keep in sync with settings.min_image_attachment_kb (default 70).
+_INLINE_TIMESHEET_MIN_BYTES = 70 * 1024  # keep — real pasted grids / screenshots
+_INLINE_JUNK_MAX_BYTES = 12_000          # skip — tiny signature logos/icons
 _CID_REF_RE = re.compile(r"cid:([^\"'\s>)]+)", re.IGNORECASE)
 _GENERIC_INLINE_NAME_RE = re.compile(
     r"^(image\d{2,3}\.(png|jpe?g|gif)|outlook-.+\.(png|jpe?g|gif|bmp)"
     r"|c2_signature_.+\.(png|jpe?g|gif))$", re.I)
+# Explicit brand chrome — never send these pixels to OpenAI.
+_LOGO_NAME_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:logo|banner|footer|letterhead|brandmark|watermark|"
+    r"facebook|instagram|linkedin|twitter|youtube)(?:[^a-z0-9]|$)|"
+    r"c2_signature_",
+    re.I,
+)
+_KEEP_IMAGE_NAME_RE = re.compile(
+    r"(screenshot|approval|attendance|timesheet|smarttime|report|capture|"
+    r"leave|sick|cert)",
+    re.I,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -110,22 +123,65 @@ def detect_file_type(filename: str, data: bytes) -> str:
         return "pdf"
     if data.startswith(b"\x89PNG\r\n\x1a\n") or data.startswith(b"\xff\xd8\xff"):
         return "image"
-    if data[:2] == b"PK" and zipfile.is_zipfile(io.BytesIO(data)):
-        if name.endswith(".docx"):
+    # Old OLE .doc / .xls — LibreOffice can still convert these.
+    if data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        if name.endswith((".xls", ".xlsx")) or name.endswith(".csv"):
+            return "xlsx"
+        if name.endswith((".doc", ".docx")):
             return "docx"
+        return "xlsx" if any(k in name for k in ("sheet", "xls", "report")) else "docx"
+    if data[:2] == b"PK" and zipfile.is_zipfile(io.BytesIO(data)):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                names = {n.lower() for n in zf.namelist()}
+            if any(n.startswith("xl/") for n in names) or name.endswith(".xlsx"):
+                return "xlsx"
+            if any(n.startswith("word/") for n in names) or name.endswith(".docx"):
+                return "docx"
+        except Exception:
+            pass
         if name.endswith(".xlsx"):
             return "xlsx"
+        if name.endswith(".docx"):
+            return "docx"
     if name.endswith(".pdf"):
         return "pdf"
-    if name.endswith(".docx"):
+    # Extension alone is not enough for OOXML — non-zip "xlsx" must not hit openpyxl.
+    if name.endswith(".docx") and data[:2] == b"PK":
         return "docx"
-    if name.endswith(".xlsx"):
+    if name.endswith(".xlsx") and data[:2] == b"PK":
         return "xlsx"
+    if name.endswith((".xlsx", ".xls")):
+        return "xlsx"
+    if name.endswith((".docx", ".doc")):
+        return "docx"
     if name.endswith(".eml"):
         return "eml"
     if name.endswith((".png", ".jpg", ".jpeg")):
         return "image"
     return "unknown"
+
+
+def content_type_for(filename: str, data: bytes, fallback: str | None = None) -> str:
+    """Canonical MIME for preview/download — Graph often lies with octet-stream."""
+    ftype = detect_file_type(filename or "", data or b"")
+    return {
+        "pdf": "application/pdf",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "eml": "message/rfc822",
+        "image": "image/jpeg",
+    }.get(ftype) or (fallback or "application/octet-stream")
+
+
+def _placeholder_jpeg(message: str) -> bytes:
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (900, 240), (248, 250, 252))
+    d = ImageDraw.Draw(img)
+    font = _load_font(22)
+    d.text((24, 100), message[:120], fill=(100, 116, 139), font=font)
+    return _to_jpeg_bytes(img)
 
 
 def image_to_images(image_bytes: bytes, max_side: int = IMAGE_MAX_SIDE) -> list[bytes]:
@@ -158,8 +214,8 @@ def _soffice_to_pdf(in_path: Path, out_dir: Path) -> bytes | None:
 
 
 def _office_to_pdf_bytes(file_bytes: bytes, ext: str) -> bytes | None:
-    """Convert docx/xlsx -> PDF via LibreOffice headless, if soffice is installed."""
-    if not file_bytes or ext not in {"docx", "xlsx"}:
+    """Convert docx/xlsx/doc/xls -> PDF via LibreOffice headless, if soffice is installed."""
+    if not file_bytes or ext not in {"docx", "xlsx", "doc", "xls"}:
         return None
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
@@ -247,53 +303,83 @@ def _load_font(size: int):
     return font
 
 
+def _docx_text_lines(docx_bytes: bytes) -> list[str] | None:
+    """Paragraphs + flattened tables. None when the file can't be opened."""
+    try:
+        from docx import Document
+        doc = Document(io.BytesIO(docx_bytes))
+        lines = [p.text for p in doc.paragraphs if p.text.strip()]
+        for t in doc.tables:
+            for row in t.rows:
+                cells = [c.text.strip().replace("\n", " ") for c in row.cells]
+                if any(cells):
+                    lines.append(" | ".join(cells))
+        return lines
+    except Exception:
+        return None
+
+
+def _xlsx_text_lines(xlsx_bytes: bytes) -> list[str] | None:
+    """Non-empty rows as pipe-separated text. None when it can't be opened."""
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+        ws = wb.active
+        lines = []
+        for r in range(1, min(ws.max_row or 1, 400) + 1):
+            vals = [("" if ws.cell(r, c + 1).value is None else str(ws.cell(r, c + 1).value))
+                    for c in range(min(ws.max_column or 1, 40))]
+            if any(vals):
+                lines.append(" | ".join(vals))
+        return lines
+    except Exception:
+        return None
+
+
 def docx_to_images(docx_bytes: bytes) -> list[bytes]:
     from PIL import Image, ImageDraw
 
-    pdf = _office_to_pdf_bytes(docx_bytes, "docx")
-    if pdf:
-        return [pdf_to_single_image(pdf)]
+    for ext in ("docx", "doc"):
+        pdf = _office_to_pdf_bytes(docx_bytes, ext)
+        if pdf:
+            return [pdf_to_single_image(pdf)]
     # fallback: render extracted text
-    from docx import Document
-    doc = Document(io.BytesIO(docx_bytes))
-    lines = [p.text for p in doc.paragraphs if p.text.strip()]
-    for t in doc.tables:
-        for row in t.rows:
-            cells = [c.text.strip().replace("\n", " ") for c in row.cells]
-            if any(cells):
-                lines.append(" | ".join(cells))
+    lines = _docx_text_lines(docx_bytes)
+    if lines is None:
+        return [_placeholder_jpeg("Could not open this Word document for preview.")]
     text = "\n".join(lines[:400]) or "(empty DOCX)"
     img = Image.new("RGB", (1800, 2400), (255, 255, 255))
     d = ImageDraw.Draw(img)
+    font = _load_font(26)
     y = 20
     for ln in text.splitlines():
-        d.text((20, y), ln[:240], fill=(0, 0, 0))
-        y += 20
+        d.text((20, y), ln[:240], fill=(0, 0, 0), font=font)
+        y += 28
+        if y > 2350:
+            break
     return [_to_jpeg_bytes(img)]
 
 
 def xlsx_to_images(xlsx_bytes: bytes) -> list[bytes]:
     from PIL import Image, ImageDraw
 
-    pdf = _office_to_pdf_bytes(xlsx_bytes, "xlsx")
-    if pdf:
-        return [pdf_to_single_image(pdf)]
-    from openpyxl import load_workbook
-    wb = load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
-    ws = wb.active
-    lines = []
-    for r in range(1, min(ws.max_row or 1, 400) + 1):
-        vals = [("" if ws.cell(r, c + 1).value is None else str(ws.cell(r, c + 1).value))
-                for c in range(min(ws.max_column or 1, 40))]
-        if any(vals):
-            lines.append(" | ".join(vals))
+    for ext in ("xlsx", "xls"):
+        pdf = _office_to_pdf_bytes(xlsx_bytes, ext)
+        if pdf:
+            return [pdf_to_single_image(pdf)]
+    lines = _xlsx_text_lines(xlsx_bytes)
+    if lines is None:
+        return [_placeholder_jpeg("Could not open this spreadsheet for preview.")]
     text = "\n".join(lines) or "(empty XLSX)"
     img = Image.new("RGB", (2400, 3000), (255, 255, 255))
     d = ImageDraw.Draw(img)
+    font = _load_font(22)
     y = 20
     for ln in text.splitlines():
-        d.text((20, y), ln[:340], fill=(0, 0, 0))
-        y += 18
+        d.text((20, y), ln[:340], fill=(0, 0, 0), font=font)
+        y += 24
+        if y > 2950:
+            break
     return [_to_jpeg_bytes(img)]
 
 
@@ -419,20 +505,21 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
     """Return (filename, payload, file_type) for real attachments inside .eml.
 
     Excluded:
+    - Signature logos, marketing banners, social icons (never sent to OpenAI).
     - Small CID-referenced inline images (logos, icons embedded in HTML).
     - Other tiny inline images without an attachment disposition.
 
     Kept:
     - PDF / Office / nested .eml parts — even when they carry a Content-Id
       (Outlook and Graph often tag file attachments with CIDs too).
-    - Parts with Content-Disposition: attachment.
-    - Large inline images (e.g. approval screenshots)."""
+    - Parts with Content-Disposition: attachment (non-decorative).
+    - Large inline images that look like pasted attendance grids / screenshots."""
     try:
         msg = _parse_eml(eml_bytes)
     except Exception:
         return []
 
-    found: list[tuple[str, bytes, str]] = []
+    found: list[tuple[str, bytes, str, bool]] = []  # + is_inline
     for part in msg.walk():
         maintype = part.get_content_maintype()
         if maintype == "multipart":
@@ -446,7 +533,8 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
         if maintype == "message":
             nested = _nested_message_bytes(part)
             if nested:
-                found.extend(_eml_collect_attachments(nested))
+                for name, payload, ftype in _eml_collect_attachments(nested):
+                    found.append((name, payload, ftype, False))
             continue
 
         payload = part.get_payload(decode=True)
@@ -460,33 +548,46 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
         if not ftype:
             continue
 
+        is_inline = disposition == "inline" or bool(cid)
+
         # Documents are always real attachments — Graph/Outlook assign Content-Id
         # to PDFs and Office files, not only HTML-embedded images.
         if ftype in ("pdf", "docx", "xlsx", "eml"):
-            found.append((filename, payload, ftype))
+            found.append((filename, payload, ftype, False))
             continue
 
-        if disposition == "attachment":
-            found.append((filename, payload, ftype))
+        if ftype != "image":
+            if disposition == "attachment":
+                found.append((filename, payload, ftype, False))
             continue
 
+        # Images: drop brand chrome before anything else.
+        # has_doc filled after the walk; mark candidates first.
+        found.append((filename, payload, ftype, is_inline))
+
+    has_doc = any(ft in ("pdf", "docx", "xlsx", "eml") for _, _, ft, _ in found)
+    kept: list[tuple[str, bytes, str]] = []
+    for filename, payload, ftype, is_inline in found:
         if ftype == "image":
-            fn = filename.lower()
-            n = len(payload)
-            # Tiny inline logos/icons — never a timesheet.
-            if n < _INLINE_JUNK_MAX_BYTES and disposition != "attachment":
-                continue
-            # Pasted attendance grids in the body (Outlook inline CID) — keep even
-            # when the filename is generic (image001.png).
-            if (
-                disposition == "attachment"
-                or n >= _INLINE_TIMESHEET_MIN_BYTES
-                or any(k in fn for k in (
-                    "screenshot", "approval", "attendance", "timesheet",
-                    "smarttime", "report", "capture",
-                ))
+            # An explicit name ("Screenshot…", "approval…") is stronger evidence
+            # than any size heuristic — a genuine approval screenshot is often
+            # inline and well under the pasted-grid size bar, and dropping it
+            # loses the manager sign-off entirely. So the name wins over the
+            # decorative/size checks rather than being evaluated after them.
+            named_keep = bool(_KEEP_IMAGE_NAME_RE.search(filename or ""))
+            if not named_keep and is_decorative_image(
+                filename, payload, has_doc=has_doc, is_inline=is_inline,
             ):
-                found.append((filename, payload, ftype))
+                continue
+            # Otherwise keep only pasted-grid / screenshot-like payloads (or an
+            # attachment-disposition image big enough to be a real sheet).
+            if not (
+                named_keep
+                or _likely_pasted_timesheet_image(payload)
+                or (not is_inline and len(payload) >= _INLINE_TIMESHEET_MIN_BYTES)
+            ):
+                continue
+        kept.append((filename, payload, ftype))
 
     # De-duplicate by CONTENT, not name — Outlook/Graph commonly attach the
     # exact same image twice: once inline (cid-referenced, generic name like
@@ -499,7 +600,7 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
 
     seen: dict[bytes, tuple[str, bytes, str]] = {}
     order: list[bytes] = []
-    for fn, payload, ftype in found:
+    for fn, payload, ftype in kept:
         key = hashlib.sha256(payload).digest()
         if key not in seen:
             seen[key] = (fn, payload, ftype)
@@ -508,8 +609,7 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
         existing_fn, _existing_payload, _existing_ft = seen[key]
         if _GENERIC_INLINE_NAME_RE.match(existing_fn or "") and not _GENERIC_INLINE_NAME_RE.match(fn or ""):
             seen[key] = (fn, payload, ftype)
-    deduped = [seen[k] for k in order]
-    return deduped
+    return [seen[k] for k in order]
 
 
 def _nested_message_bytes(part) -> bytes | None:
@@ -610,6 +710,39 @@ def _likely_pasted_timesheet_image(payload: bytes) -> bool:
         return len(payload) >= 40_000
 
 
+def is_decorative_image(
+    filename: str,
+    payload: bytes,
+    *,
+    has_doc: bool = False,
+    is_inline: bool = False,
+) -> bool:
+    """True → never send this image to OpenAI (logo / banner / signature chrome).
+
+    Order of trust:
+      1. Explicit logo/banner/footer/social filename
+      2. Tiny / wide-strip geometry (not a sheet or screenshot)
+      3. Generic Outlook body name (image00N / Outlook- / C2_signature_) when a
+         real PDF/Office/.eml already exists — those are signature chrome next
+         to the document, not a second timesheet
+    """
+    fn = (filename or "").strip()
+    if _LOGO_NAME_RE.search(fn):
+        return True
+    if _KEEP_IMAGE_NAME_RE.search(fn):
+        # Named like a real sheet/screenshot — only drop if geometry is junk.
+        return (
+            not _likely_pasted_timesheet_image(payload)
+            and len(payload or b"") < _INLINE_TIMESHEET_MIN_BYTES
+        )
+    if not _likely_pasted_timesheet_image(payload):
+        return True
+    if has_doc and _GENERIC_INLINE_NAME_RE.match(fn):
+        return True
+    _ = is_inline  # reserved for callers; generic+has_doc already covers CID chrome
+    return False
+
+
 _IMG_TAG_CID_RE = re.compile(
     r"<img\b[^>]*\bsrc\s*=\s*[\"']cid:[^\"']+[\"'][^>]*/?>",
     re.IGNORECASE,
@@ -640,6 +773,8 @@ def _resolve_eml_html_cids(eml_bytes: bytes, html_body: str) -> str:
             continue
         payload = part.get_payload(decode=True)
         if not payload or not _likely_pasted_timesheet_image(payload):
+            continue
+        if _LOGO_NAME_RE.search(part.get_filename() or ""):
             continue
         ctype = (part.get_content_type() or "image/png").split(";")[0]
         uri = f"data:{ctype};base64,{base64.b64encode(payload).decode()}"
@@ -771,6 +906,86 @@ def pdf_to_single_image(
     return _to_jpeg_bytes(canvas)
 
 
+# ---------------------------------------------------------------------------
+# On-screen preview rendering — ONE image PER PAGE.
+#
+# The renderers above stitch every page into a single tall canvas on purpose:
+# the vision model must see a timesheet as one uninterrupted screenshot so no
+# table row is cut across a page break. That shape is wrong for a human
+# preview. A multi-page workbook became one 8000px-tall canvas (the
+# STITCH_MAX_HEIGHT clamp) that the modal then scaled to ~600px wide, so the
+# text was an unreadable smudge — and because it was a SINGLE image the page
+# navigator never appeared, leaving no way to reach pages 2+.
+#
+# Previews therefore get their own renderer: real page boundaries, and a width
+# chosen for reading rather than for the model's context window.
+# ---------------------------------------------------------------------------
+
+PREVIEW_MAX_WIDTH = 1700     # readable on screen without huge payloads
+PREVIEW_MAX_PAGES = 40       # previews may page deeper than the vision cap
+
+
+def pdf_to_page_images(
+    pdf_bytes: bytes,
+    dpi: int | None = None,
+    max_pages: int = PREVIEW_MAX_PAGES,
+) -> list[bytes]:
+    """Render a PDF to one JPEG per page for on-screen preview (never stitched)."""
+    import fitz
+    from PIL import Image
+
+    if dpi is None:
+        dpi = int(getattr(settings, "pdf_render_dpi", 150) or 150)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    out: list[bytes] = []
+    try:
+        for i in range(min(doc.page_count, max_pages)):
+            pix = doc.load_page(i).get_pixmap(matrix=mat, alpha=False)
+            im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            if im.width > PREVIEW_MAX_WIDTH:
+                h = max(1, round(im.height * PREVIEW_MAX_WIDTH / im.width))
+                im = im.resize((PREVIEW_MAX_WIDTH, h), Image.LANCZOS)
+            out.append(_to_jpeg_bytes(im))
+    finally:
+        doc.close()
+    if not out:
+        raise ValueError("empty PDF")
+    return out
+
+
+def to_page_images(file_type: str, data: bytes) -> list[bytes]:
+    """One JPEG PER PAGE, for the file-preview modal.
+
+    The human-facing counterpart of `to_images` (which stitches for vision).
+    Every preview surface — vault, inbox attachment, pipeline raw copy and
+    embedded .eml attachment — goes through here so they all paginate alike.
+    """
+    if file_type == "pdf":
+        return pdf_to_page_images(data)
+    if file_type == "docx":
+        for ext in ("docx", "doc"):
+            pdf = _office_to_pdf_bytes(data, ext)
+            if pdf:
+                return pdf_to_page_images(pdf)
+        lines = _docx_text_lines(data)
+        if lines is None:
+            return [_placeholder_jpeg("Could not open this Word document for preview.")]
+        return _text_to_page_images("\n".join(lines) or "(empty DOCX)")
+    if file_type == "xlsx":
+        for ext in ("xlsx", "xls"):
+            pdf = _office_to_pdf_bytes(data, ext)
+            if pdf:
+                return pdf_to_page_images(pdf)
+        lines = _xlsx_text_lines(data)
+        if lines is None:
+            return [_placeholder_jpeg("Could not open this spreadsheet for preview.")]
+        return _text_to_page_images("\n".join(lines) or "(empty XLSX)")
+    if file_type == "image":
+        return image_to_images(data)
+    raise ValueError(f"Unsupported file type: {file_type}")
+
+
 def eml_body_to_images(eml_bytes: bytes) -> list[bytes]:
     """Render the EMAIL ITSELF (Subject + body) to ONE continuous tall image —
     the inline timesheet table renders crisply (WeasyPrint → LibreOffice) with
@@ -786,45 +1001,13 @@ def eml_body_to_images(eml_bytes: bytes) -> list[bytes]:
         return [_stitch_text_images(scrubbed)]
 
     # Scrub BEFORE rendering — once addresses/phones/secrets are pixels in the
-    # JPEG the vision model reads them like any other text. Signature footers
-    # are cut so "Password:" lines under Thanks never leave the server.
+    # JPEG the vision model reads them like any other text. Whole-thread mode:
+    # keep signatures + quoted history, tokenise PII inside them (no cut).
     # CID logos / wide brand banners are not inlined (see _resolve_eml_html_cids).
     subject, plain_body = scrub_email_for_llm(subject, plain_body)
     if html_body:
-        from app.core.pii import strip_html_quoted_reply_thread
-
-        _, focused_plain = scrub_email_for_llm(subject, _extract_eml_body_text(eml_bytes))
         html_body = scrub_text(html_body)
-        html_body = strip_html_quoted_reply_thread(html_body)
-        html_body = _strip_html_after_sheet_signatures(html_body)
         html_body = _resolve_eml_html_cids(eml_bytes, html_body)
-        # Prefer focused plain when HTML is reply-chain chrome (no real grid).
-        # Do NOT treat the word "timesheet" in RE: subjects as an inline sheet —
-        # that kept full quoted threads in the body JPEG.
-        html_l = (html_body or "").lower()
-        has_inline_grid = any(
-            m in html_l
-            for m in (
-                "attendance sheet",
-                "emp no",
-                "empno",
-                "hours worked",
-                "daily total",
-            )
-        ) or (
-            "<table" in html_l
-            and any(m in html_l for m in ("public holiday", "leave", "regular", "in</", "out</"))
-        )
-        has_pasted_sheet_img = "data:image/" in html_l
-        plain_trimmed = (
-            "[signature-redacted]" in (focused_plain or "")
-            or "[quoted-thread-redacted]" in (focused_plain or "")
-        )
-        if focused_plain and plain_trimmed and not has_inline_grid and not has_pasted_sheet_img:
-            plain_body = focused_plain
-            html_body = None
-        else:
-            plain_body = scrub_text(plain_body)
     header = f"<p style='font-family:sans-serif'><b>Subject:</b> {unescape_safe(subject)}</p><hr/>"
     if html_body:
         doc = (

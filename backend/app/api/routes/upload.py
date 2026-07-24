@@ -26,6 +26,40 @@ _MANUAL_BUCKETS = ("annual", "remote", "sick", "maternity", "unpaid", "absent", 
 router = APIRouter(prefix="/upload", tags=["upload"])
 
 
+@router.post("/stream")
+async def upload_timesheets_streamed(files: list[UploadFile] = File(...)):
+    """Same as POST /upload, but streams live progress (SSE) — one frame per
+    pipeline stage/LLM call/auto-accept decision — then a final `done` frame
+    with the staged items."""
+    from fastapi.responses import StreamingResponse
+
+    from app.api.routes.pipeline import _out as _pipeline_out
+    from app.core.database import SessionLocal
+    from app.services.extract_email.streaming import sse_events
+
+    batch: list[tuple[str, str, bytes]] = []
+    for f in files or []:
+        data = await f.read()
+        if data:
+            batch.append((f.filename or "upload",
+                          f.content_type or "application/octet-stream", data))
+    if not batch:
+        raise HTTPException(400, "No files uploaded")
+
+    async def run() -> dict:
+        async with SessionLocal() as db:
+            staged = []
+            for filename, content_type, data in batch:
+                res = await extract_upload(db, filename=filename,
+                                           content_type=content_type, data=data)
+                staged.extend(res["staged"])
+            await datacache.bust_pipeline()
+            return {"staged": [_pipeline_out(t).model_dump(mode="json") for t in staged]}
+
+    return StreamingResponse(sse_events(run), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @router.post("", response_model=list[PipelineFileOut])
 async def upload_timesheets(
     files: list[UploadFile] = File(...),

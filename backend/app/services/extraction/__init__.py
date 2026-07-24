@@ -1,9 +1,8 @@
 """Factory: the deterministic fallback engine.
 
-The REAL extraction pipeline is services/agents/full_email_extract.py -- the
-single path every entry point uses (Extract Email, selected attachments,
-Upload page, chat). This engine only serves as its per-sheet fallback when a
-vision batch call fails, and as the $0 keyless engine for dev/tests.
+Extract Email lives in services/extract_email/ — the single path every
+entry point uses (Extract Email, Upload page, chat). This engine only serves
+as its per-sheet fallback when a vision extract call fails.
 """
 from __future__ import annotations
 

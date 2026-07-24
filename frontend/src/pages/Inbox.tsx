@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Mail,
@@ -14,6 +14,7 @@ import {
   Search,
   Undo2,
   ChevronRight,
+  ChevronDown,
   Forward,
   Maximize2,
   MoreVertical,
@@ -25,28 +26,32 @@ import {
   attachmentUrl,
   decideEmail,
   emlUrl,
-  extractFullEmail,
+  extractFullEmailStream,
   fetchEmail,
   fetchEmployeeMatcher,
-  fetchInbox,
+  fetchThread,
+  fetchThreads,
   fetchLlmPreview,
   MONTHS_LONG,
   restoreEmail,
   saveEmlToVault,
   type Attachment,
   type Employee,
+  type EmailDetail,
   type EmailListItem,
-  type IngestSelection,
+  type EmailRecipient,
   type LlmEgressPreview,
   type PipelineFile,
+  type ThreadListItem,
 } from "../api/client";
-import { cn, formatDateTime, initials, avatarColor } from "../lib/utils";
+import { cn, formatBytes, formatDateTime, formatOutlookDateTime, emailSnippet, initials, avatarColor } from "../lib/utils";
 import { isBodyJunkImage, isImageAttachment } from "../lib/attachmentFilters";
 import { FilePreviewModal } from "../components/FilePreview";
 import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
-import { downloadFile, sanitizeEmailHtml } from "../lib/filePreview";
+import { attachmentRenderUrlIfSupported, buildEmailHtmlDocument, downloadFile } from "../lib/filePreview";
 import { Badge, Button, Card, EmptyState, Modal, Select, Skeleton, Spinner } from "../components/ui";
 import { useToast } from "../components/toast";
+import { ExtractionActivityModal, useExtractionStream } from "../components/ExtractionActivity";
 import { useDebounced, useSentinel } from "../lib/useInfinite";
 import type { PreviewFile } from "../lib/filePreview";
 
@@ -285,7 +290,7 @@ function LlmEgressPreviewModal({
 
           <div>
             <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-              Sample vision prompt (first batch, scrubbed)
+              Sample vision prompt (first sheet, scrubbed)
             </p>
             <p className="mb-1 text-[11px] text-slate-500">{preview.system_prompt_note}</p>
             <pre className="max-h-64 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] text-slate-800 whitespace-pre-wrap">
@@ -498,6 +503,45 @@ function isForwardedSubject(subject: string | null): boolean {
 // ---------------------------------------------------------------------------
 
 const CID_RE = /\[cid:([^\]]+)\]/g;
+const UUID_RE =
+  /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
+function normCid(value: string | null | undefined): string {
+  return (value ?? "").replace(/^<|>$/g, "").toLowerCase();
+}
+
+function uuids(value: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of value.matchAll(UUID_RE)) out.add(m[0].toLowerCase());
+  return out;
+}
+
+function cidRefMatches(
+  cidRef: string,
+  att: { cid?: string | null; filename: string },
+): boolean {
+  const refFull = normCid(cidRef);
+  const refName = refFull.split("@")[0];
+  const refUuids = uuids(refFull);
+  const ac = normCid(att.cid);
+  if (ac && (ac === refFull || ac === refName || refName.includes(ac) || ac.includes(refFull))) {
+    return true;
+  }
+  const fn = att.filename.toLowerCase();
+  if (fn && (fn === refName || fn.includes(refName) || refFull.includes(fn))) {
+    return true;
+  }
+  const fnStem = fn.replace(/\.[^.]+$/, "");
+  if (fnStem && (refFull.includes(fnStem) || refName.includes(fnStem))) {
+    return true;
+  }
+  for (const blob of [ac, fn, refFull, refName]) {
+    if (!blob) continue;
+    const shared = [...refUuids].filter((u) => blob.includes(u));
+    if (shared.length) return true;
+  }
+  return false;
+}
 
 /**
  * Returns a map of raw CID token (e.g. "[cid:image001.jpg@xxx]") → attachment URL.
@@ -516,18 +560,9 @@ function buildCidMap(
   return map;
 }
 
-/** Find attachment by CID ref: match on attachment.cid first, then filename fallback. */
+/** Find attachment by CID ref (content-id, filename, or shared UUID). */
 function findByCid(cidRef: string, attachments: Attachment[]): Attachment | undefined {
-  const cidLower = cidRef.toLowerCase();
-  const cidName = cidRef.split("@")[0].toLowerCase();
-  // Exact cid match (strip angle brackets Graph sometimes adds)
-  let att = attachments.find((a) => {
-    const ac = (a.cid ?? "").replace(/^<|>$/g, "").toLowerCase();
-    return ac === cidLower || ac === cidName;
-  });
-  // Filename fallback
-  if (!att) att = attachments.find((a) => a.filename.toLowerCase() === cidName);
-  return att;
+  return attachments.find((a) => cidRefMatches(cidRef, a));
 }
 
 // ---------------------------------------------------------------------------
@@ -566,7 +601,7 @@ function TextWithInlineImages({
           key={`img-${match.index}`}
           src={url}
           alt={match[1].split("@")[0]}
-          className="my-1 inline-block max-h-12 max-w-[120px] object-contain align-middle"
+          className="my-2 block max-h-48 max-w-full object-contain"
         />
       );
     } else if (match.index !== undefined) {
@@ -598,17 +633,6 @@ function TextWithInlineImages({
 // Email body renderer — HTML iframe when body_html available, text fallback
 // ---------------------------------------------------------------------------
 
-/**
- * Replaces `cid:filename@...` in an HTML string with actual attachment URLs
- * so inline images (logos, signatures, tables) render correctly in the iframe.
- */
-function resolveCidsInHtml(html: string, attachments: Attachment[], providerId: string): string {
-  return html.replace(/cid:([^"'\s>)]+)/gi, (match, cidRef: string) => {
-    const att = findByCid(cidRef, attachments);
-    return att ? attachmentUrl(providerId, att.attachment_id) : match;
-  });
-}
-
 function EmailBodyRenderer({
   bodyText,
   bodyHtml,
@@ -635,20 +659,11 @@ function EmailBodyRenderer({
       setBlobUrl(null);
       return;
     }
-    const resolved = resolveCidsInHtml(bodyHtml, attachments, providerId);
-    const safe = sanitizeEmailHtml(resolved);
-    const doc =
-      `<!doctype html><html><head><meta charset="utf-8">` +
-      `<base target="_blank">` +
-      `<style>html,body{margin:0;padding:12px;font-family:Calibri,Segoe UI,Arial,sans-serif;` +
-      `color:#1f2937;font-size:14px;line-height:1.5;word-wrap:break-word}` +
-      `img{max-width:min(100%,520px);max-height:420px;height:auto;object-fit:contain;display:block;margin:6px 0}` +
-      `table{max-width:100%}</style></head>` +
-      `<body>${safe}</body></html>`;
+    const doc = buildEmailHtmlDocument(bodyHtml);
     const blob = URL.createObjectURL(new Blob([doc], { type: "text/html" }));
     setBlobUrl(blob);
     return () => URL.revokeObjectURL(blob);
-  }, [bodyHtml, attachments, providerId]);
+  }, [bodyHtml]);
 
   const sizeToContent = (e: React.SyntheticEvent<HTMLIFrameElement>) => {
     try {
@@ -702,11 +717,7 @@ function EmailBodyRenderer({
   return <TextWithInlineImages text={text} cidMap={cidMap} />;
 }
 
-// ---------------------------------------------------------------------------
-// Outlook-style attachment chips rendered at the top of the email
-// ---------------------------------------------------------------------------
-
-// Attachment chips: image preview cards + document chips (pdf/docx/xlsx/eml).
+// Attachment type helpers — shared by thread view and legacy chips.
 const DOC_TYPES = new Set([
   "application/pdf",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -723,193 +734,233 @@ function isDocAttachment(a: Attachment): boolean {
   return DOC_EXTS.has(ext);
 }
 
+// ---------------------------------------------------------------------------
+// Outlook-style helpers — recipients, attachment strip, thread message card
+// ---------------------------------------------------------------------------
 
-function ImageAttachmentCard({
-  a,
+function formatRecipient(r: EmailRecipient): string {
+  return r.name ? `${r.name} <${r.email}>` : r.email;
+}
+
+function RecipientRows({ to, cc }: { to: EmailRecipient[]; cc: EmailRecipient[] }) {
+  if (!to.length && !cc.length) return null;
+  return (
+    <div className="mt-2 space-y-0.5 text-xs text-slate-600">
+      {to.length > 0 && (
+        <div className="flex gap-2">
+          <span className="w-7 shrink-0 font-medium text-slate-500">To</span>
+          <span className="min-w-0 break-words">{to.map(formatRecipient).join("; ")}</span>
+        </div>
+      )}
+      {cc.length > 0 && (
+        <div className="flex gap-2">
+          <span className="w-7 shrink-0 font-medium text-slate-500">Cc</span>
+          <span className="min-w-0 break-words">{cc.map(formatRecipient).join("; ")}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function visibleFileAttachments(attachments: Attachment[], inlineIds: string[]): Attachment[] {
+  const images = attachments.filter(
+    (a) => isImageAttachment(a) && !isBodyJunkImage(a, inlineIds));
+  const docs = attachments.filter(isDocAttachment);
+  return [...docs, ...images];
+}
+
+function attachmentPreviewFile(providerId: string, a: Attachment): PreviewFile {
+  return {
+    url: attachmentUrl(providerId, a.attachment_id),
+    filename: a.filename,
+    contentType: a.content_type,
+    renderUrl: attachmentRenderUrlIfSupported(
+      a.filename, a.content_type, attachmentRenderUrl(providerId, a.attachment_id)),
+  };
+}
+
+function OutlookAttachmentStrip({
+  attachments,
+  inlineIds,
   providerId,
-  selectedTimesheetIds,
-  setSelectedTimesheetIds,
-  status,
   setPreview,
 }: {
-  a: Attachment;
+  attachments: Attachment[];
+  inlineIds: string[];
   providerId: string;
-  selectedTimesheetIds: Set<string>;
-  setSelectedTimesheetIds: Dispatch<SetStateAction<Set<string>>>;
-  status: string;
   setPreview: (f: PreviewFile) => void;
 }) {
-  const url = attachmentUrl(providerId, a.attachment_id);
-  const timesheetChecked = selectedTimesheetIds.has(a.attachment_id);
-  const canExtract = (status === "new" || status === "ingested")
-    && (a.kind === "timesheet" || a.kind === "approval_screenshot");
+  const files = visibleFileAttachments(attachments, inlineIds);
+  const [showAll, setShowAll] = useState(files.length <= 2);
+  if (!files.length) return null;
+
+  const visible = showAll ? files : files.slice(0, 2);
+  const hiddenCount = files.length - visible.length;
+  const totalBytes = files.reduce((n, a) => n + (a.size ?? 0), 0);
+
+  const downloadAll = () => {
+    for (const a of files) {
+      downloadFile(attachmentUrl(providerId, a.attachment_id), a.filename);
+    }
+  };
 
   return (
-    <div className="flex w-[148px] flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
-      <button
-        type="button"
-        onClick={() => setPreview({ url, filename: a.filename, contentType: a.content_type })}
-        className="group relative flex h-[108px] items-center justify-center bg-slate-50 p-1"
-      >
-        <img
-          src={url}
-          alt={a.filename}
-          className="max-h-full max-w-full object-contain"
-          loading="lazy"
-        />
-        <span className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition group-hover:bg-black/10 group-hover:opacity-100">
-          <Maximize2 className="h-5 w-5 text-white drop-shadow" />
-        </span>
-      </button>
-      <div className="border-t border-slate-100 px-2 py-1.5">
-        <p className="truncate text-[11px] font-medium text-slate-700" title={a.filename}>
-          {a.filename}
-        </p>
-        {canExtract && (
-          <label className="mt-1 flex cursor-pointer items-center gap-1 text-[10px] font-semibold text-slate-500">
-            <input
-              type="checkbox"
-              checked={timesheetChecked}
-              onChange={(e) => {
-                setSelectedTimesheetIds((prev) => {
-                  const next = new Set(prev);
-                  if (e.target.checked) next.add(a.attachment_id);
-                  else next.delete(a.attachment_id);
-                  return next;
-                });
-              }}
-              className="rounded border-slate-300 text-brand-600"
-            />
-            Extract
-          </label>
+    <div className="border-b border-slate-100 px-4 py-3">
+      <div className="flex flex-col gap-2">
+        {visible.map((a) => (
+            <div
+              key={a.attachment_id}
+              className="flex items-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 hover:border-slate-300"
+            >
+              <button
+                type="button"
+                onClick={() => setPreview(attachmentPreviewFile(providerId, a))}
+                className="flex min-w-0 flex-1 items-center gap-2 text-left"
+              >
+                <FileText className="h-5 w-5 shrink-0 text-red-500" />
+                <span className="min-w-0">
+                  <span className="block truncate text-sm font-medium text-slate-800">{a.filename}</span>
+                  {a.size != null && a.size > 0 && (
+                    <span className="text-xs text-slate-500">{formatBytes(a.size)}</span>
+                  )}
+                </span>
+              </button>
+              <button
+                type="button"
+                title="Download"
+                onClick={() => downloadFile(attachmentUrl(providerId, a.attachment_id), a.filename)}
+                className="shrink-0 rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+              >
+                <Download className="h-4 w-4" />
+              </button>
+            </div>
+          ))}
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-brand-600">
+        {!showAll && hiddenCount > 0 && (
+          <button
+            type="button"
+            onClick={() => setShowAll(true)}
+            className="inline-flex items-center gap-1 font-medium hover:underline"
+          >
+            <ChevronDown className="h-3.5 w-3.5" />
+            Show all {files.length} attachments
+            {totalBytes > 0 ? ` (${formatBytes(totalBytes)})` : ""}
+          </button>
+        )}
+        {files.length > 1 && (
+          <button
+            type="button"
+            onClick={downloadAll}
+            className="inline-flex items-center gap-1 font-medium hover:underline"
+          >
+            <Download className="h-3.5 w-3.5" />
+            Download all
+          </button>
         )}
       </div>
     </div>
   );
 }
 
-function AttachmentChip({
-  a,
-  providerId,
-  selectedTimesheetIds,
-  setSelectedTimesheetIds,
-  status,
+function ThreadMessageCard({
+  msg,
+  open,
+  onToggle,
   setPreview,
 }: {
-  a: Attachment;
-  providerId: string;
-  selectedTimesheetIds: Set<string>;
-  setSelectedTimesheetIds: Dispatch<SetStateAction<Set<string>>>;
-  status: string;
+  msg: EmailDetail;
+  open: boolean;
+  onToggle: () => void;
   setPreview: (f: PreviewFile) => void;
 }) {
-  const timesheetChecked = selectedTimesheetIds.has(a.attachment_id);
-  const canExtract = status === "new" || status === "ingested";
-
-  const chipColor = timesheetChecked
-    ? "border-brand-300 bg-brand-50 ring-1 ring-brand-100"
-    : "border-slate-200 bg-white hover:border-brand-200";
+  const inlineIds = msg.inline_attachment_ids ?? [];
+  const to = msg.to_recipients ?? [];
+  const cc = msg.cc_recipients ?? [];
+  const fileCount = visibleFileAttachments(msg.attachments, inlineIds).length;
 
   return (
-    <div className={cn("flex items-center gap-2 rounded-lg border px-2.5 py-2 text-xs transition-colors", chipColor)}>
-      <FileText className="h-4 w-4 shrink-0 text-brand-500" />
-      <span className="min-w-0">
-        <span className="block max-w-[200px] truncate font-medium text-slate-700">{a.filename}</span>
-      </span>
-      {canExtract && (
-        <label className="flex cursor-pointer items-center gap-1 text-[10px] font-semibold text-slate-500">
-          <input
-            type="checkbox"
-            checked={timesheetChecked}
-            onChange={(e) => {
-              setSelectedTimesheetIds((prev) => {
-                const next = new Set(prev);
-                if (e.target.checked) next.add(a.attachment_id);
-                else next.delete(a.attachment_id);
-                return next;
-              });
-            }}
-            className="rounded border-slate-300 text-brand-600"
-          />
-          Extract
-        </label>
-      )}
+    <div className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
       <button
         type="button"
-        onClick={() => setPreview({
-          url: attachmentUrl(providerId, a.attachment_id),
-          filename: a.filename,
-          contentType: a.content_type,
-          // DOCX/XLSX preview = server-rendered page images (works everywhere).
-          renderUrl: attachmentRenderUrl(providerId, a.attachment_id),
-        })}
-        className="ml-1 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-brand-500 hover:text-brand-700"
+        onClick={onToggle}
+        className="flex w-full gap-3 px-3 py-3 text-left transition-colors hover:bg-slate-50/80"
       >
-        Preview
-      </button>
-    </div>
-  );
-}
-
-function AttachmentChips({
-  attachments,
-  inlineIds,
-  providerId,
-  selectedTimesheetIds,
-  setSelectedTimesheetIds,
-  status,
-  setPreview,
-}: {
-  attachments: Attachment[];
-  inlineIds: string[];
-  providerId: string;
-  selectedTimesheetIds: Set<string>;
-  setSelectedTimesheetIds: Dispatch<SetStateAction<Set<string>>>;
-  status: string;
-  setPreview: (f: PreviewFile) => void;
-}) {
-  const images = attachments.filter(
-    (a) => isImageAttachment(a) && !isBodyJunkImage(a, inlineIds));
-  const docs = attachments.filter(isDocAttachment);
-  const total = images.length + docs.length;
-
-  if (!total) return null;
-
-  return (
-    <div className="border-b border-slate-100 px-5 py-3">
-      <p className="mb-2 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400">
-        <Paperclip className="h-3 w-3" />
-        {total} attachment{total !== 1 ? "s" : ""}
-      </p>
-      {images.length > 0 && (
-        <div className="mb-3 flex flex-wrap gap-2">
-          {images.map((a) => (
-            <ImageAttachmentCard
-              key={a.attachment_id}
-              a={a}
-              providerId={providerId}
-              selectedTimesheetIds={selectedTimesheetIds}
-              setSelectedTimesheetIds={setSelectedTimesheetIds}
-              status={status}
-              setPreview={setPreview}
-            />
-          ))}
+        <div className="relative shrink-0">
+          <span
+            className={cn(
+              "flex h-10 w-10 items-center justify-center rounded-full text-xs font-bold",
+              avatarColor(msg.sender_name)
+            )}
+          >
+            {initials(msg.sender_name)}
+          </span>
+          {open && (
+            <span className="absolute -bottom-0.5 -right-0.5 flex h-4 w-4 items-center justify-center rounded-full border border-white bg-slate-400 text-white shadow-sm">
+              <ChevronDown className="h-2.5 w-2.5" />
+            </span>
+          )}
         </div>
-      )}
-      {docs.length > 0 && (
-        <div className="flex flex-wrap gap-2">
-          {docs.map((a) => (
-            <div key={a.attachment_id}>
-              <AttachmentChip
-                a={a}
-                providerId={providerId}
-                selectedTimesheetIds={selectedTimesheetIds}
-                setSelectedTimesheetIds={setSelectedTimesheetIds}
-                status={status}
-                setPreview={setPreview}
-              />
-            </div>
-          ))}
+
+        <span className="min-w-0 flex-1">
+          {open ? (
+            <span className="flex items-start justify-between gap-3">
+              <span className="min-w-0">
+                <span className="block text-sm font-semibold text-slate-900">
+                  {msg.sender_name}
+                  {msg.sender_email && (
+                    <span className="font-normal text-slate-500">
+                      {" "}&lt;{msg.sender_email}&gt;
+                    </span>
+                  )}
+                </span>
+                <RecipientRows to={to} cc={cc} />
+              </span>
+              <span className="shrink-0 text-right">
+                {fileCount > 0 && (
+                  <Paperclip className="mb-1 ml-auto h-4 w-4 text-slate-400" aria-label="Has attachments" />
+                )}
+                <span className="block text-xs text-slate-500 whitespace-nowrap">
+                  {formatOutlookDateTime(msg.received_at)}
+                </span>
+              </span>
+            </span>
+          ) : (
+            <>
+              <span className="flex items-start justify-between gap-2">
+                <span className="truncate text-sm font-semibold text-slate-900">{msg.sender_name}</span>
+                {fileCount > 0 && (
+                  <Paperclip className="h-4 w-4 shrink-0 text-slate-400" aria-label="Has attachments" />
+                )}
+              </span>
+              <span className="mt-0.5 block truncate text-sm text-slate-500">
+                {emailSnippet(msg.body_text)}
+              </span>
+              <span className="mt-1 block text-right text-xs text-slate-400">
+                {formatOutlookDateTime(msg.received_at)}
+              </span>
+            </>
+          )}
+        </span>
+      </button>
+
+      {open && (
+        <div className="border-t border-slate-100">
+          <OutlookAttachmentStrip
+            attachments={msg.attachments}
+            inlineIds={inlineIds}
+            providerId={msg.provider_message_id}
+            setPreview={setPreview}
+          />
+          <div className="px-4 py-3">
+            <EmailBodyRenderer
+              bodyText={msg.body_text}
+              bodyHtml={msg.body_html}
+              subject={msg.subject}
+              attachments={msg.attachments}
+              providerId={msg.provider_message_id}
+            />
+          </div>
         </div>
       )}
     </div>
@@ -921,9 +972,10 @@ function InboxListAttachmentPreview({
 }: {
   email: EmailListItem;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const atts = email.attachments ?? [];
   if (!atts.length) return null;
-  const shown = atts.slice(0, 2);
+  const shown = expanded ? atts : atts.slice(0, 2);
   const extra = atts.length - shown.length;
   return (
     <span className="mt-2 flex flex-wrap items-end gap-1.5">
@@ -950,8 +1002,26 @@ function InboxListAttachmentPreview({
         );
       })}
       {extra > 0 && (
-        <span className="inline-flex h-[44px] items-center rounded border border-slate-200 bg-white px-3 text-sm font-medium text-slate-500">
-          +{extra}
+        <span
+          role="button"
+          tabIndex={0}
+          title={`Show ${extra} more attachment${extra !== 1 ? "s" : ""}`}
+          onClick={(e) => { e.stopPropagation(); setExpanded(true); }}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); setExpanded(true); } }}
+          className="inline-flex h-[44px] items-center rounded border border-slate-200 bg-white px-3 text-sm font-medium text-slate-500 hover:bg-slate-50 hover:text-brand-600 cursor-pointer"
+        >
+          +{extra} more
+        </span>
+      )}
+      {expanded && atts.length > 2 && (
+        <span
+          role="button"
+          tabIndex={0}
+          onClick={(e) => { e.stopPropagation(); setExpanded(false); }}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); setExpanded(false); } }}
+          className="inline-flex h-[44px] items-center rounded border border-slate-200 bg-white px-3 text-[11px] font-medium text-slate-400 hover:bg-slate-50 hover:text-slate-600 cursor-pointer"
+        >
+          Show less
         </span>
       )}
     </span>
@@ -969,27 +1039,16 @@ export default function InboxPage() {
   const [status, setStatus] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [preview, setPreview] = useState<PreviewFile | null>(null);
-  const [selectedTimesheetIds, setSelectedTimesheetIds] = useState<Set<string>>(new Set());
-  const [extractBodyEnabled, setExtractBodyEnabled] = useState(false);
   const [stagedQueue, setStagedQueue] = useState<PipelineFile[]>([]);
+  // Live Extract Email activity + the review queue to open once it closes.
+  const extractRun = useExtractionStream();
+  const [pendingReview, setPendingReview] = useState<PipelineFile[]>([]);
   const [llmPreviewOpen, setLlmPreviewOpen] = useState(false);
   const [llmPreview, setLlmPreview] = useState<LlmEgressPreview | null>(null);
   const [llmPreviewLoading, setLlmPreviewLoading] = useState(false);
   const [llmPreviewError, setLlmPreviewError] = useState<string | null>(null);
 
   useEffect(() => setPreview(null), [selected]);
-  useEffect(() => {
-    setExtractBodyEnabled(false);
-    setSelectedTimesheetIds(new Set());
-  }, [selected]);
-
-  const buildSelection = (): IngestSelection => ({
-    attachment_ids: [...selectedTimesheetIds],
-    extract_body: extractBodyEnabled,
-  });
-
-  const extractCount = selectedTimesheetIds.size + (extractBodyEnabled ? 1 : 0);
-  const canExtract = extractCount > 0;
 
   const openLlmPreview = async (msgId: string) => {
     setLlmPreviewOpen(true);
@@ -1009,12 +1068,12 @@ export default function InboxPage() {
 
   const dq = useDebounced(q, 350);
   const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
-    queryKey: ["inbox", dq, status],
-    queryFn: ({ pageParam }) => fetchInbox(dq, status, pageParam as number),
+    queryKey: ["inbox-threads", dq, status],
+    queryFn: ({ pageParam }) => fetchThreads(dq, status, pageParam as number),
     initialPageParam: 0,
     getNextPageParam: (last) => (last.has_more ? last.offset + last.items.length : undefined),
   });
-  const emails = data?.pages.flatMap((p) => p.items) ?? [];
+  const emails: ThreadListItem[] = data?.pages.flatMap((p) => p.items) ?? [];
   const inboxTotal = data?.pages[0]?.total ?? 0;
 
   const [scrollRoot, setScrollRoot] = useState<HTMLDivElement | null>(null);
@@ -1030,18 +1089,47 @@ export default function InboxPage() {
     enabled: !!selected,
   });
 
+  // Outlook-style "see the full history": every OTHER message in this
+  // email's conversation (the selected row is always the thread's newest —
+  // see backend _to_list_item — so this is the earlier history below it).
+  const { data: thread, isLoading: loadingThread } = useQuery({
+    queryKey: ["email-thread", selected],
+    queryFn: () => fetchThread(selected!),
+    enabled: !!selected,
+  });
+
+  const threadMessages: EmailDetail[] = useMemo(() => {
+    const msgs = thread?.messages?.length
+      ? [...thread.messages]
+      : detail
+        ? [detail]
+        : [];
+    if (!detail || !msgs.length) return msgs;
+    return msgs.map((m) =>
+      m.provider_message_id === detail.provider_message_id ? detail : m);
+  }, [thread, detail]);
+
+  const [expandedThreadIds, setExpandedThreadIds] = useState<Set<string>>(new Set());
+
   useEffect(() => {
-    if (!detail) return;
-    // Default selection: timesheet-classified docs and image attachments —
-    // never body-embedded signature/logo images.
-    const inlineIds = detail.inline_attachment_ids ?? [];
-    const timesheetIds = detail.attachments
-      .filter((a) => a.kind === "timesheet" && (isDocAttachment(a) || isImageAttachment(a))
-        && !isBodyJunkImage(a, inlineIds))
-      .map((a) => a.attachment_id);
-    setSelectedTimesheetIds(new Set(timesheetIds));
-    setExtractBodyEnabled(false);
-  }, [detail?.provider_message_id]);
+    if (selected) setExpandedThreadIds(new Set([selected]));
+  }, [selected]);
+
+  const toggleThreadMessage = (id: string) => {
+    setExpandedThreadIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (selected) {
+      qc.invalidateQueries({ queryKey: ["email", selected] });
+      qc.invalidateQueries({ queryKey: ["email-thread", selected] });
+    }
+  }, [selected, qc]);
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["inbox"] });
@@ -1061,26 +1149,26 @@ export default function InboxPage() {
     onError: (e: any) => toast("error", "Action failed", e?.response?.data?.detail ?? String(e)),
   });
 
-  // Extract Email — whole .eml (or just the selected sheets) through the ONE
-  // extraction pipeline, grouped per employee/month, staged for review.
+  // Extract Email — whole .eml through the ONE extraction pipeline.
   const extractEmail = useMutation({
-    mutationFn: ({ id, selection }: { id: string; selection?: IngestSelection }) =>
-      extractFullEmail(id, selection),
+    // Streams live pipeline activity into the ExtractionActivityModal; the
+    // resolved value is the same {staged, groups, message} payload as before.
+    mutationFn: (id: string) =>
+      extractRun.start((onEvent) => extractFullEmailStream(id, onEvent)) as Promise<{
+        staged: PipelineFile[]; groups: number; message: string;
+      }>,
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["inbox"] });
       qc.invalidateQueries({ queryKey: ["email", selected] });
       qc.invalidateQueries({ queryKey: ["pipeline"] });
       qc.invalidateQueries({ queryKey: ["pipeline-stats"] });
-      if (!res.staged.length) {
-        toast("warning", "Nothing to review", res.message);
-        return;
-      }
-      toast("success",
-        res.groups === 1 ? "1 item ready to review" : `${res.groups} items ready to review`,
-        res.message);
-      setStagedQueue(res.staged);
+      // Auto-accepted items are already filed (status "success"); only the
+      // held-for-review ones need Compare & Fix — opened when the user closes
+      // the live activity panel.
+      const review = (res.staged ?? []).filter((t) => t.status === "needs_review");
+      setPendingReview(review);
     },
-    onError: (e: any) => toast("error", "Extract Email failed", e?.response?.data?.detail ?? String(e)),
+    onError: (e: any) => toast("error", "Extract Email failed", e?.message ?? String(e)),
   });
 
   const [vaultEmailId, setVaultEmailId] = useState<string | null>(null);
@@ -1172,7 +1260,17 @@ export default function InboxPage() {
                   </span>
                   <span className="min-w-0 flex-1">
                     <span className="flex items-baseline justify-between gap-2">
-                      <span className="truncate text-sm font-semibold text-slate-800">{m.sender_name}</span>
+                      <span className="flex min-w-0 items-baseline gap-1.5">
+                        <span className="truncate text-sm font-semibold text-slate-800">{m.sender_name}</span>
+                        {m.thread_message_count > 1 && (
+                          <span
+                            title={`${m.thread_message_count} messages in this thread`}
+                            className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-500"
+                          >
+                            {m.thread_message_count}
+                          </span>
+                        )}
+                      </span>
                       <span className="shrink-0 text-[11px] text-slate-400">
                         {formatDateTime(m.received_at).split(",")[0]}
                       </span>
@@ -1232,10 +1330,9 @@ export default function InboxPage() {
                 </div>
               ) : (
                 <>
-                  {/* ── Email header — Outlook style ─────────────── */}
+                  {/* ── Email header — subject + actions ───────────── */}
                   <div className="shrink-0 border-b border-slate-100 px-5 py-3">
                     <div className="flex items-start gap-3">
-                      {/* Left: subject + meta */}
                       <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2">
                           <h2 className="text-sm font-bold leading-snug text-slate-900">
@@ -1246,31 +1343,11 @@ export default function InboxPage() {
                               <Forward className="h-3 w-3" /> Forwarded
                             </span>
                           )}
-                        </div>
-
-                        {/* From / Date metadata */}
-                        <div className="mt-1.5 space-y-0.5 text-xs text-slate-600">
-                          <div className="flex gap-2">
-                            <span className="w-10 shrink-0 font-semibold text-slate-400">From</span>
-                            <span className="flex min-w-0 flex-wrap items-center gap-1.5">
-                              <span
-                                className={cn(
-                                  "flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[8px] font-bold",
-                                  avatarColor(detail.sender_name)
-                                )}
-                              >
-                                {initials(detail.sender_name)}
-                              </span>
-                              <span className="font-medium text-slate-800">{detail.sender_name}</span>
-                              {detail.sender_email && (
-                                <span className="text-slate-400 truncate">&lt;{detail.sender_email}&gt;</span>
-                              )}
+                          {threadMessages.length > 1 && (
+                            <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-500">
+                              {threadMessages.length} messages
                             </span>
-                          </div>
-                          <div className="flex gap-2">
-                            <span className="w-10 shrink-0 font-semibold text-slate-400">Date</span>
-                            <span>{formatDateTime(detail.received_at)}</span>
-                          </div>
+                          )}
                         </div>
                       </div>
 
@@ -1292,36 +1369,24 @@ export default function InboxPage() {
                         </div>
 
                         <div className="flex flex-wrap justify-end gap-1.5">
-                    <Button
-                            size="sm"
-                            disabled={extractEmail.isPending || loadingDetail}
-                            onClick={() => extractEmail.mutate({ id: detail.provider_message_id })}
-                            title={detail.extract_email_at
-                              ? "Re-run Extract Email — replaces staged review items from the last run"
-                              : "Whole .eml to vision — all attachments, approvals detected, grouped per employee/month for Compare & Fix"}
-                          >
-                            {extractEmail.isPending ? (
-                              <Spinner className="border-white/40 border-t-white h-3 w-3" />
-                            ) : (
-                              <Wand2 className="h-3 w-3" />
-                            )}
-                            {extractEmail.isPending
-                              ? "Extracting…"
-                              : detail.extract_email_at
-                                ? "Re-extract"
-                                : "Extract Email"}
-                    </Button>
+                          {!detail.extract_email_at && (
+                            <Button
+                              size="sm"
+                              disabled={extractEmail.isPending || loadingDetail}
+                              onClick={() => extractEmail.mutate(detail.provider_message_id)}
+                              title="Whole .eml to vision — all attachments, approvals detected, grouped per employee/month for Compare & Fix"
+                            >
+                              {extractEmail.isPending ? (
+                                <Spinner className="border-white/40 border-t-white h-3 w-3" />
+                              ) : (
+                                <Wand2 className="h-3 w-3" />
+                              )}
+                              {extractEmail.isPending ? "Extracting…" : "Extract Email"}
+                            </Button>
+                          )}
                           <EmailMenu
                             busy={extractEmail.isPending || decide.isPending}
                             manualActions={[
-                              ...(canExtract ? [{
-                                label: `Extract selected (${extractCount})`,
-                                icon: CheckCircle2,
-                                onClick: () => extractEmail.mutate({
-                                  id: detail.provider_message_id,
-                                  selection: buildSelection(),
-                                }),
-                              }] : []),
                               ...(detail.status === "new" ? [{
                                 label: "Archive email",
                                 icon: Archive,
@@ -1365,30 +1430,27 @@ export default function InboxPage() {
                 </div>
               </div>
 
-                  {/* ── Attachments — Outlook chips, above body ──── */}
-                  <AttachmentChips
-                    attachments={detail.attachments}
-                    inlineIds={detail.inline_attachment_ids ?? []}
-                    providerId={detail.provider_message_id}
-                    selectedTimesheetIds={selectedTimesheetIds}
-                    setSelectedTimesheetIds={setSelectedTimesheetIds}
-                    status={detail.status}
-                    setPreview={setPreview}
-                  />
-
                 </>
               )}
 
-              {/* ── Body ─────────────────────────────────────────── */}
-              <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-                {/* Email body — HTML iframe when available, plain-text fallback */}
-                <EmailBodyRenderer
-                  bodyText={detail.body_text}
-                  bodyHtml={detail.body_html}
-                  subject={detail.subject}
-                  attachments={detail.attachments}
-                  providerId={detail.provider_message_id}
-                />
+              {/* ── Outlook-style conversation thread ─────────────── */}
+              <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50/70 px-4 py-4">
+                {loadingThread && !!detail.conversation_id && threadMessages.length <= 1 && (
+                  <div className="mb-3 flex items-center gap-2 text-xs text-slate-400">
+                    <Spinner className="h-3.5 w-3.5" /> Loading conversation…
+                  </div>
+                )}
+                <div className="space-y-2">
+                  {threadMessages.map((m) => (
+                    <ThreadMessageCard
+                      key={m.provider_message_id}
+                      msg={m}
+                      open={expandedThreadIds.has(m.provider_message_id)}
+                      onToggle={() => toggleThreadMessage(m.provider_message_id)}
+                      setPreview={setPreview}
+                    />
+                  ))}
+                </div>
               </div>
             </>
           )}
@@ -1396,6 +1458,22 @@ export default function InboxPage() {
       </div>
 
       <FilePreviewModal file={preview} onClose={() => setPreview(null)} />
+
+      {/* Live Extract Email activity — stages, LLM-call count, auto-accept
+          outcome. On close, open Compare & Fix for any held-for-review items. */}
+      <ExtractionActivityModal
+        run={extractRun}
+        title="Extract Email"
+        onDone={() => {
+          if (pendingReview.length) {
+            setStagedQueue(pendingReview);
+            setPendingReview([]);
+          } else {
+            toast("success", "Extract Email complete",
+              "No items need review — see the pipeline for auto-accepted records.");
+          }
+        }}
+      />
 
       <SaveEmlToVaultModal
         emailId={vaultEmailId}

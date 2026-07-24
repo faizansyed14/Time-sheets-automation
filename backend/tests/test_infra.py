@@ -48,7 +48,7 @@ async def test_langchain_model_factory_builds():
     from app.core.database import SessionLocal
     from app.services.llm import provider
     async with SessionLocal() as db:
-        model = await provider.get_chat_model(db, kind="extraction", provider="deepseek")
+        model = await provider.get_chat_model(db, kind="agent")
     assert model.__class__.__name__ == "ChatOpenAI"
 
 

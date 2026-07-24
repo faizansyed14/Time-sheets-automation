@@ -200,7 +200,7 @@ async def test_pasted_grid_body_reaches_the_model_and_stages():
         units = fx._collect_units(mail, eml)
         body_unit = next(u for u in units if u.name == "(email body)")
         assert "ATTENDANCE SHEET" in body_unit.text
-        prompt = fx._batch_prompt(mail, units)
+        prompt = fx._extract_prompt(mail, body_unit)
         assert "(email body)" in prompt and "E2507067" in prompt
 
         # Simulate the model's per-sheet verdict → the rest of the flow works.
@@ -224,8 +224,8 @@ async def test_pasted_grid_body_reaches_the_model_and_stages():
             db, source_kind="email", source_id=mail.provider_message_id,
             raw_bytes=eml, raw_name="kevin.eml", content_type="message/rfc822",
             groups=groups, approval=approval,
-            run_meta={"method": "vision-batch", "model": "gpt-4o", "batches": 1,
-                      "batch_size": 2, "sheet_count": 1, "errors": []})
+            run_meta={"method": "vision", "model": "gpt-4o", "calls": 1,
+                      "sheet_count": 1, "errors": []})
         assert staged[0].employee_id == "E2507067" and staged[0].month == 6
 
 

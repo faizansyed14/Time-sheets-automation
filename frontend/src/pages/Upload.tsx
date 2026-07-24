@@ -12,13 +12,14 @@ import {
   Layers,
 } from "lucide-react";
 import {
-  uploadTimesheets,
+  uploadTimesheetsStream,
   MONTHS_LONG,
   type PipelineFile,
   type UploadResult,
 } from "../api/client";
 import { cn, formatBytes } from "../lib/utils";
 import { Button, Card, PageHeader } from "../components/ui";
+import { ExtractionActivityModal, useExtractionStream } from "../components/ExtractionActivity";
 import StoredFilesPreview from "../components/StoredFilesPreview";
 import ManualEntryForm from "../components/ManualEntryForm";
 import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
@@ -32,9 +33,10 @@ export default function UploadPage() {
   const [queue, setQueue] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [progress, setProgress] = useState(0);
   const [manualResults, setManualResults] = useState<UploadResult[]>([]);
   const [stagedQueue, setStagedQueue] = useState<PipelineFile[]>([]);
+  const extractRun = useExtractionStream();
+  const [pendingReview, setPendingReview] = useState<PipelineFile[]>([]);
   const [mode, setMode] = useState<"files" | "manual">("files");
 
   const afterChange = () => {
@@ -63,23 +65,22 @@ export default function UploadPage() {
   const run = async () => {
     if (!queue.length) return;
     setBusy(true);
-    setProgress(0);
+    const files = [...queue];
     try {
-      const staged = await uploadTimesheets(queue, setProgress);
+      const res = await extractRun.start((onEvent) =>
+        uploadTimesheetsStream(files, onEvent),
+      ) as { staged?: PipelineFile[] };
       setQueue([]);
+      const staged = res?.staged ?? [];
       if (!staged.length) {
         toast("warning", "Nothing to extract", "No timesheet could be extracted from the selection.");
         return;
       }
-      toast(
-        "success",
-        staged.length === 1 ? "1 item ready to review" : `${staged.length} items ready to review`,
-        "Check the extracted leaves, then Accept to file the record."
-      );
-      setStagedQueue(staged);
+      const review = staged.filter((t) => t.status === "needs_review");
+      setPendingReview(review);
       afterChange();
     } catch (e: any) {
-      toast("error", "Upload failed", e?.response?.data?.detail ?? String(e));
+      toast("error", "Upload failed", e?.message ?? String(e));
     } finally {
       setBusy(false);
     }
@@ -182,14 +183,6 @@ export default function UploadPage() {
                 </div>
               ))}
             </div>
-            {busy && (
-              <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-slate-200">
-                <div
-                  className="h-full rounded-full bg-brand-600 transition-all"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
-            )}
             <div className="mt-4 flex justify-end gap-2">
               <Button variant="secondary" onClick={() => setQueue([])} disabled={busy}>
                 Clear
@@ -257,6 +250,24 @@ export default function UploadPage() {
           </div>
         </Card>
       )}
+
+      <ExtractionActivityModal
+        run={extractRun}
+        title="Upload extraction"
+        onDone={() => {
+          if (pendingReview.length) {
+            setStagedQueue(pendingReview);
+            setPendingReview([]);
+            toast(
+              "info",
+              pendingReview.length === 1 ? "1 item needs review" : `${pendingReview.length} items need review`,
+              "Check the extracted leaves, then Accept to file the record.",
+            );
+          } else {
+            toast("success", "Extraction complete", "All records were auto-accepted — see the pipeline.");
+          }
+        }}
+      />
 
       <PipelineCompareFixModal
         file={stagedQueue[0] ?? null}

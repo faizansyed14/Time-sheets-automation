@@ -17,20 +17,22 @@ import {
   type Employee,
   type UploadResult,
 } from "../api/client";
-import { isPdf, isPreviewable } from "../lib/filePreview";
-import { cn, formatBytes, initials, avatarColor } from "../lib/utils";
+import { ATTACHABLE_FILE_RE } from "../lib/filePreview";
+import { cn, filterEmployees, formatBytes, initials, avatarColor } from "../lib/utils";
 import { Button, Card, Field, Select } from "./ui";
 import { useToast } from "./toast";
+import { SourcePreview } from "./FilePreview";
 
 import { leaveBucketDefs } from "../lib/theme";
 
 const BUCKETS = leaveBucketDefs();
 
 const NOW = new Date();
-const FILE_RE = /\.(pdf|docx|xlsx|png|jpe?g|eml)$/i;
 
 // ---------------------------------------------------------------------------
-// Local-file preview pane (no upload — pure object URL)
+// Local-file preview pane — a File picked in the form, not uploaded anywhere
+// yet. SourcePreview's blob-URL + sourceUrl fallback handles every format;
+// this just supplies the object URL and marks EML as "not previewable yet".
 // ---------------------------------------------------------------------------
 function LocalFilePreview({ file }: { file: File }) {
   const [url, setUrl] = useState<string | null>(null);
@@ -42,37 +44,13 @@ function LocalFilePreview({ file }: { file: File }) {
   }, [file]);
 
   if (!url) return null;
-
-  if (isPdf(file.name)) {
-    return (
-      <iframe
-        src={url}
-        title={file.name}
-        className="h-full w-full rounded-lg border border-slate-200 bg-white"
-      />
-    );
-  }
-
-  if (isPreviewable(file.name)) {
-    return (
-      <img
-        src={url}
-        alt={file.name}
-        className="mx-auto block max-h-full max-w-full rounded-lg object-contain"
-      />
-    );
-  }
-
-  // EML or unsupported — show a friendly card
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 rounded-lg border border-slate-200 bg-white p-8 text-center">
-      <FileText className="h-10 w-10 text-slate-300" />
-      <p className="font-medium text-slate-700">{file.name}</p>
-      <p className="text-sm text-slate-400">{formatBytes(file.size)}</p>
-      <p className="text-xs text-slate-400">
-        Preview unavailable — file will be attached when the record is saved.
-      </p>
-    </div>
+    <SourcePreview
+      url={url}
+      name={file.name}
+      ct={file.type}
+      emlUnavailable
+    />
   );
 }
 
@@ -99,15 +77,10 @@ export default function ManualEntryForm({ onResult }: { onResult: (r: UploadResu
     setPreviewIdx((i) => (files.length ? Math.min(i, files.length - 1) : 0));
   }, [files]);
 
-  const matches = useMemo(() => {
-    if (!picked && q.trim()) {
-      const t = q.toLowerCase();
-      return (employees ?? [])
-        .filter((e) => e.name.toLowerCase().includes(t) || e.employee_id.toLowerCase().includes(t))
-        .slice(0, 8);
-    }
-    return [];
-  }, [employees, q, picked]);
+  const matches = useMemo(
+    () => (!picked && q.trim() ? filterEmployees(employees, q).slice(0, 8) : []),
+    [employees, q, picked]
+  );
 
   const totalDays = BUCKETS.reduce((a, b) => a + (dates[b.key]?.length ?? 0), 0);
 
@@ -120,7 +93,7 @@ export default function ManualEntryForm({ onResult }: { onResult: (r: UploadResu
 
   const addFiles = (list: FileList | null) => {
     if (!list) return;
-    const valid = Array.from(list).filter((f) => FILE_RE.test(f.name));
+    const valid = Array.from(list).filter((f) => ATTACHABLE_FILE_RE.test(f.name));
     setFiles((prev) => {
       const names = new Set(prev.map((f) => f.name));
       return [...prev, ...valid.filter((f) => !names.has(f.name))];

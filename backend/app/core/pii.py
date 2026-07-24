@@ -7,8 +7,11 @@ Threat model (product decision):
   (after Thanks / Regards) → MUST NOT reach the model.
 
 ``scrub_text``         — general text (emails, phones, secrets).
-``scrub_email_for_llm`` — email subject + body: headers softened, signature cut,
-                          then scrub_text. Used for body→JPEG and prompt text.
+``scrub_email_for_llm`` — email subject + body: scrub_text over the FULL content
+                          (signatures + quoted reply history included). Used for
+                          body→JPEG and prompt text when sending whole threads.
+                          Optional cut_signature / cut_quoted_thread truncate
+                          instead (legacy).
 ``PII_REDACTION=false`` disables all of the above (dev A/B only).
 """
 from __future__ import annotations
@@ -226,19 +229,24 @@ def scrub_email_for_llm(
     subject: str | None,
     body: str | None,
     *,
-    cut_signature: bool = True,
+    cut_signature: bool = False,
+    cut_quoted_thread: bool = False,
 ) -> tuple[str, str]:
     """Subject + body as they will be shown to the vision model.
 
-    Order: drop quoted reply thread → optional signature cut → scrub_text
-    (headers / emails / phones / secrets). Timesheet attachment files are NOT
-    passed through this — only email subject/body content.
+    Default (whole-thread mode): scrub emails / phones / secrets in the FULL
+    body — signatures and quoted reply history stay, PII inside them is
+    tokenised. Set cut_signature / cut_quoted_thread to truncate instead
+    (legacy). Timesheet attachment files are NOT passed through this — only
+    email subject/body content.
     """
     subj = subject or ""
     raw = body or ""
     if not settings.pii_redaction:
         return subj, raw
-    body_out = strip_quoted_reply_thread(raw)
+    body_out = raw
+    if cut_quoted_thread:
+        body_out = strip_quoted_reply_thread(body_out)
     if cut_signature:
         body_out = strip_signature_block(body_out)
     return scrub_text(subj), scrub_text(body_out)

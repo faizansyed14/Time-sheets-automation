@@ -70,15 +70,9 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     async with SessionLocal() as db:
-        # default admin + apply any saved AI config to the live process
         try:
             from app.seed.seed_admin import seed_admin
             await seed_admin(db)
-        except Exception:
-            pass
-        try:
-            from app.services.config.service import load_and_apply
-            await load_and_apply(db)
         except Exception:
             pass
     yield
@@ -102,20 +96,6 @@ _EMBEDDABLE_PATH_MARKERS = ("/files/content", "/attachments/", "/raw-preview")
 
 def _embeddable_preview_path(path: str) -> bool:
     return any(marker in path for marker in _EMBEDDABLE_PATH_MARKERS)
-
-
-@app.middleware("http")
-async def sync_runtime_config(request: Request, call_next):
-    """Each uvicorn worker keeps its own `settings` copy; bump rev on admin save
-    so every worker reloads the DB overlay on the next request."""
-    if request.url.path.startswith(f"{settings.api_prefix}/"):
-        try:
-            from app.services.config.service import sync_runtime_if_stale
-            async with SessionLocal() as db:
-                await sync_runtime_if_stale(db)
-        except Exception:
-            pass
-    return await call_next(request)
 
 
 @app.middleware("http")

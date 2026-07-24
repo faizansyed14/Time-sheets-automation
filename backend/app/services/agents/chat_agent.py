@@ -493,46 +493,11 @@ def _to_lc_messages(history: list[dict]):
     return out
 
 
-def _extraction_context(extractions: list[dict] | None) -> str:
-    """Render uploaded-sheet extractions as grounded context for the agent."""
-    import json
-    if not extractions:
-        return ""
-    slim = []
-    for e in extractions:
-        if not isinstance(e, dict) or e.get("status") != "ok":
-            continue
-        slim.append({
-            "filename": e.get("filename"),
-            "extracted_employee_name": e.get("extracted_employee_name"),
-            "extracted_employee_id": e.get("extracted_employee_id"),
-            "matched_employee": e.get("matched_employee"),
-            "month": e.get("month"), "year": e.get("year"),
-            "leaves": e.get("leaves"), "counts": e.get("counts"),
-            "validation_status": e.get("validation_status"),
-        })
-    if not slim:
-        return ""
-    return (
-        "\n\nUPLOADED SHEETS (already extracted by the validated pipeline — these "
-        "are the ground truth; use these EXACT employee, month/year and dates, and "
-        "NEVER invent or alter them):\n" + json.dumps(slim, default=str) +
-        "\n\nIf the user asks to apply/update an uploaded sheet to an employee: use "
-        "update_leaves with the sheet's matched_employee (or ask which employee if "
-        "there is no match), the sheet's month and year, and the exact dates per "
-        "leave type. If several leave types have dates, update each one. Confirm "
-        "what changed afterwards."
-    )
-
-
-async def run_chat(
-    db: AsyncSession, history: list[dict], extractions: list[dict] | None = None,
-) -> dict[str, Any]:
+async def run_chat(db: AsyncSession, history: list[dict]) -> dict[str, Any]:
     """Run one assistant turn over the conversation `history`.
 
     Returns {answer, changes, tools_used, error}. `changes` is a list of
     before→after edit blocks the UI renders so the user sees what was modified.
-    `extractions` are grounded results of any sheets uploaded into the chat.
     """
     import datetime as _dt
 
@@ -553,8 +518,7 @@ async def run_chat(
     model = model.bind_tools(TOOL_SCHEMAS)
 
     today = _dt.date.today().isoformat()
-    system = SYSTEM_PROMPT.format(today=today) + _extraction_context(extractions)
-    messages = [SystemMessage(content=system)]
+    messages = [SystemMessage(content=SYSTEM_PROMPT.format(today=today))]
     messages += _to_lc_messages(history)
 
     changes: list[dict] = []
@@ -665,9 +629,7 @@ def _proactive_suggestions(cards: list[dict]) -> list[str]:
     return uniq[:3]
 
 
-async def run_chat_stream(
-    db: AsyncSession, history: list[dict], extractions: list[dict] | None = None,
-):
+async def run_chat_stream(db: AsyncSession, history: list[dict]):
     """Streaming version of run_chat. Async-generates events the SSE endpoint
     forwards to the UI:
       {"type":"token","text":...}          answer text as it is produced
@@ -690,8 +652,8 @@ async def run_chat_stream(
 
     model = (await llm_provider.get_chat_model(db, kind="agent")).bind_tools(TOOL_SCHEMAS)
     today = _dt.date.today().isoformat()
-    system = SYSTEM_PROMPT.format(today=today) + _extraction_context(extractions)
-    messages = [SystemMessage(content=system)] + _to_lc_messages(history)
+    messages = ([SystemMessage(content=SYSTEM_PROMPT.format(today=today))]
+                + _to_lc_messages(history))
 
     tools_used: list[str] = []
     changes: list[dict] = []

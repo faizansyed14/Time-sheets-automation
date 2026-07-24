@@ -49,8 +49,6 @@ os.environ.update(
     GRAPH_MAILBOX="",
     GRAPH_OTP_SENDER="",
     OPENAI_API_KEY="",
-    DEEPSEEK_API_KEY="",
-    VLLM_API_KEY="",
 )
 
 from httpx import ASGITransport, AsyncClient  # noqa: E402

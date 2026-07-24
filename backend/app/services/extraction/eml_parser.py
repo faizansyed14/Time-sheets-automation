@@ -11,6 +11,7 @@ import base64
 import email
 import email.header
 import email.policy
+import re
 from typing import Any
 
 
@@ -35,6 +36,100 @@ def _decode_text(part) -> str:
     return raw.decode(charset, errors="replace")
 
 
+_DOC_EXTS = (".pdf", ".docx", ".xlsx", ".xls", ".doc", ".eml")
+_DOC_CTS = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/msword",
+    "application/vnd.ms-excel",
+    "message/rfc822",
+    "application/eml",
+}
+
+
+def _guess_content_type(filename: str, declared: str, raw: bytes) -> str:
+    """Prefer real MIME from filename/magic — EML parts often say octet-stream."""
+    name = (filename or "").lower()
+    if raw.startswith(b"%PDF") or name.endswith(".pdf"):
+        return "application/pdf"
+    if name.endswith(".docx"):
+        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if name.endswith((".xlsx", ".xls")):
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if name.endswith(".eml"):
+        return "message/rfc822"
+    if name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")):
+        if declared.startswith("image/"):
+            return declared
+        ext = name.rsplit(".", 1)[-1]
+        return "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+    if declared and declared.lower() not in ("application/octet-stream", "application/binary"):
+        return declared
+    return declared or "application/octet-stream"
+
+
+def _is_document_part(filename: str, content_type: str) -> bool:
+    fn = (filename or "").lower()
+    ct = (content_type or "").lower()
+    return fn.endswith(_DOC_EXTS) or ct in _DOC_CTS
+
+
+def _nested_inner(part):
+    """The parsed Message inside a message/rfc822 part, if any."""
+    payload = part.get_payload()
+    if isinstance(payload, list) and payload:
+        return payload[0]
+    return payload if hasattr(payload, "as_bytes") else None
+
+
+def _nested_message_bytes(part) -> bytes:
+    """Raw .eml bytes of a message/rfc822 part.
+
+    ``get_payload(decode=True)`` returns None for these — the payload is an
+    already-parsed Message, not an encoded string — which is why a forwarded
+    email used to reach the preview with size 0 and no way to open it.
+    """
+    inner = _nested_inner(part)
+    if inner is not None:
+        try:
+            return inner.as_bytes()
+        except Exception:
+            pass
+    payload = part.get_payload()
+    if isinstance(payload, str) and payload.strip():
+        return payload.encode("utf-8", "replace")
+    return part.get_payload(decode=True) or b""
+
+
+def _nested_message_name(part) -> str:
+    """Name a nested email after its own Subject, the way Outlook does."""
+    inner = _nested_inner(part)
+    subject = ""
+    if inner is not None and hasattr(inner, "get"):
+        subject = _decode_header_value(inner.get("Subject"))
+    subject = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", subject).strip()
+    return f"{subject[:120]}.eml" if subject else "Forwarded message.eml"
+
+
+def _walk_parts(part, *, root: bool = True):
+    """Like ``Message.walk()``, but a nested message/rfc822 is ONE leaf.
+
+    The stdlib walk descends into forwarded mail, which hoisted the inner
+    email's attachments into the outer email's list and left the forwarded
+    message itself empty. Stopping at the boundary preserves the real
+    structure: a nested email is an attachment you open to see its own body
+    and its own files, at any depth.
+    """
+    yield part
+    if not root and part.get_content_type() == "message/rfc822":
+        return
+    if part.is_multipart():
+        for sub in part.get_payload():
+            if hasattr(sub, "walk"):
+                yield from _walk_parts(sub, root=False)
+
+
 def parse_eml(raw: bytes) -> dict[str, Any]:
     """Parse raw EML bytes → JSON-serialisable dict.
 
@@ -53,12 +148,10 @@ def parse_eml(raw: bytes) -> dict[str, Any]:
 
     body_text = ""
     body_html = ""
-    # content-id → data + metadata (sometimes providers set Content-Id on real
-    # attachments; we only treat it as inline if HTML actually references it)
     inline_images: dict[str, dict[str, Any]] = {}
     attachments: list[dict[str, Any]] = []
 
-    for part in msg.walk():
+    for part in _walk_parts(msg):
         ct = part.get_content_type()
         disp = str(part.get("Content-Disposition", "")).lower()
         cid = (part.get("Content-Id") or "").strip().strip("<>")
@@ -69,16 +162,28 @@ def parse_eml(raw: bytes) -> dict[str, Any]:
         if is_multipart:
             continue
 
+        # A forwarded/attached email — kept whole so it opens as its own
+        # email (headers, body, its own attachments) instead of having its
+        # parts spilled into this one.
+        if ct == "message/rfc822" and part is not msg:
+            nested = _nested_message_bytes(part)
+            attachments.append({
+                "filename": fn or _nested_message_name(part),
+                "content_type": "message/rfc822",
+                "size": len(nested),
+                "data_b64": base64.b64encode(nested).decode(),
+            })
+            continue
+
         if ct == "text/plain" and not is_attachment and not body_text:
             body_text = _decode_text(part)
-        elif ct == "text/html" and not is_attachment and not body_html:
+            continue
+        if ct == "text/html" and not is_attachment and not body_html:
             body_html = _decode_text(part)
-        # Content-Id images are usually inline (cid:...) but some providers
-        # also set Content-Id on real attachments. If disposition is
-        # attachment, keep it as an attachment so the UI can show it in
-        # "Attachments (N)".
-        elif cid and ct.startswith("image/") and not is_attachment:
-            # Inline image (Content-Id present) — embed as data URI.
+            continue
+
+        # Signature/body CID images — inline into HTML when referenced.
+        if cid and ct.startswith("image/") and not is_attachment and not _is_document_part(fn, ct):
             data = part.get_payload(decode=True) or b""
             b64 = base64.b64encode(data).decode()
             inline_images[cid] = {
@@ -88,30 +193,62 @@ def parse_eml(raw: bytes) -> dict[str, Any]:
                 "size": len(data),
                 "filename": fn or f"inline_{cid}.png",
             }
-        # Some providers export real document images with a filename but without a
-        # reliable `Content-Disposition: attachment` value (sometimes `inline`,
-        # sometimes empty). For vault preview, prefer the filename + content-type.
-        elif is_attachment or (fn and not cid and ct.startswith("image/")):
-            raw_att = part.get_payload(decode=True) or b""
-            attachments.append({
-                "filename": fn,
-                "content_type": ct,
-                "size": len(raw_att),
-                "data_b64": base64.b64encode(raw_att).decode(),
-            })
+            continue
 
-    # Replace cid: references in the HTML body so it renders self-contained.
-    # If provider set Content-Id but HTML does not reference it, treat as a
-    # normal attachment so the UI still shows it.
+        # Downloadable / previewable files: disposition=attachment, named
+        # documents (PDF/DOCX/XLSX/EML), or named images that aren't CID body art.
+        keep = (
+            is_attachment
+            or _is_document_part(fn, ct)
+            or (bool(fn) and ct.startswith("image/") and not cid)
+        )
+        if not keep:
+            continue
+
+        raw_att = part.get_payload(decode=True) or b""
+        attachments.append({
+            "filename": fn or "attachment",
+            "content_type": _guess_content_type(fn, ct, raw_att),
+            "size": len(raw_att),
+            "data_b64": base64.b64encode(raw_att).decode(),
+        })
+
     if inline_images:
+        from app.services.inbox.inline_images import (
+            _CID_REF_RE,
+            cid_ref_matches,
+            strip_unresolved_cids,
+        )
+
+        parts = [
+            {
+                "cid": cid_val,
+                "filename": info["filename"],
+                "data_uri": info["data_uri"],
+            }
+            for cid_val, info in inline_images.items()
+        ]
+
+        def _uri_for_ref(ref: str) -> str | None:
+            for p in parts:
+                if cid_ref_matches(
+                    ref, cid=p["cid"], filename=p["filename"],
+                ):
+                    return p["data_uri"]
+            return None
+
+        def _sub(m: re.Match) -> str:
+            return _uri_for_ref(m.group(1)) or m.group(0)
+
+        if body_html:
+            body_html = _CID_REF_RE.sub(_sub, body_html)
+            body_html = strip_unresolved_cids(body_html)
+
+        # Unreferenced inline parts stay as downloadable attachments.
         html = body_html or ""
         for cid_val, info in inline_images.items():
             ref = f"cid:{cid_val}"
-            if html and ref in html:
-                body_html = (body_html or "").replace(ref, info["data_uri"])
-            else:
-                # CID existed but HTML never used it => must be a real
-                # attachment mislabeled as inline.
+            if ref not in html and f"cid:{cid_val.split('@')[0]}" not in html:
                 attachments.append({
                     "filename": info["filename"],
                     "content_type": info["content_type"],

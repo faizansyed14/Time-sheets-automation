@@ -209,6 +209,7 @@ def _to_provider_message(msg: dict) -> ProviderMessage:
         body_text=msg["body_text"],
         body_html=msg.get("body_html"),
         attachments=_build_attachments(msg),
+        conversation_id=msg.get("conversation_id"),
     )
 
 
@@ -231,6 +232,11 @@ class MockEmailProvider(EmailProvider):
     async def get_message(self, message_id: str) -> ProviderMessage | None:
         raw = mock_data.message_by_id(message_id)
         return _to_provider_message(raw) if raw else None
+
+    async def list_thread_messages(self, conversation_id: str) -> list[ProviderMessage]:
+        msgs = [_to_provider_message(m) for m in mock_data.MESSAGES
+                if m.get("conversation_id") == conversation_id]
+        return sorted(msgs, key=lambda m: m.received_at)
 
     async def get_attachment_bytes(self, message_id: str, attachment_id: str) -> tuple[bytes, str, str]:
         msg = mock_data.message_by_id(message_id)

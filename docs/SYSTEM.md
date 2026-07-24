@@ -109,8 +109,7 @@ touched** — those are the data being extracted, so accuracy is unaffected. The
 
 Only the vision reads in step 4 — **nothing else calls the AI**:
 
-- **calls ≈ number of sheets ÷ 2** (sheets are sent 2 per call, and never more
-  than `VLLM_MAX_IMAGES_PER_PROMPT` images per call).
+- **calls ≈ number of sheets ÷ 2** (sheets are sent 2 per call).
 - A typical email (one timesheet + the body) = **1–2 calls**.
 - There is **no separate "summary" AI call** and **no separate "validation" AI
   call** in this flow — the summary and the date-validation are done by plain
@@ -118,9 +117,10 @@ Only the vision reads in step 4 — **nothing else calls the AI**:
 - If the AI is unavailable, each sheet falls back to a local, no-AI reader so
   the button still works.
 
-(Upload and chat-upload share the **same** vision extraction pipeline. Agentic
-chat is a separate text model with tools. Neither uses a second validation LLM —
-summaries/flags stay in `validation.py`.)
+(Extract Email and Upload share the **same** vision extraction pipeline — those
+two, plus Manual Entry, are the only ways a sheet enters the system. Agentic
+chat is a separate text model with tools and accepts no file uploads. Neither
+uses a second validation LLM — summaries/flags stay in `validation.py`.)
 
 ### Key guarantees
 
@@ -133,6 +133,7 @@ summaries/flags stay in `validation.py`.)
   items (no duplicates).
 
 Full detail: `services/agents/full_email_extract.py` (top-of-file docstring).
+Deep dive (all entry points, full prompts, APIs, vault): [`EXTRACTION_FLOWS.md`](EXTRACTION_FLOWS.md).
 
 ## Caching & queue
 - **Redis** backs the cache (OTP/CAPTCHA state, rate-limit sliding windows,
@@ -164,18 +165,12 @@ Default admin (`admin`/`admin`) is seeded from `.env` and configurable.
 ## Admin panel
 - **Users & access** (`/admin/users`): create users, assign OTP emails, switch a
   user between **OTP** and **CAPTCHA**, enable/disable, set roles.
-- **AI Settings** (`/admin/settings`): pick provider per service (vision /
-  agentic chat) and edit the extraction system prompt. Models, keys and URLs
-  live in `.env` only (`VISION_PROVIDER`, `OPENAI_VISION_MODEL` /
-  `VLLM_MODEL`, `AGENT_CHAT_MODEL`, …). Changes to providers/prompts apply
-  live from the UI; model/key changes need a backend restart.
-- Stored in a dedicated, isolated **`app_config`** table; secret values
-  (API keys) are **encrypted at rest** (`core/crypto.py`) and masked in the API.
+- **AI Settings** (`/admin/settings`): read-only view of active OpenAI models and
+  key status. All tuning lives in `.env`; restart backend after changes.
 
 ## LangChain (provider-agnostic AI)
-`services/llm/provider.py` builds a LangChain chat model from the active config
-(`ChatOpenAI` with per-provider base_url/key covers OpenAI, DeepSeek, vLLM …),
-so switching providers is a settings change, not a code change. Uses a
+`services/llm/provider.py` builds a LangChain OpenAI chat model from `.env`
+settings, so model/key changes are an env + restart change, not a code change. Uses a
 `ChatPromptTemplate | model | StrOutputParser` chain and an LRU on construction.
 
 ## Docker, environments, scripts

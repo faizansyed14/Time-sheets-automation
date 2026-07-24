@@ -19,7 +19,7 @@ import {
   X,
   XCircle,
 } from "lucide-react";
-import { isEml, isPdf, isPreviewable } from "../lib/filePreview";
+import { isDocx, isEml, isPdf, isPreviewable, isXlsx } from "../lib/filePreview";
 import {
   approveRecord,
   deleteRecord,
@@ -34,7 +34,7 @@ import {
   type TimesheetRecord,
 } from "../api/client";
 import { cn, formatBytes, formatDateTime } from "../lib/utils";
-import { EmlPreviewPane, FilePreviewModal, PreviewableFileRow } from "../components/FilePreview";
+import { EmlPreviewPane, FilePreviewModal, PreviewableFileRow, ServerRenderPane } from "../components/FilePreview";
 import { Badge, Button, Card, PageHeader, Spinner } from "../components/ui";
 import type { PreviewFile } from "../lib/filePreview";
 import { ApprovalBadge, ValidationBadge } from "../components/status";
@@ -512,14 +512,22 @@ export default function RecordPage() {
                       {(() => {
                         const s = sources[Math.min(activeFile, sources.length - 1)];
                         const url = fileContentUrl(s.rel_path);
+                        const renderUrl = fileRenderUrl(s.rel_path);
                         return (
                           <div className="min-h-0 flex-1 overflow-auto p-2">
                             {isEml(s.name, s.content_type) ? (
                               <div className="h-full min-h-[60vh] overflow-hidden rounded-lg border border-slate-200 bg-white">
                                 <EmlPreviewPane fileUrl={url} filename={s.name} />
                               </div>
-                            ) : isPdf(s.name, s.content_type) ? (
-                              <iframe src={url} title={s.name} className="h-full min-h-[60vh] w-full rounded-lg bg-white" />
+                            ) : isPdf(s.name, s.content_type) || isDocx(s.name, s.content_type) || isXlsx(s.name, s.content_type) ? (
+                              <div className="h-full min-h-[60vh] overflow-hidden rounded-lg border border-slate-200 bg-white">
+                                <ServerRenderPane
+                                  renderUrl={renderUrl}
+                                  sourceUrl={url}
+                                  filename={s.name}
+                                  contentType={s.content_type}
+                                />
+                              </div>
                             ) : isPreviewable(s.name, s.content_type) ? (
                               <img src={url} alt={s.name} className="mx-auto block max-h-full min-h-[40vh] max-w-full rounded-lg object-contain" />
                             ) : (

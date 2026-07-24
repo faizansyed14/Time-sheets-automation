@@ -10,10 +10,10 @@ from app.services.agents import full_email_extract as fx
 from app.services.extraction import file_processor as fp
 
 
-def _large_png_bytes(min_bytes: int = 25_000) -> bytes:
+def _large_png_bytes(min_bytes: int = 70 * 1024) -> bytes:
     """Valid PNG large enough to pass the inline-timesheet byte threshold."""
     random.seed(42)
-    for side in (600, 800, 1000, 1200):
+    for side in (600, 800, 1000, 1200, 1400, 1600):
         img = Image.new("RGB", (side, side))
         img.putdata([
             (random.randrange(256), random.randrange(256), random.randrange(256))
@@ -85,9 +85,11 @@ def test_resolve_cid_drops_logo_and_wide_banner():
     logo.save(logo_buf, format="PNG")
     logo_bytes = logo_buf.getvalue()
 
-    banner = Image.new("RGB", (1200, 200), (0, 40, 120))
+    banner = Image.new("RGB", (1200, 200))
+    random.seed(99)
     banner.putdata([
-        (i % 256, 40, 120) for i in range(1200 * 200)
+        (random.randrange(256), random.randrange(256), random.randrange(256))
+        for _ in range(1200 * 200)
     ])
     ban_buf = io.BytesIO()
     banner.save(ban_buf, format="PNG")

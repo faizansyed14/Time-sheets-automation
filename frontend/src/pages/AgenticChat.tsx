@@ -3,28 +3,23 @@
  *
  * Natural-language questions and edits over the timesheet database: check
  * submissions, count leaves, find who is missing, and add / replace / clear
- * leave dates. You can also drop a sheet (PDF/DOCX/XLSX/EML) into the chat —
- * it is extracted by the SAME validated pipeline the rest of the app uses
- * (so the leaves/dates are grounded, not guessed), previewable inline, and the
- * assistant can update that employee directly from the extracted values.
- * The uploaded file is held in memory only (never saved).
+ * leave dates. It is a READ/UPDATE agent only — sheets enter the system
+ * through Extract Email, Upload or Manual Entry, never through the chat.
  */
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
-  Send, Sparkles, BookOpen, User, Loader2, AlertTriangle, Paperclip,
-  ArrowRight, Plus, Minus, RotateCcw, Trash2, FileText, Eye, UserCheck, CalendarDays,
-  Save, Check, X, ShieldQuestion, Mail, Copy,
+  Send, Sparkles, BookOpen, User, Loader2, AlertTriangle,
+  ArrowRight, Plus, Minus, RotateCcw, Trash2, FileText, UserCheck, CalendarDays,
+  Check, X, Mail, Copy,
 } from "lucide-react";
 import {
-  fetchChatSuggestions, sendChatStream, extractChatSheet, chatAttachmentUrl, storeChatSheet,
-  type ChatMessage, type ChatChange, type ChatExtraction, type UploadResult,
+  fetchChatSuggestions, sendChatStream,
+  type ChatMessage, type ChatChange,
   type ChatCard, type ChatStreamEvent,
 } from "../api/client";
 import { Badge, Button, Card, Modal, PageHeader, Spinner } from "../components/ui";
-import { FilePreviewModal } from "../components/FilePreview";
-import type { PreviewFile } from "../lib/filePreview";
 import { useToast } from "../components/toast";
 import { cn } from "../lib/utils";
 
@@ -34,7 +29,6 @@ interface Activity { name: string; label: string; write?: boolean; done?: boolea
 interface Turn extends ChatMessage {
   changes?: ChatChange[];
   error?: string | null;
-  extraction?: ChatExtraction;   // a user turn that carried an uploaded sheet
   cards?: ChatCard[];            // structured result cards streamed by the agent
   activity?: Activity[];         // live tool-activity chips
   suggestions?: string[];        // proactive follow-up chips
@@ -78,142 +72,6 @@ function ChangeCard({ c }: { c: ChatChange }) {
       <p className="mt-1.5 text-[11px] text-slate-400">
         {c.before.length} → {c.after.length} date{c.after.length === 1 ? "" : "s"} on this leave type
       </p>
-    </div>
-  );
-}
-
-// Per-upload "store this in the real pipeline?" decision. Keyed by the
-// upload's ephemeral token — nothing is persisted unless the user says yes.
-type StoreState =
-  | { status: "asking" }
-  | { status: "storing" }
-  | { status: "stored"; result: UploadResult }
-  | { status: "declined" }
-  | { status: "error"; message: string };
-
-function StoreConfirm({
-  store, onYes, onNo,
-}: { store: StoreState | undefined; onYes: () => void; onNo: () => void }) {
-  if (!store || store.status === "asking") {
-    return (
-      <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border border-brand-200 bg-brand-50/60 px-2.5 py-2">
-        <ShieldQuestion className="h-3.5 w-3.5 shrink-0 text-brand-500" />
-        <span className="text-slate-600">Store this file's extracted details as a real timesheet record?</span>
-        <div className="ml-auto flex items-center gap-1.5">
-          <button onClick={onNo} className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 font-semibold text-slate-600 hover:bg-slate-50">
-            <X className="h-3 w-3" /> No
-          </button>
-          <button onClick={onYes} className="inline-flex items-center gap-1 rounded-md bg-brand-600 px-2 py-1 font-semibold text-white hover:bg-brand-700">
-            <Save className="h-3 w-3" /> Yes, store it
-          </button>
-        </div>
-      </div>
-    );
-  }
-  if (store.status === "storing") {
-    return (
-      <div className="mt-2 flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-slate-500">
-        <Loader2 className="h-3.5 w-3.5 animate-spin" /> Storing through the pipeline…
-      </div>
-    );
-  }
-  if (store.status === "declined") {
-    return (
-      <p className="mt-2 flex items-center gap-1.5 text-slate-400">
-        <X className="h-3 w-3" /> Not stored — kept in this chat only.
-      </p>
-    );
-  }
-  if (store.status === "error") {
-    return (
-      <p className="mt-2 flex items-center gap-1.5 text-rose-600">
-        <AlertTriangle className="h-3 w-3" /> {store.message}
-      </p>
-    );
-  }
-  const r = store.result;
-  const failed = r.status === "failed";
-  const review = r.status === "needs_review";
-  return (
-    <div className={cn(
-      "mt-2 flex flex-wrap items-center gap-2 rounded-lg border px-2.5 py-2",
-      failed ? "border-rose-200 bg-rose-50 text-rose-700"
-        : review ? "border-amber-200 bg-amber-50 text-amber-700"
-        : "border-emerald-200 bg-emerald-50 text-emerald-700")}>
-      {failed ? <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> : <Check className="h-3.5 w-3.5 shrink-0" />}
-      <span>
-        {failed
-          ? `Could not stage it: ${r.failure_detail || r.failure_code || "unknown error"}.`
-          : review
-          ? "Staged for review — open the Pipeline page and Accept it in Compare & Fix to file the record."
-          : "Stored as a timesheet record."}
-      </span>
-      {r.record_id && (
-        <Link to={`/records/${r.record_id}`} className="ml-auto inline-flex items-center gap-0.5 font-semibold hover:underline">
-          <FileText className="h-3 w-3" /> Record
-        </Link>
-      )}
-    </div>
-  );
-}
-
-function ExtractionCard({
-  e, onPreview, store, onStoreYes, onStoreNo,
-}: {
-  e: ChatExtraction; onPreview: () => void;
-  store: StoreState | undefined; onStoreYes: () => void; onStoreNo: () => void;
-}) {
-  const ok = e.status === "ok";
-  const buckets = Object.entries(e.leaves ?? {}).filter(([, d]) => d.length > 0);
-  return (
-    <div className="mt-2 w-full rounded-lg border border-slate-200 bg-white p-3 text-xs">
-      <div className="flex items-center gap-2">
-        <FileText className="h-4 w-4 shrink-0 text-brand-500" />
-        <span className="truncate font-semibold text-slate-700">{e.filename}</span>
-        {e.token && (
-          <button onClick={onPreview} className="ml-auto inline-flex items-center gap-1 rounded-md border border-slate-200 px-1.5 py-0.5 font-semibold text-brand-600 hover:bg-brand-50">
-            <Eye className="h-3 w-3" /> Preview
-          </button>
-        )}
-      </div>
-      {!ok ? (
-        <p className="mt-2 text-rose-600">
-          {e.message || e.error || "Could not extract this file."}
-        </p>
-      ) : (
-        <>
-          <div className="mt-2 flex flex-wrap items-center gap-2">
-            {e.matched_employee ? (
-              <Badge tone="success"><UserCheck className="h-3 w-3" />{e.matched_employee.name} · {e.matched_employee.employee_id}</Badge>
-            ) : (
-              <Badge tone="warning">{e.extracted_employee_name || "Unknown"} (no match)</Badge>
-            )}
-            {e.month_name && <Badge tone="brand"><CalendarDays className="h-3 w-3" />{e.month_name} {e.year}</Badge>}
-            <Badge tone={e.validation_status === "verified" ? "success" : "warning"}>{e.total_leaves ?? 0} leave day(s)</Badge>
-          </div>
-          {e.matched_employee?.email && (
-            <p className="mt-1 text-[11px] text-slate-400">{e.matched_employee.email}</p>
-          )}
-          {buckets.length > 0 ? (
-            <ul className="mt-2 space-y-1">
-              {buckets.map(([label, dates]) => (
-                <li key={label} className="flex flex-wrap items-center gap-1">
-                  <span className="font-semibold text-slate-600">{label}:</span>
-                  {dates.map((d) => <span key={d} className="rounded bg-slate-100 px-1.5 py-0.5 text-slate-600">{d}</span>)}
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="mt-2 text-slate-500">No leave dates found on this sheet.</p>
-          )}
-          {!!e.flags?.length && (
-            <p className="mt-2 flex items-start gap-1 text-amber-700">
-              <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />{e.flags.join(" ")}
-            </p>
-          )}
-          {e.token && e.matched_employee && <StoreConfirm store={store} onYes={onStoreYes} onNo={onStoreNo} />}
-        </>
-      )}
     </div>
   );
 }
@@ -454,11 +312,9 @@ function CardRenderer({ card }: { card: ChatCard }) {
 }
 
 function Bubble({
-  turn, onPreview, onTick, storeState, onStoreYes, onStoreNo, onSuggestion,
+  turn, onTick, onSuggestion,
 }: {
-  turn: Turn; onPreview: (e: ChatExtraction) => void; onTick?: () => void;
-  storeState: Record<string, StoreState>;
-  onStoreYes: (token: string) => void; onStoreNo: (token: string) => void;
+  turn: Turn; onTick?: () => void;
   onSuggestion: (s: string) => void;
 }) {
   const isUser = turn.role === "user";
@@ -523,15 +379,6 @@ function Bubble({
             appear after the answer, not mid-stream */}
         {!streaming && (turn.cards ?? []).map((c, i) => <CardRenderer key={i} card={c} />)}
 
-        {turn.extraction && (
-          <ExtractionCard
-            e={turn.extraction}
-            onPreview={() => onPreview(turn.extraction!)}
-            store={turn.extraction.token ? storeState[turn.extraction.token] : undefined}
-            onStoreYes={() => onStoreYes(turn.extraction!.token!)}
-            onStoreNo={() => onStoreNo(turn.extraction!.token!)}
-          />
-        )}
         {turn.changes?.map((c) => <ChangeCard key={c.record_id + c.leave_type + c.action} c={c} />)}
 
         {/* proactive follow-up chips */}
@@ -551,17 +398,11 @@ function Bubble({
 }
 
 export default function AgenticChatPage() {
-  const { toast } = useToast();
   const [turns, setTurns] = useState<Turn[]>([]);
-  const [extractions, setExtractions] = useState<ChatExtraction[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
-  const [uploading, setUploading] = useState(false);
   const [bookOpen, setBookOpen] = useState(false);
-  const [preview, setPreview] = useState<PreviewFile | null>(null);
-  const [storeState, setStoreState] = useState<Record<string, StoreState>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const fileRef = useRef<HTMLInputElement | null>(null);
 
   const { data: suggest } = useQuery({ queryKey: ["chat-suggestions"], queryFn: fetchChatSuggestions });
 
@@ -570,7 +411,7 @@ export default function AgenticChatPage() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [turns, sending, uploading]);
+  }, [turns, sending]);
 
   const send = async (text: string) => {
     const msg = text.trim();
@@ -588,7 +429,6 @@ export default function AgenticChatPage() {
     try {
       await sendChatStream(
         history.filter((t) => t.content).map((t) => ({ role: t.role, content: t.content })),
-        extractions,
         (ev: ChatStreamEvent) => {
           if (ev.type === "token") {
             patch((t) => ({ ...t, content: t.content + ev.text }));
@@ -626,61 +466,6 @@ export default function AgenticChatPage() {
     }
   };
 
-  const onPickFile = async (file: File | undefined) => {
-    if (!file || uploading) return;
-    setUploading(true);
-    try {
-      const e = await extractChatSheet(file);
-      // Show the upload + its grounded extraction as a user turn.
-      setTurns((prev) => [...prev, { role: "user", content: "", extraction: e }]);
-      if (e.status === "ok" && e.token) {
-        setExtractions((prev) => [...prev, e]);
-        const who = e.matched_employee?.name || e.extracted_employee_name || "the employee";
-        setTurns((prev) => [...prev, {
-          role: "assistant",
-          content:
-            `I extracted ${e.total_leaves ?? 0} leave day(s) for ${who}` +
-            (e.month_name ? ` (${e.month_name} ${e.year})` : "") +
-            `. ${e.matched_employee ? "Tell me to apply these to their timesheet, or ask anything about the sheet." : "I couldn't match this to an employee in the matcher — who should I attach it to?"}`,
-        }]);
-      } else {
-        toast("error", "Couldn't extract that file", e.message || e.error || "Unsupported or unreadable file.");
-      }
-    } catch {
-      toast("error", "Upload failed", "Could not extract that file. Please try again.");
-    } finally {
-      setUploading(false);
-      if (fileRef.current) fileRef.current.value = "";
-    }
-  };
-
-  const handleStoreNo = (token: string) => {
-    setStoreState((prev) => ({ ...prev, [token]: { status: "declined" } }));
-  };
-
-  const handleStoreYes = async (token: string) => {
-    setStoreState((prev) => ({ ...prev, [token]: { status: "storing" } }));
-    try {
-      const result = await storeChatSheet(token);
-      setStoreState((prev) => ({ ...prev, [token]: { status: "stored", result } }));
-      if (result.status === "failed") {
-        toast("error", "Could not file the record", result.failure_detail || result.failure_code || undefined);
-      } else {
-        toast("success", result.status === "needs_review" ? "Stored — flagged for review" : "Stored as a timesheet record");
-      }
-    } catch {
-      setStoreState((prev) => ({
-        ...prev, [token]: { status: "error", message: "Could not store this file. Please try again." },
-      }));
-      toast("error", "Could not store this file", "Please try again.");
-    }
-  };
-
-  const openPreview = (e: ChatExtraction) => {
-    if (!e.token) return;
-    setPreview({ url: chatAttachmentUrl(e.token), filename: e.filename, contentType: e.content_type });
-  };
-
   const onSubmit = (ev: React.FormEvent) => {
     ev.preventDefault();
     send(input);
@@ -692,7 +477,7 @@ export default function AgenticChatPage() {
     <div className="flex h-full animate-fade-up flex-col">
       <PageHeader
         title="Ask AI"
-        subtitle="Ask about timesheets and leaves, upload a sheet to extract it, or make edits — the assistant only works on this database."
+        subtitle="Ask about timesheets and leaves, or make edits — the assistant only works on this database."
         actions={
           <div className="flex items-center gap-2">
             {suggest?.enabled && suggest.model && <Badge tone="slate"><Sparkles className="h-3 w-3" />{suggest.model}</Badge>}
@@ -706,7 +491,7 @@ export default function AgenticChatPage() {
       {suggest && !suggest.enabled && (
         <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>No AI provider is configured. The chat will return a setup message until an admin adds a key under <span className="font-semibold">AI Settings</span>. Sheet extraction and the prompt book still work.</span>
+          <span>No AI provider is configured. The chat will return a setup message until an admin adds a key under <span className="font-semibold">AI Settings</span>. The prompt book still works.</span>
         </div>
       )}
 
@@ -721,8 +506,9 @@ export default function AgenticChatPage() {
                 <span className="text-gradient">How can I help with timesheets?</span>
               </h3>
               <p className="mx-auto mt-2 max-w-md text-sm text-slate-500">
-                Check submissions, count leaves, find who's missing, add / clear leave dates — or
-                <span className="font-medium text-slate-600"> attach a sheet</span> to extract it.
+                Check submissions, count leaves, find who's missing, and add / clear leave dates.
+                To bring in a sheet, use <span className="font-medium text-slate-600">Upload</span> or
+                <span className="font-medium text-slate-600"> Extract Email</span>.
               </p>
               <div className="mt-6 grid gap-2.5 sm:grid-cols-2">
                 {(suggest?.suggestions ?? []).map((s, i) => (
@@ -740,45 +526,12 @@ export default function AgenticChatPage() {
             </div>
           ) : (
             turns.map((t, i) => (
-              <Bubble
-                key={i} turn={t} onPreview={openPreview} onTick={scrollToBottom}
-                storeState={storeState} onStoreYes={handleStoreYes} onStoreNo={handleStoreNo}
-                onSuggestion={send}
-              />
+              <Bubble key={i} turn={t} onTick={scrollToBottom} onSuggestion={send} />
             ))
-          )}
-          {uploading && (
-            <div className="flex animate-bubble-in items-center gap-3 text-sm text-slate-400">
-              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-brand-600 text-white shadow-sm ring-2 ring-white">
-                <Sparkles className="h-4 w-4" />
-              </span>
-              <span className="flex items-center gap-2 rounded-2xl rounded-tl-sm bg-white px-4 py-3 shadow-xs ring-1 ring-slate-200/80">
-                <span className="typing-dots flex items-center gap-1">
-                  <span /><span /><span />
-                </span>
-                <span className="text-xs font-medium text-slate-400">Extracting sheet…</span>
-              </span>
-            </div>
           )}
         </div>
 
         <form onSubmit={onSubmit} className="flex items-end gap-2 border-t border-slate-100 p-3">
-          <input
-            ref={fileRef}
-            type="file"
-            accept=".pdf,.docx,.xlsx,.eml"
-            className="hidden"
-            onChange={(e) => onPickFile(e.target.files?.[0])}
-          />
-          <button
-            type="button"
-            title="Attach a timesheet (PDF, DOCX, XLSX, EML)"
-            onClick={() => fileRef.current?.click()}
-            disabled={uploading}
-            className="flex h-[42px] w-[42px] shrink-0 items-center justify-center rounded-xl border border-slate-300 text-slate-500 transition-colors hover:border-brand-400 hover:text-brand-600 disabled:opacity-50"
-          >
-            {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Paperclip className="h-4 w-4" />}
-          </button>
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -789,7 +542,7 @@ export default function AgenticChatPage() {
               }
             }}
             rows={1}
-            placeholder="Ask about timesheets, attach a sheet, or e.g. “Add sick leave for Faizan on 26-May-2026”…"
+            placeholder="Ask about timesheets, or e.g. “Add sick leave for Faizan on 26-May-2026”…"
             className="max-h-32 min-h-[42px] flex-1 resize-none rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-800 placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10"
           />
           <Button type="submit" disabled={sending || !input.trim()}>
@@ -821,8 +574,6 @@ export default function AgenticChatPage() {
           ))}
         </div>
       </Modal>
-
-      <FilePreviewModal file={preview} onClose={() => setPreview(null)} />
     </div>
   );
 }

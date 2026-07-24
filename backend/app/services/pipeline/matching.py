@@ -195,10 +195,22 @@ async def match_employee(
                 f'"{email_hint.name}" · {email_hint.employee_id}{_loc(email_hint)}).',
                 MatchCode.EMAIL_AND_NAME,
             )
+        # No ID on the sheet: fall back to a global fuzzy NAME search. This is
+        # still not a guess — _match_by_name returns a row ONLY when exactly one
+        # employee agrees (or one clearly outscores the rest); ties give None.
+        # Handles "John Smith" on a sheet with no ID -> John Smith · EMP1023.
+        by_name = await _match_by_name(db, name_norm)
+        if by_name is not None:
+            return MatchResult(
+                by_name,
+                f'No employee ID on the sheet — matched by name only ("{extracted_name}" → '
+                f'"{by_name.name}" · {by_name.employee_id}{_loc(by_name)}). Please verify.',
+                MatchCode.NAME_FALLBACK,
+            )
         return MatchResult(
             None,
-            f'Only a name ("{extracted_name}") was found — an employee ID is also required '
-            "to match. Please assign the correct employee.",
+            f'Only a name ("{extracted_name}") was found and it did not uniquely match any '
+            "employee. Please assign the correct employee.",
             MatchCode.NO_MATCH,
         )
     if not name_norm:

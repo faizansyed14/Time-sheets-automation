@@ -19,6 +19,11 @@ class Page(BaseModel, Generic[T]):
     has_more: bool
 
 
+class EmailRecipient(BaseModel):
+    name: str | None = None
+    email: str
+
+
 class AttachmentOut(BaseModel):
     attachment_id: str
     filename: str
@@ -54,14 +59,35 @@ class EmailListItem(BaseModel):
     no_sheets_found_at: datetime | None = None  # last run found NOTHING to stage
     no_sheets_note: str | None = None
     attachments: list[AttachmentOut] = []
+    # Outlook-style conversation grouping. thread_id is always set (falls back
+    # to this message's own id when the provider gave no conversation_id, so
+    # every message is at least its own singleton thread).
+    conversation_id: str | None = None
+    thread_id: str | None = None
+    thread_message_count: int = 1
 
 
 class EmailDetail(EmailListItem):
     body_text: str | None
     body_html: str | None = None
+    to_recipients: list[EmailRecipient] = []
+    cc_recipients: list[EmailRecipient] = []
     # Attachment ids embedded inline in body_html (resolved to data URIs) —
     # hidden from the separate attachment list, as Outlook does.
     inline_attachment_ids: list[str] = []
+
+
+class ThreadListItem(EmailListItem):
+    """One row per conversation in the threaded inbox list — the newest
+    message's summary, plus how many messages the thread has."""
+    pass
+
+
+class ThreadDetail(BaseModel):
+    """Every message in a conversation, oldest first — the Outlook-style
+    conversation view."""
+    thread_id: str
+    messages: list[EmailDetail]
 
 
 # ---- agentic chat ----
@@ -72,10 +98,6 @@ class ChatMessageIn(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessageIn]
-    # Structured results of any sheets the user uploaded into the chat this
-    # session (from POST /agentic-chat/extract). Passed back so the assistant
-    # has the grounded extraction to answer about and act on.
-    extractions: list[dict] = []
 
 
 class ChatChange(BaseModel):
@@ -115,14 +137,6 @@ class DecisionIn(BaseModel):
     """Archive (accepted=False). Direct accept-and-ingest was removed — every
     extraction goes through Extract Email + Compare & Fix review."""
     accepted: bool
-
-
-class ExtractFullIn(BaseModel):
-    """Optional scope for Extract Email: when attachment_ids is present, ONLY
-    those sheets (and optionally the body) are analysed — the stored raw copy
-    stays the full .eml. Omit entirely for the whole email."""
-    attachment_ids: list[str] | None = None
-    extract_body: bool = False
 
 
 class SourceFileEntry(BaseModel):
@@ -310,6 +324,9 @@ class PipelineFileOut(BaseModel):
     extraction_method: str | None = None
     used_ocr: bool = False
     extraction_meta: dict | None = None
+    # True when the record was filed by the AI without human review (high
+    # confidence + full verification). See extraction_meta.auto_accept for why.
+    auto_accepted: bool = False
     can_retry: bool
     can_resolve_assign: bool
     resolved_at: datetime | None

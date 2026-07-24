@@ -33,6 +33,13 @@ class ProviderMessage:
     body_text: str
     body_html: str | None = None
     attachments: list[ProviderAttachment] = field(default_factory=list)
+    # [{ "name": str | None, "email": str }] — Outlook To/Cc lines.
+    to_recipients: list[dict] = field(default_factory=list)
+    cc_recipients: list[dict] = field(default_factory=list)
+    # Groups replies/forwards into one Outlook-style conversation. None when
+    # the provider can't supply one — the message is then its own singleton
+    # thread (falls back to provider_message_id as the grouping key).
+    conversation_id: str | None = None
 
 
 class EmailProvider(ABC):
@@ -61,3 +68,10 @@ class EmailProvider(ABC):
         (Graph: GET /messages/{id}/$value). None → caller reconstructs the .eml
         from the stored fields + attachments instead."""
         return None
+
+    async def list_thread_messages(self, conversation_id: str) -> list[ProviderMessage]:
+        """Every message in this conversation, live from the provider — used
+        by the thread view so an old message outside the incremental-sync
+        window (e.g. the original attachment, replied to months later) is
+        never silently missing from the history. Default: unsupported."""
+        return []
