@@ -133,8 +133,8 @@ function resolveFocusRecord(
 function ReviewStatCard({ count }: { count: number }) {
   return (
     <Link
-      to="/review"
-      title="Open Review to accept or fix extracted timesheets."
+      to="/pipeline?status=needs_review"
+      title="Open the Activity log to accept or fix extracted timesheets."
       className="group flex items-center gap-3 rounded-xl border border-amber-200/80 bg-amber-50/30 p-4 shadow-card transition hover:border-amber-300 hover:bg-amber-50/50"
     >
       <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white/80 ring-1 ring-black/[0.04]">

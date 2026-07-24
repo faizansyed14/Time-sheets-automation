@@ -87,7 +87,13 @@ class Settings(BaseSettings):
     # Which extraction engine to use: "mock" now, "vision" for your real LLM.
     extraction_engine: str = "mock"
 
-    # ----- OpenAI (vision extraction + agentic chat) -----
+    # ----- OpenAI-compatible LLM gateway (vision extraction + agentic chat) -----
+    # "openai" gets the native Files/Responses API (vision_client._openai_thread_call
+    # uploads PDF/DOCX/XLSX directly). Any other value (e.g. "openrouter") is
+    # treated as a plain chat-completions gateway: native files are rendered to
+    # images client-side first (see vision_client._chat_thread_call), since
+    # gateways fronting third-party models don't expose OpenAI's file storage.
+    llm_provider: str = "openai"
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com"
     openai_timeout: int = 120

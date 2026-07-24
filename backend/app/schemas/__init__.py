@@ -75,6 +75,10 @@ class EmailDetail(EmailListItem):
     # Attachment ids embedded inline in body_html (resolved to data URIs) —
     # hidden from the separate attachment list, as Outlook does.
     inline_attachment_ids: list[str] = []
+    # Filenames on THIS message that Extract Email has already read — drives
+    # the "Extracted"/"New" badge. Every run re-reads everything; this records
+    # what has been looked at, it is not a cache of answers.
+    extracted_filenames: list[str] = []
 
 
 class ThreadListItem(EmailListItem):
@@ -88,6 +92,12 @@ class ThreadDetail(BaseModel):
     conversation view."""
     thread_id: str
     messages: list[EmailDetail]
+    # Sheets a previous Extract Email run on this thread has read — drives the
+    # per-attachment "Extracted"/"New" badge.
+    extracted_sheets: list[str] = []
+    extracted_at: datetime | None = None
+    # Plain-English summary of the conversation, when one has been generated.
+    summary: dict | None = None
 
 
 # ---- agentic chat ----
@@ -324,8 +334,8 @@ class PipelineFileOut(BaseModel):
     extraction_method: str | None = None
     used_ocr: bool = False
     extraction_meta: dict | None = None
-    # True when the record was filed by the AI without human review (high
-    # confidence + full verification). See extraction_meta.auto_accept for why.
+    # True when the AI recommends accepting (all checks passed) — still needs
+    # human Accept in Review before a record is filed.
     auto_accepted: bool = False
     can_retry: bool
     can_resolve_assign: bool
@@ -344,10 +354,6 @@ class PipelineStats(BaseModel):
     resolved: int
     by_failure_code: dict[str, int]
     failure_labels: dict[str, str]
-
-
-class PipelineResolveIn(BaseModel):
-    note: str | None = None
 
 
 class SkipDetail(BaseModel):

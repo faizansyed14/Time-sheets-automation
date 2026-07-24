@@ -18,6 +18,7 @@ def test_every_registry_format_has_extract_prompt():
 def test_prompt_catalog_covers_sample_formats():
     needed = {
         "alpha_adr_attendance", "adda_attendance", "adnoc_timesheet",
+        "adnoc_general_attendance",
         "digital_dubai_report", "dewa_moro_smartoffice", "dewa_professional_hiring",
         "sgrp_smarttime", "damac_excel_timesheet", "gov_employee_daily_report",
         "gpssa_daily_report", "endo_arabic_gov", "leave_certificate",

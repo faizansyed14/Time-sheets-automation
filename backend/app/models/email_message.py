@@ -71,5 +71,21 @@ class EmailMessage(Base):
     no_sheets_found_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     no_sheets_note: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # Attachments already read by Extract Email, so a thread that gains a reply
+    # months later re-reads only what is new:
+    #   {"<sha256 of bytes>": {"filename": str, "at": iso, "sheet": {...}}}
+    # Keyed by CONTENT — an edited-and-resent file is correctly seen as new.
+    # Durable on purpose: replies arrive weeks or months later, so a
+    # short-lived cache would be expired almost every time it was consulted.
+    # Preserved across inbox resync (_sync_message only overwrites the columns
+    # it lists).
+    extracted_sheets: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    # Plain-English summary of the whole conversation, generated on demand:
+    #   {"headline", "status", "narrative", "action_needed", "at", "model"}
+    # Stored on the message it was generated from and read back by
+    # conversation, so a thread holds one copy rather than one per message.
+    thread_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

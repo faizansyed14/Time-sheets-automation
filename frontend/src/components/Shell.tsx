@@ -3,7 +3,6 @@ import { NavLink, useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   LayoutDashboard,
-  ClipboardCheck,
   Mail,
   MessagesSquare,
   UploadCloud,
@@ -23,17 +22,20 @@ import {
 import { fetchHealth, fetchPipelineStats } from "../api/client";
 import { cn, avatarColor, initials } from "../lib/utils";
 import { useAuth } from "../lib/auth";
+import AutoExtractWidget from "./AutoExtractWidget";
 
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/inbox", label: "Inbox", icon: Mail },
-  { to: "/review", label: "Review", icon: ClipboardCheck, attention: true },
+  // Every record that needs a human — review, fix, or just watch it happen —
+  // lives here now, with a Review button right on each row. Keeps the
+  // attention badge that used to live on the standalone Review page.
+  { to: "/pipeline", label: "Activity log", icon: Activity, attention: true },
 ];
 
 const TOOLS_NAV = [
   { to: "/chat", label: "Ask AI", icon: MessagesSquare },
   { to: "/upload", label: "Upload", icon: UploadCloud },
-  { to: "/pipeline", label: "Activity log", icon: Activity },
   { to: "/employees", label: "Employees", icon: Users },
   { to: "/export", label: "Export", icon: FileSpreadsheet },
   { to: "/files", label: "File Vault", icon: FolderOpen },
@@ -47,7 +49,6 @@ const ADMIN_NAV = [
 const TITLES: Record<string, string> = {
   "/": "Dashboard",
   "/inbox": "Inbox",
-  "/review": "Review",
   "/chat": "Ask AI",
   "/upload": "Upload timesheets",
   "/pipeline": "Activity log",
@@ -233,6 +234,7 @@ export default function Shell({ children }: { children: ReactNode }) {
                 </span>
               </span>
             )}
+            <AutoExtractWidget />
             <button
               onClick={reload}
               disabled={refreshing}

@@ -62,6 +62,39 @@ def test_adnoc_timesheet_detected():
     assert f.id == "adnoc_timesheet", f.id
 
 
+def test_adnoc_general_attendance_detected():
+    text = ("General Attendance Report\n01-Jun-2026\n30-Jun-2026\n"
+            "Jithesh Soman Bhaskaran - 09019476\nTotal Daily Duration\n"
+            "Unauthorized Absence\nDay Off\nADS9019476")
+    f = fmt.detect_format(text, "adnoc_attendance.pdf")
+    assert f.id == "adnoc_general_attendance", f.id
+
+
+def test_adr_sample_pdf_layout_detected():
+    text = ("ATTENDANCE SHEET\nEMP NO: E2507119\nNAME: Baderuddin\n"
+            "SECTION: ADR\nMONTH: August 2025\n01/Aug/2025 08:11 AM\n"
+            "Saturday REST DAY\nDAILY TOTAL\nMANAGER SIGNATURE")
+    f = fmt.detect_format(text, "ADR format.pdf")
+    assert f.id == "alpha_adr_attendance", f.id
+
+
+def test_adr_june_2026_signed_layout_detected():
+    text = ("ATTENDANCE SHEET\nEMP NO: E2506970\nNAME: MD TAUSIF REZA\n"
+            "SECTION: ADR\nMONTH: JUNE\nYEAR: 2026\n"
+            "1 June 2026\n8:00 am\n5:00 pm\nSaturday\nWeekend\n"
+            "Public Holiday\nMANAGER SIGNATURE")
+    f = fmt.detect_format(text, "ADR STANDARD TIMESHEET - June 2026-Signed.pdf")
+    assert f.id == "alpha_adr_attendance", f.id
+
+
+def test_fdf_sample_pdf_layout_detected():
+    text = ("Employee Daily Report\nFDF Family Development Foundation\n"
+            "Emp No.\n109427\nSajin Shivadas\nFirst In\nLast Out\n"
+            "Work Duration\nRest Day\nSick Leave-OutSocruce\nHoliday -")
+    f = fmt.detect_format(text, "Sajin_FDF.pdf")
+    assert f.id == "gov_employee_daily_report", f.id
+
+
 def test_damac_excel_detected():
     text = ("DAMAC Properties\nResource/Consultant Name | Santhosh\n"
             "Line Manager | Pravind\nPO Number | 123\nTotal Hours (Billable) | Public Holiday")

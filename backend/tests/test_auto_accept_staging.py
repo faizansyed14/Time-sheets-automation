@@ -1,6 +1,6 @@
-"""End-to-end: a clean, fully-verified ADR group is FILED automatically by
-stage_groups (no human Accept) — the pipeline item is SUCCESS + auto_accepted
-and a TimesheetRecord exists. A group with a blocker is held NEEDS_REVIEW."""
+"""End-to-end: a clean, fully-verified ADR group is STAGED with an AI
+recommendation (NEEDS_REVIEW, not filed) until a human Accepts. A group with
+a blocker is held without the recommendation."""
 import calendar
 
 from sqlalchemy import select
@@ -68,7 +68,7 @@ async def _clean_records(db, emp):
     await db.commit()
 
 
-async def test_clean_adr_group_is_auto_filed():
+async def test_clean_adr_group_is_staged_with_ai_recommendation():
     async with SessionLocal() as db:
         emp = await _employee(db)
         await _clean_records(db, emp)
@@ -79,32 +79,19 @@ async def test_clean_adr_group_is_auto_filed():
             groups=[g], approval={"detected": False, "detail": "No approval."},
             run_meta={"method": "vision", "model": "gpt-4o", "calls": 1})
         t = staged[0]
-        assert t.status == PipelineStatus.SUCCESS, (t.status, t.failure_detail)
+        assert t.status == PipelineStatus.NEEDS_REVIEW, (t.status, t.failure_detail)
         assert t.extraction_meta["auto_accept"]["accepted"] is True
-        assert t.record_id is not None
-        rec = (await db.execute(select(TimesheetRecord).where(
-            TimesheetRecord.id == t.record_id))).scalar_one()
-        assert rec.public_holiday_dates == ["2026-06-15"]
-        assert rec.sick_leave_dates == ["2026-06-19"]
-
-        # The SOURCE FILE must land in the File Vault — an auto-accepted record
-        # with an empty vault folder loses the evidence for the leave it filed.
-        from app.services import storage_provider as sp
-        assert rec.storage_folder, "record has no vault folder"
-        items = sp.get_storage_provider().list_items(
-            rec.account_manager, rec.employee_name,
-            sp.month_label(rec.month, rec.year))
-        names = [getattr(i, "name", None) or getattr(i, "filename", "") for i in items]
-        assert any("bhargavi" in str(n).lower() for n in names), \
-            f"source file not filed in the vault: {names}"
-        # cleanup
+        assert t.record_id is None
+        assert t.raw_path is not None
+        recs = (await db.execute(select(TimesheetRecord).where(
+            TimesheetRecord.matched_employee_pk == emp.id,
+            TimesheetRecord.month == 6, TimesheetRecord.year == 2026))).scalars().all()
+        assert recs == []
         await _clean_records(db, emp)
 
 
-async def test_pipeline_list_filters_auto_accepted(client, admin_token):
-    """The Review page asks for AI-filed records specifically. Filtering has to
-    happen in SQL — successes are mostly human accepts, so filtering a page
-    client-side would hide auto-accepts that fall past the first page."""
+async def test_pipeline_list_filters_ai_recommendation(client, admin_token):
+    """Activity log can filter items the AI recommends accepting vs held."""
     from tests.conftest import auth_headers
 
     async with SessionLocal() as db:
@@ -116,10 +103,9 @@ async def test_pipeline_list_filters_auto_accepted(client, admin_token):
             groups=[_group(emp, {"public_holiday": ["2026-06-15"]}, _adr_text())],
             approval={"detected": False, "detail": "No approval."},
             run_meta={"method": "vision", "model": "gpt-4o", "calls": 1})
-        auto_id = staged[0].id
+        recommended_id = staged[0].id
         assert staged[0].extraction_meta["auto_accept"]["accepted"] is True
 
-        # A held item, to prove the filter separates them.
         held = await stage_groups(
             db, source_kind="email", source_id="autotest-filter-2",
             raw_bytes=b"%PDF-fake", raw_name="held.pdf", content_type="application/pdf",
@@ -130,17 +116,17 @@ async def test_pipeline_list_filters_auto_accepted(client, admin_token):
         held_id = held[0].id
 
     h = auth_headers(admin_token)
-    r = await client.get("/api/v1/pipeline?status=success&auto_accepted=true", headers=h)
+    r = await client.get(
+        "/api/v1/pipeline?status=needs_review&auto_accepted=true", headers=h)
     assert r.status_code == 200, r.text
     ids = [i["id"] for i in r.json()["items"]]
-    assert auto_id in ids
+    assert recommended_id in ids
     assert held_id not in ids
     assert all(i["auto_accepted"] for i in r.json()["items"])
 
-    # And the inverse filter must not return the auto-accepted one.
     r2 = await client.get("/api/v1/pipeline?auto_accepted=false", headers=h)
     assert r2.status_code == 200, r2.text
-    assert auto_id not in [i["id"] for i in r2.json()["items"]]
+    assert recommended_id not in [i["id"] for i in r2.json()["items"]]
 
     async with SessionLocal() as db:
         emp = await _employee(db)

@@ -107,13 +107,43 @@ export interface EmailDetail extends EmailListItem {
   cc_recipients?: EmailRecipient[];
   attachments: Attachment[];
   inline_attachment_ids: string[];
+  /** Filenames on THIS message Extract Email has already read — for the
+   *  Extracted/New badge. Every run re-reads everything; this is a record of
+   *  what has been looked at, not a cache of answers. */
+  extracted_filenames?: string[];
 }
 
 /** Every message in a conversation, oldest first — the Outlook-style
  *  "see the full history" view. */
+/** Plain-English read of what a conversation is about. Produced by PASS 1 of
+ *  Extract Email — the same call that decides which items are timesheets also
+ *  says what the thread is about, so there is no separate summarisation call. */
+export interface ThreadSummary {
+  headline: string;
+  status: "sheet_submitted" | "awaiting_approval" | "approved"
+        | "correction_requested" | "chasing" | "other";
+  narrative: string;
+  timesheet_sent: boolean;
+  approval_requested: boolean;
+  approval_given: boolean;
+  period: string;
+  employee: string;
+  action_needed: string;
+  message_count: number;
+  model: string;
+  at: string;
+}
+
 export interface ThreadDetail {
   thread_id: string;
   messages: EmailDetail[];
+  summary?: ThreadSummary | null;
+  /** Sheets already read by a previous Extract Email run on this thread. */
+  extracted_sheets?: string[];
+  /** When this conversation was last extracted — null if never. Extraction
+   *  always sends the WHOLE thread, so any message that arrived before this
+   *  was included in that run. */
+  extracted_at?: string | null;
 }
 
 export interface MatchedEmployee {
@@ -252,8 +282,7 @@ export interface PipelineFile {
   extraction_method: string | null;
   used_ocr: boolean;
   extraction_meta: Record<string, unknown> | null;
-  // True when the AI filed this record automatically (high confidence + full
-  // verification), with no human review. Details in extraction_meta.auto_accept.
+  // True when AI recommends accept (all checks passed). Record not filed until Review.
   auto_accepted: boolean;
   can_retry: boolean;
   can_resolve_assign: boolean;
@@ -331,26 +360,38 @@ export const pipelineRawRenderUrl = (pipelineId: string) =>
 export const emlUrl = (msgId: string) =>
   withAuthParam(`/api/v1/inbox/${encodeURIComponent(msgId)}/as-eml`);
 
+export interface LlmEgressPart {
+  name: string;
+  file_type: string;
+  bytes: number;
+  sha256: string;
+  jpeg_b64?: string;
+}
+
+/** Exactly what Extract Email sends to OpenAI, built the same way the real
+ *  run builds it — so this is a record of what leaves, not a description. */
 export interface LlmEgressPreview {
+  flow: string;
+  model: string;
   pii_redaction: boolean;
   scope: string;
+  steps: { n: number; title: string; detail: string; items: string[] }[];
+  thread_messages: string[];
+  /** Non-empty when the mailbox fetch degraded — e.g. a long thread got
+   * truncated to its newest messages, or the conversation couldn't be fully
+   * fetched — so fewer messages were sent than the reviewer would assume. */
+  warnings?: string[];
   subject_sent: string;
   body_sent: string;
-  sender_omitted: boolean;
-  // Present when this email is part of a thread: the 2 messages (newest +
-  // the one before it) whose sheets were merged into this preview/run.
-  thread_sources: { provider_message_id: string; subject: string | null }[] | null;
-  sheets: {
-    name: string;
-    file_type: string;
-    image_pages: number;
-    image_jpeg_b64?: string;
-    text_sent: string;
-    note: string;
-  }[];
-  sample_prompt: string;
-  system_prompt_note: string;
-  omitted: string[];
+  files_sent: LlmEgressPart[];
+  images_sent: LlmEgressPart[];
+  not_sent: string[];
+  formats_detected: string[];
+  system_prompt: string;
+  user_prompt: string;
+  call_count: { inference: number; file_uploads: number; file_deletes: number };
+  redacted: string[];
+  not_redacted: string[];
   policy: string;
 }
 
@@ -372,6 +413,9 @@ export const saveEmlToVault = (
 /** One progress frame emitted by the streaming extraction endpoints. */
 export interface ExtractionEvent {
   stage: "start" | "plan" | "agent" | "unpack" | "format" | "extract" | "approval"
+       // The two model calls Extract Email makes: pass1 understands the whole
+       // conversation, pass2 transcribes only the sheets pass1 confirmed.
+       | "pass1" | "pass2"
        | "group" | "autoaccept" | "file" | "done" | "error";
   status: "start" | "spin" | "ok" | "warn" | "fail" | "skip";
   message: string;
@@ -638,7 +682,10 @@ export const fetchPipeline = (params?: {
   failure_code?: string;
   source_kind?: string;
   source_id?: string;
-  /** true = only records the AI filed on its own (no human review). */
+  /** Every record staged from this email thread (conversation) — however
+   * many employee+month groups it produced. */
+  thread_key?: string;
+  /** true = AI recommends accept (staged, not filed yet). */
   auto_accepted?: boolean;
   q?: string;
   offset?: number;
@@ -651,6 +698,7 @@ export const fetchPipeline = (params?: {
         failure_code: params?.failure_code || undefined,
         source_kind: params?.source_kind || undefined,
         source_id: params?.source_id || undefined,
+        thread_key: params?.thread_key || undefined,
         auto_accepted: params?.auto_accepted ?? undefined,
         q: params?.q || undefined,
         offset: params?.offset ?? 0,
@@ -661,9 +709,6 @@ export const fetchPipeline = (params?: {
 
 export const fetchPipelineStats = () =>
   api.get<PipelineStats>("/pipeline/stats").then((r) => r.data);
-
-export const resolvePipelineFile = (id: string, note: string) =>
-  api.post<PipelineFile>(`/pipeline/${id}/resolve`, { note }).then((r) => r.data);
 
 export const retryPipelineFile = (id: string) =>
   api.post<PipelineFile>(`/pipeline/${id}/retry`).then((r) => r.data);
@@ -751,6 +796,10 @@ export type EmlParsed = {
   body_text: string;
   body_html: string;
   attachments: { filename: string; content_type: string; size: number; data_b64?: string }[];
+  /** Non-empty when this is the full-thread export and the mailbox fetch
+   * degraded — e.g. a long conversation got truncated to its newest
+   * messages — so a thin-looking bundle can explain itself. */
+  warnings?: string[];
 };
 
 /**
@@ -1020,10 +1069,31 @@ export const adminDeleteUser = (id: string) => api.delete(`/admin/users/${id}`).
 export interface AiStatusItem {
   kind: "extraction" | "agent";
   label: string;
-  provider: "openai";
+  provider: string;
   model: string;
   has_key: boolean;
   note: string | null;
 }
 export const adminConfigStatus = () =>
   api.get<AiStatusItem[]>("/admin/config/status").then((r) => r.data);
+
+// ===========================================================================
+// Auto Extract — bulk Extract Email, one thread at a time, in the background
+// ===========================================================================
+export interface AutoExtractStatus {
+  state: "idle" | "running" | "stopping" | "stopped" | "completed";
+  total: number;
+  processed: number;
+  succeeded: number;
+  failed: number;
+  current: { thread_id: string; subject: string } | null;
+  started_at: string | null;
+  finished_at: string | null;
+  last_error: string | null;
+}
+export const startAutoExtract = () =>
+  api.post<AutoExtractStatus>("/inbox/auto-extract/start").then((r) => r.data);
+export const stopAutoExtract = () =>
+  api.post<AutoExtractStatus>("/inbox/auto-extract/stop").then((r) => r.data);
+export const fetchAutoExtractStatus = () =>
+  api.get<AutoExtractStatus>("/inbox/auto-extract/status").then((r) => r.data);

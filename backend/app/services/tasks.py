@@ -135,6 +135,15 @@ def purge_pipeline_raw_task():
     return {"removed": removed}
 
 
+@celery_app.task(name="inbox.auto_extract_all")
+def auto_extract_all_task():
+    """Bulk Extract Email: every thread in the inbox, one at a time, in the
+    background. Started from POST /inbox/auto-extract/start; progress and
+    stop live in app.services.extract_email.auto_extract (Redis-backed)."""
+    from app.services.extract_email import auto_extract
+    return _run_coro(auto_extract.run_auto_extract)
+
+
 @celery_app.task(name="ingestion.process_upload")
 def process_upload_task(filename: str, content_type: str, data_b64: str):
     """Stage an upload in a worker — the same Extract Email pipeline as the

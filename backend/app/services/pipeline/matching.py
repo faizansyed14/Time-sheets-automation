@@ -1,19 +1,15 @@
 """
 Match an extracted (employee_id, name) against all_employee_data.
 
-The primary path requires BOTH the employee_id AND the name to agree on the
-SAME matcher row (id_and_name). employee_id is NOT globally unique — the AUH
-and DXB teams have overlapping ID ranges, so the same ID can belong to two
-different people; the name decides which one when several rows share an ID.
+Client timesheets often carry an Emp No from the *client's* HR system (e.g.
+FDF 109427) that does not exist in our matcher. The sheet **name** is the
+primary key — we always try a global fuzzy name search first when a real name
+is present. The extracted employee_id is kept only as reference text for the
+reviewer; it does not gate matching.
 
-When the ID does not lead to a confident match (not found in the matcher, its
-owner's name disagrees, or a shared ID can't be disambiguated), we fall back
-to a global fuzzy NAME search across every employee — the sheet's name is
-trusted over a possibly misread/OCR'd ID. That fallback only ever returns a
-match when exactly ONE employee's name confidently agrees (or one clearly
-outscores every other agreeing candidate); a tie or no agreement leaves the
-sheet unmatched for a human to assign, same as before. Every name-fallback
-match carries a note flagging the ID mismatch so the reviewer can verify it.
+When the name alone cannot uniquely identify someone, we fall back to looking
+up the extracted ID. employee_id is NOT globally unique — AUH and DXB share
+ID ranges, so the name must still agree when several rows share an ID.
 
 Returns a MatchResult carrying the matched Employee (or None), a human-readable
 note, and a machine code the pipeline tracker uses.
@@ -134,7 +130,8 @@ def _name_score(extracted: str, candidate: str) -> float:
 class MatchCode:
     ID_AND_NAME = "id_and_name"
     EMAIL_AND_NAME = "email_and_name"  # sender / AI employee + sheet name, no id on PDF
-    NAME_FALLBACK = "name_fallback"    # ID failed to resolve; matched by name alone instead
+    NAME_PRIMARY = "name_primary"      # matched by sheet name; client ID ignored or differs
+    NAME_FALLBACK = "name_fallback"    # alias kept for older rows; same as name_primary
     AMBIGUOUS_ID = "ambiguous_id"
     NO_MATCH = "no_match"              # id or name missing / not found / disagree
     NO_IDENTITY = "no_identity"        # nothing extracted to match on
@@ -152,10 +149,9 @@ def _loc(e: Employee) -> str:
 
 
 async def _match_by_name(db: AsyncSession, name_norm: str) -> Employee | None:
-    """Global fuzzy name search — used ONLY as a fallback once the ID has
-    already failed to produce a confident match. Returns a single Employee
-    only when exactly one agrees (or one clearly outscores the rest); a tie
-    or no agreement returns None so we never guess."""
+    """Global fuzzy name search — primary matcher when the sheet carries a
+    real name. Returns a single Employee only when exactly one agrees (or one
+    clearly outscores the rest); a tie or no agreement returns None."""
     all_employees = (await db.execute(select(Employee))).scalars().all()
     agreeing = [e for e in all_employees if _name_agrees(name_norm, e.name)]
     if len(agreeing) == 1:
@@ -168,6 +164,110 @@ async def _match_by_name(db: AsyncSession, name_norm: str) -> Employee | None:
         if best_score - second >= 8:
             return best
     return None
+
+
+def _id_on_sheet_matches(emp: Employee, id_norm: str) -> bool:
+    return (emp.employee_id or "").strip().upper() == id_norm.upper()
+
+
+def _name_match_result(
+    emp: Employee,
+    extracted_name: str | None,
+    id_norm: str,
+    *,
+    email_hint: Employee | None = None,
+) -> MatchResult:
+    """Build a result after a confident name match."""
+    if email_hint and emp.id == email_hint.id:
+        return MatchResult(
+            emp,
+            f'Matched inbox employee + sheet name ("{extracted_name}" → '
+            f'"{emp.name}" · {emp.employee_id}{_loc(emp)}).',
+            MatchCode.EMAIL_AND_NAME,
+        )
+    if id_norm and _id_on_sheet_matches(emp, id_norm):
+        return MatchResult(
+            emp,
+            f'Matched by name ("{extracted_name}" → "{emp.name}"{_loc(emp)}).',
+            MatchCode.ID_AND_NAME,
+        )
+    if id_norm:
+        return MatchResult(
+            emp,
+            f'Matched by name ("{extracted_name}" → "{emp.name}" · '
+            f'{emp.employee_id}{_loc(emp)}). Sheet shows client ID {id_norm} '
+            f'— not used for matching.',
+            MatchCode.NAME_PRIMARY,
+        )
+    return MatchResult(
+        emp,
+        f'Matched by name ("{extracted_name}" → "{emp.name}" · '
+        f'{emp.employee_id}{_loc(emp)}).',
+        MatchCode.NAME_PRIMARY,
+    )
+
+
+async def _match_by_id(
+    db: AsyncSession,
+    id_norm: str,
+    name_norm: str,
+    extracted_name: str | None,
+) -> MatchResult | None:
+    """Secondary path when the name alone did not uniquely match."""
+    from sqlalchemy import func
+    candidates = (
+        await db.execute(select(Employee).where(
+            func.upper(Employee.employee_id) == id_norm.upper()))
+    ).scalars().all()
+    if not candidates:
+        return None
+
+    if len(candidates) == 1:
+        emp = candidates[0]
+        if _name_agrees(name_norm, emp.name):
+            return MatchResult(
+                emp,
+                f'Matched by employee ID ({id_norm}) + name '
+                f'("{extracted_name}" → "{emp.name}"{_loc(emp)}).',
+                MatchCode.ID_AND_NAME,
+            )
+        return MatchResult(
+            None,
+            f'Employee ID {id_norm} belongs to "{emp.name}"{_loc(emp)}, but the sheet name '
+            f'"{extracted_name}" does not match it — not matched. Please assign the correct employee.',
+            MatchCode.NO_MATCH,
+        )
+
+    agreeing = [c for c in candidates if _name_agrees(name_norm, c.name)]
+    if len(agreeing) == 1:
+        emp = agreeing[0]
+        return MatchResult(
+            emp,
+            f'Matched by employee ID ({id_norm}) + name '
+            f'("{extracted_name}" → "{emp.name}"{_loc(emp)}) — ID is shared across teams.',
+            MatchCode.ID_AND_NAME,
+        )
+    if len(agreeing) > 1:
+        ranked = sorted(((_name_score(name_norm, c), c) for c in agreeing),
+                        key=lambda t: t[0], reverse=True)
+        best_score, best = ranked[0]
+        second = ranked[1][0]
+        if best_score - second >= 8:
+            return MatchResult(
+                best,
+                f'Matched by employee ID ({id_norm}) + name '
+                f'("{extracted_name}" → "{best.name}"{_loc(best)}, '
+                f'{int(best_score)}% confidence).',
+                MatchCode.ID_AND_NAME,
+            )
+
+    who = ", ".join(f"{c.name}{_loc(c)}" for c in candidates)
+    return MatchResult(
+        None,
+        f'Employee ID {id_norm} is shared by {who}, and the sheet name "{extracted_name}" '
+        "does not clearly identify one of them — not matched. Please assign the correct employee.",
+        MatchCode.AMBIGUOUS_ID,
+    )
 
 
 async def match_employee(
@@ -183,30 +283,20 @@ async def match_employee(
         name_norm = ""           # a placeholder name counts as no name
     id_norm = (extracted_id or "").strip()
 
-    # ---- both an ID and a real name are REQUIRED ----
     if not id_norm and not name_norm:
         return MatchResult(None, "No employee ID or name found on the sheet to match.",
                            MatchCode.NO_IDENTITY)
-    if not id_norm:
-        if name_norm and email_hint and _name_agrees(name_norm, email_hint.name):
-            return MatchResult(
-                email_hint,
-                f'Matched inbox employee + sheet name ("{extracted_name}" → '
-                f'"{email_hint.name}" · {email_hint.employee_id}{_loc(email_hint)}).',
-                MatchCode.EMAIL_AND_NAME,
-            )
-        # No ID on the sheet: fall back to a global fuzzy NAME search. This is
-        # still not a guess — _match_by_name returns a row ONLY when exactly one
-        # employee agrees (or one clearly outscores the rest); ties give None.
-        # Handles "John Smith" on a sheet with no ID -> John Smith · EMP1023.
+
+    # ---- name first — client Emp No is not our matcher ID ----
+    if name_norm:
+        if email_hint and _name_agrees(name_norm, email_hint.name):
+            return _name_match_result(
+                email_hint, extracted_name, id_norm, email_hint=email_hint)
         by_name = await _match_by_name(db, name_norm)
         if by_name is not None:
-            return MatchResult(
-                by_name,
-                f'No employee ID on the sheet — matched by name only ("{extracted_name}" → '
-                f'"{by_name.name}" · {by_name.employee_id}{_loc(by_name)}). Please verify.',
-                MatchCode.NAME_FALLBACK,
-            )
+            return _name_match_result(by_name, extracted_name, id_norm)
+
+    if not id_norm:
         return MatchResult(
             None,
             f'Only a name ("{extracted_name}") was found and it did not uniquely match any '
@@ -217,90 +307,19 @@ async def match_employee(
         why = "only a placeholder name" if name_is_placeholder else "no employee name"
         return MatchResult(
             None,
-            f'Employee ID {id_norm} was found but {why} — both the ID and the name are '
+            f'Employee ID {id_norm} was found but {why} — a readable name is '
             "required to match. Please assign the correct employee.",
             MatchCode.NO_MATCH,
         )
 
-    # ---- look up by ID (AUH/DXB may share an ID -> several candidates) ----
-    candidates = (
-        await db.execute(select(Employee).where(Employee.employee_id == id_norm))
-    ).scalars().all()
-    if not candidates:
-        alt = await _match_by_name(db, name_norm)
-        if alt:
-            return MatchResult(
-                alt, f'No employee with ID {id_norm} in the matcher, but the sheet name '
-                     f'"{extracted_name}" matched "{alt.name}" · {alt.employee_id}{_loc(alt)} — '
-                     "matched by name; please verify the ID.",
-                MatchCode.NAME_FALLBACK,
-            )
-        return MatchResult(
-            None,
-            f'No employee with ID {id_norm} in the matcher (sheet name "{extracted_name}"). '
-            "Add them to the matcher or assign the correct employee.",
-            MatchCode.NO_MATCH,
-        )
-
-    # ---- single candidate: confirm the name agrees (short forms allowed) ----
-    if len(candidates) == 1:
-        emp = candidates[0]
-        if _name_agrees(name_norm, emp.name):
-            return MatchResult(
-                emp, f"Matched by employee ID ({id_norm}) + name "
-                     f'("{extracted_name}" → "{emp.name}"{_loc(emp)}).',
-                MatchCode.ID_AND_NAME,
-            )
-        alt = await _match_by_name(db, name_norm)
-        if alt:
-            return MatchResult(
-                alt, f'Employee ID {id_norm} belongs to "{emp.name}"{_loc(emp)}, but the sheet '
-                     f'name "{extracted_name}" matched "{alt.name}" · {alt.employee_id}{_loc(alt)} '
-                     "instead — matched by name; please verify the ID.",
-                MatchCode.NAME_FALLBACK,
-            )
-        return MatchResult(
-            None,
-            f'Employee ID {id_norm} belongs to "{emp.name}"{_loc(emp)}, but the sheet name '
-            f'"{extracted_name}" does not match it — not matched. Please assign the correct employee.',
-            MatchCode.NO_MATCH,
-        )
-
-    # ---- shared ID: the name must single out exactly one person ----
-    agreeing = [c for c in candidates if _name_agrees(name_norm, c.name)]
-    if len(agreeing) == 1:
-        emp = agreeing[0]
-        return MatchResult(
-            emp, f"Matched by employee ID ({id_norm}) + name "
-                 f'("{extracted_name}" → "{emp.name}"{_loc(emp)}) — ID is shared across teams.',
-            MatchCode.ID_AND_NAME,
-        )
-    if len(agreeing) > 1:
-        # multiple plausibly agree — take a clear winner only if it dominates
-        ranked = sorted(((_name_score(name_norm, c), c) for c in agreeing),
-                        key=lambda t: t[0], reverse=True)
-        best_score, best = ranked[0]
-        second = ranked[1][0]
-        if best_score - second >= 8:
-            return MatchResult(
-                best, f"Matched by employee ID ({id_norm}) + name "
-                      f'("{extracted_name}" → "{best.name}"{_loc(best)}, {int(best_score)}% confidence).',
-                MatchCode.ID_AND_NAME,
-            )
-
-    alt = await _match_by_name(db, name_norm)
-    if alt:
-        return MatchResult(
-            alt, f'Employee ID {id_norm} is shared by multiple people and the sheet name didn\'t '
-                 f'clearly pick one of them, but "{extracted_name}" matched "{alt.name}" · '
-                 f'{alt.employee_id}{_loc(alt)} — matched by name; please verify the ID.',
-            MatchCode.NAME_FALLBACK,
-        )
-    who = ", ".join(f"{c.name}{_loc(c)}" for c in candidates)
+    # ---- ID fallback when the name alone was ambiguous or missing ----
+    by_id = await _match_by_id(db, id_norm, name_norm, extracted_name)
+    if by_id is not None:
+        return by_id
     return MatchResult(
         None,
-        f'Employee ID {id_norm} is shared by {who}, and the sheet name "{extracted_name}" '
-        "does not clearly identify one of them — not matched. Please assign the correct employee.",
-        MatchCode.AMBIGUOUS_ID,
+        f'No employee with ID {id_norm} in the matcher (sheet name "{extracted_name}"). '
+        "Add them to the matcher or assign the correct employee.",
+        MatchCode.NO_MATCH,
     )
 

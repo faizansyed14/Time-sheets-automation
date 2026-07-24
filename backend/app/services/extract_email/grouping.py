@@ -31,6 +31,32 @@ def union_group_buckets(members: list[dict]) -> tuple[dict, list[str]]:
     return merged, list(dict.fromkeys(flags))
 
 
+def _multi_sheet_flags(members: list[dict]) -> tuple[list[str], list[str]]:
+    """Split overlap vs informational notes when several sheets share a month.
+
+    Four weekly ADR attachments for one employee are COMPLEMENTARY — merge
+    them. Two attachments each claiming a FULL month are a DUPLICATE.
+    """
+    overlap: list[str] = []
+    fold: list[str] = []
+    ts = [s for s in members if s.get("kind") == "timesheet"]
+    if len(ts) < 2:
+        return overlap, fold
+
+    full = [s for s in ts if s.get("period_type") == "full_month"]
+    if len(full) >= 2:
+        overlap.append(
+            "Two sheets claim the SAME full month ("
+            + ", ".join(s.get("name") or "?" for s in full[:4])
+            + ") — needs a human check.")
+        return overlap, fold
+
+    names = ", ".join(s.get("name") or "?" for s in ts[:6])
+    fold.append(
+        f"{len(ts)} partial/week sheet(s) merged for this month ({names}).")
+    return overlap, fold
+
+
 async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]) -> list[dict]:
     """Group data sheets (timesheets + certificates) by resolved employee, then
     by month/year. Returns group dicts ready for staging."""
@@ -58,7 +84,7 @@ async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]
                     "employee_pk": None, "name": s["employee_name"],
                     "employee_id": s["employee_id"],
                     "note": f"Not in the matcher — sheet says {s['employee_name'] or '?'} "
-                            f"({s['employee_id'] or 'no id'}). Pick the employee in Compare & Fix."})
+                            f"(client ID {s['employee_id'] or 'none'}). Pick the employee in Review."})
         s["_key"] = key
 
     known = [k for k in dict.fromkeys(s["_key"] for s in data_sheets) if k]
@@ -77,7 +103,7 @@ async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]
             key = "raw:unknown"
             emp_info[key] = {"employee_pk": None, "name": None, "employee_id": None,
                              "note": "No employee could be read from any sheet or the sender — "
-                                     "pick the employee in Compare & Fix."}
+                                     "pick the employee in Review."}
         for s in data_sheets:
             s["_key"] = key
         known = [key]
@@ -116,20 +142,24 @@ async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]
             by_period.setdefault(p, []).append(s)
         for (month, year), part in by_period.items():
             buckets, overlap_flags = union_group_buckets(part)
-            # Format-specific validation: run each distinct client template's
-            # own rules over the merged buckets (req 7).
+            multi_overlap, multi_fold = _multi_sheet_flags(part)
+            overlap_flags = list(dict.fromkeys(overlap_flags + multi_overlap))
+            part_folds = [n for n in fold_notes if any(s["name"] in n for s in part)]
+            part_folds = list(dict.fromkeys(part_folds + multi_fold))
+            from app.services.extract_email.auto_accept import merged_coverage
             from app.services.extract_email.formats import get_format
             fmt_flags: list[str] = []
             for fid in dict.fromkeys(s.get("format_id", "generic") for s in part):
                 fmt_flags.extend(get_format(fid).validate(buckets, month, year))
+            coverage = merged_coverage({"month": month, "year": year, "sheets": part})
             groups.append({
                 "tag": tag_for(key, month, year),
                 **emp_info[key],
                 "month": month, "year": year,
                 "buckets": buckets,
+                "coverage": coverage,
                 "overlap_flags": overlap_flags + list(dict.fromkeys(fmt_flags)),
-                "fold_notes": [n for n in fold_notes
-                               if any(s["name"] in n for s in part)],
+                "fold_notes": part_folds,
                 "sheets": part,
                 "formats": list(dict.fromkeys(
                     s.get("format_id", "generic") for s in part)),

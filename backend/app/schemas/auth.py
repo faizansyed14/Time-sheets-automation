@@ -103,7 +103,7 @@ class AiStatusItem(BaseModel):
     drift from reality the way a static label could."""
     kind: str            # "extraction" | "agent"
     label: str
-    provider: str         # "openai"
+    provider: str         # settings.llm_provider — "openai" | "openrouter" | ...
     model: str
     has_key: bool
     note: str | None = None

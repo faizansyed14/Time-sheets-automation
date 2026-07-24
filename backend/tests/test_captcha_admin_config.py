@@ -54,6 +54,11 @@ async def test_config_write_endpoints_removed(client, admin_token):
 
 
 async def test_config_status_read_only(client, admin_token):
+    """provider/model are RESOLVED from settings, not hardcoded — this must
+    reflect whatever settings.llm_provider actually is (e.g. "openrouter"),
+    never a stale "openai" literal regardless of what is configured."""
+    from app.core.config import settings
+
     h = auth_headers(admin_token)
     r = await client.get("/api/v1/admin/config/status", headers=h)
     assert r.status_code == 200
@@ -61,7 +66,8 @@ async def test_config_status_read_only(client, admin_token):
     assert len(body) == 2
     kinds = {item["kind"] for item in body}
     assert kinds == {"extraction", "agent"}
-    assert all(item["provider"] == "openai" for item in body)
+    expected_provider = (settings.llm_provider or "openai").strip().lower()
+    assert all(item["provider"] == expected_provider for item in body)
 
 
 async def test_config_reveal_endpoint_removed(client, admin_token):
