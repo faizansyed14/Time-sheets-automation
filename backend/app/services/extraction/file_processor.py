@@ -213,10 +213,51 @@ def _soffice_to_pdf(in_path: Path, out_dir: Path) -> bytes | None:
     return pdfs[0].read_bytes() if pdfs else None
 
 
+def _autofit_xlsx_columns(xlsx_bytes: bytes) -> bytes:
+    """Widen every column to fit its longest cell before LibreOffice renders
+    the PDF. A default/unset column width silently clips the LAST character
+    of anything longer (measured: '2026-06-01' rendered as '2026-06-0' with
+    the '1' cut off under the grid line) — a vision model then reads the
+    wrong day, off by one on every date in the column. Not a resolution
+    problem (higher DPI does not help); the column itself is too narrow.
+
+    openpyxl can't measure real pixel widths, so character count is used as
+    a good-enough proxy. Returns the ORIGINAL bytes unchanged if this isn't a
+    real .xlsx (legacy binary .xls, or a corrupt file) — callers already have
+    their own fallback for that."""
+    from openpyxl import load_workbook
+
+    try:
+        wb = load_workbook(io.BytesIO(xlsx_bytes))
+    except Exception:
+        return xlsx_bytes
+
+    for ws in wb.worksheets:
+        widths: dict[str, int] = {}
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value is None:
+                    continue
+                n = len(str(cell.value))
+                if n > widths.get(cell.column_letter, 0):
+                    widths[cell.column_letter] = n
+        for col, n in widths.items():
+            ws.column_dimensions[col].width = min(max(n + 2, 10), 60)
+
+    out = io.BytesIO()
+    try:
+        wb.save(out)
+    except Exception:
+        return xlsx_bytes
+    return out.getvalue()
+
+
 def _office_to_pdf_bytes(file_bytes: bytes, ext: str) -> bytes | None:
     """Convert docx/xlsx/doc/xls -> PDF via LibreOffice headless, if soffice is installed."""
     if not file_bytes or ext not in {"docx", "xlsx", "doc", "xls"}:
         return None
+    if ext == "xlsx":
+        file_bytes = _autofit_xlsx_columns(file_bytes)
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
         in_path = td_path / f"input.{ext}"

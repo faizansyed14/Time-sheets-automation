@@ -82,7 +82,13 @@ class PipelineFile(Base):
     content_type: Mapped[str | None] = mapped_column(String, nullable=True)
     size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_kind: Mapped[str] = mapped_column(String, index=True)  # "upload" | "email"
+    # The message this was extracted FROM — still what retries, "mark email
+    # ingested" and TimesheetRecord.source_email_id resolve against.
     source_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    # The CONVERSATION this belongs to. Extract Email reads a whole thread, so
+    # this is the dedupe key: re-extracting after a new reply updates the same
+    # review item instead of creating a second one for the same month.
+    thread_key: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
     attachment_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # ---- where it got to ----

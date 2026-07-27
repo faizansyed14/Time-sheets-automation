@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useNavigate } from "react-router-dom";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Mail,
@@ -20,6 +21,9 @@ import {
   MoreVertical,
   Shield,
   Wand2,
+  PlayCircle,
+  AlertTriangle,
+  ExternalLink,
 } from "lucide-react";
 import {
   attachmentRenderUrl,
@@ -27,6 +31,7 @@ import {
   decideEmail,
   emlUrl,
   extractFullEmailStream,
+  fetchAutoExtractStatus,
   fetchEmail,
   fetchEmployeeMatcher,
   fetchThread,
@@ -35,11 +40,13 @@ import {
   MONTHS_LONG,
   restoreEmail,
   saveEmlToVault,
+  startAutoExtract,
   type Attachment,
   type Employee,
   type EmailDetail,
   type EmailListItem,
   type EmailRecipient,
+  type LlmEgressPart,
   type LlmEgressPreview,
   type PipelineFile,
   type ThreadListItem,
@@ -48,6 +55,7 @@ import { cn, formatBytes, formatDateTime, formatOutlookDateTime, emailSnippet, i
 import { isBodyJunkImage, isImageAttachment } from "../lib/attachmentFilters";
 import { FilePreviewModal } from "../components/FilePreview";
 import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
+import { ThreadSummaryBox } from "../components/ThreadSummaryBox";
 import { attachmentRenderUrlIfSupported, buildEmailHtmlDocument, downloadFile } from "../lib/filePreview";
 import { Badge, Button, Card, EmptyState, Modal, Select, Skeleton, Spinner } from "../components/ui";
 import { useToast } from "../components/toast";
@@ -182,17 +190,35 @@ function LlmEgressPreviewModal({
   loading: boolean;
   error: string | null;
 }) {
+  const [showPrompt, setShowPrompt] = useState(false);
+  const [showBody, setShowBody] = useState(false);
+
+  const PartList = ({ parts, tone }: { parts: LlmEgressPart[]; tone: string }) => (
+    <div className="space-y-1">
+      {parts.map((f) => (
+        <div key={f.name + f.sha256} className={cn(
+          "flex items-center gap-2 rounded-md border px-2 py-1.5 text-[11px]", tone)}>
+          <FileText className="h-3.5 w-3.5 shrink-0 opacity-70" />
+          <span className="min-w-0 flex-1 truncate font-medium">{f.name}</span>
+          <span className="shrink-0 opacity-70">{f.file_type}</span>
+          <span className="shrink-0 opacity-70">{Math.round(f.bytes / 1024)} KB</span>
+          <span className="shrink-0 font-mono opacity-50">{f.sha256}</span>
+        </div>
+      ))}
+    </div>
+  );
+
   return (
     <Modal
       open={open}
       onClose={onClose}
-      title="EML sent to LLM"
-      subtitle="Subject, body text, and the exact stitched JPEGs (after PII scrub) that Extract Email would send to the vision model."
+      title="What is sent to OpenAI"
+      subtitle="Built exactly the way a real Extract Email run builds it — this is what leaves, not a description of it."
       wide
     >
       {loading && (
         <div className="flex items-center justify-center gap-2 py-12 text-sm text-slate-500">
-          <Spinner /> Building redacted preview…
+          <Spinner /> Building the preview…
         </div>
       )}
       {error && (
@@ -202,100 +228,144 @@ function LlmEgressPreviewModal({
       )}
       {preview && !loading && (
         <div className="space-y-4 text-sm">
+          {/* Headline facts */}
           <div className="flex flex-wrap items-center gap-2">
+            <Badge tone="brand">{preview.model}</Badge>
             <Badge tone={preview.pii_redaction ? "success" : "danger"}>
-              PII redaction {preview.pii_redaction ? "on" : "OFF"}
+              Body redaction {preview.pii_redaction ? "on" : "OFF"}
             </Badge>
-            <Badge tone="brand">{preview.scope}</Badge>
-            {preview.sender_omitted && <Badge tone="slate">Sender omitted</Badge>}
+            <Badge tone="slate">
+              {preview.call_count.inference} model call
+              {preview.call_count.file_uploads > 0
+                ? ` + ${preview.call_count.file_uploads} file upload(s)`
+                : ""}
+            </Badge>
+            <Badge tone="slate">{preview.thread_messages.length} message(s) in thread</Badge>
           </div>
-          <p className="text-xs leading-relaxed text-slate-500">{preview.policy}</p>
 
-          <div>
-            <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-              Redacted / omitted
-            </p>
-            <ul className="list-inside list-disc space-y-0.5 text-xs text-slate-600">
-              {preview.omitted.map((o) => (
-                <li key={o}>{o}</li>
+          {(preview.warnings?.length ?? 0) > 0 && (
+            <div className="space-y-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-800">
+              <p className="flex items-center gap-1.5 font-semibold">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                This conversation was not sent in full
+              </p>
+              {preview.warnings!.map((w, i) => (
+                <p key={i} className="leading-5">{w}</p>
               ))}
-            </ul>
-          </div>
+            </div>
+          )}
 
-          <div>
-            <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-              Subject sent
-            </p>
-            <pre className="overflow-x-auto rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-800 whitespace-pre-wrap">
-              {preview.subject_sent || "(empty)"}
-            </pre>
-          </div>
-
-          <div>
-            <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-              Body text sent (prompt text)
-            </p>
-            <pre className="max-h-48 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-800 whitespace-pre-wrap">
-              {preview.body_sent || "(empty — no body sheet)"}
-            </pre>
-          </div>
-
-          <div>
-            <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-              Sheets ({preview.sheets.length}) — images OpenAI would see
-            </p>
-            <div className="space-y-2">
-              {preview.sheets.map((s) => (
-                <div
-                  key={s.name + s.file_type}
-                  className="rounded-lg border border-slate-200 bg-white p-3"
-                >
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-semibold text-slate-800">{s.name}</span>
-                    <Badge tone="slate">{s.file_type}</Badge>
-                    <span className="text-[11px] text-slate-400">
-                      {s.image_pages ? "1 stitched image" : "no image"}
-                    </span>
-                  </div>
-                  <p className="mt-1 text-[11px] text-slate-500">{s.note}</p>
-                  {s.image_jpeg_b64 ? (
-                    <div className="mt-2 overflow-auto rounded border border-slate-100 bg-slate-50 p-2">
-                      <img
-                        src={`data:image/jpeg;base64,${s.image_jpeg_b64}`}
-                        alt={`${s.name} — vision JPEG`}
-                        className="mx-auto block max-h-[480px] max-w-full object-contain"
-                      />
-                    </div>
-                  ) : (
-                    <p className="mt-2 text-[11px] italic text-slate-400">
-                      No JPEG for this sheet
-                    </p>
+          {/* The steps, in order */}
+          <ol className="space-y-2">
+            {preview.steps.map((s) => (
+              <li key={s.n} className="flex gap-2.5 rounded-lg border border-slate-200 bg-white p-2.5">
+                <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-brand-600 text-[10px] font-bold text-white">
+                  {s.n}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[13px] font-semibold text-slate-800">{s.title}</span>
+                  <span className="mt-0.5 block text-xs leading-relaxed text-slate-600">{s.detail}</span>
+                  {s.items.length > 0 && (
+                    <ul className="mt-1.5 space-y-0.5">
+                      {s.items.map((it, i) => (
+                        <li key={i} className="truncate font-mono text-[10px] text-slate-500">
+                          {it}
+                        </li>
+                      ))}
+                    </ul>
                   )}
-                  {s.text_sent ? (
-                    <pre className="mt-2 max-h-32 overflow-auto rounded border border-slate-100 bg-slate-50 p-2 font-mono text-[11px] text-slate-700 whitespace-pre-wrap">
-                      {s.text_sent}
-                    </pre>
-                  ) : (
-                    <p className="mt-2 text-[11px] italic text-slate-400">
-                      No extracted text — images only
-                    </p>
-                  )}
-                </div>
-              ))}
-              {preview.sheets.length === 0 && (
-                <p className="text-xs text-slate-500">No readable sheets in this scope.</p>
-              )}
+                </span>
+              </li>
+            ))}
+          </ol>
+
+          {/* The exact parts attached */}
+          {preview.files_sent.length > 0 && (
+            <div>
+              <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                Files uploaded — raw bytes, NOT redacted
+              </p>
+              <PartList parts={preview.files_sent} tone="border-amber-200 bg-amber-50 text-amber-800" />
+            </div>
+          )}
+          {preview.images_sent.length > 0 && (
+            <div>
+              <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                Images inlined (base64)
+              </p>
+              <PartList parts={preview.images_sent} tone="border-slate-200 bg-slate-50 text-slate-700" />
+              <div className="mt-2 flex flex-wrap gap-2">
+                {preview.images_sent.filter((i) => i.jpeg_b64).map((i) => (
+                  <img
+                    key={i.sha256}
+                    src={`data:image/jpeg;base64,${i.jpeg_b64}`}
+                    alt={i.name}
+                    className="max-h-40 rounded-md border border-slate-200"
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+          {/* The redaction boundary, stated both ways on purpose */}
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50/50 p-2.5">
+              <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-emerald-700">
+                Redacted before sending
+              </p>
+              <ul className="list-inside list-disc space-y-0.5 text-[11px] text-slate-700">
+                {preview.redacted.map((o) => <li key={o}>{o}</li>)}
+              </ul>
+            </div>
+            <div className="rounded-lg border border-amber-200 bg-amber-50/50 p-2.5">
+              <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-amber-700">
+                NOT redacted
+              </p>
+              <ul className="list-inside list-disc space-y-0.5 text-[11px] text-slate-700">
+                {preview.not_redacted.map((o) => <li key={o}>{o}</li>)}
+              </ul>
             </div>
           </div>
 
-          <div>
-            <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-              Sample vision prompt (first sheet, scrubbed)
-            </p>
-            <p className="mb-1 text-[11px] text-slate-500">{preview.system_prompt_note}</p>
-            <pre className="max-h-64 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] text-slate-800 whitespace-pre-wrap">
-              {preview.sample_prompt || "(no prompt — nothing to analyse)"}
-            </pre>
+          <p className="rounded-lg bg-slate-50 px-3 py-2 text-xs leading-relaxed text-slate-600">
+            {preview.policy}
+          </p>
+
+          {/* Verbatim payloads, collapsed by default */}
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={() => setShowBody((v) => !v)}
+              className="flex w-full items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-left text-xs font-semibold text-slate-700 hover:bg-slate-50"
+            >
+              {showBody ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+              Scrubbed message text ({preview.body_sent.length} chars)
+            </button>
+            {showBody && (
+              <pre className="max-h-72 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] text-slate-800 whitespace-pre-wrap">
+                {preview.body_sent || "(no body text)"}
+              </pre>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setShowPrompt((v) => !v)}
+              className="flex w-full items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-left text-xs font-semibold text-slate-700 hover:bg-slate-50"
+            >
+              {showPrompt ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+              The exact prompt sent
+            </button>
+            {showPrompt && (
+              <>
+                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">System</p>
+                <pre className="max-h-40 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] text-slate-800 whitespace-pre-wrap">
+                  {preview.system_prompt}
+                </pre>
+                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">User</p>
+                <pre className="max-h-96 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] text-slate-800 whitespace-pre-wrap">
+                  {preview.user_prompt}
+                </pre>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -779,16 +849,57 @@ function attachmentPreviewFile(providerId: string, a: Attachment): PreviewFile {
   };
 }
 
+/** Per-message extraction state within a thread.
+ *
+ *  Extract Email always sends the WHOLE conversation, so a message was part of
+ *  a run exactly when it arrived before that run. A message that landed after
+ *  it has never been read — which is precisely when the thread needs
+ *  re-extracting. */
+type MsgExtractState = "extracted" | "new" | null;
+
+function messageExtractState(
+  receivedAt: string | null | undefined,
+  threadExtractedAt: string | null | undefined,
+): MsgExtractState {
+  if (!threadExtractedAt) return null;          // thread never extracted — no badge
+  if (!receivedAt) return null;
+  return new Date(receivedAt) <= new Date(threadExtractedAt) ? "extracted" : "new";
+}
+
+function MessageExtractedBadge({ state }: { state: MsgExtractState }) {
+  if (!state) return null;
+  const extracted = state === "extracted";
+  return (
+    <span
+      title={extracted
+        ? "This message was included in the last Extract Email run."
+        : "Arrived after the last run — re-extract to include it."}
+      className={cn(
+        "mb-1 inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide",
+        extracted
+          ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+          : "border-amber-200 bg-amber-50 text-amber-700")}
+    >
+      {extracted ? <CheckCircle2 className="h-2.5 w-2.5" /> : <Wand2 className="h-2.5 w-2.5" />}
+      {extracted ? "Extracted" : "Not extracted"}
+    </span>
+  );
+}
+
 function OutlookAttachmentStrip({
   attachments,
   inlineIds,
   providerId,
   setPreview,
+  extractedNames,
 }: {
   attachments: Attachment[];
   inlineIds: string[];
   providerId: string;
   setPreview: (f: PreviewFile) => void;
+  /** Filenames already read by a previous run. Undefined = never extracted,
+   *  so no per-file badge is shown at all. */
+  extractedNames?: string[];
 }) {
   const files = visibleFileAttachments(attachments, inlineIds);
   const [showAll, setShowAll] = useState(files.length <= 2);
@@ -819,7 +930,28 @@ function OutlookAttachmentStrip({
               >
                 <FileText className="h-5 w-5 shrink-0 text-red-500" />
                 <span className="min-w-0">
-                  <span className="block truncate text-sm font-medium text-slate-800">{a.filename}</span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="min-w-0 truncate text-sm font-medium text-slate-800">
+                      {a.filename}
+                    </span>
+                    {/* Extraction reuses attachments it has already read, so a
+                        re-run only pays for what is genuinely new. */}
+                    {extractedNames?.includes(a.filename) ? (
+                      <span
+                        title="Already read by Extract Email — a re-run reuses this result instead of reading it again."
+                        className="shrink-0 rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-emerald-700"
+                      >
+                        Extracted
+                      </span>
+                    ) : extractedNames && extractedNames.length > 0 ? (
+                      <span
+                        title="Not read yet — the next Extract Email run will read this one."
+                        className="shrink-0 rounded-full border border-brand-200 bg-brand-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-brand-700"
+                      >
+                        New
+                      </span>
+                    ) : null}
+                  </span>
                   {a.size != null && a.size > 0 && (
                     <span className="text-xs text-slate-500">{formatBytes(a.size)}</span>
                   )}
@@ -868,16 +1000,20 @@ function ThreadMessageCard({
   open,
   onToggle,
   setPreview,
+  threadExtractedAt,
 }: {
   msg: EmailDetail;
   open: boolean;
   onToggle: () => void;
   setPreview: (f: PreviewFile) => void;
+  /** When this conversation was last extracted — null if it never was. */
+  threadExtractedAt?: string | null;
 }) {
   const inlineIds = msg.inline_attachment_ids ?? [];
   const to = msg.to_recipients ?? [];
   const cc = msg.cc_recipients ?? [];
   const fileCount = visibleFileAttachments(msg.attachments, inlineIds).length;
+  const extractState = messageExtractState(msg.received_at, threadExtractedAt);
 
   return (
     <div className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
@@ -920,6 +1056,7 @@ function ThreadMessageCard({
                 {fileCount > 0 && (
                   <Paperclip className="mb-1 ml-auto h-4 w-4 text-slate-400" aria-label="Has attachments" />
                 )}
+                <MessageExtractedBadge state={extractState} />
                 <span className="block text-xs text-slate-500 whitespace-nowrap">
                   {formatOutlookDateTime(msg.received_at)}
                 </span>
@@ -936,8 +1073,11 @@ function ThreadMessageCard({
               <span className="mt-0.5 block truncate text-sm text-slate-500">
                 {emailSnippet(msg.body_text)}
               </span>
-              <span className="mt-1 block text-right text-xs text-slate-400">
-                {formatOutlookDateTime(msg.received_at)}
+              <span className="mt-1 flex items-center justify-end gap-1.5">
+                <MessageExtractedBadge state={extractState} />
+                <span className="text-xs text-slate-400">
+                  {formatOutlookDateTime(msg.received_at)}
+                </span>
               </span>
             </>
           )}
@@ -951,6 +1091,7 @@ function ThreadMessageCard({
             inlineIds={inlineIds}
             providerId={msg.provider_message_id}
             setPreview={setPreview}
+            extractedNames={msg.extracted_filenames}
           />
           <div className="px-4 py-3">
             <EmailBodyRenderer
@@ -1034,6 +1175,7 @@ function InboxListAttachmentPreview({
 
 export default function InboxPage() {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const { toast } = useToast();
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
@@ -1047,6 +1189,30 @@ export default function InboxPage() {
   const [llmPreview, setLlmPreview] = useState<LlmEgressPreview | null>(null);
   const [llmPreviewLoading, setLlmPreviewLoading] = useState(false);
   const [llmPreviewError, setLlmPreviewError] = useState<string | null>(null);
+
+  // Bulk Extract Email — every thread, one at a time, in the background.
+  // Live progress + Stop live in the app-wide AutoExtractWidget (Shell); this
+  // page only needs to know whether a run is already active, to disable the
+  // trigger and avoid starting a second overlapping one.
+  const { data: autoExtractStatus } = useQuery({
+    queryKey: ["auto-extract-status"],
+    queryFn: fetchAutoExtractStatus,
+    refetchInterval: (query) => {
+      const s = query.state.data?.state;
+      return s === "running" || s === "stopping" ? 2000 : 8000;
+    },
+  });
+  const autoExtractRunning =
+    autoExtractStatus?.state === "running" || autoExtractStatus?.state === "stopping";
+  const autoExtractStart = useMutation({
+    mutationFn: startAutoExtract,
+    onSuccess: (s) => {
+      qc.invalidateQueries({ queryKey: ["auto-extract-status"] });
+      toast("info", "Auto Extract started", `Processing ${s.total} thread(s) in the background.`);
+    },
+    onError: (e: any) =>
+      toast("error", "Couldn't start Auto Extract", e?.response?.data?.detail ?? String(e)),
+  });
 
   useEffect(() => setPreview(null), [selected]);
 
@@ -1224,6 +1390,16 @@ export default function InboxPage() {
               <option value="ingested">Ingested</option>
               <option value="archived">Archived</option>
             </Select>
+            <button
+              type="button"
+              onClick={() => autoExtractStart.mutate()}
+              disabled={autoExtractRunning || autoExtractStart.isPending}
+              title="Extract every thread in the inbox, one at a time, in the background — watch progress and Stop from the widget bottom-right"
+              className="flex shrink-0 items-center gap-1.5 rounded-lg border border-brand-200 bg-brand-50 px-2.5 py-1.5 text-xs font-semibold text-brand-700 transition-colors hover:bg-brand-100 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <PlayCircle className="h-3.5 w-3.5" />
+              {autoExtractRunning ? "Running…" : "Auto Extract"}
+            </button>
           </div>
           {inboxTotal > 0 && (
             <p className="border-b border-slate-100 px-4 py-1.5 text-[10px] text-slate-400">
@@ -1369,19 +1545,51 @@ export default function InboxPage() {
                         </div>
 
                         <div className="flex flex-wrap justify-end gap-1.5">
-                          {!detail.extract_email_at && (
+                          {/* Extract Email reads the whole conversation, so the
+                              badge is thread-level. This message still needs a
+                              run if it arrived AFTER the last one — otherwise a
+                              reply carrying the approval would never be read. */}
+                          {(() => {
+                            const at = detail.extract_email_at;
+                            const isNewer = !!at && !!detail.received_at
+                              && new Date(detail.received_at) > new Date(at);
+                            if (at && !isNewer) return null;
+                            return (
+                              <Button
+                                size="sm"
+                                variant={isNewer ? "secondary" : undefined}
+                                disabled={extractEmail.isPending || loadingDetail}
+                                onClick={() => extractEmail.mutate(detail.provider_message_id)}
+                                title={isNewer
+                                  ? "This reply arrived after the last run — re-read the thread so its content (and any approval) is included."
+                                  : "Whole conversation to the model in one call — every attachment, approval detected, grouped per employee/month for Compare & Fix"}
+                              >
+                                {extractEmail.isPending ? (
+                                  <Spinner className="border-white/40 border-t-white h-3 w-3" />
+                                ) : (
+                                  <Wand2 className="h-3 w-3" />
+                                )}
+                                {extractEmail.isPending
+                                  ? "Extracting…"
+                                  : isNewer ? "Re-extract (new reply)" : "Extract Email"}
+                              </Button>
+                            );
+                          })()}
+                          {detail.extract_email_at && (
                             <Button
                               size="sm"
-                              disabled={extractEmail.isPending || loadingDetail}
-                              onClick={() => extractEmail.mutate(detail.provider_message_id)}
-                              title="Whole .eml to vision — all attachments, approvals detected, grouped per employee/month for Compare & Fix"
+                              variant="secondary"
+                              onClick={() =>
+                                navigate(
+                                  `/pipeline?thread_key=${encodeURIComponent(
+                                    detail.thread_id || detail.provider_message_id
+                                  )}`
+                                )
+                              }
+                              title="Open the exact pipeline record(s) this conversation was staged into — not just the thread, the genuinely extracted result"
                             >
-                              {extractEmail.isPending ? (
-                                <Spinner className="border-white/40 border-t-white h-3 w-3" />
-                              ) : (
-                                <Wand2 className="h-3 w-3" />
-                              )}
-                              {extractEmail.isPending ? "Extracting…" : "Extract Email"}
+                              <ExternalLink className="h-3 w-3" />
+                              View in Pipeline
                             </Button>
                           )}
                           <EmailMenu
@@ -1440,6 +1648,7 @@ export default function InboxPage() {
                     <Spinner className="h-3.5 w-3.5" /> Loading conversation…
                   </div>
                 )}
+                {thread?.summary && <ThreadSummaryBox summary={thread.summary} />}
                 <div className="space-y-2">
                   {threadMessages.map((m) => (
                     <ThreadMessageCard
@@ -1448,6 +1657,7 @@ export default function InboxPage() {
                       open={expandedThreadIds.has(m.provider_message_id)}
                       onToggle={() => toggleThreadMessage(m.provider_message_id)}
                       setPreview={setPreview}
+                      threadExtractedAt={thread?.extracted_at}
                     />
                   ))}
                 </div>
@@ -1470,7 +1680,7 @@ export default function InboxPage() {
             setPendingReview([]);
           } else {
             toast("success", "Extract Email complete",
-              "No items need review — see the pipeline for auto-accepted records.");
+              "No items need review — see the Activity log for AI recommendations.");
           }
         }}
       />

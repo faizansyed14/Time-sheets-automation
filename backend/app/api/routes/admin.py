@@ -184,6 +184,7 @@ async def config_status(db: AsyncSession = Depends(get_db)):
     key = (settings.openai_api_key or "").strip().lower()
     has_key = bool(key) and key not in ("change-me", "missing")
     engine = (settings.extraction_engine or "mock").strip().lower()
+    provider = (settings.llm_provider or "openai").strip().lower()
     extraction_note = None
     if engine != "vision":
         extraction_note = f"EXTRACTION_ENGINE={engine} — vision LLM disabled; using mock/deterministic engine."
@@ -192,15 +193,15 @@ async def config_status(db: AsyncSession = Depends(get_db)):
         AiStatusItem(
             kind="extraction",
             label="Vision extraction (Extract Email, Upload, chat uploads)",
-            provider="openai",
-            model=model_for("openai"),
+            provider=provider,
+            model=model_for(provider),
             has_key=has_key,
             note=extraction_note,
         ),
         AiStatusItem(
             kind="agent",
             label="Agentic chat",
-            provider="openai",
+            provider=provider,
             model=settings.agent_chat_model or "gpt-4o-mini",
             has_key=has_key,
             note=None,

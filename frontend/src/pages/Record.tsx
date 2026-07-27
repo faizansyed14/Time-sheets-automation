@@ -519,7 +519,14 @@ export default function RecordPage() {
                               <div className="h-full min-h-[60vh] overflow-hidden rounded-lg border border-slate-200 bg-white">
                                 <EmlPreviewPane fileUrl={url} filename={s.name} />
                               </div>
-                            ) : isPdf(s.name, s.content_type) || isDocx(s.name, s.content_type) || isXlsx(s.name, s.content_type) ? (
+                            ) : isPdf(s.name, s.content_type) ? (
+                              // Native browser PDF viewer — zoom, search, print.
+                              <iframe
+                                src={url}
+                                title={s.name}
+                                className="h-full min-h-[60vh] w-full rounded-lg border border-slate-200 bg-white"
+                              />
+                            ) : isDocx(s.name, s.content_type) || isXlsx(s.name, s.content_type) ? (
                               <div className="h-full min-h-[60vh] overflow-hidden rounded-lg border border-slate-200 bg-white">
                                 <ServerRenderPane
                                   renderUrl={renderUrl}

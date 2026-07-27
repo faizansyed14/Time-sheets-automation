@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
-  Download, ExternalLink, FileText, Mail,
-  Maximize2, Minimize2, Paperclip, X,
+  AlertTriangle, Download, ExternalLink, FileText, Mail,
+  Maximize2, Minimize2, Paperclip, X, ZoomIn, ZoomOut, Scan,
 } from "lucide-react";
 import { cn, formatBytes } from "../lib/utils";
 import { isTinyImage } from "../lib/attachmentFilters";
@@ -134,6 +134,18 @@ export function EmlPreviewPane({
           </p>
         </div>
 
+        {(parsed.warnings?.length ?? 0) > 0 && (
+          <div className="shrink-0 space-y-1 border-b border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-800">
+            <p className="flex items-center gap-1.5 font-semibold">
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+              This is not the full conversation
+            </p>
+            {parsed.warnings!.map((w, i) => (
+              <p key={i} className="leading-5">{w}</p>
+            ))}
+          </div>
+        )}
+
         {/* Body */}
         <div className="min-h-0 flex-1 overflow-hidden bg-white">
           {bodyBlobRef.current ? (
@@ -218,6 +230,13 @@ export function ServerRenderPane({
   const [imgs, setImgs] = useState<string[]>([]);
   const [pageCount, setPageCount] = useState<number>(1);
   const [err, setErr] = useState<string | null>(null);
+  // Page images are rasterised server-side (browsers can't render DOCX/XLSX
+  // natively), so zoom is applied here as a width scale — 100% = fit width.
+  const [zoom, setZoom] = useState<number>(100);
+  const ZOOM_MIN = 40;
+  const ZOOM_MAX = 400;
+  const step = (delta: number) =>
+    setZoom((z) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z + delta)));
 
   useEffect(() => {
     let alive = true;
@@ -317,6 +336,50 @@ export function ServerRenderPane({
 
   return (
     <div className="flex h-full flex-col">
+      {/* Zoom toolbar — DOCX/XLSX page images have no native viewer, so this
+          gives the zoom in/out the browser's own PDF viewer provides. */}
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-white px-3 py-1.5">
+        <span className="text-[11px] font-medium text-slate-400">
+          {pageCount > 1 ? `${pageCount} pages` : "1 page"}
+        </span>
+        <div className="flex items-center gap-0.5">
+          <button
+            type="button"
+            onClick={() => step(-20)}
+            disabled={zoom <= ZOOM_MIN}
+            title="Zoom out"
+            className="rounded-md p-1.5 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-40"
+          >
+            <ZoomOut className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setZoom(100)}
+            title="Fit width (reset)"
+            className="min-w-[3.25rem] rounded-md px-2 py-1 text-xs font-semibold text-slate-600 transition-colors hover:bg-slate-100"
+          >
+            {zoom}%
+          </button>
+          <button
+            type="button"
+            onClick={() => step(20)}
+            disabled={zoom >= ZOOM_MAX}
+            title="Zoom in"
+            className="rounded-md p-1.5 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-40"
+          >
+            <ZoomIn className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setZoom(100)}
+            title="Fit to width"
+            className="ml-0.5 rounded-md p-1.5 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800"
+          >
+            <Scan className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+
       <div className="min-h-0 flex-1 overflow-auto bg-slate-100 p-3">
         {imgs.length ? (
           <div className="space-y-3">
@@ -325,7 +388,8 @@ export function ServerRenderPane({
                 key={u}
                 src={u}
                 alt={`page ${i + 1} / ${pageCount}`}
-                className="mx-auto block w-full rounded-lg bg-white shadow-sm object-contain"
+                style={{ width: `${zoom}%` }}
+                className="mx-auto block rounded-lg bg-white shadow-sm object-contain"
               />
             ))}
           </div>
@@ -384,26 +448,27 @@ export function SourcePreview({
     );
   }
   if (isPdf(name, ct)) {
-    const useServerPages = !!renderUrl || !!renderUpload;
-    if (useServerPages) {
+    // Prefer the browser's own PDF viewer (zoom, search, print) — the URL
+    // carries its own auth token, so the iframe loads it directly. Server
+    // page-images are only the fallback when there is no raw-bytes URL.
+    if (url) {
       return (
-        <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
-          <ServerRenderPane
-            renderUrl={renderUrl}
-            renderUpload={renderUpload}
-            sourceUrl={!renderUrl && !renderUpload ? url : null}
-            filename={name}
-            contentType={ct}
-          />
-        </div>
+        <iframe
+          src={url}
+          title={name}
+          className="h-full w-full rounded-lg border border-slate-200 bg-white"
+        />
       );
     }
     return (
-      <iframe
-        src={url}
-        title={name}
-        className="h-full w-full rounded-lg border border-slate-200 bg-white"
-      />
+      <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
+        <ServerRenderPane
+          renderUrl={renderUrl}
+          renderUpload={renderUpload}
+          filename={name}
+          contentType={ct}
+        />
+      </div>
     );
   }
   if (isXlsx(name, ct)) {
@@ -567,11 +632,15 @@ export function FilePreviewModal({
   // unreadable strip before it got its own component).
   const office = isDocx(file.filename, file.contentType);
   const image = !pdf && !eml && !xlsx && !office && isPreviewable(file.filename, file.contentType);
-  // Nested EML embeds + inbox render URLs → server page images for PDF/DOCX.
-  const useServerPages = (office || pdf || xlsx) && (!!file.renderUrl || !!file.renderUpload);
+  // PDF → the browser's own viewer (zoom, search, page nav, print) whenever we
+  // have the raw-bytes URL. The token rides in the query string, so the iframe
+  // can load it; only fall back to server page-images when there is no URL.
+  const usePdfIframe = pdf && !!file.url;
+  // DOCX/XLSX (and a URL-less PDF) → server page images.
+  const useServerPages = !usePdfIframe
+    && (office || xlsx || pdf) && (!!file.renderUrl || !!file.renderUpload);
   // DOCX without a dedicated render source: fetch blob/url → render-upload.
   const useOfficeFetch = office && !useServerPages && !!file.url;
-  const usePdfIframe = pdf && !useServerPages;
 
   // Images get a dedicated full-screen lightbox instead of the framed card.
   if (image) return <ImageLightbox file={file} onClose={onClose} />;

@@ -218,11 +218,22 @@ def _doc_count(attachments, body_html: str | None = None) -> int:
     )
 
 
-async def _extract_email_times(db: AsyncSession, msg_ids: list[str]) -> dict[str, datetime]:
-    """Latest Extract Email timestamp per inbox message (from staged pipeline items)."""
+async def _extract_email_times(
+    db: AsyncSession, msg_ids: list[str], rows: list[EmailMessage] | None = None,
+) -> dict[str, datetime]:
+    """Latest Extract Email timestamp per inbox message.
+
+    Extract Email reads the WHOLE conversation, so a run started from any
+    message counts as "this thread has been extracted" for every message in
+    it. Without that, a new reply looks unprocessed even though its thread was
+    just read — and re-running would only re-read the same conversation.
+    """
     if not msg_ids:
         return {}
-    rows = (await db.execute(
+    out: dict[str, datetime] = {}
+
+    # Runs keyed to the message they were started from (and pre-thread rows).
+    for sid, at in (await db.execute(
         select(PipelineFile.source_id, func.max(PipelineFile.updated_at))
         .where(
             PipelineFile.source_kind == "email",
@@ -230,8 +241,58 @@ async def _extract_email_times(db: AsyncSession, msg_ids: list[str]) -> dict[str
             PipelineFile.attachment_id.like(f"{_EXTRACT_EMAIL_TAG}%"),
         )
         .group_by(PipelineFile.source_id)
+    )).all():
+        if sid:
+            out[sid] = at
+
+    # Thread-level: any run on this conversation marks all of its messages.
+    convs = {r.conversation_id for r in (rows or []) if r.conversation_id}
+    if convs:
+        by_conv = {
+            key: at for key, at in (await db.execute(
+                select(PipelineFile.thread_key, func.max(PipelineFile.updated_at))
+                .where(
+                    PipelineFile.source_kind == "email",
+                    PipelineFile.thread_key.in_(convs),
+                    PipelineFile.attachment_id.like(f"{_EXTRACT_EMAIL_TAG}%"),
+                )
+                .group_by(PipelineFile.thread_key)
+            )).all() if key
+        }
+        for r in (rows or []):
+            at = by_conv.get(r.conversation_id)
+            if at and (r.provider_message_id not in out or out[r.provider_message_id] < at):
+                out[r.provider_message_id] = at
+    return out
+
+
+async def _thread_extraction_state(
+    db: AsyncSession, thread_id: str,
+) -> tuple[list[str], datetime | None]:
+    """Which sheets this conversation has already had read, and when.
+
+    Extraction is thread-level and reuses attachments it has already read, so
+    the UI can mark each one "Extracted" or "New" instead of implying the next
+    run re-reads the lot. Read off the staged items rather than a second store
+    — they already record exactly which sheets a run covered."""
+    rows = (await db.execute(
+        select(PipelineFile.extraction_meta, PipelineFile.updated_at).where(
+            PipelineFile.source_kind == "email",
+            PipelineFile.thread_key == thread_id,
+            PipelineFile.attachment_id.like(f"{_EXTRACT_EMAIL_TAG}%"),
+        )
     )).all()
-    return {sid: at for sid, at in rows if sid}
+
+    names: list[str] = []
+    latest: datetime | None = None
+    for meta, at in rows:
+        if at and (latest is None or at > latest):
+            latest = at
+        for s in (((meta or {}).get("full_email_extract") or {}).get("sheets") or []):
+            fn = s.get("filename")
+            if fn and fn not in names:
+                names.append(fn)
+    return names, latest
 
 
 def _to_list_item(
@@ -322,7 +383,7 @@ async def list_inbox(
     rows = (await db.execute(
         base.order_by(EmailMessage.received_at.desc()).limit(limit).offset(offset)
     )).scalars().all()
-    times = await _extract_email_times(db, [r.provider_message_id for r in rows])
+    times = await _extract_email_times(db, [r.provider_message_id for r in rows], rows)
     items = [_to_list_item(r, times.get(r.provider_message_id)) for r in rows]
     return Page(items=items, total=total, limit=limit, offset=offset,
                 has_more=offset + len(items) < total)
@@ -387,7 +448,7 @@ async def list_threads(
     )).all()
 
     rows = [r[0] for r in rows_with_counts]
-    times = await _extract_email_times(db, [r.provider_message_id for r in rows])
+    times = await _extract_email_times(db, [r.provider_message_id for r in rows], rows)
     items = [
         _to_list_item(row, times.get(row.provider_message_id), thread_message_count=count)
         for row, count in rows_with_counts
@@ -396,17 +457,43 @@ async def list_threads(
                 has_more=offset + len(items) < total)
 
 
+# Fixed paths — MUST stay registered before GET/{provider_message_id} below,
+# or FastAPI matches "auto-extract" itself as a provider_message_id.
+@router.post("/auto-extract/start")
+async def auto_extract_start():
+    """Start (or return the already-running) bulk Extract Email job — every
+    thread in the inbox, one at a time, in a background Celery worker."""
+    from app.services.extract_email import auto_extract
+    return await auto_extract.start()
+
+
+@router.post("/auto-extract/stop")
+async def auto_extract_stop():
+    """Ask the running job to stop after its current thread finishes."""
+    from app.services.extract_email import auto_extract
+    return await auto_extract.request_stop()
+
+
+@router.get("/auto-extract/status")
+async def auto_extract_status():
+    """Live progress: state, processed/total, which thread is in flight."""
+    from app.services.extract_email import auto_extract
+    return await auto_extract.get_status()
+
+
 async def _build_email_detail(db: AsyncSession, provider, row: EmailMessage) -> EmailDetail:
     """EmailDetail for an ALREADY-SYNCED row — resolves inline cid: images to
     data URIs so the body renders exactly like Outlook. Shared by the single-
     message detail endpoint and the thread view (one call per message)."""
+    from app.services.extract_email import sheet_cache
     from app.services.inbox.inline_images import inline_cid_images
     body_html, inline_ids = await inline_cid_images(
         provider, row.provider_message_id, row.body_html, row.attachments or [])
 
     base = _to_list_item(
         row,
-        (await _extract_email_times(db, [row.provider_message_id])).get(row.provider_message_id),
+        (await _extract_email_times(db, [row.provider_message_id], [row]))
+        .get(row.provider_message_id),
     )
     # Same visible set as the list row (docs + real images; logos/tiny
     # images already stripped by `_is_body_junk_image`). Always include size
@@ -418,6 +505,7 @@ async def _build_email_detail(db: AsyncSession, provider, row: EmailMessage) -> 
         to_recipients=row.to_recipients or [],
         cc_recipients=row.cc_recipients or [],
         inline_attachment_ids=inline_ids,
+        extracted_filenames=sheet_cache.extracted_filenames(row),
         attachments=base.attachments,
     )
 
@@ -480,7 +568,17 @@ async def get_thread(
         rows.sort(key=lambda r: r.received_at or anchor_row.received_at)
 
     messages = [await _build_email_detail(db, provider, r) for r in rows]
-    return ThreadDetail(thread_id=thread_id, messages=messages)
+    # Extraction keys a conversation-less message by its PROVIDER id, while
+    # thread_id falls back to the DB row id — look up what extraction actually
+    # wrote, or a singleton thread would never show as extracted.
+    extracted_sheets, extracted_at = await _thread_extraction_state(
+        db, anchor_row.conversation_id or anchor_row.provider_message_id)
+    from app.services.extract_email.thread_summary import load_summary
+    summary = await load_summary(
+        db, anchor_row.conversation_id, [r.provider_message_id for r in rows])
+    return ThreadDetail(thread_id=thread_id, messages=messages,
+                        extracted_sheets=extracted_sheets, extracted_at=extracted_at,
+                        summary=summary)
 
 
 async def _email_row_or_404(db: AsyncSession, provider_message_id: str) -> EmailMessage:
@@ -497,14 +595,34 @@ async def _email_row_or_404(db: AsyncSession, provider_message_id: str) -> Email
     return row
 
 
+async def _thread_bundle_or_single(
+    db: AsyncSession, row: EmailMessage,
+) -> tuple[bytes, str, list[str]]:
+    """The COMPLETE conversation as one .eml — every message in the thread,
+    each with its own body, attachments and nested forwarded email — the SAME
+    bundle Extract Email sends to the model and stores as evidence, so what
+    you preview/download here is what was actually read, not just the
+    latest message. Degrades to the single message when there is no
+    conversation (or the thread fetch failed — `notes` says so)."""
+    from app.services.extract_email.thread_collect import build_thread_bundle, collect_thread_emls
+    from app.services.extract_email.thread_scope import prior_message_for_merge
+    from app.services.inbox.eml_export import build_full_eml
+
+    provider = get_email_provider()
+    prior_row = await prior_message_for_merge(db, row)
+    thread_messages, notes = await collect_thread_emls(provider, row, prior_row)
+    if thread_messages:
+        data, fname = build_thread_bundle(thread_messages, row.subject)
+        return data, fname, notes
+    data, fname = await build_full_eml(provider, row)
+    return data, fname, notes
+
+
 @router.get("/{provider_message_id}/as-eml")
 async def download_as_eml(provider_message_id: str, db: AsyncSession = Depends(get_db)):
-    """The COMPLETE email as one .eml — headers, body, every attachment and
-    nested forwarded email. Graph serves the byte-exact original MIME; the mock
-    provider gets a faithful reconstruction."""
-    from app.services.inbox.eml_export import build_full_eml
+    """The whole conversation as one .eml (see _thread_bundle_or_single)."""
     row = await _email_row_or_404(db, provider_message_id)
-    data, fname = await build_full_eml(get_email_provider(), row)
+    data, fname, _notes = await _thread_bundle_or_single(db, row)
     from urllib.parse import quote
     return Response(
         content=data,
@@ -515,12 +633,16 @@ async def download_as_eml(provider_message_id: str, db: AsyncSession = Depends(g
 
 @router.get("/{provider_message_id}/as-eml/preview")
 async def preview_as_eml(provider_message_id: str, db: AsyncSession = Depends(get_db)):
-    """Parsed view of the exported .eml (same JSON shape as other EML previews)."""
+    """Parsed view of the exported .eml (same JSON shape as other EML previews).
+    `warnings` is non-empty when the thread fetch degraded — e.g. a very long
+    conversation got truncated to its newest messages — so a thin-looking
+    preview can explain itself instead of looking like the thread was short."""
     from app.services.extraction.eml_parser import parse_eml
-    from app.services.inbox.eml_export import build_full_eml
     row = await _email_row_or_404(db, provider_message_id)
-    data, _ = await build_full_eml(get_email_provider(), row)
-    return parse_eml(data)
+    data, _fname, notes = await _thread_bundle_or_single(db, row)
+    parsed = parse_eml(data)
+    parsed["warnings"] = notes
+    return parsed
 
 
 @router.get("/{provider_message_id}/llm-preview")
@@ -528,15 +650,15 @@ async def preview_llm_payload(
     provider_message_id: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """Audit view: subject/body/prompt text that Extract Email would send to
-    the vision model AFTER PII redaction. Does not call the LLM. When the
-    selected message has its own attachments, only that message is shown;
-    otherwise the prior thread message is merged (approval-only reply)."""
-    from app.services.agents.full_email_extract import preview_llm_egress
+    """Audit view: exactly what Extract Email would send to OpenAI, step by
+    step — the whole conversation, which attachments are uploaded versus
+    uploaded, the verbatim prompts, and what is redacted versus what is not.
+    Built the same way the real run builds it. Does not call the LLM."""
+    from app.services.extract_email.preview import preview_llm_egress
     from app.services.extract_email.thread_scope import prior_message_for_merge
     row = await _email_row_or_404(db, provider_message_id)
     prior_row = await prior_message_for_merge(db, row)
-    return await preview_llm_egress(row, prior_email=prior_row)
+    return await preview_llm_egress(row, prior_email=prior_row, db=db)
 
 
 async def _resolve_thread_anchor_and_prior(
@@ -585,7 +707,9 @@ async def extract_full(provider_message_id: str,
 
 
 @router.post("/{provider_message_id}/extract-full/stream")
-async def extract_full_streamed(provider_message_id: str):
+async def extract_full_streamed(
+    provider_message_id: str,
+):
     """Same as extract-full, but streams live progress (Server-Sent Events):
     one frame per pipeline stage — unpack, format detected, each LLM call,
     approval, grouping, and the auto-accept decision per employee — then a

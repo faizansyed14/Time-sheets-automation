@@ -15,6 +15,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
+  AlertTriangle,
   CheckCircle2,
   Columns2,
   Download,
@@ -23,6 +24,7 @@ import {
   PencilLine,
   Plus,
   Search,
+  Sparkles,
   Trash2,
   User,
   X,
@@ -211,7 +213,6 @@ function EmployeePicker({
   );
 }
 
-// ---------------------------------------------------------------------------
 // Right-side preview panes
 function RawFilePreview({ file }: { file: PipelineFile }) {
   return (
@@ -222,6 +223,40 @@ function RawFilePreview({ file }: { file: PipelineFile }) {
       ct={file.content_type ?? ""}
     />
   );
+}
+
+// ---------------------------------------------------------------------------
+// Plain-English reasons the AI held a record for review
+// ---------------------------------------------------------------------------
+// auto_accept.py's blocker strings are written for someone who already knows
+// the pipeline ("unrecognised timesheet template", "validation flags: ...").
+// These rewrites are for the person actually opening this screen, who just
+// needs to know what to check before they click Accept. Anything not covered
+// still shows (capitalised) rather than being hidden.
+const BLOCKER_REWRITES: [RegExp, (m: RegExpMatchArray) => string][] = [
+  [/^employee is not matched.*$/i,
+    () => "We couldn't match the name or ID on this file to anyone in your employee list."],
+  [/^no month\/year could be read.*$/i,
+    () => "We couldn't tell which month this timesheet is for."],
+  [/^unrecognised timesheet template.*$/i,
+    () => "This timesheet's layout isn't one we recognise yet."],
+  [/^validation flags:\s*(.*)$/i,
+    (m) => `Something on the sheet needs a look: ${m[1]}`],
+  [/^not a verifiable full-month daily grid\s*(.*)$/i,
+    (m) => `We couldn't confirm every day of the month is on this sheet${m[1] ? ` ${m[1]}` : ""}.`],
+  [/^the sheet is missing rows for\s*(.*)$/i,
+    (m) => `Some days are missing from the sheet: ${m[1]}`],
+  [/^auto-file failed:\s*(.*)$/i,
+    (m) => `Something went wrong saving it automatically: ${m[1]}`],
+];
+
+function humanizeBlocker(raw: string): string {
+  const text = raw.trim();
+  for (const [pattern, rewrite] of BLOCKER_REWRITES) {
+    const m = text.match(pattern);
+    if (m) return rewrite(m);
+  }
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -290,30 +325,56 @@ export default function PipelineCompareFixModal({
   }, [sourceEmail, emailSourceId, file?.attachment_id]);
   const activeSource = relatedSources.find((s) => s.id === activeSourceId) ?? null;
 
-  // Reset when a new file is opened. Pre-fill from the AI-staged extraction
-  // (extraction_meta.staged) so a "Run Extraction" review starts populated.
+  const isStaged = file?.failure_code === "pending_review";
+  const aiRecommends = !!(isStaged && file?.auto_accepted);
+  const fullEmail = (file?.extraction_meta?.full_email_extract ?? null) as {
+    sheets?: {
+      filename: string; kind: string; leave_days?: number;
+      manager_signature?: boolean;
+      employee_name?: string | null;
+      employee_id?: string | null;
+    }[];
+    approval?: { detected: boolean; detail: string };
+  } | null;
+  const sheetOnFile = useMemo(() => {
+    const sheets = fullEmail?.sheets ?? [];
+    const hit = sheets.find((s) => s.employee_name || s.employee_id);
+    return {
+      name: hit?.employee_name ?? file?.employee_name ?? null,
+      clientId: hit?.employee_id ?? null,
+    };
+  }, [fullEmail, file?.employee_name]);
+
+  // Reset when a new file is opened.
   useEffect(() => {
     if (!file || file.id === prevFileId.current) return;
     prevFileId.current = file.id;
+
     const staged = (file.extraction_meta?.staged ?? null) as {
       employee_pk?: string | null; matched_name?: string | null;
       matched_employee_id?: string | null; month?: number | null; year?: number | null;
       buckets?: Record<string, string[]>;
     } | null;
+    const sheets = ((file.extraction_meta?.full_email_extract ?? null) as {
+      sheets?: { employee_name?: string | null; employee_id?: string | null }[];
+    } | null)?.sheets ?? [];
+    const sheetHit = sheets.find((s) => s.employee_name || s.employee_id);
+    const sheetName = sheetHit?.employee_name ?? file.employee_name ?? "";
+
     if (staged?.employee_pk) {
       setEmployeePk(staged.employee_pk);
-      setEmployeeQ(`${staged.matched_employee_id ?? ""} · ${staged.matched_name ?? ""}`.trim());
+      setEmployeeQ(
+        `${staged.matched_name ?? ""}${staged.matched_employee_id ? ` · ${staged.matched_employee_id}` : ""}`.trim()
+      );
     } else {
       setEmployeePk("");
-      setEmployeeQ(file.employee_id ?? file.employee_name ?? "");
+      setEmployeeQ(sheetName || file.employee_id || "");
     }
     setMonth(staged?.month ?? file.month ?? new Date().getMonth() + 1);
     setYear(staged?.year ?? file.year ?? new Date().getFullYear());
     setDates(staged?.buckets ?? {});
     setAttachments([]);
     setNote("");
-    // Manager approval — pre-filled from what Extract Email found (signature
-    // on a sheet, approval screenshot, approval wording); reviewer can flip it.
     const foundApproval = (file.extraction_meta?.full_email_extract ?? null) as {
       approval?: { detected: boolean; detail: string };
     } | null;
@@ -323,15 +384,11 @@ export default function PipelineCompareFixModal({
     setActiveSourceId(null);
   }, [file]);
 
-  const isStaged = file?.failure_code === "pending_review";
-  // Present only on items staged by the one-button "Extract Email" flow.
-  const fullEmail = (file?.extraction_meta?.full_email_extract ?? null) as {
-    sheets?: {
-      filename: string; kind: string; leave_days?: number;
-      manager_signature?: boolean;
-    }[];
-    approval?: { detected: boolean; detail: string };
-  } | null;
+  const autoAcceptMeta = (file?.extraction_meta?.auto_accept ?? null) as
+    | { reasons?: string[]; blockers?: string[] }
+    | null;
+  const autoAcceptReasons = autoAcceptMeta?.reasons ?? [];
+  const autoAcceptBlockers = autoAcceptMeta?.blockers ?? [];
 
   // Lock scroll + Escape key.
   useEffect(() => {
@@ -437,7 +494,7 @@ export default function PipelineCompareFixModal({
         <div className="flex shrink-0 items-center gap-2 border-b border-slate-100 bg-slate-50 px-4 py-3">
           <Columns2 className="h-4 w-4 text-slate-400" />
           <span className="min-w-0 flex-1 truncate text-sm font-semibold text-slate-700">
-            {isStaged ? "Review extraction" : "Compare & Fix"} — {file.filename}
+            Review — {file.filename}
           </span>
           {file.failure_detail && (
             <span className="hidden truncate text-xs text-rose-500 sm:block max-w-sm">
@@ -462,21 +519,60 @@ export default function PipelineCompareFixModal({
               Manual entry
             </h3>
 
-            {/* Banner — info for AI-staged review, error for a real failure */}
-            {isStaged ? (
-              <div className="mb-3 rounded-lg border border-brand-200 bg-brand-50 p-3 text-sm leading-5 text-brand-800">
-                <p className="font-semibold">AI-extracted — review &amp; accept</p>
-                <p className="mt-0.5 text-slate-600">
-                  The leaves below were read from the document. Check them against the preview, edit if
-                  needed, then Accept to file the record. Closing leaves it in the pipeline.
+            {/* Banner — AI recommendation, held for review, or failure */}
+            {isStaged && aiRecommends ? (
+              <div className="mb-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm leading-5">
+                <p className="flex items-center gap-1.5 font-semibold text-emerald-900">
+                  <Sparkles className="h-4 w-4 shrink-0 text-emerald-600" />
+                  AI recommends accepting
                 </p>
+                <p className="mt-1 text-slate-700">
+                  Extraction looks clean — compare with the file on the right, then press{" "}
+                  <strong>Accept &amp; file record</strong> to store it. Nothing is saved until you do.
+                </p>
+                {autoAcceptReasons.length > 0 && (
+                  <ul className="mt-2 space-y-1 text-xs leading-relaxed text-emerald-900/90">
+                    {autoAcceptReasons.map((r, i) => (
+                      <li key={i} className="flex gap-1.5">
+                        <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
+                        <span>{r}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </div>
-            ) : (
+            ) : isStaged ? (
+              <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm leading-5">
+                <p className="flex items-center gap-1.5 font-semibold text-amber-900">
+                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
+                  Needs your review
+                </p>
+                <p className="mt-1 text-slate-700">
+                  The AI wasn't fully sure about this one. Check the details, fix anything
+                  wrong, then press <strong>Accept &amp; file record</strong>.
+                </p>
+                {autoAcceptBlockers.length > 0 && (
+                  <div className="mt-2 rounded-md border border-amber-100 bg-white/70 p-2.5">
+                    <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-amber-700">
+                      What it wasn't sure about
+                    </p>
+                    <ul className="space-y-1 text-xs leading-relaxed text-slate-700">
+                      {autoAcceptBlockers.map((b, i) => (
+                        <li key={i} className="flex gap-1.5">
+                          <span className="mt-0.5 shrink-0 text-amber-500">•</span>
+                          <span>{humanizeBlocker(b)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            ) : file.failure_detail ? (
               <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm leading-5 text-rose-800">
                 <p className="font-semibold">{file.failure_label ?? "Failed"}</p>
                 <p className="mt-0.5">{file.failure_detail}</p>
               </div>
-            )}
+            ) : null}
 
             {/* Extract Email breakdown — which sheets inside the email were
                 read, their kind, and where the approval evidence came from. */}
@@ -509,9 +605,20 @@ export default function PipelineCompareFixModal({
             )}
 
             {/* Employee */}
+            {(sheetOnFile.name || sheetOnFile.clientId) && (
+              <div className="mb-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                <span className="font-semibold uppercase tracking-wide text-slate-500">On the sheet</span>
+                <p className="mt-0.5 text-sm text-slate-800">
+                  {sheetOnFile.name ?? "Name not read"}
+                  {sheetOnFile.clientId ? (
+                    <span className="text-slate-500"> · client ID {sheetOnFile.clientId}</span>
+                  ) : null}
+                </p>
+              </div>
+            )}
             <label className="mb-3 block">
               <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">
-                Employee (from matcher)
+                Match to employee
               </span>
               <EmployeePicker
                 employees={employees}
@@ -521,7 +628,7 @@ export default function PipelineCompareFixModal({
                 onChange={(q) => { setEmployeeQ(q); setEmployeePk(""); }}
                 onPick={(e) => {
                   setEmployeePk(e.id);
-                  setEmployeeQ(`${e.employee_id} · ${e.name}${e.location ? ` [${e.location}]` : ""}`);
+                  setEmployeeQ(`${e.name}${e.employee_id ? ` · ${e.employee_id}` : ""}${e.location ? ` [${e.location}]` : ""}`);
                 }}
               />
               {selected && (

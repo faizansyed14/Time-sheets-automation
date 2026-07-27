@@ -1,7 +1,7 @@
 """
 Pipeline tracker routes — full visibility of every file that entered the
-extraction pipeline: where it is, where it failed and why, plus Resolve
-(human sign-off) and Retry (re-run after fixing the cause).
+extraction pipeline: where it is, where it failed and why, plus Review
+(manual fix / correct a filed record) and Retry (re-run after fixing the cause).
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from app.core import datacache
 from app.core.http_headers import content_disposition
 from app.core.database import get_db
 from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
-from app.schemas import Page, PipelineFileOut, PipelineResolveIn, PipelineStats
+from app.schemas import Page, PipelineFileOut, PipelineStats
 from app.services.pipeline.ingestion import can_resolve_assign, retry_pipeline_file
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
@@ -67,8 +67,13 @@ async def list_pipeline_files(
     failure_code: str | None = Query(default=None),
     source_kind: str | None = Query(default=None, description="upload|email"),
     source_id: str | None = Query(default=None, description="Filter by PipelineFile.source_id"),
+    thread_key: str | None = Query(
+        default=None,
+        description="Filter by PipelineFile.thread_key (conversation) — every "
+                     "record staged from this email thread, however many "
+                     "employee+month groups it produced"),
     auto_accepted: bool | None = Query(
-        default=None, description="true = only records the AI filed on its own"),
+        default=None, description="true = AI recommends accept (not yet filed)"),
     q: str | None = Query(default=None, description="search filename / employee (whole table)"),
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -85,6 +90,8 @@ async def list_pipeline_files(
         base = base.where(PipelineFile.source_kind == source_kind)
     if source_id:
         base = base.where(PipelineFile.source_id == source_id)
+    if thread_key:
+        base = base.where(PipelineFile.thread_key == thread_key)
     if auto_accepted is not None:
         # Filter in SQL, not on the page: successes are mostly human accepts,
         # so client-side filtering would drop auto-accepts past the first page.
@@ -131,33 +138,6 @@ async def pipeline_stats(db: AsyncSession = Depends(get_db)):
     # Cached (short TTL) — the UI polls this every 15s from several screens.
     data = await datacache.get_or_set(datacache.NS_PIPELINE, "stats", datacache.TTL_STATS, _compute)
     return PipelineStats(**data)
-
-
-@router.post("/{pipeline_id}/resolve", response_model=PipelineFileOut)
-async def resolve_pipeline_file(
-    pipeline_id: str, body: PipelineResolveIn, db: AsyncSession = Depends(get_db),
-):
-    """Human sign-off: mark a failed / needs-review file as resolved."""
-    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
-    if not t:
-        raise HTTPException(404, "Pipeline file not found")
-    if t.status not in (PipelineStatus.FAILED, PipelineStatus.NEEDS_REVIEW):
-        raise HTTPException(409, f"Only failed / needs-review files can be resolved (status is '{t.status}').")
-    t.status = PipelineStatus.RESOLVED
-    t.resolved_at = datetime.now(timezone.utc)
-    t.resolution_note = (body.note or "").strip() or "Marked resolved by reviewer."
-    t.events = (t.events or []) + [{
-        "stage": t.stage, "status": "ok",
-        "detail": f"Resolved by reviewer: {t.resolution_note}",
-        "at": t.resolved_at.isoformat(),
-    }]
-    # Resolved => no longer awaiting a retry, so drop the raw copy.
-    from app.services.pipeline.ingestion import purge_raw_copy
-    purge_raw_copy(t)
-    await db.commit()
-    await db.refresh(t)
-    await datacache.bust_pipeline()
-    return _out(t)
 
 
 @router.post("/{pipeline_id}/retry", response_model=PipelineFileOut)
@@ -207,9 +187,8 @@ async def pipeline_manual_fix(
 ):
     """Resolve a failed/needs-review file by manually entering leave data.
 
-    Identical to /upload/manual but re-uses (and resolves) the existing
-    pipeline tracker instead of creating a new one. Raw copy is purged on
-    success so the S3 _pipeline-raw object is deleted.
+    Identical to /upload/manual but re-uses the existing pipeline tracker
+    instead of creating a new one. Raw copy is purged on success.
     """
     t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
     if not t:
@@ -278,14 +257,14 @@ async def pipeline_manual_fix(
     t.failure_code = None
     t.failure_detail = None
     t.resolved_at = datetime.now(timezone.utc)
-    t.resolution_note = (note or "").strip() or "Resolved via manual entry."
+    t.resolution_note = (note or "").strip() or "Filed via Review."
     t.month = rec.month
     t.year = rec.year
     t.employee_name = rec.employee_name
     t.employee_id = rec.employee_id
     t.events = (t.events or []) + [{
         "stage": "recorded", "status": "ok",
-        "detail": f"Manually resolved by reviewer: {t.resolution_note}",
+        "detail": f"Filed via Review: {t.resolution_note}",
         "at": t.resolved_at.isoformat(),
     }]
     purge_raw_copy(t)

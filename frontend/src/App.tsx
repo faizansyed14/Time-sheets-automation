@@ -3,7 +3,6 @@ import Shell from "./components/Shell";
 import Dashboard from "./pages/Dashboard";
 import InboxPage from "./pages/Inbox";
 import AgenticChatPage from "./pages/AgenticChat";
-import ReviewPage from "./pages/Review";
 import UploadPage from "./pages/Upload";
 import PipelinePage from "./pages/Pipeline";
 import EmployeesPage from "./pages/Employees";
@@ -43,7 +42,6 @@ export default function App() {
               <Routes>
                 <Route path="/" element={<Dashboard />} />
                 <Route path="/inbox" element={<InboxPage />} />
-                <Route path="/review" element={<ReviewPage />} />
                 <Route path="/chat" element={<AgenticChatPage />} />
                 <Route path="/upload" element={<UploadPage />} />
                 <Route path="/pipeline" element={<PipelinePage />} />

@@ -55,7 +55,7 @@ RESOLVABLE_MATCH_CODES = frozenset({
     FailureCode.ID_NAME_MISMATCH,
     FailureCode.NAME_NOT_FOUND,    # LLM found period but no identity — pick employee
     FailureCode.MONTH_NOT_FOUND,   # LLM found identity but no period — pick period
-    FailureCode.PENDING_REVIEW,    # AI-extracted, staged for accept via Compare & Fix
+    FailureCode.PENDING_REVIEW,    # AI-extracted, staged for accept via Review
 })
 
 
@@ -376,6 +376,8 @@ async def retry_pipeline_file(db: AsyncSession, tracker: PipelineFile) -> tuple[
     """Re-run the ANALYSIS for a tracked file and re-stage it for review —
     retry never files a record directly (everything goes through Compare & Fix)."""
     from app.services.agents import full_email_extract as fx
+    from app.services.extract_email import auto_accept
+    from app.services.extract_email.staging import sheet_summaries
     from app.services.extraction.validation import summarize as summarize_record
     from app.services.extraction.validation import validate
 
@@ -407,14 +409,28 @@ async def retry_pipeline_file(db: AsyncSession, tracker: PipelineFile) -> tuple[
         summary = "Could not read a month/year — pick the period in Compare & Fix."
     flags = list(dict.fromkeys(primary["overlap_flags"] + primary["fold_notes"] + val_flags))
 
+    # The accept/hold verdict must be recomputed here too — the buckets and
+    # employee match above are FRESH from this retry, and leaving the old
+    # decision in extraction_meta would show a reviewer a "why held" reason
+    # (or an "AI recommends") left over from the run before the retry.
+    g_for_eval = {**primary, "buckets": cleaned}
+    decision = auto_accept.evaluate(g_for_eval, extra_flags=val_flags)
+
     tracker.employee_id = primary["employee_id"]
     tracker.employee_name = primary["name"]
     tracker.month, tracker.year = month, year
     tracker.status = PipelineStatus.NEEDS_REVIEW
     tracker.failure_code = FailureCode.PENDING_REVIEW
-    tracker.failure_detail = "Re-extracted — review the leaves and accept to file."
+    if decision.accepted:
+        tracker.failure_detail = ("Re-extracted. AI recommends accepting — "
+                                   "review the leaves and press Accept to file.")
+    else:
+        hold = ("; ".join(decision.blockers[:3]) if decision.blockers
+                 else "needs a human check")
+        tracker.failure_detail = f"Re-extracted. Held for review: {hold}"
     tracker.extraction_method = analysis["run_meta"].get("method")
     tracker.extraction_model = analysis["run_meta"].get("model")
+    prior_fee = (tracker.extraction_meta or {}).get("full_email_extract") or {}
     tracker.extraction_meta = {
         **(tracker.extraction_meta or {}),
         "staged": {
@@ -427,6 +443,15 @@ async def retry_pipeline_file(db: AsyncSession, tracker: PipelineFile) -> tuple[
             "flags": flags,
             "summary": f"{summary} {analysis['approval']['detail']}",
             "extraction_status": "ok",
+        },
+        "auto_accept": decision.as_meta(),
+        "full_email_extract": {
+            **prior_fee,
+            "method": analysis["run_meta"].get("method"),
+            "model": analysis["run_meta"].get("model"),
+            "match_note": primary.get("note"),
+            "approval": analysis["approval"],
+            "sheets": sheet_summaries(primary["sheets"]),
         },
     }
     await db.commit()

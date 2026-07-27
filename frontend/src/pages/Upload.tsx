@@ -264,7 +264,7 @@ export default function UploadPage() {
               "Check the extracted leaves, then Accept to file the record.",
             );
           } else {
-            toast("success", "Extraction complete", "All records were auto-accepted — see the pipeline.");
+            toast("success", "Extraction complete", "Review AI recommendations in the Activity log.");
           }
         }}
       />

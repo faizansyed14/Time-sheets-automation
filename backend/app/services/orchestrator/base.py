@@ -31,6 +31,9 @@ class AgentContext:
     raw_name: str = ""
     content_type: str = ""
     prior_source: Any = None               # previous message in the thread
+    # Conversation id for Extract Email — the dedupe key for review items, so
+    # a thread re-extracted after a new reply updates rather than duplicates.
+    thread_key: str | None = None
 
     # ---- progressively filled by the agents ----
     units: list = field(default_factory=list)          # EmailAgent/AttachmentAgent
@@ -42,6 +45,12 @@ class AgentContext:
     notes: list[str] = field(default_factory=list)      # any agent, surfaced to UI
     aborted: str | None = None                          # set to stop the pipeline
     message: str = ""                                   # final human message
+    # Extract Email: every message in the conversation as (label, .eml bytes),
+    # oldest first — the ThreadAgent sends them all in one call.
+    thread_messages: list = field(default_factory=list)
+    # Cross-sheet conflicts the thread call reported (duplicate full months,
+    # complementary partials, re-sends).
+    conflicts: list[dict] = field(default_factory=list)
 
     def abort(self, reason: str) -> None:
         self.aborted = reason

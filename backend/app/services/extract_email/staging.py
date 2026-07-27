@@ -9,33 +9,63 @@ from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, P
 from app.services.extract_email.constants import TAG_PREFIX
 from app.services.extract_email.results import now, now_iso
 
+
+def sheet_summaries(sheets: list[dict]) -> list[dict]:
+    """The per-sheet shape shown in extraction_meta.full_email_extract.sheets —
+    what the Pipeline page's "what was extracted" panel reads. One place so a
+    retry (ingestion.py) and the original stage (below) can never drift apart."""
+    return [{
+        "filename": s["name"], "kind": s["kind"],
+        "employee_name": s["employee_name"], "employee_id": s["employee_id"],
+        "month": s["month"], "year": s["year"],
+        "manager_signature": s.get("manager_signature", False),
+        "leave_days": sum(len(v) for v in s["buckets"].values()),
+        "format_id": s.get("format_id"),
+        "incomplete_sheet": bool(s.get("incomplete_sheet")),
+        "dates_complete": s.get("dates_complete", True),
+        "missing_days": s.get("missing_days") or [],
+        "classify_confidence": s.get("classify_confidence"),
+    } for s in sheets]
+
+
 async def stage_groups(
     db: AsyncSession, *, source_kind: str, source_id: str,
     raw_bytes: bytes, raw_name: str, content_type: str,
     groups: list[dict], approval: dict, run_meta: dict,
+    thread_key: str | None = None,
 ) -> list[PipelineFile]:
     """One item per employee+month group — the SINGLE staging path for every
     entry point (Extract Email, selected attachments, Upload, chat store).
 
-    Each group is scored by the AI auto-accept engine. A HIGH-confidence,
-    fully-verified group is FILED immediately (record + vault) and its item is
-    marked SUCCESS = "Auto-accepted by AI". Anything short is staged
-    NEEDS_REVIEW for Compare & Fix, with the blocker reasons recorded."""
+    Each group is scored by the AI auto-accept engine. When every check passes
+    the item is still staged NEEDS_REVIEW with an "AI recommends accept" flag —
+    nothing is filed until a human presses Accept in Review. Groups with
+    blockers are staged the same way but without the recommendation."""
     from app.services.extract_email import auto_accept
     from app.services.extract_email.progress import emit
     from app.services.extraction.validation import summarize as summarize_record
     from app.services.extraction.validation import validate
     from app.services.pipeline import raw_store
-    from app.services.pipeline.ingestion import (
-        _file_key, ingest_manual_entry, mark_source_email_ingested,
-    )
 
-    existing = (await db.execute(select(PipelineFile).where(
+    # Match on the CONVERSATION when we have one. Extract Email reads a whole
+    # thread, so a reply arriving later must re-run into the SAME review items
+    # — matching on source_id (one message) produced a second set for the same
+    # employee+month, plus another stored copy of the thread.
+    scope = (PipelineFile.thread_key == thread_key if thread_key
+             else PipelineFile.source_id == source_id)
+    where = [
         PipelineFile.source_kind == source_kind,
-        PipelineFile.source_id == source_id,
+        scope,
         PipelineFile.attachment_id.like(f"{TAG_PREFIX}%"),
-        PipelineFile.failure_code == FailureCode.PENDING_REVIEW,
-    ))).scalars().all()
+    ]
+    if not thread_key:
+        # Legacy per-message runs only ever reused items still awaiting review.
+        where.append(PipelineFile.failure_code == FailureCode.PENDING_REVIEW)
+    # With a thread key we reuse the item WHATEVER its state — including one
+    # already auto-accepted. Restricting to PENDING_REVIEW meant a filed thread
+    # grew a second row on every later reply, so the pipeline showed the same
+    # employee+month again and again.
+    existing = (await db.execute(select(PipelineFile).where(*where))).scalars().all()
     by_tag = {t.attachment_id: t for t in existing}
 
     staged: list[PipelineFile] = []
@@ -75,12 +105,22 @@ async def stage_groups(
             t = PipelineFile(
                 filename=display, content_type=content_type,
                 size_bytes=len(raw_bytes), source_kind=source_kind,
-                source_id=source_id, attachment_id=tag)
+                source_id=source_id, thread_key=thread_key, attachment_id=tag)
             db.add(t)
             await db.flush()
         t.filename = display
-        if not t.raw_path:
-            t.raw_path = raw_store.save_raw(t.id, raw_name, raw_bytes)
+        # Point at the message that triggered THIS run, so a retry re-fetches
+        # the newest message rather than the one first seen weeks ago.
+        t.source_id = source_id
+        t.thread_key = thread_key or t.thread_key
+        t.size_bytes = len(raw_bytes)
+        # Replace the stored evidence: a re-run after a new reply carries a
+        # LONGER thread, and the item must show what was actually read. Written
+        # under the same key, so a thread stores one copy however often it is
+        # re-extracted.
+        if t.raw_path:
+            raw_store.delete_raw(t.raw_path)
+        t.raw_path = raw_store.save_raw(t.id, raw_name, raw_bytes)
         t.employee_id = g["employee_id"]
         t.employee_name = g["name"]
         t.month, t.year = month, year
@@ -103,18 +143,7 @@ async def stage_groups(
                 **run_meta,
                 "match_note": g["note"],
                 "approval": approval,
-                "sheets": [{
-                    "filename": s["name"], "kind": s["kind"],
-                    "employee_name": s["employee_name"], "employee_id": s["employee_id"],
-                    "month": s["month"], "year": s["year"],
-                    "manager_signature": s["manager_signature"],
-                    "leave_days": sum(len(v) for v in s["buckets"].values()),
-                    "format_id": s.get("format_id"),
-                    "incomplete_sheet": bool(s.get("incomplete_sheet")),
-                    "dates_complete": s.get("dates_complete", True),
-                    "missing_days": s.get("missing_days") or [],
-                    "classify_confidence": s.get("classify_confidence"),
-                } for s in g["sheets"]],
+                "sheets": sheet_summaries(g["sheets"]),
             },
             "source_kind": source_kind,
         }
@@ -126,67 +155,35 @@ async def stage_groups(
             "at": now_iso(),
         }]
 
-        filed = False
-        if decision.accepted and g.get("employee_pk"):
-            # File the record automatically — same path as a human Accept.
-            try:
-                rec_approval = None
-                if approval.get("detected"):
-                    rec_approval = {"approved": True, "detail": approval.get("detail", "")}
-                rec, tmp_tracker = await ingest_manual_entry(
-                    db, employee_pk=g["employee_pk"], month=month, year=year,
-                    buckets=cleaned, approval=rec_approval,
-                    # Carry the source (.eml / uploaded sheet) through so the
-                    # File Vault gets the evidence — exactly what a human Accept
-                    # does. Without this the record is filed pointing at an
-                    # EMPTY vault folder and the raw copy is then purged.
-                    attachments=[(raw_name, content_type, raw_bytes)],
-                    note=f"Auto-accepted by AI — {'; '.join(decision.reasons[:4])}.",
-                    source_key=_file_key(source_id, tag, display),
-                    source_filename=(g["name"] or display))
-                await db.delete(tmp_tracker)   # ingest made its own tracker; keep ours
-                t.record_id = rec.id
-                t.status = PipelineStatus.SUCCESS
-                t.failure_code = None
-                t.failure_detail = None
-                t.resolved_at = now()
-                t.resolution_note = "Auto-accepted by AI (high confidence)."
-                t.events.append({
-                    "stage": PipelineStage.RECORDED, "status": "ok",
-                    "detail": "Auto-accepted by AI: " + "; ".join(decision.reasons[:5]),
-                    "at": now_iso(),
-                })
-                raw_store.delete_raw(t.raw_path)
-                t.raw_path = None
-                await mark_source_email_ingested(db, t)
-                filed = True
-                emit("autoaccept", "ok",
-                     f"{g['name'] or 'Record'} — AUTO-ACCEPTED by AI and filed.",
-                     employee=g["name"], reasons=decision.reasons)
-                emit("file", "ok",
-                     f"Filed {g['name'] or 'record'} — {month}/{year} ({total} leave day(s)).")
-            except Exception as exc:
-                # Never lose a group to an auto-file error — fall back to review.
-                decision.accepted = False
-                decision.blockers.append(f"auto-file failed: {str(exc)[:120]}")
-                t.extraction_meta["auto_accept"] = decision.as_meta()
-
-        if not filed:
+        if decision.accepted:
+            emit("autoaccept", "ok",
+                 f"{g['name'] or 'Record'} — AI recommends accept.",
+                 employee=g["name"], reasons=decision.reasons)
+            t.failure_detail = (
+                "AI recommends accepting — review the leaves and press Accept to file."
+                + (f" ({g['name']})" if g["name"] and len(groups) > 1 else "")
+            )
+        else:
             emit("autoaccept", "warn",
                  f"{g['name'] or 'Record'} — held for review: "
                  + ("; ".join(decision.blockers[:2]) if decision.blockers else "needs a human check"),
                  employee=g["name"], blockers=decision.blockers)
-            t.status = PipelineStatus.NEEDS_REVIEW
-            t.failure_code = FailureCode.PENDING_REVIEW
             hold = (" AI held for review: " + "; ".join(decision.blockers[:3])
                     if decision.blockers else "")
             t.failure_detail = ("Extracted from the full email — review the leaves and accept to file."
                                 + (f" ({g['name']})" if g["name"] and len(groups) > 1 else "")
                                 + hold)
+
+        t.status = PipelineStatus.NEEDS_REVIEW
+        t.failure_code = FailureCode.PENDING_REVIEW
         staged.append(t)
 
     # A re-run that produced different groups must not leave stale items behind.
+    # An item that already FILED a record is never dropped, though: deleting it
+    # would erase the audit trail for a record that still exists.
     for t in existing:
+        if t.record_id:
+            continue
         if t.attachment_id not in used:
             raw_store.delete_raw(t.raw_path)
             await db.delete(t)
