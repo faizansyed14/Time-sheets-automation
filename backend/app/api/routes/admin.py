@@ -10,17 +10,31 @@ Users:
 
 Config (read-only status from .env):
   GET    /admin/config/status        resolved models + key status
+
+Month calendars (weekends + public holidays fed into Pass 2):
+  GET    /admin/calendars            list
+  PUT    /admin/calendars            upsert (by month+year)
+  DELETE /admin/calendars/{id}
+
+Extraction debug runs (temporary, purgeable — see debug_capture.py):
+  GET    /admin/debug/runs           list (summary only)
+  GET    /admin/debug/runs/{id}      full detail (prompts, responses, dropped items, sheets)
+  GET    /admin/debug/image          serve one saved dropped-item image
+  DELETE /admin/debug/runs           bulk-delete everything
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_admin
 from app.core.database import get_db
 from app.core.security import hash_password
 from app.models.auth import AuthMode, Role, User
+from app.models.extraction_debug_run import ExtractionDebugRun
+from app.models.month_calendar import MonthCalendar
+from app.schemas import DebugRunOut, DebugRunSummary, MonthCalendarIn, MonthCalendarOut
 from app.schemas.auth import (
     AdminUserCreate,
     AdminUserUpdate,
@@ -209,20 +223,131 @@ async def config_status(db: AsyncSession = Depends(get_db)):
     ]
 
 
-@router.get("/extraction/formats")
-async def extraction_formats():
-    """The per-client timesheet templates the extractor recognises (req 7).
-    Detection is deterministic from text markers; each known format routes its
-    own extraction hint. 'generic' is the always-present fallback."""
-    from app.services.extract_email.formats import all_formats
+# ----------------------------- month calendars -----------------------------
+def _calendar_out(c: MonthCalendar) -> MonthCalendarOut:
+    return MonthCalendarOut(
+        id=c.id, month=c.month, year=c.year,
+        weekend_weekdays=c.weekend_weekdays or [],
+        public_holidays=c.public_holidays or [],
+        created_at=c.created_at, updated_at=c.updated_at,
+    )
 
-    return [
-        {
-            "id": f.id,
-            "label": f.label,
-            "marker_count": len(f.markers),
-            "has_extraction_hint": bool(f.extraction_hint),
-            "has_validator": f.validator is not None,
-        }
-        for f in all_formats()
-    ]
+
+@router.get("/calendars", response_model=list[MonthCalendarOut])
+async def list_calendars(db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(
+        select(MonthCalendar).order_by(MonthCalendar.year.desc(), MonthCalendar.month.desc())
+    )).scalars().all()
+    return [_calendar_out(c) for c in rows]
+
+
+@router.put("/calendars", response_model=MonthCalendarOut)
+async def upsert_calendar(body: MonthCalendarIn, db: AsyncSession = Depends(get_db)):
+    """Create or replace the calendar for this (month, year) — one row per period."""
+    if not (1 <= body.month <= 12):
+        raise HTTPException(400, "month must be 1-12")
+    row = (await db.execute(select(MonthCalendar).where(
+        MonthCalendar.month == body.month, MonthCalendar.year == body.year
+    ))).scalar_one_or_none()
+    if row is None:
+        row = MonthCalendar(month=body.month, year=body.year)
+        db.add(row)
+    row.weekend_weekdays = list(dict.fromkeys(body.weekend_weekdays))
+    row.public_holidays = [h.model_dump() for h in body.public_holidays]
+    await db.commit()
+    await db.refresh(row)
+    return _calendar_out(row)
+
+
+@router.delete("/calendars/{calendar_id}")
+async def delete_calendar(calendar_id: str, db: AsyncSession = Depends(get_db)):
+    row = (await db.execute(select(MonthCalendar).where(
+        MonthCalendar.id == calendar_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "Calendar not found")
+    await db.delete(row)
+    await db.commit()
+    return {"deleted": calendar_id}
+
+
+# ----------------------------- extraction debug runs -----------------------
+def _debug_summary(r: ExtractionDebugRun) -> DebugRunSummary:
+    return DebugRunSummary(
+        id=r.id, created_at=r.created_at, source_kind=r.source_kind,
+        source_id=r.source_id, thread_key=r.thread_key, subject=r.subject,
+        model=r.model, calls=r.calls, reused_sheets=r.reused_sheets,
+        n_pass1_calls=len(r.pass1_calls or []), n_pass2_calls=len(r.pass2_calls or []),
+        n_dropped=len(r.dropped_items or []), n_sheets=len(r.sheets or []),
+        n_errors=len(r.errors or []),
+    )
+
+
+@router.get("/debug/runs", response_model=list[DebugRunSummary])
+async def list_debug_runs(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    rows = (await db.execute(
+        select(ExtractionDebugRun)
+        .order_by(ExtractionDebugRun.created_at.desc())
+        .limit(limit).offset(offset)
+    )).scalars().all()
+    return [_debug_summary(r) for r in rows]
+
+
+@router.get("/debug/runs/{run_id}", response_model=DebugRunOut)
+async def get_debug_run(run_id: str, db: AsyncSession = Depends(get_db)):
+    r = (await db.execute(select(ExtractionDebugRun).where(
+        ExtractionDebugRun.id == run_id))).scalar_one_or_none()
+    if not r:
+        raise HTTPException(404, "Debug run not found")
+    return DebugRunOut(
+        **_debug_summary(r).model_dump(),
+        pass1_calls=r.pass1_calls or [], pass2_calls=r.pass2_calls or [],
+        dropped_items=r.dropped_items or [], triage=r.triage or [],
+        sheets=r.sheets or [], errors=r.errors or [],
+    )
+
+
+@router.get("/debug/image")
+async def get_debug_image(rel_path: str = Query(...)):
+    """Serve a dropped-item's full-resolution image, saved under the same
+    storage the pipeline's raw retry copies use (see raw_store.py) —
+    rel_path always starts with 'debug/', never any other pipeline id."""
+    if not rel_path.startswith("debug/"):
+        raise HTTPException(400, "Not a debug image path")
+    from app.services.pipeline import raw_store
+    data = raw_store.read_raw(rel_path)
+    if not data:
+        raise HTTPException(404, "Image not found")
+    return Response(content=data, media_type="image/jpeg")
+
+
+@router.delete("/debug/runs")
+async def clear_debug_runs(db: AsyncSession = Depends(get_db)):
+    """Bulk-purge every debug run and its stored images — for when you're
+    done testing (see the module docstring: this is a temporary aid, not a
+    permanent audit log).
+
+    Images were saved via raw_store.save_raw("debug/<run_id>", ...), but
+    raw_store.delete_raw() assumes a single-segment pipeline id (it only
+    strips the FIRST path segment for local storage, and deletes exactly one
+    S3 key) — neither matches this nested "debug/<run_id>" layout, so the
+    whole debug/ tree is removed directly here for local storage instead.
+    (S3-backed deployments: this clears the DB rows; the S3 objects under
+    the debug/ prefix are left for the bucket's own lifecycle rules — not
+    implemented here since this app's storage_provider is local.)"""
+    import shutil
+
+    from app.core.config import settings
+
+    count = (await db.execute(select(func.count()).select_from(ExtractionDebugRun))).scalar_one()
+    await db.execute(delete(ExtractionDebugRun))
+    await db.commit()
+
+    debug_dir = settings.pipeline_raw_path / "debug"
+    shutil.rmtree(debug_dir, ignore_errors=True)
+    return {"deleted": count}
+
+

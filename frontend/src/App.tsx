@@ -12,6 +12,8 @@ import RecordPage from "./pages/Record";
 import Login from "./pages/Login";
 import AdminSettings from "./pages/admin/Settings";
 import AdminUsers from "./pages/admin/Users";
+import AdminCalendars from "./pages/admin/Calendars";
+import AdminExtractionDebug from "./pages/admin/ExtractionDebug";
 import { useAuth } from "./lib/auth";
 import { Spinner } from "./components/ui";
 
@@ -51,6 +53,8 @@ export default function App() {
                 <Route path="/records/:id" element={<RecordPage />} />
                 <Route path="/admin/settings" element={<Protected adminOnly><AdminSettings /></Protected>} />
                 <Route path="/admin/users" element={<Protected adminOnly><AdminUsers /></Protected>} />
+                <Route path="/admin/calendars" element={<Protected adminOnly><AdminCalendars /></Protected>} />
+                <Route path="/admin/debug" element={<Protected adminOnly><AdminExtractionDebug /></Protected>} />
               </Routes>
             </Shell>
           </Protected>

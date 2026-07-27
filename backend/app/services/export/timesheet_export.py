@@ -9,7 +9,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from app.services.extraction.validation import BUCKETS
+from app.services.extraction.validation import BUCKETS, DAY_FIELDS
+
+_ALL_FIELDS = BUCKETS + DAY_FIELDS
 
 # (record attribute for dates, count header, dates header)
 _LEAVE_SPECS: list[tuple[str, str, str]] = [
@@ -20,6 +22,8 @@ _LEAVE_SPECS: list[tuple[str, str, str]] = [
     ("unpaid_leave_dates", "Unpaid Leave Count", "Unpaid Leave Dates"),
     ("absent_dates", "Absent Count", "Absent Dates"),
     ("public_holiday_dates", "Public Holiday Count", "Public Holiday Dates"),
+    ("working_dates", "Working Days Count", "Working Dates"),
+    ("weekend_dates", "Weekend Days Count", "Weekend Dates"),
 ]
 
 _EMPLOYEE_HEADERS: list[tuple[str, str]] = [
@@ -57,8 +61,8 @@ def _empty_row_dict(employee: Any, month: int, year: int) -> dict[str, Any]:
         "validation_status": "",
         "approval_status": "",
         "source_file_count": 0,
-        **{f"{b}_dates": "" for b in BUCKETS},
-        **{f"{b}_count": 0 for b in BUCKETS},
+        **{f"{b}_dates": "" for b in _ALL_FIELDS},
+        **{f"{b}_count": 0 for b in _ALL_FIELDS},
     }
 
 
@@ -71,8 +75,10 @@ def _row_dict(record: Any, employee: Any | None, month: int, year: int) -> dict[
         "unpaid": "unpaid_leave_dates",
         "absent": "absent_dates",
         "public_holiday": "public_holiday_dates",
+        "working": "working_dates",
+        "weekend": "weekend_dates",
     }
-    leave_dates = {b: sorted(getattr(record, attr_map[b]) or []) for b in BUCKETS}
+    leave_dates = {b: sorted(getattr(record, attr_map[b]) or []) for b in _ALL_FIELDS}
 
     return {
         "employee_id": record.employee_id or "",
@@ -88,8 +94,8 @@ def _row_dict(record: Any, employee: Any | None, month: int, year: int) -> dict[
         "validation_status": record.validation_status or "",
         "approval_status": record.approval_status or "",
         "source_file_count": record.source_file_count,
-        **{f"{b}_dates": ", ".join(leave_dates[b]) for b in BUCKETS},
-        **{f"{b}_count": len(leave_dates[b]) for b in BUCKETS},
+        **{f"{b}_dates": ", ".join(leave_dates[b]) for b in _ALL_FIELDS},
+        **{f"{b}_count": len(leave_dates[b]) for b in _ALL_FIELDS},
     }
 
 
@@ -124,6 +130,8 @@ def build_timesheet_xlsx(rows: list[dict[str, Any]], month: int, year: int) -> b
         "unpaid_leave_dates": "unpaid",
         "absent_dates": "absent",
         "public_holiday_dates": "public_holiday",
+        "working_dates": "working",
+        "weekend_dates": "weekend",
     }
 
     for row_idx, data in enumerate(rows, 2):

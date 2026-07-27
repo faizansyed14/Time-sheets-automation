@@ -108,6 +108,30 @@ const LEAVE_COLS: Col[] = [
     width: "min-w-[220px]",
     get: (r) => r.public_holiday_dates.join(", "),
   },
+  {
+    key: "working_count",
+    header: "Working Days Count",
+    width: "min-w-[96px]",
+    get: (r) => r.working_dates_count,
+  },
+  {
+    key: "working_dates",
+    header: "Working Dates",
+    width: "min-w-[220px]",
+    get: (r) => r.working_dates.join(", "),
+  },
+  {
+    key: "weekend_count",
+    header: "Weekend Days Count",
+    width: "min-w-[96px]",
+    get: (r) => r.weekend_dates_count,
+  },
+  {
+    key: "weekend_dates",
+    header: "Weekend Dates",
+    width: "min-w-[220px]",
+    get: (r) => r.weekend_dates.join(", "),
+  },
 ];
 
 const COLUMNS: Col[] = [

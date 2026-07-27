@@ -14,6 +14,8 @@ import {
   CircleDot,
   Settings,
   ShieldCheck,
+  CalendarClock,
+  Bug,
   LogOut,
   ChevronLeft,
   ChevronRight,
@@ -44,6 +46,8 @@ const TOOLS_NAV = [
 const ADMIN_NAV = [
   { to: "/admin/users", label: "Users & access", icon: ShieldCheck },
   { to: "/admin/settings", label: "AI Settings", icon: Settings },
+  { to: "/admin/calendars", label: "Month calendars", icon: CalendarClock },
+  { to: "/admin/debug", label: "Extraction debug", icon: Bug },
 ];
 
 const TITLES: Record<string, string> = {

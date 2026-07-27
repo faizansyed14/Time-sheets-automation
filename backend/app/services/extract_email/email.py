@@ -11,6 +11,7 @@ from app.services.extract_email.staging import mark_no_sheets
 async def extract_full_email(
     db: AsyncSession, email: EmailMessage, *,
     prior_email: EmailMessage | None = None,
+    force_full: bool = False,
 ) -> dict:
     """Extract Email — the agent pipeline reads every sheet in the full .eml,
     resolves the employee, merges partial periods, checks duplicates and
@@ -22,22 +23,39 @@ async def extract_full_email(
     conversation is merged (deduplicated) so "Approved." can match the original
     timesheet. Messages with their own PDFs/DOCX are extracted alone.
 
+    `force_full`: bypass incremental windowing/attachment-cache reuse and
+    re-read the ENTIRE conversation fresh — the "Re-read entire thread" escape
+    hatch, for when a stale/wrong past read is suspected. Off by default: an
+    already-extracted thread only re-fetches the new message(s) + a couple of
+    prior ones for context (see thread_collect.collect_thread_emls' `since`),
+    reusing everything else already extracted for this conversation.
+
     Returns {staged, groups, sheets, employees, approval, message}."""
     from app.services.email_provider import get_email_provider
+    from app.services.extract_email import sheet_cache
     from app.services.extract_email.thread_collect import (
         build_thread_bundle, collect_thread_emls,
     )
-    from app.services.extract_email.thread_extract import thread_call_available
+    from app.services.extract_email.thread_extract import require_vision_configured
     from app.services.inbox.eml_export import build_full_eml
-    from app.services.orchestrator import (
-        AgentContext, Orchestrator, build_pipeline, build_thread_pipeline,
-    )
+    from app.services.orchestrator import AgentContext, Orchestrator, build_thread_pipeline
+
+    # Fail loudly and immediately rather than silently reporting "no sheets
+    # found" — there is no fallback pipeline, a vision model is mandatory.
+    require_vision_configured()
 
     provider = get_email_provider()
+    thread_key = email.conversation_id or email.provider_message_id
 
-    # The WHOLE conversation goes to the model in one call — an approval that
-    # arrived three replies later is only visible if the thread is sent whole.
-    thread_messages, thread_notes = await collect_thread_emls(provider, email, prior_email)
+    # When this thread has been extracted before, only fetch what's new (plus
+    # a couple of messages of context) — not the whole conversation again.
+    since = None if force_full else await sheet_cache.last_extraction_at(db, thread_key)
+
+    # The relevant WINDOW of the conversation goes to the model in one call —
+    # an approval that arrived three replies later is only visible if that
+    # reply (and enough of what it's replying to) is sent together.
+    thread_messages, thread_notes = await collect_thread_emls(
+        provider, email, prior_email, since=since)
     if thread_messages:
         # Store what the model actually read. Filing only the clicked message
         # would leave a record whose approval evidence lives in a reply nobody
@@ -51,17 +69,13 @@ async def extract_full_email(
         # Extract Email's unit of work is the CONVERSATION, so review items
         # dedupe on it: a reply arriving later re-runs into the SAME item
         # instead of stacking a second one for the same employee+month.
-        thread_key=(email.conversation_id or email.provider_message_id),
+        thread_key=thread_key,
         source=email, raw_bytes=eml_bytes, raw_name=eml_name,
         content_type="message/rfc822", prior_source=prior_email,
-        thread_messages=thread_messages,
+        thread_messages=thread_messages, force_full=force_full,
     )
     ctx.notes.extend(thread_notes)
-    # Without a usable model the one-call read cannot run at all. Rather than
-    # return "nothing found" — which reads as "this email is empty" — fall back
-    # to the per-sheet pipeline, whose local engine still extracts what it can.
-    pipeline = build_thread_pipeline() if thread_call_available() else build_pipeline()
-    await Orchestrator(pipeline).run(ctx)
+    await Orchestrator(build_thread_pipeline()).run(ctx)
 
     approval = ctx.approval or {"detected": False, "detail": "No approval check ran."}
 

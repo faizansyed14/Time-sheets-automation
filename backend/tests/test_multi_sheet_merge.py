@@ -87,3 +87,78 @@ async def test_reaccepting_same_sheet_replaces_its_own_dates():
             buckets={"annual": ["2026-07-03"]},
             source_key="email::sheet.pdf", source_filename="s.pdf")
         assert sorted(rec2.annual_leave_dates) == ["2026-07-03"]
+
+
+async def test_working_and_weekend_dates_union_across_sheets():
+    """working/weekend are day-accounting fields, not leave, but persist and
+    union across multi-file months exactly like the leave buckets do — two
+    weekly sheets' working days must combine, not overwrite."""
+    async with SessionLocal() as db:
+        emp = await _employee(db)
+        for r in (await db.execute(select(TimesheetRecord).where(
+                TimesheetRecord.matched_employee_pk == emp.id,
+                TimesheetRecord.month == 8, TimesheetRecord.year == 2026))).scalars():
+            await db.delete(r)
+        await db.commit()
+
+        rec1, _ = await ingest_manual_entry(
+            db, employee_pk=emp.id, month=8, year=2026,
+            buckets={"working": ["2026-08-01", "2026-08-02", "2026-08-03"],
+                     "weekend": ["2026-08-07", "2026-08-08"]},
+            source_key="email::week1.pdf", source_filename="week1.pdf")
+        assert sorted(rec1.working_dates) == ["2026-08-01", "2026-08-02", "2026-08-03"]
+
+        rec2, _ = await ingest_manual_entry(
+            db, employee_pk=emp.id, month=8, year=2026,
+            buckets={"working": ["2026-08-04", "2026-08-05"],
+                     "weekend": ["2026-08-07", "2026-08-08"]},
+            source_key="email::week2.pdf", source_filename="week2.pdf")
+
+        assert rec2.id == rec1.id
+        assert sorted(rec2.working_dates) == [
+            "2026-08-01", "2026-08-02", "2026-08-03", "2026-08-04", "2026-08-05"]
+        # weekend dates repeated on both sheets dedupe, not double-count.
+        assert sorted(rec2.weekend_dates) == ["2026-08-07", "2026-08-08"]
+
+
+async def test_working_and_remote_same_day_is_not_a_validation_conflict():
+    """A day worked remotely is still a working day — two true facts about
+    one date, not a cross-bucket conflict (mirrors grouping.py's own
+    _COMPATIBLE_WITH_WORKING exception at extraction time)."""
+    async with SessionLocal() as db:
+        emp = await _employee(db)
+        for r in (await db.execute(select(TimesheetRecord).where(
+                TimesheetRecord.matched_employee_pk == emp.id,
+                TimesheetRecord.month == 9, TimesheetRecord.year == 2026))).scalars():
+            await db.delete(r)
+        await db.commit()
+
+        rec, _ = await ingest_manual_entry(
+            db, employee_pk=emp.id, month=9, year=2026,
+            buckets={"working": ["2026-09-01"], "remote": ["2026-09-01"]},
+            source_key="email::wfh.pdf", source_filename="wfh.pdf")
+
+        assert rec.working_dates == ["2026-09-01"]
+        assert rec.remote_work_dates == ["2026-09-01"]
+        assert not any("multiple categories" in f for f in rec.hr_flags), rec.hr_flags
+        assert rec.validation_status == "verified"
+
+
+async def test_working_and_sick_same_day_is_still_a_validation_conflict():
+    """Unlike remote/public_holiday, sick genuinely conflicts with working —
+    the compatibility exception must not swallow real conflicts."""
+    async with SessionLocal() as db:
+        emp = await _employee(db)
+        for r in (await db.execute(select(TimesheetRecord).where(
+                TimesheetRecord.matched_employee_pk == emp.id,
+                TimesheetRecord.month == 10, TimesheetRecord.year == 2026))).scalars():
+            await db.delete(r)
+        await db.commit()
+
+        rec, _ = await ingest_manual_entry(
+            db, employee_pk=emp.id, month=10, year=2026,
+            buckets={"working": ["2026-10-01"], "sick": ["2026-10-01"]},
+            source_key="email::contradiction.pdf", source_filename="contradiction.pdf")
+
+        assert any("multiple categories" in f for f in rec.hr_flags), rec.hr_flags
+        assert rec.validation_status == "manual_review"

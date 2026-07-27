@@ -22,6 +22,10 @@ openpyxl==3.1.5
 # Without the binary, OCR is skipped gracefully (extraction still works).
 pytesseract==0.3.13
 
+# Outlook .msg attachment parsing (unwraps to headers/body/sub-attachments,
+# same as the existing .eml recursive unwrap).
+extract-msg==0.54.1
+
 # High-fidelity email/HTML -> image rendering (real "screenshot" of the email
 # with table borders + colours), pure-Python (no browser). On Debian/Ubuntu it
 # needs the Pango/Cairo system libs:

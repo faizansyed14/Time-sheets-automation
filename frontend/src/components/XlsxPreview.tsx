@@ -10,6 +10,7 @@
 import { useEffect, useState } from "react";
 import { cn } from "../lib/utils";
 import { Spinner } from "./ui";
+import { ServerRenderPane } from "./FilePreview";
 
 const MAX_ROWS = 500;
 const MAX_COLS = 60;
@@ -190,6 +191,28 @@ function findWorkbookCtor(node: unknown, depth = 0): any {
   return undefined;
 }
 
+// A real .xlsx is a ZIP (OOXML). Anything with this header instead is the
+// legacy OLE2/Compound-File container — either an old binary .xls saved
+// with an .xlsx extension, or a rights-managed (IRM/RMS) file, which ECMA-376
+// stores as an encrypted stream inside the SAME container type. ExcelJS's
+// ZIP parser fails on either with a cryptic "not a zip file" error, so this
+// is checked up front to give an honest, specific message instead.
+const OLE_SIGNATURE = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+
+function isOleCompoundFile(bytes: Uint8Array): boolean {
+  return OLE_SIGNATURE.every((b, i) => bytes[i] === b);
+}
+
+// "Microsoft.Metadata.DRMTransform" / "EncryptedPackage" are the standard
+// [MS-OFFCRYPTO] markers for an Information-Rights-Management-protected
+// Office file, stored as plain ASCII inside the container's DataSpaces
+// stream — cheap to spot without a real OLE2 directory parser.
+function looksRightsProtected(bytes: Uint8Array): boolean {
+  const text = new TextDecoder("latin1").decode(bytes);
+  return text.includes("DRMTransform") || text.includes("EncryptedPackage")
+    || text.includes("MicrosoftIRMServices");
+}
+
 async function loadWorkbook(url: string) {
   // Lazy-loaded — only users who actually open an XLSX preview pay for the
   // parser. The browser build (package.json "browser" field) is imported by
@@ -200,6 +223,10 @@ async function loadWorkbook(url: string) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const buf = await res.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  if (isOleCompoundFile(bytes)) {
+    throw new Error(looksRightsProtected(bytes) ? "RIGHTS_PROTECTED" : "LEGACY_XLS_FORMAT");
+  }
   const wb = new Workbook();
   await wb.xlsx.load(buf);
   return wb;
@@ -209,11 +236,15 @@ export function XlsxPreviewPane({ url }: { url: string }) {
   const [sheets, setSheets] = useState<SheetModel[] | null>(null);
   const [active, setActive] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
+  const [pageFallback, setPageFallback] = useState(false);
 
   useEffect(() => {
     let alive = true;
     setSheets(null);
     setError(null);
+    setErrorCode(null);
+    setPageFallback(false);
     setActive(0);
     loadWorkbook(url)
       .then((wb) => {
@@ -228,13 +259,46 @@ export function XlsxPreviewPane({ url }: { url: string }) {
       .catch((e) => {
         if (!alive) return;
         console.error("XLSX preview failed:", e);
-        setError("Could not read this spreadsheet.");
+        const code = e instanceof Error ? e.message : "";
+        setErrorCode(code);
+        setError(
+          code === "RIGHTS_PROTECTED"
+            ? "This spreadsheet is rights-protected (encrypted) — it can't be previewed here. Download it and open in Excel with the right permissions."
+            : code === "LEGACY_XLS_FORMAT"
+            ? "This is an older Excel format (.xls), not a modern .xlsx file, so it can't be shown as a spreadsheet grid here."
+            : "Could not read this spreadsheet."
+        );
       });
     return () => { alive = false; };
   }, [url]);
 
+  // A legacy binary .xls (real content, just an .xlsx extension) has no
+  // ZIP/OOXML structure for ExcelJS to read, but LibreOffice on the server
+  // can still open it — offered as an explicit fallback, not the default, so
+  // a genuinely modern .xlsx never regresses back to page images.
+  if (pageFallback) {
+    return (
+      <div className="h-full overflow-hidden">
+        <ServerRenderPane sourceUrl={url} filename="sheet.xlsx" contentType="application/vnd.ms-excel" />
+      </div>
+    );
+  }
+
   if (error) {
-    return <div className="flex h-full items-center justify-center text-sm text-rose-500">{error}</div>;
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center text-sm text-rose-500">
+        <p>{error}</p>
+        {errorCode === "LEGACY_XLS_FORMAT" && (
+          <button
+            type="button"
+            onClick={() => setPageFallback(true)}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+          >
+            Try a page-image preview instead
+          </button>
+        )}
+      </div>
+    );
   }
   if (!sheets) {
     return <div className="flex h-full items-center justify-center"><Spinner className="h-6 w-6" /></div>;

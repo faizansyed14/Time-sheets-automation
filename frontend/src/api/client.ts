@@ -184,6 +184,8 @@ export interface TimesheetRecord {
   unpaid_leave_dates: string[];
   absent_dates: string[];
   public_holiday_dates: string[];
+  working_dates: string[];
+  weekend_dates: string[];
   annual_leave_count: number;
   remote_work_count: number;
   sick_leave_count: number;
@@ -191,6 +193,8 @@ export interface TimesheetRecord {
   unpaid_leave_count: number;
   absent_count: number;
   public_holiday_count: number;
+  working_dates_count: number;
+  weekend_dates_count: number;
   validation_status: "verified" | "manual_review";
   llm_summary: string | null;
   hr_flags: string[];
@@ -413,14 +417,14 @@ export const saveEmlToVault = (
 /** One progress frame emitted by the streaming extraction endpoints. */
 export interface ExtractionEvent {
   stage: "start" | "plan" | "agent" | "unpack" | "format" | "extract" | "approval"
-       // The two model calls Extract Email makes: pass1 understands the whole
-       // conversation, pass2 transcribes only the sheets pass1 confirmed.
+       // The two model calls: pass1 classifies the thread, pass2 extracts confirmed sheets.
        | "pass1" | "pass2"
        | "group" | "autoaccept" | "file" | "done" | "error";
   status: "start" | "spin" | "ok" | "warn" | "fail" | "skip";
   message: string;
   llm_calls: number;
   elapsed_ms: number;
+  /** Stage-specific payload — e.g. unpack.dropped, pass1.confirmed, pass2.raw */
   data: Record<string, unknown>;
 }
 
@@ -477,11 +481,14 @@ export async function streamExtraction(
   return result;
 }
 
-/** Extract Email with live progress. */
+/** Extract Email with live progress. `forceFull` bypasses incremental
+ *  windowing/attachment-cache reuse and re-reads the whole thread fresh —
+ *  the "Re-read entire thread" escape hatch for a suspected stale read. */
 export const extractFullEmailStream = (
-  msgId: string, onEvent: (ev: ExtractionEvent) => void,
+  msgId: string, onEvent: (ev: ExtractionEvent) => void, forceFull = false,
 ) => streamExtraction(
-  `/inbox/${encodeURIComponent(msgId)}/extract-full/stream`, undefined, onEvent);
+  `/inbox/${encodeURIComponent(msgId)}/extract-full/stream${forceFull ? "?force_full=true" : ""}`,
+  undefined, onEvent);
 
 /** Upload page extraction with live progress. */
 export const uploadTimesheetsStream = (
@@ -659,6 +666,8 @@ export interface TimesheetUpdate {
   unpaid_leave_dates?: string[];
   absent_dates?: string[];
   public_holiday_dates?: string[];
+  working_dates?: string[];
+  weekend_dates?: string[];
   month?: number;
   year?: number;
 }
@@ -1076,6 +1085,84 @@ export interface AiStatusItem {
 }
 export const adminConfigStatus = () =>
   api.get<AiStatusItem[]>("/admin/config/status").then((r) => r.data);
+
+// ===========================================================================
+// Admin — month calendars (weekends + public holidays fed into Pass 2)
+// ===========================================================================
+export interface PublicHoliday {
+  date: string;
+  name: string;
+}
+export interface MonthCalendar {
+  id: string;
+  month: number;
+  year: number;
+  weekend_weekdays: string[];
+  public_holidays: PublicHoliday[];
+  created_at: string;
+  updated_at: string;
+}
+export const adminListCalendars = () =>
+  api.get<MonthCalendar[]>("/admin/calendars").then((r) => r.data);
+export const adminUpsertCalendar = (body: {
+  month: number; year: number; weekend_weekdays: string[]; public_holidays: PublicHoliday[];
+}) => api.put<MonthCalendar>("/admin/calendars", body).then((r) => r.data);
+export const adminDeleteCalendar = (id: string) =>
+  api.delete(`/admin/calendars/${id}`).then((r) => r.data);
+
+// ===========================================================================
+// Admin — extraction debug runs (temporary, purgeable full LLM trace)
+// ===========================================================================
+export interface DebugRunSummary {
+  id: string;
+  created_at: string;
+  source_kind: string | null;
+  source_id: string | null;
+  thread_key: string | null;
+  subject: string | null;
+  model: string | null;
+  calls: number;
+  reused_sheets: number;
+  n_pass1_calls: number;
+  n_pass2_calls: number;
+  n_dropped: number;
+  n_sheets: number;
+  n_errors: number;
+}
+export interface DebugLlmCall {
+  label: string;
+  model: string;
+  system_prompt: string;
+  user_text: string;
+  image_count: number;
+  response_json: unknown;
+}
+export interface DebugDroppedItem {
+  name: string;
+  reason: string;
+  filter: string;
+  size: number;
+  mime: string;
+  msg_index: number;
+  thumb: string | null;
+  image_path: string | null;
+}
+export interface DebugRunOut extends DebugRunSummary {
+  pass1_calls: DebugLlmCall[];
+  pass2_calls: DebugLlmCall[];
+  dropped_items: DebugDroppedItem[];
+  triage: Record<string, unknown>[];
+  sheets: Record<string, unknown>[];
+  errors: string[];
+}
+export const adminListDebugRuns = (limit = 50, offset = 0) =>
+  api.get<DebugRunSummary[]>("/admin/debug/runs", { params: { limit, offset } }).then((r) => r.data);
+export const adminGetDebugRun = (id: string) =>
+  api.get<DebugRunOut>(`/admin/debug/runs/${id}`).then((r) => r.data);
+export const adminDebugImageUrl = (relPath: string) =>
+  withAuthParam(`/api/v1/admin/debug/image?rel_path=${encodeURIComponent(relPath)}`);
+export const adminClearDebugRuns = () =>
+  api.delete<{ deleted: number }>("/admin/debug/runs").then((r) => r.data);
 
 // ===========================================================================
 // Auto Extract — bulk Extract Email, one thread at a time, in the background

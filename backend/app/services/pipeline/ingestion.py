@@ -45,6 +45,10 @@ BUCKET_FIELDS = {
     "unpaid": "unpaid_leave_dates",
     "absent": "absent_dates",
     "public_holiday": "public_holiday_dates",
+    # Not leave — day-accounting fields (worked / off) — but reviewer-editable
+    # and multi-file-unioned exactly like the leave buckets above.
+    "working": "working_dates",
+    "weekend": "weekend_dates",
 }
 
 # Failed / flagged files a reviewer can complete by picking the right employee
@@ -136,10 +140,15 @@ def _merge_source_files(existing_entries: list, new_entry: dict) -> list:
     return out
 
 
+_REPEATS_ON_EVERY_SHEET = frozenset({"public_holiday", "weekend"})
+
+
 def _union_buckets(entries: list) -> tuple[dict, list[str]]:
     """Union each bucket across all contributing files; flag dates that two
     DIFFERENT files both claim (overlapping weekly sheets), except public
-    holidays which legitimately repeat on every sheet."""
+    holidays and weekends, which are calendar facts that legitimately repeat
+    identically on every overlapping sheet rather than a claim that could
+    disagree."""
     merged: dict[str, list[str]] = {b: [] for b in BUCKET_FIELDS}
     overlap_flags: list[str] = []
     for b in BUCKET_FIELDS:
@@ -148,7 +157,7 @@ def _union_buckets(entries: list) -> tuple[dict, list[str]]:
             fname = e.get("filename") or "file"
             for d in (e.get("buckets", {}).get(b) or []):
                 if d in seen:
-                    if b != "public_holiday" and seen[d] != fname:
+                    if b not in _REPEATS_ON_EVERY_SHEET and seen[d] != fname:
                         overlap_flags.append(
                             f"Date {d} is claimed by two files ({seen[d]} and {fname}) "
                             f"in the same category."
@@ -377,9 +386,7 @@ async def retry_pipeline_file(db: AsyncSession, tracker: PipelineFile) -> tuple[
     retry never files a record directly (everything goes through Compare & Fix)."""
     from app.services.agents import full_email_extract as fx
     from app.services.extract_email import auto_accept
-    from app.services.extract_email.staging import sheet_summaries
-    from app.services.extraction.validation import summarize as summarize_record
-    from app.services.extraction.validation import validate
+    from app.services.extract_email.staging import group_flags, sheet_summaries, summarize_group
 
     data, filename = await _tracker_bytes(tracker)
     analysis = await fx.analyse_upload(db, filename=filename, data=data)
@@ -401,20 +408,14 @@ async def retry_pipeline_file(db: AsyncSession, tracker: PipelineFile) -> tuple[
 
     primary = max(groups, key=lambda g: sum(len(v) for v in g["buckets"].values()))
     month, year = primary["month"], primary["year"]
-    if month and year:
-        cleaned, val_flags = validate(primary["buckets"], month, year)
-        summary = summarize_record(cleaned, val_flags, month, year, len(primary["sheets"]))
-    else:
-        cleaned, val_flags = primary["buckets"], ["No usable month/year — pick the period."]
-        summary = "Could not read a month/year — pick the period in Compare & Fix."
-    flags = list(dict.fromkeys(primary["overlap_flags"] + primary["fold_notes"] + val_flags))
+    flags = group_flags(primary)
+    summary = summarize_group(primary)
 
     # The accept/hold verdict must be recomputed here too — the buckets and
     # employee match above are FRESH from this retry, and leaving the old
     # decision in extraction_meta would show a reviewer a "why held" reason
     # (or an "AI recommends") left over from the run before the retry.
-    g_for_eval = {**primary, "buckets": cleaned}
-    decision = auto_accept.evaluate(g_for_eval, extra_flags=val_flags)
+    decision = auto_accept.evaluate(primary)
 
     tracker.employee_id = primary["employee_id"]
     tracker.employee_name = primary["name"]
@@ -438,7 +439,11 @@ async def retry_pipeline_file(db: AsyncSession, tracker: PipelineFile) -> tuple[
             "matched_name": primary["name"],
             "matched_employee_id": primary["employee_id"],
             "month": month, "year": year,
-            "buckets": cleaned,
+            "buckets": primary["buckets"],
+            "working_days": primary.get("working_days") or [],
+            "weekend_days": primary.get("weekend_days") or [],
+            "uncertain_days": primary.get("uncertain_days") or [],
+            "unaccounted_days": primary.get("unaccounted_days") or [],
             "validation_status": "manual_review" if flags else "verified",
             "flags": flags,
             "summary": f"{summary} {analysis['approval']['detail']}",

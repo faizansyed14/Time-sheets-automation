@@ -169,7 +169,10 @@ async def delete_pipeline_file(pipeline_id: str, db: AsyncSession = Depends(get_
     return {"deleted": pipeline_id}
 
 
-_MANUAL_BUCKETS = ("annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday")
+_MANUAL_BUCKETS = (
+    "annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday",
+    "working", "weekend",
+)
 
 
 @router.post("/{pipeline_id}/manual-fix", response_model=PipelineFileOut)

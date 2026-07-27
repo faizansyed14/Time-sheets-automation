@@ -5,6 +5,13 @@ context that has a ProgressSink installed, and yields one SSE frame per
 progress event the pipeline emits — then a final `done` frame carrying the
 result. The pipeline code itself is unchanged; it just calls progress.emit(),
 which is a no-op on the non-streamed paths.
+
+The extraction itself runs as its OWN task (`runner`), decoupled from this
+generator's iteration on purpose: navigating away / closing the tab tears
+down the SSE connection (this generator), but must NOT abort the extraction
+already in flight — that's a paid LLM call and a database write in progress,
+and killing it mid-way is worse than just losing the live progress feed
+(partial DB state is a bigger problem than a UI that stopped watching).
 """
 from __future__ import annotations
 
@@ -17,6 +24,15 @@ from app.services.extract_email.progress import ProgressSink, reset_sink, set_si
 
 def _frame(event: dict) -> str:
     return f"data: {json.dumps(event, default=str)}\n\n"
+
+
+# asyncio only holds a WEAK reference to a task created with create_task() —
+# with nothing else referencing it, the task can be garbage-collected (and
+# silently dropped) before it finishes. A strong reference here, discarded
+# via the done-callback once the task actually completes, keeps every
+# in-flight extraction alive for its own duration regardless of whether the
+# request that started it is still around.
+_background_tasks: set[asyncio.Task] = set()
 
 
 async def sse_events(run: Callable[[], Awaitable[dict]]) -> AsyncIterator[str]:
@@ -36,16 +52,18 @@ async def sse_events(run: Callable[[], Awaitable[dict]]) -> AsyncIterator[str]:
             reset_sink(token)
             sink.close()
 
+    # Not awaited here on purpose — see module docstring. This task keeps
+    # running even after this generator is torn down (client disconnect),
+    # so extraction always finishes and stages/files its result regardless
+    # of whether anyone is still watching the live progress feed.
     task = asyncio.create_task(runner())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     # Kick-off frame so the client shows the panel instantly.
     yield _frame({"stage": "start", "status": "start", "message": "Starting…",
                   "llm_calls": 0, "elapsed_ms": 0, "data": {}})
-    try:
-        while True:
-            event = await sink.queue.get()
-            if event is None:       # sentinel from sink.close()
-                break
-            yield _frame(event)
-    finally:
-        if not task.done():
-            task.cancel()
+    while True:
+        event = await sink.queue.get()
+        if event is None:       # sentinel from sink.close()
+            break
+        yield _frame(event)

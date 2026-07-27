@@ -472,21 +472,9 @@ export function SourcePreview({
     );
   }
   if (isXlsx(name, ct)) {
-    const useServerPages = !!renderUrl || !!renderUpload;
-    if (useServerPages) {
-      return (
-        <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
-          <ServerRenderPane
-            renderUrl={renderUrl}
-            renderUpload={renderUpload}
-            sourceUrl={!renderUrl && !renderUpload ? url : null}
-            filename={name}
-            contentType={ct}
-          />
-        </div>
-      );
-    }
-    // Fallback: real spreadsheet grid (only when server render source missing).
+    // Always the dedicated grid renderer — one continuous scrollable table,
+    // same as PDF/EML — never the server page-image path (that stitched a
+    // whole workbook into an unreadable strip of print-page screenshots).
     return (
       <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
         <XlsxPreviewPane url={url} />
@@ -636,9 +624,10 @@ export function FilePreviewModal({
   // have the raw-bytes URL. The token rides in the query string, so the iframe
   // can load it; only fall back to server page-images when there is no URL.
   const usePdfIframe = pdf && !!file.url;
-  // DOCX/XLSX (and a URL-less PDF) → server page images.
+  // DOCX (and a URL-less PDF) → server page images. XLSX never takes this
+  // path — see the comment above.
   const useServerPages = !usePdfIframe
-    && (office || xlsx || pdf) && (!!file.renderUrl || !!file.renderUpload);
+    && (office || pdf) && (!!file.renderUrl || !!file.renderUpload);
   // DOCX without a dedicated render source: fetch blob/url → render-upload.
   const useOfficeFetch = office && !useServerPages && !!file.url;
 

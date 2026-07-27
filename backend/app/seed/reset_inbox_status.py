@@ -5,6 +5,12 @@ Clears per-email decision markers and deletes email-sourced pipeline items
 (including Extract Email staging) so the inbox looks untouched. Does NOT delete
 timesheet records, vault files, or employees.
 
+Also clears the two incremental-extraction caches (EmailMessage.extracted_sheets,
+.thread_summary) — durable across an ORDINARY resync/reply on purpose, but a
+RESET means "make this look untouched," and either surviving it means the next
+extraction silently skips Pass 2 ("served from cache") and the inbox keeps
+showing a stale thread summary.
+
   bash scripts/db/reset-inbox.sh
   bash scripts/db/reset-inbox.sh --dry-run
 """
@@ -40,6 +46,13 @@ async def _dirty_email_ids(db) -> list[str]:
                     EmailMessage.status.in_(_RESET_STATUSES),
                     EmailMessage.decided_at.isnot(None),
                     EmailMessage.no_sheets_found_at.isnot(None),
+                    # Already status=new (e.g. a message reset by an OLDER
+                    # build of this script, before it cleared these two
+                    # columns) but still carrying a stale cache/summary is
+                    # NOT a clean row either — catch it too, so re-running
+                    # reset is self-healing for stragglers left behind.
+                    EmailMessage.extracted_sheets.isnot(None),
+                    EmailMessage.thread_summary.isnot(None),
                     has_pipeline,
                 )
             )
@@ -79,11 +92,25 @@ async def main() -> None:
                 .group_by(EmailMessage.status)
             )).all()
         )
+        n_cached_sheets = (await db.execute(
+            select(func.count()).where(
+                EmailMessage.provider_message_id.in_(ids),
+                EmailMessage.extracted_sheets.isnot(None),
+            )
+        )).scalar_one()
+        n_thread_summaries = (await db.execute(
+            select(func.count()).where(
+                EmailMessage.provider_message_id.in_(ids),
+                EmailMessage.thread_summary.isnot(None),
+            )
+        )).scalar_one()
 
         print(f"  emails to reset: {len(ids)}")
         for st, n in sorted(status_before.items()):
             print(f"    status {st!r}: {n}")
         print(f"  email pipeline items to delete: {len(trackers)}")
+        print(f"  cached attachment digests to clear: {n_cached_sheets}")
+        print(f"  thread summaries to clear: {n_thread_summaries}")
 
         if args.dry_run:
             print("Dry run — no changes written.")
@@ -106,6 +133,14 @@ async def main() -> None:
                 decided_at=None,
                 no_sheets_found_at=None,
                 no_sheets_note=None,
+                # Both are deliberately durable across an ordinary inbox
+                # resync (a reply weeks later should still skip re-reading
+                # what's unchanged) — but a RESET means "make this look
+                # untouched," and a stale cache/summary surviving it is
+                # exactly why extraction looked skipped and the old summary
+                # kept showing after a reset.
+                extracted_sheets=None,
+                thread_summary=None,
             )
         )
         await db.commit()

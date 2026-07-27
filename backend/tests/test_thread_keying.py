@@ -90,23 +90,27 @@ async def _employee(db) -> Employee:
     return emp
 
 
+_ALL_BUCKETS = ("annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday")
+
+
 def _group(emp, buckets):
     return {
         "tag": f"{TAG_PREFIX}:threadtest",
         "employee_pk": emp.id, "name": emp.name, "employee_id": emp.employee_id,
         "note": "matched", "month": 6, "year": 2026,
-        "buckets": {**{b: [] for b in
-                       ("annual", "remote", "sick", "maternity", "unpaid",
-                        "absent", "public_holiday")}, **buckets},
+        "buckets": {**{b: [] for b in _ALL_BUCKETS}, **buckets},
+        "working_days": [], "weekend_days": [], "uncertain_days": [],
+        "issues": [], "missing_days": [], "unaccounted_days": [], "days_covered_total": 0,
         "overlap_flags": [], "fold_notes": [],
-        "sheets": [{"name": "sheet.pdf", "kind": "timesheet",
-                    "employee_name": emp.name, "employee_id": emp.employee_id,
-                    "month": 6, "year": 2026, "manager_signature": False,
-                    "approval_evidence": "", "format_id": "generic",
-                    "text": "1-June-26 08:00 AM",
-                    "buckets": {**{b: [] for b in
-                                   ("annual", "remote", "sick", "maternity",
-                                    "unpaid", "absent", "public_holiday")}, **buckets}}],
+        "sheets": [{
+            "name": "sheet.pdf", "kind": "timesheet",
+            "employee_name": emp.name, "employee_id": emp.employee_id,
+            "month": 6, "year": 2026, "manager_signature": False,
+            "approval_evidence": "", "text": "1-June-26 08:00 AM",
+            "working_days": [], "weekend_days": [], "uncertain_days": [],
+            "days_covered": 0, "period_type": "partial", "missing_days": [],
+            **{b: [] for b in _ALL_BUCKETS}, **buckets,
+        }],
     }
 
 
@@ -242,18 +246,18 @@ async def test_read_attachments_are_recorded_for_the_badge():
         await db.commit()
 
 
-async def test_nothing_is_reused_between_runs():
-    """The reuse path is gone on purpose. If it ever comes back, a wrong
-    reading (MEDICAL booked as ANNUAL) becomes permanent again."""
-    from app.services.extract_email import sheet_cache, thread_extract
-
-    assert not hasattr(sheet_cache, "load_for_thread")
-    assert not hasattr(sheet_cache, "summarise_for_prompt")
-
+async def test_reuse_is_explicit_and_opt_in_per_call():
+    """Incremental reuse (see test_incremental_extraction.py) is deliberate and
+    scoped to one parameter — extract_thread_sheets only reuses a sheet when a
+    caller explicitly hands it a cache map; passing nothing (or {}) reads
+    everything fresh, exactly like before incremental extraction existed."""
     import inspect
+
+    from app.services.extract_email import thread_extract
+
     params = inspect.signature(thread_extract.extract_thread_sheets).parameters
-    assert "already" not in params
-    assert "force_reread" not in params
+    assert "cached_sheets" in params
+    assert params["cached_sheets"].default is None
 
 
 async def test_items_from_different_threads_stay_separate():

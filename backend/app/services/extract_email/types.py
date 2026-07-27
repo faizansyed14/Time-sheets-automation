@@ -1,22 +1,7 @@
 """Extract Email datatypes."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
-
-
-@dataclass
-class SheetUnit:
-    """One analysable sheet found inside the full .eml."""
-    name: str
-    ftype: str
-    payload: bytes
-    images: list[bytes] = field(default_factory=list)
-    text: str = ""
-    # Detected / classified client-template id (see extract_email.formats).
-    format_id: str = "generic"
-    # Latest classify result (ClassifyResult) — set by classify_unit.
-    classify: Any = None
+from dataclasses import dataclass
 
 
 @dataclass

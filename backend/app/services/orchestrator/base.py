@@ -51,6 +51,10 @@ class AgentContext:
     # Cross-sheet conflicts the thread call reported (duplicate full months,
     # complementary partials, re-sends).
     conflicts: list[dict] = field(default_factory=list)
+    # True = bypass incremental windowing/cache reuse entirely and re-read the
+    # whole thread fresh (the "Re-read entire thread" escape hatch) — set by
+    # email.py from the caller's explicit request, read by ThreadAgent.
+    force_full: bool = False
 
     def abort(self, reason: str) -> None:
         self.aborted = reason

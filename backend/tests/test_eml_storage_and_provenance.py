@@ -7,9 +7,13 @@ Covers the guarantees around email storage and cost visibility:
      "TIMESHEET … .eml" with Sri_Timesheet_May2026.pdf inside), the vault
      keeps ONLY the original .eml — nested attachments/inline images are not
      filed as separate documents (they already live inside the .eml, and the
-     LLM already saw them during extraction).
+     vision model already saw them during extraction).
   2. Every pipeline file records HOW it was read (extraction_method / model /
      used_ocr) so the tracker can show cost per file.
+
+The vision model itself is mocked (see conftest.mock_vision_calls) — these
+tests exercise the real collector/grouping/staging path end to end, just
+without a live network call.
 """
 import json
 
@@ -63,7 +67,7 @@ def _eml_with_pdf_and_inline_logo(
     pdf_bytes: bytes, attachment_name: str, subject: str,
 ) -> bytes:
     """A real timesheet PDF attachment PLUS a large inline CID logo in the
-    HTML body (signature banner) — the logo must NOT reach OpenAI and must
+    HTML body (signature banner) — the logo must NOT reach the model and must
     NOT be filed into the vault as its own document."""
     import io
     import random
@@ -102,7 +106,29 @@ def _eml_with_pdf_and_inline_logo(
     return msg.as_bytes()
 
 
-async def test_inline_signature_logo_not_filed_to_vault(client, admin_token):
+def _pass1_reply(source: str, employee_name: str, employee_id: str) -> dict:
+    return {
+        "thread_summary": f"{employee_name} submitted a timesheet.",
+        "items": [{
+            "source": source, "is_timesheet": True, "kind": "timesheet",
+            "employee_name": employee_name, "employee_id": employee_id,
+            "period_hint": "May 2026", "evidence": "2026-05-04 Annual Leave",
+            "manager_signature": False, "signature_evidence": "", "notes": "",
+        }],
+    }
+
+
+def _pass2_reply(source: str, employee_name: str, employee_id: str) -> dict:
+    return {"sheets": [{
+        "source": source, "employee_name": employee_name, "employee_id": employee_id,
+        "month": 5, "year": 2026, "days_covered": 1, "period_type": "partial",
+        "missing_days": [], "working_days": [], "weekend_days": [], "uncertain_days": [],
+        "annual": ["2026-05-04"], "remote": [], "sick": [], "maternity": [],
+        "unpaid": [], "absent": [], "public_holiday": [], "notes": "",
+    }]}
+
+
+async def test_inline_signature_logo_not_filed_to_vault(client, admin_token, mock_vision_calls):
     """Inline signature logo must not be filed to the vault — only the .eml."""
     h = auth_headers(admin_token)
     emp = await client.post("/api/v1/employee-matcher", headers=h,
@@ -116,6 +142,10 @@ async def test_inline_signature_logo_not_filed_to_vault(client, admin_token):
     att_name = "Logo_Timesheet_May2026.pdf"
     eml = _eml_with_pdf_and_inline_logo(pdf, att_name, "TIMESHEET for May 2026 - Logo Test Person")
 
+    mock_vision_calls([
+        _pass1_reply(att_name, "Logo Test Person", "E9911001"),
+        _pass2_reply(att_name, "Logo Test Person", "E9911001"),
+    ])
     up = await client.post("/api/v1/upload", headers=h,
                            files={"files": (eml_name, eml, "message/rfc822")})
     assert up.status_code == 200, up.text
@@ -147,10 +177,10 @@ async def test_inline_signature_logo_not_filed_to_vault(client, admin_token):
     assert "image001.png" not in files, f"inline logo must not be filed separately: {files}"
 
 
-def test_inline_logo_never_collected_for_openai():
-    """PDF + large generic CID image → only the PDF becomes an extract unit."""
-    from app.models.email_message import EmailMessage
-    from app.services.extract_email.collector import collect_units
+def test_inline_logo_never_collected_for_the_vision_model():
+    """PDF + large generic CID image → only the PDF becomes a real item; the
+    logo is dropped (over the size floor, but OCR finds no real text)."""
+    from app.services.extract_email.thread_extract import collect_thread
     from app.services.extraction import file_processor as fp
 
     pdf = _timesheet_pdf("Logo Test Person", "E9911001", "May 2026")
@@ -159,17 +189,10 @@ def test_inline_logo_never_collected_for_openai():
     assert all(ft != "image" for _, _, ft in atts), atts
     assert any(ft == "pdf" for _, _, ft in atts)
 
-    mail = EmailMessage(
-        provider_message_id="LOGO-STRIP-1",
-        sender_name="Client",
-        sender_email="c@example.com",
-        subject="TIMESHEET May 2026",
-        body_text="Please find attached.",
-        attachments=[],
-    )
-    units = collect_units(mail, eml)
-    assert not any(u.ftype == "image" and u.name != "(email body)" for u in units), [
-        (u.name, u.ftype) for u in units
+    th = collect_thread([("msg 1", eml)])
+    assert any(it.name == "sheet.pdf" for it in th.items)
+    assert not any(it.name == "image001.png" and it.images for it in th.items), [
+        (it.name, len(it.images)) for it in th.items
     ]
 
 
@@ -211,7 +234,7 @@ def _vault_files() -> list[str]:
     return [p.name for p in root.rglob("*") if p.is_file()]
 
 
-async def test_eml_attachment_not_stored_separately_with_provenance(client, admin_token):
+async def test_eml_attachment_not_stored_separately_with_provenance(client, admin_token, mock_vision_calls):
     h = auth_headers(admin_token)
     emp = await client.post("/api/v1/employee-matcher", headers=h,
                             json={"employee_id": "E2506966", "name": "Sri Naachammai", "location": "AUH"})
@@ -223,6 +246,10 @@ async def test_eml_attachment_not_stored_separately_with_provenance(client, admi
     att_name = "Sri_Timesheet_May2026.pdf"
     eml = _eml_with_pdf(pdf, att_name, "TIMESHEET for May 2026 - Sri Naachammai")
 
+    mock_vision_calls([
+        _pass1_reply(att_name, "Sri Naachammai", "E2506966"),
+        _pass2_reply(att_name, "Sri Naachammai", "E2506966"),
+    ])
     up = await client.post("/api/v1/upload", headers=h,
                            files={"files": (eml_name, eml, "message/rfc822")})
     assert up.status_code == 200, up.text
@@ -252,9 +279,7 @@ async def test_eml_attachment_not_stored_separately_with_provenance(client, admi
     assert fix.status_code == 200, fix.text
     tracked = fix.json()
     assert tracked["status"] == "success"
-    # Upload now runs through the unified extraction pipeline; without a vision
-    # key it falls back to the deterministic per-file engine (the mock in tests).
-    assert tracked["extraction_method"] in ("engine-per-file", "mock")
+    assert tracked["extraction_method"] == "thread-two-pass"
     assert tracked["used_ocr"] is False
     assert "extraction_model" in tracked
 
@@ -267,7 +292,7 @@ async def test_eml_attachment_not_stored_separately_with_provenance(client, admi
     assert tracked["extraction_meta"]["source_kind"] == "upload"
 
 
-async def test_nested_email_inside_email_pdf_is_extracted(client, admin_token):
+async def test_nested_email_inside_email_pdf_is_extracted(client, admin_token, mock_vision_calls):
     """A forwarded email (message/rfc822) carrying the timesheet PDF inside it
     must still extract — the 'email inside the email' edge case."""
     from app.services.extraction import file_processor as fp
@@ -286,6 +311,10 @@ async def test_nested_email_inside_email_pdf_is_extracted(client, admin_token):
     assert any(t == "pdf" for _n, _p, t in atts), f"nested PDF not found: {atts}"
     assert "Nested Person" in fp.extract_document_text("eml", outer)
 
+    mock_vision_calls([
+        _pass1_reply("inner_timesheet.pdf", "Nested Person", "NEST-1"),
+        _pass2_reply("inner_timesheet.pdf", "Nested Person", "NEST-1"),
+    ])
     # upload stages for review (Run Extraction path) — employee matched from sheet
     up = await client.post("/api/v1/upload", headers=h,
                            files={"files": ("forwarded.eml", outer, "message/rfc822")})
