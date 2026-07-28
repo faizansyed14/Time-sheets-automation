@@ -14,6 +14,7 @@ from app.services.extract_email.results import now, now_iso
 _LEAVE_LABEL = {
     "annual": "annual", "remote": "WFH", "sick": "sick", "maternity": "maternity",
     "unpaid": "unpaid", "absent": "absent", "public_holiday": "public holiday",
+    "other": "other leave",
 }
 
 

@@ -123,6 +123,9 @@ async def security_headers(request: Request, call_next):
 app.include_router(auth.router, prefix=settings.api_prefix)
 # admin (admin role enforced inside the router)
 app.include_router(admin.router, prefix=settings.api_prefix)
+# month calendars — same read/write split as the business routes below, not
+# admin-only (see admin.py's module docstring).
+app.include_router(admin.calendars_router, prefix=settings.api_prefix)
 
 # business routes — authenticated; viewers may read but not mutate (require_write
 # allows safe methods for everyone and blocks writes for the read-only role).

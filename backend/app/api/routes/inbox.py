@@ -23,7 +23,6 @@ from app.schemas import (
     EmailDetail,
     EmailListItem,
     Page,
-    PipelineFileOut,
     ThreadDetail,
     ThreadListItem,
 )

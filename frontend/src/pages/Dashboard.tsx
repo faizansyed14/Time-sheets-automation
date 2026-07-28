@@ -89,7 +89,7 @@ function MonthStrip({
   focusMonth: number;
 }) {
   return (
-    <div className="flex gap-[3px]">
+    <div className="flex gap-px">
       {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => {
         const done = submitted.includes(m);
         const future = year > CUR_YEAR || (year === CUR_YEAR && m > CUR_MONTH);
@@ -100,7 +100,7 @@ function MonthStrip({
             key={m}
             title={`${MONTHS_LONG[m]} ${year}: ${state}`}
             className={cn(
-              "flex h-5 w-5 items-center justify-center rounded text-[9px] font-bold transition-colors",
+              "flex h-4 w-4 items-center justify-center rounded-sm text-[8px] font-bold transition-colors",
               done
                 ? "bg-emerald-500 text-white"
                 : future
@@ -111,7 +111,7 @@ function MonthStrip({
               isFocus && !done && !future && "ring-1 ring-rose-300"
             )}
           >
-            {done ? <Check className="h-3 w-3" /> : MONTHS[m][0]}
+            {done ? <Check className="h-2.5 w-2.5" /> : MONTHS[m][0]}
           </span>
         );
       })}
@@ -174,13 +174,14 @@ function ViewRecordButton({
   return (
     <Link
       to={`/records/${rec.id}`}
+      title="View record"
       className={cn(
-        "inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-white shadow-sm",
+        "inline-flex items-center gap-0.5 rounded-md px-1.5 py-1 text-[11px] font-semibold text-white shadow-sm",
         needsReview ? "bg-amber-500 hover:bg-amber-600" : "bg-brand-600 hover:bg-brand-700"
       )}
     >
-      <Eye className="h-3.5 w-3.5" />
-      View record
+      <Eye className="h-3 w-3" />
+      View
     </Link>
   );
 }
@@ -359,18 +360,25 @@ export default function Dashboard() {
           />
         ) : (
           <div className="overflow-x-auto">
-            <table className="min-w-full text-left text-sm">
+            <table className="w-full table-fixed text-left text-xs">
+              <colgroup>
+                <col className="w-[28%]" />
+                <col className="hidden w-[10%] sm:table-column" />
+                <col className="hidden w-[7%] md:table-column" />
+                <col className="hidden w-[12%] lg:table-column" />
+                <col className="w-[14%]" />
+                <col className="w-[18%]" />
+                <col className="w-[8%]" />
+              </colgroup>
               <thead>
-                <tr className="border-b border-slate-100 bg-slate-50/80 text-[11px] font-bold uppercase tracking-wide text-slate-400">
-                  <th className="px-4 py-2.5">Employee</th>
-                  <th className="hidden px-4 py-2.5 sm:table-cell">ID</th>
-                  <th className="hidden px-4 py-2.5 md:table-cell">Location</th>
-                  <th className="hidden px-4 py-2.5 lg:table-cell">Manager</th>
-                  <th className="px-4 py-2.5">{MONTHS[month]} {year}</th>
-                  <th className="px-4 py-2.5">{year}</th>
-                  <th className="sticky right-0 z-10 bg-slate-50/95 px-4 py-2.5 text-right shadow-[-8px_0_12px_-8px_rgba(0,0,0,0.08)]">
-                    View
-                  </th>
+                <tr className="border-b border-slate-100 bg-slate-50/80 text-[10px] font-bold uppercase tracking-wide text-slate-400">
+                  <th className="px-2.5 py-2">Employee</th>
+                  <th className="hidden px-2 py-2 sm:table-cell">ID</th>
+                  <th className="hidden px-2 py-2 md:table-cell">Loc</th>
+                  <th className="hidden px-2 py-2 lg:table-cell">Manager</th>
+                  <th className="px-2 py-2">{MONTHS[month]} {year}</th>
+                  <th className="px-2 py-2">{year}</th>
+                  <th className="px-2 py-2 text-right">View</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -384,43 +392,51 @@ export default function Dashboard() {
                   const showView = !!r.employee_pk && (hasSubmittedMonth || !!r.focus_record_id);
                   return (
                     <tr key={key} className="group hover:bg-slate-50/80">
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-2.5">
+                      <td className="px-2.5 py-1.5">
+                        <div className="flex min-w-0 items-center gap-1.5">
                           <span
                             className={cn(
-                              "flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[11px] font-bold",
+                              "flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[9px] font-bold",
                               avatarColor(r.employee_name)
                             )}
                           >
                             {initials(r.employee_name)}
                           </span>
-                          <div className="min-w-0">
-                            <p className="truncate font-semibold text-slate-800">
+                          <div className="min-w-0 flex-1">
+                            <p
+                              className="truncate text-[11px] font-semibold leading-tight text-slate-800"
+                              title={r.employee_name ?? "Unknown"}
+                            >
                               {r.employee_name ?? "Unknown"}
                             </p>
-                            <p className="truncate text-xs text-slate-400 sm:hidden">{r.employee_id}</p>
+                            <p className="truncate text-[10px] text-slate-400 sm:hidden">{r.employee_id}</p>
                           </div>
                         </div>
                       </td>
-                      <td className="hidden px-4 py-3 font-mono text-xs text-slate-500 sm:table-cell">
+                      <td className="hidden truncate px-2 py-1.5 font-mono text-[10px] text-slate-500 sm:table-cell">
                         {r.employee_id ?? "—"}
                       </td>
-                      <td className="hidden px-4 py-3 md:table-cell">
+                      <td className="hidden px-2 py-1.5 md:table-cell">
                         {r.location ? (
-                          <Badge tone={locationBadgeTone(r.location)}>{r.location}</Badge>
+                          <Badge tone={locationBadgeTone(r.location)} className="px-1.5 py-0 text-[10px]">
+                            {r.location}
+                          </Badge>
                         ) : (
                           <span className="text-slate-300">—</span>
                         )}
                       </td>
-                      <td className="hidden max-w-[140px] truncate px-4 py-3 text-slate-600 lg:table-cell">
+                      <td
+                        className="hidden truncate px-2 py-1.5 text-[11px] text-slate-600 lg:table-cell"
+                        title={r.account_manager ?? undefined}
+                      >
                         {r.account_manager ?? "—"}
                       </td>
-                      <td className="px-4 py-3">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <Badge tone={status.tone as BadgeTone}>
-                            {status.tone === "success" && <CheckCircle2 className="h-3 w-3" />}
-                            {status.tone === "danger" && <CalendarX className="h-3 w-3" />}
-                            {status.tone === "slate" && <Clock className="h-3 w-3" />}
+                      <td className="px-2 py-1.5">
+                        <div className="flex flex-wrap items-center gap-1">
+                          <Badge tone={status.tone as BadgeTone} className="px-1.5 py-0 text-[10px]">
+                            {status.tone === "success" && <CheckCircle2 className="h-2.5 w-2.5" />}
+                            {status.tone === "danger" && <CalendarX className="h-2.5 w-2.5" />}
+                            {status.tone === "slate" && <Clock className="h-2.5 w-2.5" />}
                             {status.label}
                           </Badge>
                           {hasSubmittedMonth && r.focus_validation_status && (
@@ -431,14 +447,14 @@ export default function Dashboard() {
                           )}
                         </div>
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="px-2 py-1.5">
                         <MonthStrip
                           submitted={r.submitted_months}
                           year={year}
                           focusMonth={month}
                         />
                       </td>
-                      <td className="sticky right-0 z-10 bg-white px-4 py-3 text-right shadow-[-8px_0_12px_-8px_rgba(0,0,0,0.06)] group-hover:bg-slate-50/80">
+                      <td className="px-2 py-1.5 text-right">
                         {showView ? (
                           <ViewRecordButton
                             pk={r.employee_pk!}

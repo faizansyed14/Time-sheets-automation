@@ -14,7 +14,7 @@
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   }
   h1, h2, h3, h4 {
-    @apply tracking-tight text-slate-900;
+    @apply font-serif tracking-tight text-slate-900;
   }
   table, .tabular {
     font-variant-numeric: tabular-nums;
@@ -44,6 +44,11 @@
 
   .app-canvas {
     @apply bg-canvas;
+    background-image:
+      radial-gradient(80% 60% at 20% -10%, rgba(15, 118, 110, 0.12), transparent),
+      radial-gradient(60% 40% at 90% 10%, rgba(51, 74, 96, 0.08), transparent);
+    background-attachment: fixed;
+    background-repeat: no-repeat;
   }
 
   .surface-glass {

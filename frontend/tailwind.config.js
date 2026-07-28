@@ -4,34 +4,42 @@ export default {
   theme: {
     extend: {
       fontFamily: {
-        sans: ['"Inter"', "system-ui", "-apple-system", "sans-serif"],
+        sans: ['"DM Sans"', '"Segoe UI"', "sans-serif"],
+        serif: ['"Fraunces"', "Georgia", "serif"],
         mono: ['"JetBrains Mono"', "ui-monospace", "monospace"],
       },
       colors: {
-        /* Primary — indigo */
+        /* Primary — teal (JobApply design system) */
         brand: {
-          50: "#eef2ff",
-          100: "#e0e7ff",
-          200: "#c7d2fe",
-          300: "#a5b4fc",
-          400: "#818cf8",
-          500: "#6366f1",
-          600: "#4f46e5",
-          700: "#4338ca",
-          800: "#3730a3",
-          900: "#312e81",
-          950: "#1e1b4b",
+          50: "#ccfbf1",
+          100: "#99f6e4",
+          200: "#5eead4",
+          300: "#2dd4bf",
+          400: "#14b8a6",
+          500: "#0d9488",
+          600: "#0f766e",
+          700: "#115e59",
+          800: "#134e4a",
+          900: "#042f2e",
+          950: "#021815",
+        },
+        /* Neutrals — "ink" scale */
+        slate: {
+          50: "#f6f7f9",
+          100: "#eceef2",
+          200: "#d5dae3",
+          300: "#b0bac9",
+          400: "#8594ab",
+          500: "#667790",
+          600: "#516076",
+          700: "#434e60",
+          800: "#3a4351",
+          900: "#343a46",
+          950: "#1a1d24",
         },
         /* App surfaces */
-        canvas: "#f4f6f9",
+        canvas: "#f6f7f9",
         surface: "#ffffff",
-        sidebar: {
-          DEFAULT: "#0f172a",
-          hover: "#1e293b",
-          border: "#334155",
-          muted: "#94a3b8",
-          text: "#f1f5f9",
-        },
       },
       borderRadius: {
         DEFAULT: "0.5rem",
@@ -40,11 +48,10 @@ export default {
         "2xl": "1rem",
       },
       boxShadow: {
-        xs: "0 1px 2px 0 rgb(15 23 42 / 0.04)",
-        card: "0 1px 3px 0 rgb(15 23 42 / 0.06), 0 1px 2px -1px rgb(15 23 42 / 0.04)",
-        "card-hover": "0 4px 12px -2px rgb(15 23 42 / 0.08), 0 2px 4px -2px rgb(15 23 42 / 0.04)",
-        pop: "0 12px 32px -8px rgb(15 23 42 / 0.14), 0 4px 12px -4px rgb(15 23 42 / 0.08)",
-        sidebar: "4px 0 24px -4px rgb(15 23 42 / 0.12)",
+        xs: "0 1px 2px 0 rgb(26 29 36 / 0.04)",
+        card: "0 1px 2px rgb(26 29 36 / 0.04), 0 8px 24px rgb(26 29 36 / 0.06)",
+        "card-hover": "0 4px 12px -2px rgb(26 29 36 / 0.08), 0 2px 4px -2px rgb(26 29 36 / 0.04)",
+        pop: "0 12px 32px -8px rgb(26 29 36 / 0.16), 0 4px 12px -4px rgb(26 29 36 / 0.08)",
       },
       keyframes: {
         "fade-up": {

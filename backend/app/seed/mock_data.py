@@ -404,8 +404,3 @@ def case_for_attachment(att_id: str) -> dict | None:
         if c["slot"] == slot:
             return c
     return None
-
-
-def approval_for_message(message_id: str) -> dict | None:
-    msg = message_by_id(message_id)
-    return msg.get("approval") if msg else None

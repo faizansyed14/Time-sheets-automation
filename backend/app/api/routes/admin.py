@@ -1,22 +1,29 @@
 """
-Admin routes (RBAC: admin only).
+Admin routes.
 
-Users:
+Users, config and debug traces below are admin-only. Month calendars are the
+one exception — they're read by every extraction run and relevant to normal
+timesheet review, not just admin configuration, so they live on their own
+router with the same read/write split the business routes use (require_write):
+any authenticated role can view them, but only admin/user (not viewer) can
+edit — see `calendars_router` below.
+
+Users (RBAC: admin only):
   GET    /admin/users                list
   POST   /admin/users                create (assign email for OTP, set role + auth_mode)
   PATCH  /admin/users/{id}           update (email, role, auth_mode, active, password)
   POST   /admin/users/{id}/auth-mode switch OTP <-> CAPTCHA
   DELETE /admin/users/{id}
 
-Config (read-only status from .env):
+Config (RBAC: admin only; read-only status from .env):
   GET    /admin/config/status        resolved models + key status
 
-Month calendars (weekends + public holidays fed into Pass 2):
+Month calendars (RBAC: any role reads, admin/user writes):
   GET    /admin/calendars            list
   PUT    /admin/calendars            upsert (by month+year)
   DELETE /admin/calendars/{id}
 
-Extraction debug runs (temporary, purgeable — see debug_capture.py):
+Extraction debug runs (RBAC: admin only; temporary, purgeable — see debug_capture.py):
   GET    /admin/debug/runs           list (summary only)
   GET    /admin/debug/runs/{id}      full detail (prompts, responses, dropped items, sheets)
   GET    /admin/debug/image          serve one saved dropped-item image
@@ -28,7 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_admin
+from app.api.deps import require_admin, require_write
 from app.core.database import get_db
 from app.core.security import hash_password
 from app.models.auth import AuthMode, Role, User
@@ -45,6 +52,7 @@ from app.schemas.auth import (
 from app.services.auth import totp as totp_svc
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
+calendars_router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_write)])
 
 
 MIN_PASSWORD_LEN = 8
@@ -233,7 +241,7 @@ def _calendar_out(c: MonthCalendar) -> MonthCalendarOut:
     )
 
 
-@router.get("/calendars", response_model=list[MonthCalendarOut])
+@calendars_router.get("/calendars", response_model=list[MonthCalendarOut])
 async def list_calendars(db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(
         select(MonthCalendar).order_by(MonthCalendar.year.desc(), MonthCalendar.month.desc())
@@ -241,7 +249,7 @@ async def list_calendars(db: AsyncSession = Depends(get_db)):
     return [_calendar_out(c) for c in rows]
 
 
-@router.put("/calendars", response_model=MonthCalendarOut)
+@calendars_router.put("/calendars", response_model=MonthCalendarOut)
 async def upsert_calendar(body: MonthCalendarIn, db: AsyncSession = Depends(get_db)):
     """Create or replace the calendar for this (month, year) — one row per period."""
     if not (1 <= body.month <= 12):
@@ -259,7 +267,7 @@ async def upsert_calendar(body: MonthCalendarIn, db: AsyncSession = Depends(get_
     return _calendar_out(row)
 
 
-@router.delete("/calendars/{calendar_id}")
+@calendars_router.delete("/calendars/{calendar_id}")
 async def delete_calendar(calendar_id: str, db: AsyncSession = Depends(get_db)):
     row = (await db.execute(select(MonthCalendar).where(
         MonthCalendar.id == calendar_id))).scalar_one_or_none()

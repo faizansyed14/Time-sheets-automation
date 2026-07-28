@@ -109,6 +109,18 @@ const LEAVE_COLS: Col[] = [
     get: (r) => r.public_holiday_dates.join(", "),
   },
   {
+    key: "other_count",
+    header: "Other Leave Count",
+    width: "min-w-[88px]",
+    get: (r) => r.other_leave_count,
+  },
+  {
+    key: "other_dates",
+    header: "Other Leave Dates",
+    width: "min-w-[220px]",
+    get: (r) => r.other_leave_dates.join(", "),
+  },
+  {
     key: "working_count",
     header: "Working Days Count",
     width: "min-w-[96px]",

@@ -15,7 +15,7 @@ import calendar
 import datetime as dt
 from collections import Counter
 
-BUCKETS = ["annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday"]
+BUCKETS = ["annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday", "other"]
 # Not leave — day-accounting fields (worked / off) — but persisted, editable,
 # and validated the same way as the leave buckets above.
 DAY_FIELDS = ["working", "weekend"]
@@ -23,6 +23,7 @@ _LABEL = {
     "annual": "Annual leave", "remote": "Remote/WFH", "sick": "Sick leave",
     "maternity": "Maternity leave",
     "unpaid": "Unpaid leave", "absent": "Absent", "public_holiday": "Public holiday",
+    "other": "Other leave",
     "working": "Working day", "weekend": "Weekend",
 }
 
@@ -30,6 +31,7 @@ _LABEL = {
 _SHORT = {
     "annual": "annual", "remote": "WFH", "sick": "sick", "maternity": "maternity",
     "unpaid": "unpaid", "absent": "absent", "public_holiday": "public holiday",
+    "other": "other leave",
     "working": "working", "weekend": "weekend",
 }
 
@@ -56,45 +58,6 @@ def _parse(d: str) -> dt.date | None:
 
 def _mname(month: int) -> str:
     return calendar.month_name[month] if 1 <= month <= 12 else str(month)
-
-
-def unaccounted_working_days(
-    month: int, year: int, present: set[str], weekend_labeled: set[str], accounted: set[str],
-) -> list[str]:
-    """Weekdays (Mon–Fri, excluding public holidays / labelled weekends) that
-    have NO hours logged and NO leave recorded — i.e. the employee neither
-    worked nor took a recognised leave. Returns the ISO dates, sorted.
-
-    Only meaningful for a real daily attendance grid, so the caller should
-    require a reasonable number of `present` days before flagging."""
-    if not (1 <= month <= 12 and year):
-        return []
-    last = calendar.monthrange(year, month)[1]
-    out: list[str] = []
-    for d in range(1, last + 1):
-        date = dt.date(year, month, d)
-        iso = date.isoformat()
-        if date.weekday() >= 5:        # Saturday / Sunday
-            continue
-        if iso in weekend_labeled or iso in accounted or iso in present:
-            continue
-        out.append(iso)
-    return out
-
-
-def unaccounted_flag(dates: list[str]) -> str | None:
-    """A concise, human review flag for unaccounted working days."""
-    if not dates:
-        return None
-    def _fmt(iso: str) -> str:
-        try:
-            return dt.date.fromisoformat(iso).strftime("%d %b")
-        except Exception:
-            return iso
-    shown = ", ".join(_fmt(d) for d in dates[:6]) + (" …" if len(dates) > 6 else "")
-    n = len(dates)
-    return (f"{n} working day{'s' if n != 1 else ''} have no hours and no leave recorded "
-            f"({shown}) — please confirm whether these are unmarked absence or leave.")
 
 
 def summarize(cleaned: dict, flags: list[str], month: int, year: int, n_files: int = 1) -> str:

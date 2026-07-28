@@ -36,6 +36,7 @@ def to_out(r: TimesheetRecord) -> TimesheetOut:
         unpaid_leave_dates=r.unpaid_leave_dates or [],
         absent_dates=r.absent_dates or [],
         public_holiday_dates=r.public_holiday_dates or [],
+        other_leave_dates=r.other_leave_dates or [],
         working_dates=r.working_dates or [],
         weekend_dates=r.weekend_dates or [],
         annual_leave_count=r.annual_leave_count,
@@ -45,6 +46,7 @@ def to_out(r: TimesheetRecord) -> TimesheetOut:
         unpaid_leave_count=r.unpaid_leave_count,
         absent_count=r.absent_count,
         public_holiday_count=r.public_holiday_count,
+        other_leave_count=r.other_leave_count,
         working_dates_count=r.working_dates_count,
         weekend_dates_count=r.weekend_dates_count,
         validation_status=r.validation_status,
@@ -90,6 +92,7 @@ def empty_export_out(emp: Employee, month: int, year: int) -> TimesheetExportOut
         unpaid_leave_dates=[],
         absent_dates=[],
         public_holiday_dates=[],
+        other_leave_dates=[],
         working_dates=[],
         weekend_dates=[],
         annual_leave_count=0,
@@ -99,6 +102,7 @@ def empty_export_out(emp: Employee, month: int, year: int) -> TimesheetExportOut
         unpaid_leave_count=0,
         absent_count=0,
         public_holiday_count=0,
+        other_leave_count=0,
         working_dates_count=0,
         weekend_dates_count=0,
         validation_status="",
@@ -254,6 +258,8 @@ async def update_record(record_id: str, body: TimesheetUpdate, db: AsyncSession 
         r.absent_dates = _clean(body.absent_dates)
     if body.public_holiday_dates is not None:
         r.public_holiday_dates = _clean(body.public_holiday_dates)
+    if body.other_leave_dates is not None:
+        r.other_leave_dates = _clean(body.other_leave_dates)
     if body.working_dates is not None:
         r.working_dates = _clean(body.working_dates)
     if body.weekend_dates is not None:
@@ -264,6 +270,7 @@ async def update_record(record_id: str, body: TimesheetUpdate, db: AsyncSession 
         "sick": r.sick_leave_dates or [], "maternity": r.maternity_leave_dates or [],
         "unpaid": r.unpaid_leave_dates or [],
         "absent": r.absent_dates or [], "public_holiday": r.public_holiday_dates or [],
+        "other": r.other_leave_dates or [],
         "working": r.working_dates or [], "weekend": r.weekend_dates or [],
     }
     cleaned, flags = _validate(buckets, r.month, r.year)
@@ -274,6 +281,7 @@ async def update_record(record_id: str, body: TimesheetUpdate, db: AsyncSession 
     r.unpaid_leave_dates = cleaned["unpaid"]
     r.absent_dates = cleaned["absent"]
     r.public_holiday_dates = cleaned["public_holiday"]
+    r.other_leave_dates = cleaned["other"]
     r.working_dates = cleaned["working"]
     r.weekend_dates = cleaned["weekend"]
     r.hr_flags = flags

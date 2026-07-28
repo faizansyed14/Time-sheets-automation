@@ -162,16 +162,6 @@ def strip_quoted_reply_thread(text: str) -> str:
     return text[: m.start()].rstrip() + THREAD_QUOTE_NOTE
 
 
-def strip_html_quoted_reply_thread(html: str) -> str:
-    """Same as strip_quoted_reply_thread for HTML bodies (hr / Outlook wrappers)."""
-    if not html or not html.strip():
-        return html or ""
-    m = _HTML_QUOTE_THREAD_RE.search(html)
-    if not m or m.start() < 40:
-        return html
-    return html[: m.start()].rstrip() + "<!-- quoted-thread-redacted -->"
-
-
 def strip_signature_block(text: str) -> str:
     """Cut corporate footers after Thanks/Regards so emails/phones/passwords
     in the signature never become model pixels or prompt text.
