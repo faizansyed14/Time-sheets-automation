@@ -168,3 +168,52 @@ def test_calendar_mismatch_flags_clean_when_matching():
         "public_holidays": [{"date": "2026-07-15", "name": "PH"}],
     })
     assert flags == []
+
+
+def test_normalise_sheet_resolves_working_weekend_conflict_via_calendar():
+    """Regression for a real bug: the model put the same date in BOTH
+    working_days and weekend_days (a self-contradiction), even though the
+    admin calendar explicitly says it's a weekend. The conflict-check used to
+    resolve this by arbitrary bucket order (working_days always wins, since
+    it's processed first) and leave a dangling "two categories" blocker.
+    With the admin calendar available, weekend_days must win instead, and
+    the now-resolved conflict must not still block review."""
+    from app.services.extract_email.grouping import normalise_sheet
+
+    sheet = {
+        "kind": "timesheet", "month": 6, "year": 2026, "period_type": "partial",
+        "working_days": ["2026-06-26", "2026-06-27", "2026-06-28", "2026-06-29"],
+        "weekend_days": ["2026-06-27", "2026-06-28"],
+        "annual": [], "remote": [], "sick": [], "maternity": [], "unpaid": [],
+        "absent": [], "public_holiday": [], "other": [], "uncertain_days": [],
+        "missing_days": [],
+    }
+    calendar_row = {"weekend_weekdays": ["Saturday", "Sunday"], "public_holidays": []}
+
+    out = normalise_sheet(sheet, calendar_row)
+
+    assert out["working_days"] == ["2026-06-26", "2026-06-29"]
+    assert out["weekend_days"] == ["2026-06-27", "2026-06-28"]
+    assert not any("two categories" in i and ("06-27" in i or "06-28" in i) for i in out["_issues"])
+
+
+def test_normalise_sheet_without_calendar_keeps_old_bucket_order_tiebreak():
+    """No calendar row (e.g. that month isn't configured in Admin) -> falls
+    back to exactly today's behaviour: first-claimed bucket wins, and the
+    conflict is still flagged for a human to check."""
+    from app.services.extract_email.grouping import normalise_sheet
+
+    sheet = {
+        "kind": "timesheet", "month": 6, "year": 2026, "period_type": "partial",
+        "working_days": ["2026-06-27"],
+        "weekend_days": ["2026-06-27"],
+        "annual": [], "remote": [], "sick": [], "maternity": [], "unpaid": [],
+        "absent": [], "public_holiday": [], "other": [], "uncertain_days": [],
+        "missing_days": [],
+    }
+
+    out = normalise_sheet(sheet)
+
+    assert out["working_days"] == ["2026-06-27"]
+    assert out["weekend_days"] == []
+    assert any("two categories" in i and "06-27" in i for i in out["_issues"])

@@ -149,6 +149,10 @@ async def run_auto_extract() -> dict:
                     await _update_status(last_error=f"{subject}: {str(e)[:180]}")
                 await datacache.bust_pipeline()
         processed += 1
-        await _update_status(processed=processed, succeeded=succeeded, failed=failed)
+        # Clear `current` the instant this thread is done — otherwise it stays
+        # set to the just-finished thread (already counted in `processed`)
+        # until the next one starts, so the UI would show a stale "processing
+        # X" for a thread that's actually already been counted as done.
+        await _update_status(processed=processed, succeeded=succeeded, failed=failed, current=None)
 
     return await _update_status(state="completed", current=None, finished_at=_now_iso())

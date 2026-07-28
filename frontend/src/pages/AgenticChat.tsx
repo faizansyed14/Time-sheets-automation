@@ -21,6 +21,7 @@ import {
 } from "../api/client";
 import { Badge, Button, Card, Modal, PageHeader, Spinner } from "../components/ui";
 import { useToast } from "../components/toast";
+import { useAuth } from "../lib/auth";
 import { cn } from "../lib/utils";
 
 // A live tool-activity chip shown while the agent works.
@@ -33,6 +34,7 @@ interface Turn extends ChatMessage {
   activity?: Activity[];         // live tool-activity chips
   suggestions?: string[];        // proactive follow-up chips
   streaming?: boolean;           // true while tokens are still arriving
+  streamed?: boolean;            // true once tokens arrived; prevents double typing animation
 }
 
 const ACTION_META: Record<ChatChange["action"], { label: string; icon: typeof Plus; tone: string }> = {
@@ -369,6 +371,8 @@ function Bubble({
                 {turn.content}
                 <span className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] animate-blink rounded-full bg-brand-500 align-middle" />
               </p>
+            ) : turn.streamed ? (
+              <p className="whitespace-pre-wrap">{turn.content}</p>
             ) : (
               <Typewriter text={turn.content} onTick={onTick} />
             )}
@@ -403,6 +407,8 @@ export default function AgenticChatPage() {
   const [sending, setSending] = useState(false);
   const [bookOpen, setBookOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const { isAdmin } = useAuth();
+  const locked = !isAdmin;
 
   const { data: suggest } = useQuery({ queryKey: ["chat-suggestions"], queryFn: fetchChatSuggestions });
 
@@ -414,6 +420,7 @@ export default function AgenticChatPage() {
   }, [turns, sending]);
 
   const send = async (text: string) => {
+    if (locked) return;
     const msg = text.trim();
     if (!msg || sending) return;
     const history: Turn[] = [...turns, { role: "user", content: msg }];
@@ -431,7 +438,7 @@ export default function AgenticChatPage() {
         history.filter((t) => t.content).map((t) => ({ role: t.role, content: t.content })),
         (ev: ChatStreamEvent) => {
           if (ev.type === "token") {
-            patch((t) => ({ ...t, content: t.content + ev.text }));
+            patch((t) => ({ ...t, content: t.content + ev.text, streamed: true }));
           } else if (ev.type === "tool" && ev.phase === "start") {
             patch((t) => ({
               ...t,
@@ -478,80 +485,99 @@ export default function AgenticChatPage() {
       <PageHeader
         title="Ask AI"
         actions={
-          <div className="flex items-center gap-2">
-            {suggest?.enabled && suggest.model && <Badge tone="slate"><Sparkles className="h-3 w-3" />{suggest.model}</Badge>}
-            <Button variant="secondary" onClick={() => setBookOpen(true)}>
-              <BookOpen className="h-4 w-4" /> Prompt book
-            </Button>
-          </div>
+          isAdmin ? (
+            <div className="flex items-center gap-2">
+              {suggest?.enabled && suggest.model && <Badge tone="slate"><Sparkles className="h-3 w-3" />{suggest.model}</Badge>}
+              <Button variant="secondary" onClick={() => setBookOpen(true)}>
+                <BookOpen className="h-4 w-4" /> Prompt book
+              </Button>
+            </div>
+          ) : null
         }
       />
 
-      {suggest && !suggest.enabled && (
+      {isAdmin && suggest && !suggest.enabled && (
         <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <span>No AI provider is configured. The chat will return a setup message until an admin adds a key under <span className="font-semibold">AI Settings</span>. The prompt book still works.</span>
         </div>
       )}
 
-      <Card className="flex min-h-0 flex-1 flex-col">
-        <div ref={scrollRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
-          {empty ? (
-            <div className="mx-auto max-w-xl py-8 text-center">
-              <div className="mx-auto mb-4 flex h-14 w-14 animate-scale-in items-center justify-center rounded-2xl bg-brand-600 text-white shadow-card">
-                <Sparkles className="h-7 w-7" />
+      <Card className="relative flex min-h-0 flex-1 overflow-hidden">
+        <div className={cn("flex min-h-0 flex-1 flex-col", locked && "pointer-events-none select-none opacity-25 blur-[2px]")}>
+          <div ref={scrollRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
+            {empty ? (
+              <div className="mx-auto max-w-xl py-8 text-center">
+                <div className="mx-auto mb-4 flex h-14 w-14 animate-scale-in items-center justify-center rounded-2xl bg-brand-600 text-white shadow-card">
+                  <Sparkles className="h-7 w-7" />
+                </div>
+                <h3 className="text-xl font-bold">
+                  <span className="text-gradient">How can I help with timesheets?</span>
+                </h3>
+                <p className="mx-auto mt-2 max-w-md text-sm text-slate-500">
+                  Check submissions, count leaves, find who's missing, and add / clear leave dates.
+                  To bring in a sheet, use <span className="font-medium text-slate-600">Upload</span> or
+                  <span className="font-medium text-slate-600"> Extract Email</span>.
+                </p>
+                <div className="mt-6 grid gap-2.5 sm:grid-cols-2">
+                  {(suggest?.suggestions ?? []).map((s, i) => (
+                    <button
+                      key={s}
+                      onClick={() => send(s)}
+                      style={{ animationDelay: `${i * 70}ms` }}
+                      className="group animate-fade-up rounded-xl border border-slate-200 bg-white px-3.5 py-3 text-left text-sm text-slate-700 shadow-xs transition-all hover:-translate-y-0.5 hover:border-brand-300 hover:shadow-card-hover"
+                    >
+                      <Sparkles className="mr-1.5 inline h-3.5 w-3.5 text-brand-500 transition-transform group-hover:scale-110" />
+                      {s}
+                    </button>
+                  ))}
+                </div>
               </div>
-              <h3 className="text-xl font-bold">
-                <span className="text-gradient">How can I help with timesheets?</span>
-              </h3>
-              <p className="mx-auto mt-2 max-w-md text-sm text-slate-500">
-                Check submissions, count leaves, find who's missing, and add / clear leave dates.
-                To bring in a sheet, use <span className="font-medium text-slate-600">Upload</span> or
-                <span className="font-medium text-slate-600"> Extract Email</span>.
-              </p>
-              <div className="mt-6 grid gap-2.5 sm:grid-cols-2">
-                {(suggest?.suggestions ?? []).map((s, i) => (
-                  <button
-                    key={s}
-                    onClick={() => send(s)}
-                    style={{ animationDelay: `${i * 70}ms` }}
-                    className="group animate-fade-up rounded-xl border border-slate-200 bg-white px-3.5 py-3 text-left text-sm text-slate-700 shadow-xs transition-all hover:-translate-y-0.5 hover:border-brand-300 hover:shadow-card-hover"
-                  >
-                    <Sparkles className="mr-1.5 inline h-3.5 w-3.5 text-brand-500 transition-transform group-hover:scale-110" />
-                    {s}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ) : (
-            turns.map((t, i) => (
-              <Bubble key={i} turn={t} onTick={scrollToBottom} onSuggestion={send} />
-            ))
-          )}
+            ) : (
+              turns.map((t, i) => (
+                <Bubble key={i} turn={t} onTick={scrollToBottom} onSuggestion={send} />
+              ))
+            )}
+          </div>
+
+          <form onSubmit={onSubmit} className="flex items-end gap-2 border-t border-slate-100 p-3">
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  send(input);
+                }
+              }}
+              rows={1}
+              placeholder="Ask about timesheets, or e.g. “Add sick leave for Faizan on 26-May-2026”…"
+              className="max-h-32 min-h-[42px] flex-1 resize-none rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-800 placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10"
+            />
+            <Button type="submit" disabled={sending || !input.trim()}>
+              {sending ? <Spinner className="h-4 w-4" /> : <Send className="h-4 w-4" />}
+              Send
+            </Button>
+          </form>
         </div>
 
-        <form onSubmit={onSubmit} className="flex items-end gap-2 border-t border-slate-100 p-3">
-          <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                send(input);
-              }
-            }}
-            rows={1}
-            placeholder="Ask about timesheets, or e.g. “Add sick leave for Faizan on 26-May-2026”…"
-            className="max-h-32 min-h-[42px] flex-1 resize-none rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-800 placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10"
-          />
-          <Button type="submit" disabled={sending || !input.trim()}>
-            {sending ? <Spinner className="h-4 w-4" /> : <Send className="h-4 w-4" />}
-            Send
-          </Button>
-        </form>
+        {locked && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/80 p-6 backdrop-blur-sm">
+            <div className="max-w-md text-center">
+              <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-card">
+                <Sparkles className="h-8 w-8" />
+              </div>
+              <p className="text-xs font-bold uppercase tracking-[0.24em] text-brand-600">Coming soon</p>
+              <h3 className="mt-2 text-2xl font-bold text-slate-900">Working on something exciting</h3>
+              <p className="mt-2 text-sm leading-6 text-slate-600">
+                Ask AI is being polished for non-admin users. More to come soon.
+              </p>
+            </div>
+          </div>
+        )}
       </Card>
 
-      <Modal open={bookOpen} onClose={() => setBookOpen(false)} title="Prompt book" wide
+      <Modal open={isAdmin && bookOpen} onClose={() => setBookOpen(false)} title="Prompt book" wide
         subtitle="Examples you can ask. Replace the {placeholders} with real names, months and dates.">
         <div className="space-y-5">
           {(suggest?.prompt_book ?? []).map((g) => (

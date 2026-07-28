@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import datacache
 from app.core.database import get_db
 from app.models.employee import Employee
-from app.schemas import EmployeeIn, EmployeeOut, ImportSummary
+from app.schemas import EmployeeIn, EmployeeOut, EmployeeStatusIn, ImportSummary
 
 router = APIRouter(prefix="/employee-matcher", tags=["employee-matcher"])
 
@@ -25,6 +25,7 @@ def _out(e: Employee) -> EmployeeOut:
         contact_no=e.contact_no,
         location=e.location,
         all_emails=e.all_emails,
+        active=e.active,
     )
 
 
@@ -35,6 +36,7 @@ async def list_employees(db: AsyncSession = Depends(get_db)):
         return [_out(e).model_dump() for e in rows]
 
     # Cached — the matcher list is read on the Employees page and Compare & Fix.
+    # Returns BOTH active and inactive rows; callers filter for display.
     return await datacache.get_or_set(
         datacache.NS_EMPLOYEES, "list", datacache.TTL_EMPLOYEES, _compute)
 
@@ -74,15 +76,19 @@ async def update_employee(pk: str, body: EmployeeIn, db: AsyncSession = Depends(
     return _out(e)
 
 
-@router.delete("/{pk}")
-async def delete_employee(pk: str, db: AsyncSession = Depends(get_db)):
+@router.patch("/{pk}/status", response_model=EmployeeOut)
+async def set_employee_status(pk: str, body: EmployeeStatusIn, db: AsyncSession = Depends(get_db)):
+    """Activate/inactivate an employee. Inactivating is the replacement for
+    delete: the row, its timesheet records and vault files are all kept —
+    the employee is just excluded from active headline counts and coverage."""
     e = (await db.execute(select(Employee).where(Employee.id == pk))).scalar_one_or_none()
     if not e:
         raise HTTPException(404, "Employee not found")
-    await db.delete(e)
+    e.active = body.active
     await db.commit()
+    await db.refresh(e)
     await datacache.bust_employees()
-    return {"deleted": pk}
+    return _out(e)
 
 
 @router.post("/import", response_model=ImportSummary, status_code=200)

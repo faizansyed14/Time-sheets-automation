@@ -208,7 +208,7 @@ async def test_read_attachments_are_recorded_for_the_badge():
     permanent (a MEDICAL day booked as ANNUAL survived re-extraction). What is
     kept is a RECORD of what has been looked at, driving the Extracted/New
     badge, and it has to survive an inbox resync which rewrites the row."""
-    from app.api.routes.inbox import _sync_message
+    from app.services.inbox.sync import sync_message
     from app.models.email_message import EmailMessage
     from app.services.email_provider.base import ProviderMessage
     from app.services.extract_email import sheet_cache
@@ -225,7 +225,7 @@ async def test_read_attachments_are_recorded_for_the_badge():
         # received_at is non-null in the model; give it a real value.
         from datetime import datetime, timezone
         msg.received_at = datetime.now(timezone.utc)
-        await _sync_message(db, msg)
+        await sync_message(db, msg)
         await db.commit()
 
         await sheet_cache.remember(db, "thread-cache-msg-1", "gpt-4o", {digest: sheet})
@@ -236,7 +236,7 @@ async def test_read_attachments_are_recorded_for_the_badge():
 
         # An inbox resync rewrites the row — the record must survive it, or
         # every attachment would flip back to "New" after a sync.
-        await _sync_message(db, msg)
+        await sync_message(db, msg)
         await db.commit()
         await db.refresh(row)
         assert sheet_cache.extracted_filenames(row) == ["sheet.pdf"], \

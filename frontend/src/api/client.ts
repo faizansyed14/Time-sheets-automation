@@ -921,6 +921,7 @@ export interface Employee {
   contact_no: string | null;
   location: string | null;
   all_emails: string | null;
+  active: boolean;
 }
 export type EmployeeInput = Omit<Employee, "id">;
 
@@ -929,8 +930,8 @@ export const createEmployee = (e: EmployeeInput) =>
   api.post<Employee>("/employee-matcher", e).then((r) => r.data);
 export const updateEmployee = (id: string, e: EmployeeInput) =>
   api.put<Employee>(`/employee-matcher/${id}`, e).then((r) => r.data);
-export const deleteEmployee = (id: string) =>
-  api.delete(`/employee-matcher/${id}`).then((r) => r.data);
+export const setEmployeeStatus = (id: string, active: boolean) =>
+  api.patch<Employee>(`/employee-matcher/${id}/status`, { active }).then((r) => r.data);
 
 export interface SkipDetail { sheet: string; row: number; id: string; name: string; reason: string; }
 export interface ImportSummary {

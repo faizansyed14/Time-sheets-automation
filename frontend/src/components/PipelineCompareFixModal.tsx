@@ -411,6 +411,47 @@ export default function PipelineCompareFixModal({
     setActiveTab({ kind: "staged" });
   }, [file]);
 
+  // Land directly on THIS record's own source document, not the raw staged
+  // wrapper — a bulk thread (many employees, many attachments) otherwise
+  // forces the reviewer to hunt for the right tab among all of them. Tried
+  // exactly once per file (as soon as the thread's documents have loaded,
+  // possibly on the very next render if they're already cached — hence this
+  // runs AFTER the reset effect above, so it always has the last word for a
+  // freshly opened file), and never fights a reviewer who deliberately
+  // switches tabs afterward.
+  //
+  // Two ways a sheet's own document shows up as a doc tab:
+  //  - a plain PDF/DOCX attached directly — its filename matches a doc tab
+  //    exactly (Graph reports the same name both places).
+  //  - a nested forward: the actual PDF lives INSIDE a wrapping .eml (a bulk
+  //    "Timesheet Report - <Name> (Staff No: <ID>).eml" per employee). Graph
+  //    only ever exposes that OUTER .eml as an attachment — the inner PDF's
+  //    own derived name (what `sheets[].filename` reports) never appears as
+  //    a doc tab at all, so an exact match can never succeed here. Fall back
+  //    to matching the employee's own name/ID against the wrapper's
+  //    filename instead.
+  const autoSelectedDocFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!file || autoSelectedDocFor.current === file.id) return;
+    if (docTabs.length === 0) return;
+    const sheet = fullEmail?.sheets?.[0];
+    if (!sheet) return;
+    autoSelectedDocFor.current = file.id;
+
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    let match = docTabs.find((d) => d.filename === sheet.filename);
+    if (!match) {
+      const idNeedle = sheet.employee_id ? norm(sheet.employee_id) : "";
+      const nameNeedle = sheet.employee_name ? norm(sheet.employee_name) : "";
+      match = docTabs.find((d) => {
+        const hay = norm(d.filename);
+        return (idNeedle.length >= 3 && hay.includes(idNeedle))
+          || (nameNeedle.length >= 4 && hay.includes(nameNeedle));
+      });
+    }
+    if (match) setActiveTab({ kind: "doc", id: match.id });
+  }, [file, fullEmail, docTabs]);
+
   const autoAcceptMeta = (file?.extraction_meta?.auto_accept ?? null) as
     | { reasons?: string[]; blockers?: string[] }
     | null;
@@ -540,72 +581,13 @@ export default function PipelineCompareFixModal({
         {/* Two-pane body */}
         <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-2">
 
-          {/* LEFT — manual entry form */}
+          {/* LEFT — summary first, form second, AI/review callout last */}
           <div className="flex min-h-0 flex-col overflow-y-auto border-b border-slate-100 p-5 lg:border-b-0 lg:border-r">
-            <h3 className="mb-3 text-xs font-bold uppercase tracking-wide text-slate-500">
-              Manual entry
-            </h3>
-
-            {/* Banner — AI recommendation, held for review, or failure */}
-            {isStaged && aiRecommends ? (
-              <div className="mb-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm leading-5">
-                <p className="flex items-center gap-1.5 font-semibold text-emerald-900">
-                  <Sparkles className="h-4 w-4 shrink-0 text-emerald-600" />
-                  AI recommends accepting
-                </p>
-                <p className="mt-1 text-slate-700">
-                  Extraction looks clean — compare with the file on the right, then press{" "}
-                  <strong>Accept &amp; file record</strong> to store it. Nothing is saved until you do.
-                </p>
-                {autoAcceptReasons.length > 0 && (
-                  <ul className="mt-2 space-y-1 text-xs leading-relaxed text-emerald-900/90">
-                    {autoAcceptReasons.map((r, i) => (
-                      <li key={i} className="flex gap-1.5">
-                        <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
-                        <span>{r}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            ) : isStaged ? (
-              <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm leading-5">
-                <p className="flex items-center gap-1.5 font-semibold text-amber-900">
-                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
-                  Needs your review
-                </p>
-                <p className="mt-1 text-slate-700">
-                  The AI wasn't fully sure about this one. Check the details, fix anything
-                  wrong, then press <strong>Accept &amp; file record</strong>.
-                </p>
-                {autoAcceptBlockers.length > 0 && (
-                  <div className="mt-2 rounded-md border border-amber-100 bg-white/70 p-2.5">
-                    <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-amber-700">
-                      What it wasn't sure about
-                    </p>
-                    <ul className="space-y-1 text-xs leading-relaxed text-slate-700">
-                      {autoAcceptBlockers.map((b, i) => (
-                        <li key={i} className="flex gap-1.5">
-                          <span className="mt-0.5 shrink-0 text-amber-500">•</span>
-                          <span>{humanizeBlocker(b)}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-              </div>
-            ) : file.failure_detail ? (
-              <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm leading-5 text-rose-800">
-                <p className="font-semibold">{file.failure_label ?? "Failed"}</p>
-                <p className="mt-0.5">{file.failure_detail}</p>
-              </div>
-            ) : null}
-
             {/* Extract Email breakdown — Pass 1's plain-English read of the
                 whole conversation, followed by the structured per-sheet facts
                 (kind, leave days, signature check) and the approval verdict. */}
             {fullEmail && (
-              <div className="mb-3">
+              <div className="mb-4 space-y-3">
                 {fullEmail.thread_summary ? (
                   <ThreadSummaryBox summary={fullEmail.thread_summary} defaultOpen />
                 ) : fullEmail.summary ? (
@@ -643,6 +625,13 @@ export default function PipelineCompareFixModal({
                 )}
               </div>
             )}
+
+            <div className="mb-3 flex items-center gap-2 border-b border-slate-100 pb-2">
+              <PencilLine className="h-4 w-4 text-slate-400" />
+              <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                Manual entry
+              </h3>
+            </div>
 
             {/* Employee */}
             {(sheetOnFile.name || sheetOnFile.clientId) && (
@@ -840,6 +829,62 @@ export default function PipelineCompareFixModal({
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10"
               />
             </div>
+
+            {/* Banner — AI recommendation, held for review, or failure. Kept
+                below manual entry so the thread summary stays topmost. */}
+            {isStaged && aiRecommends ? (
+              <div className="mb-4 rounded-xl border border-emerald-200 bg-emerald-50/80 p-3 text-sm leading-5 shadow-sm">
+                <p className="flex items-center gap-1.5 font-semibold text-emerald-900">
+                  <Sparkles className="h-4 w-4 shrink-0 text-emerald-600" />
+                  AI recommends accepting
+                </p>
+                <p className="mt-1 text-slate-700">
+                  Extraction looks clean — compare with the file on the right, then press{" "}
+                  <strong>Accept &amp; file record</strong> to store it. Nothing is saved until you do.
+                </p>
+                {autoAcceptReasons.length > 0 && (
+                  <ul className="mt-2 space-y-1 text-xs leading-relaxed text-emerald-900/90">
+                    {autoAcceptReasons.map((r, i) => (
+                      <li key={i} className="flex gap-1.5">
+                        <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
+                        <span>{r}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ) : isStaged ? (
+              <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50/80 p-3 text-sm leading-5 shadow-sm">
+                <p className="flex items-center gap-1.5 font-semibold text-amber-900">
+                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
+                  Needs your review
+                </p>
+                <p className="mt-1 text-slate-700">
+                  The AI wasn't fully sure about this one. Check the details, fix anything
+                  wrong, then press <strong>Accept &amp; file record</strong>.
+                </p>
+                {autoAcceptBlockers.length > 0 && (
+                  <div className="mt-2 rounded-lg border border-amber-100 bg-white/80 p-2.5">
+                    <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-amber-700">
+                      What it wasn't sure about
+                    </p>
+                    <ul className="space-y-1 text-xs leading-relaxed text-slate-700">
+                      {autoAcceptBlockers.map((b, i) => (
+                        <li key={i} className="flex gap-1.5">
+                          <span className="mt-0.5 shrink-0 text-amber-500">•</span>
+                          <span>{humanizeBlocker(b)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            ) : file.failure_detail ? (
+              <div className="mb-4 rounded-xl border border-rose-200 bg-rose-50/80 p-3 text-sm leading-5 text-rose-800 shadow-sm">
+                <p className="font-semibold">{file.failure_label ?? "Failed"}</p>
+                <p className="mt-0.5">{file.failure_detail}</p>
+              </div>
+            ) : null}
 
             {/* Actions */}
             <div className="flex items-center gap-3 border-t border-slate-100 pt-4">

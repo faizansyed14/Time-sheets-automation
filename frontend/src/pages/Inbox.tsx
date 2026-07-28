@@ -29,7 +29,6 @@ import {
   attachmentUrl,
   decideEmail,
   emlUrl,
-  extractFullEmailStream,
   fetchEmail,
   fetchEmployeeMatcher,
   fetchThread,
@@ -43,26 +42,63 @@ import {
   type EmailDetail,
   type EmailListItem,
   type EmailRecipient,
+  type ExtractionEvent,
   type LlmEgressPart,
   type LlmEgressPreview,
-  type PipelineFile,
   type ThreadListItem,
 } from "../api/client";
 import { cn, formatBytes, formatDateTime, formatOutlookDateTime, emailSnippet, initials, avatarColor } from "../lib/utils";
 import { isBodyJunkImage, isImageAttachment } from "../lib/attachmentFilters";
 import { FilePreviewModal } from "../components/FilePreview";
-import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
 import { ThreadSummaryBox } from "../components/ThreadSummaryBox";
 import { attachmentRenderUrlIfSupported, buildEmailHtmlDocument, downloadFile } from "../lib/filePreview";
 import { Badge, Button, Card, EmptyState, Modal, Select, Skeleton, Spinner } from "../components/ui";
 import { useToast } from "../components/toast";
-import { ExtractionActivityModal, useExtractionStream } from "../components/ExtractionActivity";
+import { ExtractionActivityModal, type ExtractionRun } from "../components/ExtractionActivity";
+import { useExtractQueue, type ExtractTask } from "../lib/extractQueue";
 import { useDebounced, useSentinel } from "../lib/useInfinite";
 import type { PreviewFile } from "../lib/filePreview";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Adapts a global-queue ExtractTask to the shape ExtractionActivityModal
+ * expects. A queued (not yet started) task gets a synthetic placeholder
+ * event so the panel shows its position instead of a blank "0 AI calls". */
+function taskToRun(
+  task: ExtractTask | null,
+  tasks: ExtractTask[],
+  dismiss: (id: string) => void
+): ExtractionRun {
+  if (!task) {
+    return {
+      events: [], running: false, open: false, llmCalls: 0, elapsedMs: 0, error: null,
+      start: async () => undefined, close: () => {},
+    };
+  }
+  let events = task.events;
+  if (task.status === "queued" && events.length === 0) {
+    const ahead = tasks.filter((t) => t.status === "queued" && t.queuedAt < task.queuedAt).length;
+    const placeholder: ExtractionEvent = {
+      stage: "start", status: "spin",
+      message: ahead > 0 ? `Queued — ${ahead} other run(s) ahead of this one…` : "Queued — starting shortly…",
+      llm_calls: 0, elapsed_ms: 0, data: {},
+    };
+    events = [placeholder];
+  }
+  const last = events[events.length - 1];
+  return {
+    events,
+    running: task.status === "queued" || task.status === "running",
+    open: true,
+    llmCalls: last?.llm_calls ?? 0,
+    elapsedMs: last?.elapsed_ms ?? 0,
+    error: task.error,
+    start: async () => undefined,
+    close: () => dismiss(task.id),
+  };
+}
 
 function StatusBadge({ status }: { status: EmailListItem["status"] }) {
   if (status === "ingested")
@@ -1166,10 +1202,16 @@ export default function InboxPage() {
   const [status, setStatus] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [preview, setPreview] = useState<PreviewFile | null>(null);
-  const [stagedQueue, setStagedQueue] = useState<PipelineFile[]>([]);
-  // Live Extract Email activity + the review queue to open once it closes.
-  const extractRun = useExtractionStream();
-  const [pendingReview, setPendingReview] = useState<PipelineFile[]>([]);
+  // Extract Email runs through the global queue (lib/extractQueue) so it
+  // keeps going — and stays visible in the top nav bar — across page
+  // navigation, and so clicking Extract on several threads in a row queues
+  // them instead of racing. `focusTaskId` is just "which run this page is
+  // currently showing the live activity panel for". Review-needed results
+  // are NOT auto-opened here — the toast (with a "Review now" link) and the
+  // Activity log's own Review button are how the user gets to Compare & Fix.
+  const { tasks, enqueue, isBusy, taskFor, dismiss: dismissTask } = useExtractQueue();
+  const [focusTaskId, setFocusTaskId] = useState<string | null>(null);
+  const focusTask = tasks.find((t) => t.id === focusTaskId) ?? null;
   const [llmPreviewOpen, setLlmPreviewOpen] = useState(false);
   const [llmPreview, setLlmPreview] = useState<LlmEgressPreview | null>(null);
   const [llmPreviewLoading, setLlmPreviewLoading] = useState(false);
@@ -1261,8 +1303,9 @@ export default function InboxPage() {
   }, [selected, qc]);
 
   const invalidate = () => {
-    qc.invalidateQueries({ queryKey: ["inbox"] });
+    qc.invalidateQueries({ queryKey: ["inbox-threads"] });
     qc.invalidateQueries({ queryKey: ["email", selected] });
+    qc.invalidateQueries({ queryKey: ["email-thread", selected] });
     qc.invalidateQueries({ queryKey: ["pipeline"] });
     qc.invalidateQueries({ queryKey: ["pipeline-stats"] });
     qc.invalidateQueries({ queryKey: ["coverage"] });
@@ -1278,39 +1321,17 @@ export default function InboxPage() {
     onError: (e: any) => toast("error", "Action failed", e?.response?.data?.detail ?? String(e)),
   });
 
-  // Extract Email — whole .eml through the ONE extraction pipeline.
-  const extractEmail = useMutation({
-    // Streams live pipeline activity into the ExtractionActivityModal; the
-    // resolved value is the same {staged, groups, message} payload as before.
-    // Incremental by default (only new + a couple of context messages are
-    // re-read); `forceFull` re-reads the whole thread from scratch.
-    mutationFn: ({ id, forceFull }: { id: string; forceFull?: boolean }) =>
-      extractRun.start((onEvent) => extractFullEmailStream(id, onEvent, forceFull)) as Promise<{
-        staged: PipelineFile[]; groups: number; message: string;
-      }>,
-    onSuccess: (res) => {
-      qc.invalidateQueries({ queryKey: ["inbox"] });
-      qc.invalidateQueries({ queryKey: ["email", selected] });
-      qc.invalidateQueries({ queryKey: ["pipeline"] });
-      qc.invalidateQueries({ queryKey: ["pipeline-stats"] });
-      // Auto-accepted items are already filed (status "success"); only the
-      // held-for-review ones need Compare & Fix — opened when the user closes
-      // the live activity panel.
-      const review = (res.staged ?? []).filter((t) => t.status === "needs_review");
-      setPendingReview(review);
-    },
-    onError: (e: any) => toast("error", "Extract Email failed", e?.message ?? String(e)),
-  });
+  // Extract Email — whole .eml through the ONE extraction pipeline, queued
+  // globally (see lib/extractQueue) so several threads can be triggered back
+  // to back without racing. Incremental by default (only new + a couple of
+  // context messages re-read); `forceFull` re-reads the whole thread.
+  const runExtract = (id: string, subject: string | null | undefined, forceFull = false) => {
+    if (isBusy(id)) return;
+    const taskId = enqueue(id, subject ?? "(no subject)", forceFull);
+    setFocusTaskId(taskId);
+  };
 
   const [vaultEmailId, setVaultEmailId] = useState<string | null>(null);
-
-  // Advance the review queue (after Accept/file or Reject/cancel).
-  const advanceQueue = () => setStagedQueue((q) => q.slice(1));
-  const onStagedSaved = () => {
-    toast("success", "Record filed", "Saved to the pipeline and File Vault.");
-    invalidate();
-    advanceQueue();
-  };
 
   const restore = useMutation({
     mutationFn: restoreEmail,
@@ -1524,33 +1545,37 @@ export default function InboxPage() {
                             const isNewer = !!at && !!detail.received_at
                               && new Date(detail.received_at) > new Date(at);
                             if (at && !isNewer) return null;
+                            const busy = isBusy(detail.provider_message_id);
+                            const myTask = taskFor(detail.provider_message_id);
+                            const queued = myTask?.status === "queued";
                             return (
                               <>
                                 <Button
                                   size="sm"
                                   variant={isNewer ? "secondary" : undefined}
-                                  disabled={extractEmail.isPending || loadingDetail}
-                                  onClick={() => extractEmail.mutate({ id: detail.provider_message_id })}
+                                  disabled={busy || loadingDetail}
+                                  onClick={() => runExtract(detail.provider_message_id, detail.subject)}
                                   title={isNewer
                                     ? "This reply arrived after the last run — reads only the new message(s) + a couple of prior ones for context, reusing everything else already extracted."
                                     : "Whole conversation to the model in one call — every attachment, approval detected, grouped per employee/month for Compare & Fix"}
                                 >
-                                  {extractEmail.isPending ? (
+                                  {busy ? (
                                     <Spinner className="border-white/40 border-t-white h-3 w-3" />
                                   ) : (
                                     <Wand2 className="h-3 w-3" />
                                   )}
-                                  {extractEmail.isPending
-                                    ? "Extracting…"
-                                    : isNewer ? "Re-extract (new reply)" : "Extract Email"}
+                                  {queued
+                                    ? "Queued…"
+                                    : busy
+                                      ? "Extracting…"
+                                      : isNewer ? "Re-extract (new reply)" : "Extract Email"}
                                 </Button>
                                 {at && (
                                   <Button
                                     size="sm"
                                     variant="ghost"
-                                    disabled={extractEmail.isPending || loadingDetail}
-                                    onClick={() => extractEmail.mutate(
-                                      { id: detail.provider_message_id, forceFull: true })}
+                                    disabled={busy || loadingDetail}
+                                    onClick={() => runExtract(detail.provider_message_id, detail.subject, true)}
                                     title="Ignore the incremental cache and re-read the ENTIRE thread from scratch — use this if a past read looks stale or wrong."
                                   >
                                     Re-read entire thread
@@ -1577,7 +1602,7 @@ export default function InboxPage() {
                             </Button>
                           )}
                           <EmailMenu
-                            busy={extractEmail.isPending || decide.isPending}
+                            busy={isBusy(detail.provider_message_id) || decide.isPending}
                             manualActions={[
                               ...(detail.status === "new" ? [{
                                 label: "Archive email",
@@ -1654,19 +1679,13 @@ export default function InboxPage() {
       <FilePreviewModal file={preview} onClose={() => setPreview(null)} />
 
       {/* Live Extract Email activity — stages, LLM-call count, auto-accept
-          outcome. On close, open Compare & Fix for any held-for-review items. */}
+          outcome, for whichever run this page most recently triggered. Any
+          run's held-for-review items land in Compare & Fix automatically
+          (see the effect above) whether or not its panel is still open —
+          other queued/background runs keep going regardless. */}
       <ExtractionActivityModal
-        run={extractRun}
+        run={taskToRun(focusTask, tasks, dismissTask)}
         title="Extract Email"
-        onDone={() => {
-          if (pendingReview.length) {
-            setStagedQueue(pendingReview);
-            setPendingReview([]);
-          } else {
-            toast("success", "Extract Email complete",
-              "No items need review — see the Activity log for AI recommendations.");
-          }
-        }}
       />
 
       <SaveEmlToVaultModal
@@ -1680,15 +1699,6 @@ export default function InboxPage() {
         preview={llmPreview}
         loading={llmPreviewLoading}
         error={llmPreviewError}
-      />
-
-      {/* Run Extraction → review each staged file in the Compare & Fix overlay:
-          edit the extracted leaves, Accept (file record + vault) or Delete. */}
-      <PipelineCompareFixModal
-        file={stagedQueue[0] ?? null}
-        onClose={advanceQueue}
-        onSaved={onStagedSaved}
-        onDiscarded={invalidate}
       />
     </div>
   );

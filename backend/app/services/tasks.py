@@ -144,6 +144,24 @@ def auto_extract_all_task():
     return _run_coro(auto_extract.run_auto_extract)
 
 
+@celery_app.task(name="inbox.sync")
+def sync_inbox_task():
+    """Pull new mail from the provider on a fixed schedule (Celery beat),
+    independent of anyone having the Inbox page open — so new mail is
+    already in the DB by the time someone looks, instead of only syncing
+    as a side effect of loading the page. Shares the same throttle/lock as
+    the on-demand sync in GET /inbox and /inbox/threads, so this never
+    duplicates a sync a request just did (or vice versa)."""
+    from app.core.database import SessionLocal
+    from app.services.inbox.sync import sync_inbox
+
+    async def _run():
+        async with SessionLocal() as db:
+            await sync_inbox(db)
+
+    return _run_coro(_run)
+
+
 @celery_app.task(name="ingestion.process_upload")
 def process_upload_task(filename: str, content_type: str, data_b64: str):
     """Stage an upload in a worker — the same Extract Email pipeline as the

@@ -74,12 +74,17 @@ export default {
           "0%, 60%, 100%": { transform: "translateY(0)", opacity: ".4" },
           "30%": { transform: "translateY(-4px)", opacity: "1" },
         },
+        shimmer: {
+          "0%": { backgroundPosition: "200% 0" },
+          "100%": { backgroundPosition: "-200% 0" },
+        },
       },
       animation: {
         "fade-up": "fade-up .3s ease-out both",
         "slide-in": "slide-in .28s cubic-bezier(.32,.72,.35,1) both",
         "scale-in": "scale-in .22s cubic-bezier(.16,1,.3,1) both",
         "overlay-in": "overlay-in .2s ease-out both",
+        shimmer: "shimmer 1.6s linear infinite",
       },
     },
   },

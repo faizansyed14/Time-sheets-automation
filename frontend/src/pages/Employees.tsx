@@ -1,11 +1,11 @@
 import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Users, Plus, Pencil, Trash2, FileSpreadsheet, MapPin, Copy } from "lucide-react";
+import { Users, Plus, Pencil, UserX, UserCheck, FileSpreadsheet, MapPin, Copy } from "lucide-react";
 import {
   createEmployee,
-  deleteEmployee,
   fetchEmployeeMatcher,
   importEmployees,
+  setEmployeeStatus,
   updateEmployee,
   type Employee,
   type EmployeeInput,
@@ -26,7 +26,10 @@ const EMPTY: EmployeeInput = {
   contact_no: null,
   location: null,
   all_emails: null,
+  active: true,
 };
+
+type StatusFilter = "active" | "inactive" | "all";
 
 export default function EmployeesPage() {
   const qc = useQueryClient();
@@ -34,6 +37,7 @@ export default function EmployeesPage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const [q, setQ] = useState("");
   const [loc, setLoc] = useState("");
+  const [status, setStatus] = useState<StatusFilter>("active");
   const [modal, setModal] = useState<{ mode: "create" } | { mode: "edit"; row: Employee } | null>(null);
   const [form, setForm] = useState<EmployeeInput>(EMPTY);
   const [importResult, setImportResult] = useState<ImportSummary | null>(null);
@@ -63,12 +67,13 @@ export default function EmployeesPage() {
     },
     onError: (e: any) => toast("error", "Could not update", e?.response?.data?.detail ?? String(e)),
   });
-  const deleteMut = useMutation({
-    mutationFn: deleteEmployee,
-    onSuccess: () => {
-      toast("info", "Employee removed");
+  const statusMut = useMutation({
+    mutationFn: ({ id, active }: { id: string; active: boolean }) => setEmployeeStatus(id, active),
+    onSuccess: (_data, vars) => {
+      toast("info", vars.active ? "Employee reactivated" : "Employee marked inactive");
       invalidate();
     },
+    onError: (e: any) => toast("error", "Could not update status", e?.response?.data?.detail ?? String(e)),
   });
   const importMut = useMutation({
     mutationFn: importEmployees,
@@ -87,17 +92,20 @@ export default function EmployeesPage() {
     return new Set(Object.keys(count).filter((k) => count[k]! > 1));
   }, [rows]);
 
+  const activeCount = useMemo(() => (rows ?? []).filter((r) => r.active).length, [rows]);
+
   const visible = useMemo(
     () =>
       (rows ?? []).filter(
         (r) =>
+          (status === "all" || (status === "active" ? r.active : !r.active)) &&
           (!loc || r.location === loc) &&
           (!q ||
             r.name.toLowerCase().includes(q.toLowerCase()) ||
             r.employee_id.toLowerCase().includes(q.toLowerCase()) ||
             (r.account_manager ?? "").toLowerCase().includes(q.toLowerCase()))
       ),
-    [rows, q, loc]
+    [rows, q, loc, status]
   );
 
   const openCreate = () => {
@@ -140,29 +148,40 @@ export default function EmployeesPage() {
         }
       />
 
-      <Card>
-        <div className="flex flex-wrap items-center gap-3 border-b border-slate-100 px-5 py-3.5">
+      <Card className="overflow-hidden p-0">
+        <div className="flex flex-wrap items-center gap-3 border-b border-slate-100 px-4 py-2.5">
           <input
             id="employee-search"
             name="employee-search"
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="Search name, ID or manager…"
-            className="w-72 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-sm placeholder:text-slate-400 focus:border-brand-400 focus:bg-white focus:outline-none"
+            className="w-64 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs placeholder:text-slate-400 focus:border-brand-400 focus:bg-white focus:outline-none"
           />
           <Select
             id="employee-location-filter"
             name="employee-location-filter"
             value={loc}
             onChange={(e) => setLoc(e.target.value)}
-            className="py-1.5 text-xs"
+            className="max-w-[110px] py-1.5 text-xs"
           >
             <option value="">All locations</option>
             <option value="DXB">DXB</option>
             <option value="AUH">AUH</option>
           </Select>
-          <p className="ml-auto text-xs text-slate-400">
-            {visible.length} of {rows?.length ?? 0}
+          <Select
+            id="employee-status-filter"
+            name="employee-status-filter"
+            value={status}
+            onChange={(e) => setStatus(e.target.value as StatusFilter)}
+            className="max-w-[110px] py-1.5 text-xs"
+          >
+            <option value="active">Active</option>
+            <option value="inactive">Inactive</option>
+            <option value="all">All statuses</option>
+          </Select>
+          <p className="ml-auto text-[11px] text-slate-400">
+            {visible.length} of {activeCount} active{(rows?.length ?? 0) > activeCount ? ` · ${(rows?.length ?? 0) - activeCount} inactive` : ""}
           </p>
         </div>
 
@@ -174,80 +193,132 @@ export default function EmployeesPage() {
         ) : visible.length === 0 ? (
           <EmptyState icon={<Users className="h-6 w-6" />} title="No employees" detail="Add one manually or import your Excel (DXB + AUH sheets)." />
         ) : (
-          <table className="w-full text-left text-sm">
-            <thead>
-              <tr className="border-b border-slate-100 text-[11px] uppercase tracking-wide text-slate-400">
-                <th className="px-5 py-2.5 font-semibold">Employee</th>
-                <th className="px-3 py-2.5 font-semibold">ID</th>
-                <th className="px-3 py-2.5 font-semibold">Location</th>
-                <th className="hidden px-3 py-2.5 font-semibold lg:table-cell">Manager</th>
-                <th className="hidden px-3 py-2.5 font-semibold xl:table-cell">Project</th>
-                <th className="hidden px-3 py-2.5 font-semibold xl:table-cell">Email</th>
-                <th className="px-3 py-2.5" />
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {visible.map((r) => (
-                <tr key={r.id} className="transition-colors hover:bg-slate-50">
-                  <td className="px-5 py-2.5">
-                    <div className="flex items-center gap-2.5">
-                      <span
-                        className={cn(
-                          "flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[11px] font-bold",
-                          avatarColor(r.name)
-                        )}
-                      >
-                        {initials(r.name)}
-                      </span>
-                      <span className="font-semibold text-slate-800">{r.name}</span>
-                    </div>
-                  </td>
-                  <td className="px-3 py-2.5">
-                    <span className="flex items-center gap-1.5 font-mono text-xs text-slate-600">
-                      {r.employee_id}
-                      {sharedIds.has(r.employee_id) && (
-                        <span title="This ID exists in both teams — matching uses ID + name">
-                          <Copy className="h-3.5 w-3.5 text-amber-500" />
-                        </span>
-                      )}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2.5">
-                    {r.location ? (
-                      <Badge tone={locationBadgeTone(r.location)}>
-                        <MapPin className="h-3 w-3" /> {r.location}
-                      </Badge>
-                    ) : (
-                      <span className="text-xs text-slate-300">—</span>
-                    )}
-                  </td>
-                  <td className="hidden px-3 py-2.5 text-slate-600 lg:table-cell">{r.account_manager ?? "—"}</td>
-                  <td className="hidden px-3 py-2.5 text-xs text-slate-500 xl:table-cell">{r.project ?? "—"}</td>
-                  <td className="hidden max-w-[200px] truncate px-3 py-2.5 text-xs text-slate-500 xl:table-cell">
-                    {r.employee_email_id ?? "—"}
-                  </td>
-                  <td className="px-3 py-2.5">
-                    <div className="flex justify-end gap-1">
-                      <button
-                        onClick={() => openEdit(r)}
-                        className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-brand-600"
-                      >
-                        <Pencil className="h-4 w-4" />
-                      </button>
-                      <button
-                        onClick={() => {
-                          if (confirm(`Remove ${r.name} (${r.employee_id})?`)) deleteMut.mutate(r.id);
-                        }}
-                        className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-500"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                    </div>
-                  </td>
+          <div className="overflow-x-auto">
+            <table className="w-full table-fixed text-left text-xs">
+              <colgroup>
+                <col className="w-[20%]" />
+                <col className="w-[12%]" />
+                <col className="w-[8%]" />
+                <col className="hidden lg:table-column lg:w-[14%]" />
+                <col className="hidden xl:table-column xl:w-[10%]" />
+                <col className="hidden xl:table-column xl:w-[16%]" />
+                <col className="w-[10%]" />
+                <col className="w-[10%]" />
+              </colgroup>
+              <thead>
+                <tr className="border-b border-slate-100 bg-slate-50/80 text-[10px] font-bold uppercase tracking-wide text-slate-400">
+                  <th className="px-2.5 py-2">Employee</th>
+                  <th className="px-2 py-2">ID</th>
+                  <th className="px-2 py-2">Loc</th>
+                  <th className="hidden px-2 py-2 lg:table-cell">Manager</th>
+                  <th className="hidden px-2 py-2 xl:table-cell">Project</th>
+                  <th className="hidden px-2 py-2 xl:table-cell">Email</th>
+                  <th className="px-2 py-2">Status</th>
+                  <th className="px-2 py-2 text-right">Actions</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {visible.map((r) => (
+                  <tr
+                    key={r.id}
+                    className={cn("transition-colors hover:bg-slate-50", !r.active && "opacity-60")}
+                  >
+                    <td className="px-2.5 py-1.5">
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        <span
+                          className={cn(
+                            "flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[9px] font-bold",
+                            avatarColor(r.name)
+                          )}
+                        >
+                          {initials(r.name)}
+                        </span>
+                        <span className="truncate text-[11px] font-semibold text-slate-800" title={r.name}>
+                          {r.name}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <span className="flex items-center gap-1 truncate font-mono text-[10px] text-slate-600">
+                        <span className="truncate">{r.employee_id}</span>
+                        {sharedIds.has(r.employee_id) && (
+                          <span
+                            title="This ID exists in both teams — matching uses ID + name"
+                            className="shrink-0"
+                          >
+                            <Copy className="h-3 w-3 text-amber-500" />
+                          </span>
+                        )}
+                      </span>
+                    </td>
+                    <td className="px-2 py-1.5">
+                      {r.location ? (
+                        <Badge tone={locationBadgeTone(r.location)} className="px-1.5 py-0 text-[10px]">
+                          <MapPin className="h-2.5 w-2.5" /> {r.location}
+                        </Badge>
+                      ) : (
+                        <span className="text-[10px] text-slate-300">—</span>
+                      )}
+                    </td>
+                    <td
+                      className="hidden truncate px-2 py-1.5 text-[11px] text-slate-600 lg:table-cell"
+                      title={r.account_manager ?? undefined}
+                    >
+                      {r.account_manager ?? "—"}
+                    </td>
+                    <td
+                      className="hidden truncate px-2 py-1.5 text-[10px] text-slate-500 xl:table-cell"
+                      title={r.project ?? undefined}
+                    >
+                      {r.project ?? "—"}
+                    </td>
+                    <td
+                      className="hidden truncate px-2 py-1.5 text-[10px] text-slate-500 xl:table-cell"
+                      title={r.employee_email_id ?? undefined}
+                    >
+                      {r.employee_email_id ?? "—"}
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <Badge tone={r.active ? "success" : "slate"} className="px-1.5 py-0 text-[10px]">
+                        {r.active ? "Active" : "Inactive"}
+                      </Badge>
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <div className="flex items-center justify-end gap-0.5">
+                        <button
+                          title="Edit"
+                          onClick={() => openEdit(r)}
+                          className="rounded-md p-1 text-slate-400 hover:bg-slate-100 hover:text-brand-600"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          title={r.active ? "Mark inactive" : "Reactivate"}
+                          onClick={() => {
+                            const next = !r.active;
+                            if (
+                              !next &&
+                              !confirm(
+                                `Mark ${r.name} (${r.employee_id}) inactive? Their records and files are kept — this only hides them from active counts.`
+                              )
+                            )
+                              return;
+                            statusMut.mutate({ id: r.id, active: next });
+                          }}
+                          className={cn(
+                            "rounded-md p-1 text-slate-400",
+                            r.active ? "hover:bg-rose-50 hover:text-rose-500" : "hover:bg-emerald-50 hover:text-emerald-600"
+                          )}
+                        >
+                          {r.active ? <UserX className="h-3.5 w-3.5" /> : <UserCheck className="h-3.5 w-3.5" />}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </Card>
 

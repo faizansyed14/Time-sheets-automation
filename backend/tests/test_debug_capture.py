@@ -146,10 +146,10 @@ async def test_extract_full_email_persists_a_debug_run(mock_vision_calls):
         row = (await db.execute(select(EmailMessage).where(
             EmailMessage.provider_message_id == "MSG-0001"))).scalar_one_or_none()
         if row is None:
-            from app.api.routes.inbox import _sync_message
+            from app.services.inbox.sync import sync_message
             from app.services.email_provider import get_email_provider
             msg = await get_email_provider().get_message("MSG-0001")
-            row = await _sync_message(db, msg)
+            row = await sync_message(db, msg)
             await db.commit()
             await db.refresh(row)
 

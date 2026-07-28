@@ -25,6 +25,9 @@ import { fetchHealth, fetchPipelineStats } from "../api/client";
 import { cn, avatarColor, initials } from "../lib/utils";
 import { useAuth } from "../lib/auth";
 import AutoExtractWidget from "./AutoExtractWidget";
+import ExtractQueueWidget from "./ExtractQueueWidget";
+import ExtractQueueBridge from "./ExtractQueueBridge";
+import { useExtractQueue } from "../lib/extractQueue";
 
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
@@ -78,6 +81,10 @@ export default function Shell({ children }: { children: ReactNode }) {
   const location = useLocation();
   const qc = useQueryClient();
   const { user, isAdmin, canWrite, logout } = useAuth();
+  // While a run is actually working, its step bar takes over the whole
+  // header — left corner to right corner, right up against the stats pill —
+  // instead of squeezing in beside the page title.
+  const { current: extracting } = useExtractQueue();
   const { data: health } = useQuery({ queryKey: ["health"], queryFn: fetchHealth, refetchInterval: 60_000 });
   const { data: stats } = useQuery({
     queryKey: ["pipeline-stats"],
@@ -111,8 +118,8 @@ export default function Shell({ children }: { children: ReactNode }) {
 
   const navLinkClass = ({ isActive }: { isActive: boolean }) =>
     cn(
-      "group relative flex items-center rounded-lg py-2.5 text-sm font-medium transition-colors duration-150",
-      collapsed ? "justify-center px-2" : "gap-3 px-3",
+      "group relative flex items-center rounded-md py-2 text-xs font-medium transition-colors duration-150",
+      collapsed ? "justify-center px-1.5" : "gap-2 px-2",
       isActive
         ? "bg-brand-600/10 text-brand-600 font-semibold"
         : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
@@ -120,36 +127,37 @@ export default function Shell({ children }: { children: ReactNode }) {
 
   return (
     <div className="flex h-screen overflow-hidden app-canvas">
+      <ExtractQueueBridge />
       <aside
         className={cn(
           "relative flex shrink-0 flex-col border-r border-slate-200/80 bg-white/70 text-slate-700 backdrop-blur-md transition-[width] duration-200",
-          collapsed ? "w-[72px]" : "w-60"
+          collapsed ? "w-14" : "w-48"
         )}
       >
-        <div className={cn("flex items-center border-b border-slate-200/70 py-5", collapsed ? "justify-center px-2" : "gap-3 px-4")}>
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-brand-600 shadow-sm">
-            <Zap className="h-5 w-5 text-white" />
+        <div className={cn("flex items-center border-b border-slate-200/70 py-3", collapsed ? "justify-center px-1.5" : "gap-2 px-2.5")}>
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-brand-600 shadow-sm">
+            <Zap className="h-4 w-4 text-white" />
           </div>
           {!collapsed && (
             <div className="min-w-0">
-              <p className="truncate font-serif text-sm font-bold leading-tight text-slate-900">Timesheets</p>
-              <p className="text-[11px] font-medium text-slate-500">Intelligence Portal</p>
+              <p className="truncate font-serif text-xs font-bold leading-tight text-slate-900">Timesheets</p>
+              <p className="truncate text-[10px] font-medium text-slate-500">Intelligence Portal</p>
             </div>
           )}
         </div>
 
-        <nav className="flex-1 space-y-0.5 overflow-y-auto px-2 py-4">
+        <nav className="flex-1 space-y-0.5 overflow-y-auto px-1.5 py-3">
           {NAV.map(({ to, label, icon: Icon, end, attention: showAttention }) => (
             <NavLink key={to} to={to} end={end} title={collapsed ? label : undefined} className={navLinkClass}>
               {({ isActive }) => (
                 <>
-                  <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive ? "text-brand-600" : "text-slate-400 group-hover:text-slate-700")} />
-                  {!collapsed && <span className="flex-1">{label}</span>}
+                  <Icon className={cn("h-4 w-4 shrink-0", isActive ? "text-brand-600" : "text-slate-400 group-hover:text-slate-700")} />
+                  {!collapsed && <span className="min-w-0 flex-1 truncate leading-tight">{label}</span>}
                   {showAttention && attention > 0 && (
                     <span
                       className={cn(
                         "rounded-full bg-amber-500 font-bold text-white",
-                        collapsed ? "absolute right-1.5 top-1.5 h-2 w-2" : "px-1.5 py-0.5 text-[10px]"
+                        collapsed ? "absolute right-1 top-1 h-1.5 w-1.5" : "px-1 py-px text-[9px]"
                       )}
                     >
                       {collapsed ? "" : attention}
@@ -161,15 +169,15 @@ export default function Shell({ children }: { children: ReactNode }) {
           ))}
 
           {!collapsed && (
-            <p className="px-3 pb-1.5 pt-6 text-[10px] font-semibold uppercase tracking-widest text-slate-500">Tools</p>
+            <p className="px-2 pb-1 pt-4 text-[9px] font-semibold uppercase tracking-widest text-slate-500">Tools</p>
           )}
           {collapsed && <div className="my-3 border-t border-slate-200/70" />}
           {TOOLS_NAV.filter((n) => canWrite || n.to !== "/upload").map(({ to, label, icon: Icon }) => (
             <NavLink key={to} to={to} title={collapsed ? label : undefined} className={navLinkClass}>
               {({ isActive }) => (
                 <>
-                  <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive ? "text-brand-600" : "text-slate-400 group-hover:text-slate-700")} />
-                  {!collapsed && <span className="flex-1">{label}</span>}
+                  <Icon className={cn("h-4 w-4 shrink-0", isActive ? "text-brand-600" : "text-slate-400 group-hover:text-slate-700")} />
+                  {!collapsed && <span className="min-w-0 flex-1 truncate leading-tight">{label}</span>}
                 </>
               )}
             </NavLink>
@@ -178,15 +186,15 @@ export default function Shell({ children }: { children: ReactNode }) {
           {isAdmin && (
             <>
               {!collapsed && (
-                <p className="px-3 pb-1.5 pt-6 text-[10px] font-semibold uppercase tracking-widest text-slate-500">Admin</p>
+                <p className="px-2 pb-1 pt-4 text-[9px] font-semibold uppercase tracking-widest text-slate-500">Admin</p>
               )}
               {collapsed && <div className="my-3 border-t border-slate-200/70" />}
               {ADMIN_NAV.map(({ to, label, icon: Icon }) => (
                 <NavLink key={to} to={to} title={collapsed ? label : undefined} className={navLinkClass}>
                   {({ isActive }) => (
                     <>
-                      <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive ? "text-brand-600" : "text-slate-400 group-hover:text-slate-700")} />
-                      {!collapsed && <span className="flex-1">{label}</span>}
+                      <Icon className={cn("h-4 w-4 shrink-0", isActive ? "text-brand-600" : "text-slate-400 group-hover:text-slate-700")} />
+                      {!collapsed && <span className="min-w-0 flex-1 truncate leading-tight">{label}</span>}
                     </>
                   )}
                 </NavLink>
@@ -196,21 +204,21 @@ export default function Shell({ children }: { children: ReactNode }) {
         </nav>
 
         {!collapsed && (
-          <div className="mx-2 mb-4 rounded-lg border border-slate-200/70 bg-slate-100/50 p-3">
-            <p className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-slate-500">System</p>
-            <div className="space-y-2 text-xs">
-              <div className="flex items-center justify-between">
+          <div className="mx-1.5 mb-3 rounded-md border border-slate-200/70 bg-slate-100/50 p-2">
+            <p className="mb-1.5 text-[9px] font-semibold uppercase tracking-widest text-slate-500">System</p>
+            <div className="space-y-1.5 text-[10px]">
+              <div className="flex items-center justify-between gap-1">
                 <span className="text-slate-500">Email</span>
-                <span className="flex items-center gap-1.5 font-medium text-slate-700">
-                  <CircleDot className="h-3 w-3 text-emerald-500" />
-                  {health?.email_provider ?? "…"}
+                <span className="flex min-w-0 items-center gap-1 truncate font-medium text-slate-700">
+                  <CircleDot className="h-2.5 w-2.5 shrink-0 text-emerald-500" />
+                  <span className="truncate">{health?.email_provider ?? "…"}</span>
                 </span>
               </div>
-              <div className="flex items-center justify-between">
-                <span className="text-slate-500">Extraction</span>
-                <span className="flex items-center gap-1.5 font-medium text-slate-700">
-                  <CircleDot className="h-3 w-3 text-emerald-500" />
-                  {health?.extraction_engine ?? "…"}
+              <div className="flex items-center justify-between gap-1">
+                <span className="text-slate-500">Extract</span>
+                <span className="flex min-w-0 items-center gap-1 truncate font-medium text-slate-700">
+                  <CircleDot className="h-2.5 w-2.5 shrink-0 text-emerald-500" />
+                  <span className="truncate">{health?.extraction_engine ?? "…"}</span>
                 </span>
               </div>
             </div>
@@ -233,19 +241,26 @@ export default function Shell({ children }: { children: ReactNode }) {
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-14 shrink-0 items-center justify-between surface-glass px-5 sm:px-6">
-          <div className="min-w-0">
-            <p className="flex flex-wrap items-baseline gap-x-2 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
-              <span>Workspace</span>
-              {workspaceBlurb && (
-                <span className="normal-case tracking-normal font-medium text-slate-500">
-                  · {workspaceBlurb}
-                </span>
-              )}
-            </p>
-            <p className="font-serif text-base font-bold tracking-tight text-slate-900">{title}</p>
-          </div>
-          <div className="flex items-center gap-2.5 text-xs text-slate-500">
+        <header className="flex h-14 shrink-0 items-center gap-4 surface-glass px-5 sm:px-6">
+          {/* Page title steps aside while a run is actually in progress so
+              the step bar can run edge to edge instead of squeezing beside it. */}
+          {!extracting && (
+            <div className="min-w-0 shrink-0">
+              <p className="flex flex-wrap items-baseline gap-x-2 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
+                <span>Workspace</span>
+                {workspaceBlurb && (
+                  <span className="normal-case tracking-normal font-medium text-slate-500">
+                    · {workspaceBlurb}
+                  </span>
+                )}
+              </p>
+              <p className="font-serif text-base font-bold tracking-tight text-slate-900">{title}</p>
+            </div>
+          )}
+          {/* Extract Email progress — full-width 3-step bar, renders nothing
+              when no run is active/recently finished. */}
+          <ExtractQueueWidget />
+          <div className="ml-auto flex shrink-0 items-center gap-2.5 text-xs text-slate-500">
             {stats && (
               <span className="hidden items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-1.5 lg:inline-flex">
                 <span className="font-semibold text-slate-700">{stats.total}</span>

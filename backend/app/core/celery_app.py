@@ -36,11 +36,18 @@ celery_app.conf.update(
     # Periodic maintenance (runs under `celery worker -B` or a dedicated beat).
     # Interval configurable from .env (see config.Settings):
     #   PIPELINE_RAW_PURGE_INTERVAL_HOURS  — purge S3/disk retry copies (default daily)
+    #   INBOX_AUTO_SYNC_INTERVAL_SECONDS   — background Outlook/Graph pull (default 60s)
     beat_schedule={
         "purge-pipeline-raw": {
             "task": "maintenance.purge_pipeline_raw",
             "schedule": max(60.0, settings.pipeline_raw_purge_interval_hours * 3600.0),
         },
+        **({
+            "sync-inbox": {
+                "task": "inbox.sync",
+                "schedule": max(30.0, float(settings.inbox_auto_sync_interval_seconds)),
+            },
+        } if settings.inbox_auto_sync_enabled else {}),
     },
 )
 

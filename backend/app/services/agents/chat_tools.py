@@ -277,8 +277,10 @@ async def list_submitted(db: AsyncSession, month: int, year: int) -> dict[str, A
 
 
 async def list_missing(db: AsyncSession, month: int, year: int) -> dict[str, Any]:
-    """List employees with NO timesheet record for the given month/year."""
-    emps = list((await db.execute(select(Employee).order_by(Employee.name))).scalars().all())
+    """List employees with NO timesheet record for the given month/year.
+    Inactive employees are excluded — they're no longer expected to submit."""
+    emps = list((await db.execute(
+        select(Employee).where(Employee.active.is_(True)).order_by(Employee.name))).scalars().all())
     recs = list((await db.execute(select(TimesheetRecord).where(
         TimesheetRecord.month == month, TimesheetRecord.year == year))).scalars().all())
     submitted_pks = {r.matched_employee_pk for r in recs if r.matched_employee_pk}
@@ -481,8 +483,9 @@ async def _all_records_for(db: AsyncSession, month: int, year: int) -> list[Time
 async def dashboard_summary(db: AsyncSession, month: int, year: int) -> dict[str, Any]:
     """Org-wide roll-up for a month: totals submitted / missing, pending manager
     approval, and records flagged for review. Use for 'how are we doing for
-    May', status overviews, or as a proactive health check."""
-    emps = list((await db.execute(select(Employee))).scalars().all())
+    May', status overviews, or as a proactive health check.
+    Inactive employees are excluded — they're no longer expected to submit."""
+    emps = list((await db.execute(select(Employee).where(Employee.active.is_(True)))).scalars().all())
     recs = await _all_records_for(db, month, year)
     submitted_pks = {r.matched_employee_pk for r in recs if r.matched_employee_pk}
     submitted_names = {(r.employee_name or "").lower() for r in recs}

@@ -520,7 +520,7 @@ export default function PipelinePage() {
     onSuccess: () => {
       toast("info", "Tracker entry removed");
       invalidate();
-      qc.invalidateQueries({ queryKey: ["inbox"] });
+      qc.invalidateQueries({ queryKey: ["inbox-threads"] });
     },
     onError: (e: any) => toast("error", "Delete failed", e?.response?.data?.detail ?? String(e)),
   });

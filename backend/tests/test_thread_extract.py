@@ -287,6 +287,47 @@ def test_email_bodies_are_never_deduped_against_attachments():
     assert th.dropped == []
 
 
+def test_same_template_different_employees_in_filename_is_never_deduped():
+    """A bulk send of one identical timesheet template, one file per person,
+    must never collapse two different named employees into one — even though
+    the shared boilerplate layout scores as "near-identical" text. Regression
+    for a real bug: 5 of 10 employees in one email were silently dropped as
+    "duplicates" of each other because their sheets used the same template."""
+    th = Thread(
+        subject="June",
+        items=[
+            Item(key="A1", name="Employee_One_(11111)_hash.pdf", mime="application/pdf",
+                 msg_index=0, text=_SHEET_CORE, size=100),
+            Item(key="A2", name="Employee_Two_(22222)_hash.pdf", mime="application/pdf",
+                 msg_index=1, text=_SHEET_CORE, size=100),
+        ],
+    )
+    _dedupe_sheet_items(th)
+    assert {it.key for it in th.items} == {"A1", "A2"}
+    assert th.dropped == []
+
+
+def test_same_employee_id_in_filename_still_dedupes_regenerated_copy():
+    """The guard must not block the ORIGINAL, legitimate case it sits next to:
+    the same employee's own sheet resent/regenerated with a stronger
+    signature — same id in both filenames, so dedup still collapses them."""
+    unsigned = _SHEET_CORE + "Status: Submitted\n"
+    signed = _SHEET_CORE + "Approved By: Ahmed Shukri\nManager signature present\n"
+    th = Thread(
+        subject="June",
+        items=[
+            Item(key="A1", name="Ayaz_Kardame_(11111)_v1.pdf", mime="application/pdf",
+                 msg_index=0, text=unsigned, size=100),
+            Item(key="A2", name="Ayaz_Kardame_(11111)_v2.pdf", mime="application/pdf",
+                 msg_index=2, text=signed, size=110),
+        ],
+    )
+    _dedupe_sheet_items(th)
+    assert [it.key for it in th.items] == ["A2"]
+    assert th.dropped[0]["filter"] == "dup"
+    assert th.dropped[0]["kept_key"] == "A2"
+
+
 def test_unrelated_sheets_are_not_merged():
     th = Thread(
         subject="mixed",
@@ -562,3 +603,68 @@ async def test_no_cache_behaves_exactly_like_before(mock_vision_calls):
     assert len(sheets) == 1
     assert sheets[0]["employee_name"] == "Fresh Person"
     assert meta.get("reused_sheets", 0) == 0
+
+
+# --------------------------------------------------------------------------
+# Pass 2 retry when a confirmed, non-empty batch comes back with nothing
+# --------------------------------------------------------------------------
+
+async def test_pass2_retries_once_when_confirmed_batch_returns_no_sheets(mock_vision_calls):
+    """Regression for a real bug: pass 1 confirmed a real timesheet (it read
+    the same image successfully), but pass 2's first reply was a flatly
+    empty `{"sheets": []}` — a bad/degenerate model generation, not evidence
+    the document is blank. That must be retried once rather than accepted
+    at face value and reported as "nothing found"."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    eml = _mail(plain="See attached.", attachments=[
+        ("june-timesheet.pdf", b"%PDF-1.4 fake sheet", "application", "pdf"),
+    ])
+    mock_vision_calls([
+        {"thread_summary": "", "items": [{
+            "source": "[A1]", "is_timesheet": True, "kind": "timesheet",
+            "employee_name": "Test Person", "employee_id": "E1",
+            "period_hint": "June 2026", "evidence": "1-June-26 present",
+            "manager_signature": False, "signature_evidence": "", "notes": "",
+        }]},
+        {"sheets": []},  # first pass-2 attempt: empty (the bug)
+        {"sheets": [{  # retry: the real content comes through
+            "source": "[A1]", "employee_name": "Test Person", "employee_id": "E1",
+            "month": 6, "year": 2026, "days_covered": 1, "period_type": "partial",
+            "missing_days": [], "working_days": ["2026-06-01"], "weekend_days": [],
+            "uncertain_days": [], "annual": [], "remote": [], "sick": [],
+            "maternity": [], "unpaid": [], "absent": [], "public_holiday": [], "notes": "",
+        }]},
+    ])
+
+    sheets, approval, conflicts, meta = await extract_thread_sheets([("msg 1", eml)])
+
+    assert len(sheets) == 1
+    assert sheets[0]["employee_name"] == "Test Person"
+    assert meta["calls"] == 3  # 1 pass-1 call + 2 pass-2 calls (original + retry)
+
+
+async def test_pass2_does_not_retry_more_than_once(mock_vision_calls):
+    """If the retry ALSO comes back empty, accept it — no infinite retries,
+    and the confirmed item legitimately ends up unresolved rather than
+    hanging the run."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    eml = _mail(plain="See attached.", attachments=[
+        ("june-timesheet.pdf", b"%PDF-1.4 fake sheet", "application", "pdf"),
+    ])
+    mock_vision_calls([
+        {"thread_summary": "", "items": [{
+            "source": "[A1]", "is_timesheet": True, "kind": "timesheet",
+            "employee_name": "Test Person", "employee_id": "E1",
+            "period_hint": "June 2026", "evidence": "1-June-26 present",
+            "manager_signature": False, "signature_evidence": "", "notes": "",
+        }]},
+        {"sheets": []},  # first attempt: empty
+        {"sheets": []},  # retry: still empty — must be accepted, not retried again
+    ])
+
+    sheets, approval, conflicts, meta = await extract_thread_sheets([("msg 1", eml)])
+
+    assert sheets == []
+    assert meta["calls"] == 3

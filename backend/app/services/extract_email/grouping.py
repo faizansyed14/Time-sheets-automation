@@ -61,17 +61,41 @@ def _clean_date_list(vals, bucket_name: str, seen: dict[str, str], issues: list[
     return sorted(set(clean))
 
 
-def normalise_sheet(s: dict) -> dict:
+def normalise_sheet(s: dict, calendar_row: dict | None = None) -> dict:
     """ISO-validate every date list, catch cross-bucket conflicts (with the
     remote/public_holiday exception), and — for a full_month sheet — compute
     every day NO bucket accounted for at all (`_unaccounted_days`), the
     deterministic cross-check the auto-accept gate reads instead of trusting
-    the model's own completeness claim."""
+    the model's own completeness claim.
+
+    `calendar_row` (Admin → Month calendars, {"weekend_weekdays": [...]}) —
+    when given, a date the model put in BOTH working_days and weekend_days
+    (already flagged below as a same-sheet conflict) is resolved in favour
+    of weekend_days whenever the admin calendar confirms that date IS a
+    configured weekend: that's deterministic ground truth the model already
+    contradicted, not something a coin-flip by bucket order should decide.
+    """
     out = dict(s)
     issues: list[str] = []
     seen: dict[str, str] = {}
     for b in BUCKETS + DAY_FIELDS:
         out[b] = _clean_date_list(s.get(b), b, seen, issues)
+
+    month, year = out.get("month"), out.get("year")
+    if calendar_row and month and year:
+        expected_we = expected_weekend_dates(
+            int(month), int(year), calendar_row.get("weekend_weekdays") or [])
+        wrongly_working = expected_we & set(out.get("working_days") or [])
+        if wrongly_working:
+            out["working_days"] = sorted(set(out["working_days"]) - wrongly_working)
+            out["weekend_days"] = sorted(set(out.get("weekend_days") or []) | wrongly_working)
+            issues = [
+                iss for iss in issues
+                if not any(
+                    f"{d} in working_days and weekend_days" in iss
+                    or f"{d} in weekend_days and working_days" in iss
+                    for d in wrongly_working)
+            ]
 
     clean_uncertain = []
     for u in (s.get("uncertain_days") or []):
@@ -90,7 +114,6 @@ def normalise_sheet(s: dict) -> dict:
         clean_uncertain.append({"date": d, "reason": str(u.get("reason", ""))[:200]})
     out["uncertain_days"] = sorted(clean_uncertain, key=lambda u: u["date"])
 
-    month, year = out.get("month"), out.get("year")
     out["_days_in_month"] = 0
     out["_unaccounted_days"] = []
     # Drop day numbers the calendar does not have for this month (e.g. 31 in
@@ -383,7 +406,8 @@ async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]
             by_period.setdefault(p, []).append(s)
 
         for (month, year), part in by_period.items():
-            normalised = [normalise_sheet({**s, "month": month, "year": year}) for s in part]
+            cal_row = calendars.get((month, year)) if month and year else None
+            normalised = [normalise_sheet({**s, "month": month, "year": year}, cal_row) for s in part]
             multi_overlap, multi_fold = _multi_sheet_flags(normalised)
             part_folds = [n for n in fold_notes if any(s["name"] in n for s in part)]
             part_folds = list(dict.fromkeys(part_folds + multi_fold))
