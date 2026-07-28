@@ -80,6 +80,7 @@ def _label(subject: str | None, received) -> str:
 
 async def collect_thread_emls(
     provider, email: EmailMessage, prior_email: EmailMessage | None = None,
+    *, since=None, context_messages: int = 2,
 ) -> tuple[list[tuple[str, bytes]], list[str]]:
     """([(label, eml_bytes)], notes) for the conversation, OLDEST FIRST.
 
@@ -92,6 +93,18 @@ async def collect_thread_emls(
     sheets on early messages can end up reading almost nothing, with no sign
     anything went wrong. These notes are surfaced into the staged record so
     that degradation is visible instead of silent.
+
+    `since` (a datetime, typically sheet_cache.last_extraction_at()) trims the
+    thread to only messages received AFTER it, plus `context_messages`
+    immediately before the earliest new one — so a reply arriving into an
+    already-extracted thread only costs a read of what's actually new, not the
+    whole conversation again. Messages outside that window are never fetched
+    (no raw-MIME round-trip spent on them at all); whatever was already
+    extracted from them is carried forward separately (see
+    sheet_cache.thread_cached_sheets / thread_extract.extract_thread_sheets).
+    `since=None` (first-ever extraction on this thread, or a forced full
+    re-read) sends the whole thread, unchanged from before this parameter
+    existed.
     """
     from app.services.inbox.eml_export import build_full_eml
 
@@ -157,6 +170,22 @@ async def collect_thread_emls(
             thread_msgs = sorted(thread_msgs, key=lambda m: (_when(m) is None, _when(m)))
         except Exception:
             pass
+
+        if since is not None:
+            new_index = next(
+                (i for i, m in enumerate(thread_msgs) if (_when(m) or since) > since), None)
+            if new_index is not None:
+                window_start = max(0, new_index - context_messages)
+                if window_start > 0:
+                    notes.append(
+                        f"This thread was already extracted through an earlier message — "
+                        f"{window_start} older message(s) were NOT re-read; anything already "
+                        f"extracted from them is carried forward from the last run.")
+                    thread_msgs = thread_msgs[window_start:]
+            # else: nothing newer than `since` — a re-run with no new mail at
+            # all (e.g. triggered by hand). Fall through to the full/oldest-N
+            # behaviour below rather than silently sending nothing.
+
         # Keep the NEWEST slice when a thread is very long — that is where the
         # current period's sheets and approvals live.
         if len(thread_msgs) > MAX_THREAD_MESSAGES:

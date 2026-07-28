@@ -1,31 +1,16 @@
-"""End-to-end: a clean, fully-verified ADR group is STAGED with an AI
+"""End-to-end: a clean, fully-verified group is STAGED with an AI
 recommendation (NEEDS_REVIEW, not filed) until a human Accepts. A group with
 a blocker is held without the recommendation."""
-import calendar
-
 from sqlalchemy import select
+
+from tests._sheet_helpers import full_month_sheet
 
 from app.core.database import SessionLocal
 from app.models.employee import Employee
 from app.models.pipeline_file import PipelineStatus
 from app.models.timesheet_record import TimesheetRecord
+from app.services.extract_email.grouping import group_sheets
 from app.services.extract_email.staging import stage_groups
-
-
-def _adr_text():
-    weekend = {6, 7, 13, 14, 20, 21, 27, 28}
-    lines = []
-    for d in range(1, 31):
-        tag = f"{d}-June-26"
-        if d in weekend:
-            lines.append(f"{tag} Saturday Weekend")
-        elif d == 15:
-            lines.append(f"{tag} Public Holiday Public Holiday")
-        elif d == 19:
-            lines.append(f"{tag} Sick Leave Sick Leave")
-        else:
-            lines.append(f"{tag} 08:00 AM 5:00 PM 9 9")
-    return "\n".join(lines)
 
 
 async def _employee(db) -> Employee:
@@ -40,24 +25,23 @@ async def _employee(db) -> Employee:
     return emp
 
 
-def _group(emp, buckets, sheets_text, overlap=None):
-    return {
-        "tag": "__email_extract__:autotest",
-        "employee_pk": emp.id, "name": emp.name, "employee_id": emp.employee_id,
-        "note": "matched", "month": 6, "year": 2026,
-        "buckets": {**{b: [] for b in
-                       ("annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday")},
-                    **buckets},
-        "overlap_flags": overlap or [], "fold_notes": [],
-        "sheets": [{"name": "TIMESHEET.pdf", "kind": "timesheet",
-                    "employee_name": emp.name, "employee_id": emp.employee_id,
-                    "month": 6, "year": 2026, "manager_signature": False,
-                    "approval_evidence": "", "format_id": "alpha_adr_attendance",
-                    "text": sheets_text,
-                    "buckets": {**{b: [] for b in
-                                   ("annual", "remote", "sick", "maternity", "unpaid",
-                                    "absent", "public_holiday")}, **buckets}}],
-    }
+def _weekend_dates(month: int, year: int) -> set[str]:
+    import calendar
+    import datetime as dt
+    last = calendar.monthrange(year, month)[1]
+    return {dt.date(year, month, d).isoformat() for d in range(1, last + 1)
+            if dt.date(year, month, d).weekday() >= 5}
+
+
+def _clean_sheet(emp) -> dict:
+    weekend = _weekend_dates(6, 2026)
+    sheet = full_month_sheet("TIMESHEET.pdf", 6, 2026,
+                             public_holiday=["2026-06-15"], sick=["2026-06-19"])
+    sheet["working_days"] = [d for d in sheet["working_days"] if d not in weekend]
+    sheet["weekend_days"] = sorted(weekend - {"2026-06-15", "2026-06-19"})
+    sheet["employee_name"] = emp.name
+    sheet["employee_id"] = emp.employee_id
+    return sheet
 
 
 async def _clean_records(db, emp):
@@ -68,19 +52,20 @@ async def _clean_records(db, emp):
     await db.commit()
 
 
-async def test_clean_adr_group_is_staged_with_ai_recommendation():
+async def test_clean_group_is_staged_with_ai_recommendation():
     async with SessionLocal() as db:
         emp = await _employee(db)
         await _clean_records(db, emp)
-        g = _group(emp, {"public_holiday": ["2026-06-15"], "sick": ["2026-06-19"]}, _adr_text())
+        groups = await group_sheets(db, None, [_clean_sheet(emp)])
+        assert len(groups) == 1
         staged = await stage_groups(
             db, source_kind="email", source_id="autotest-msg-1",
             raw_bytes=b"%PDF-fake", raw_name="bhargavi.pdf", content_type="application/pdf",
-            groups=[g], approval={"detected": False, "detail": "No approval."},
-            run_meta={"method": "vision", "model": "gpt-4o", "calls": 1})
+            groups=groups, approval={"detected": False, "detail": "No approval."},
+            run_meta={"method": "thread-two-pass", "model": "test-model", "calls": 2})
         t = staged[0]
         assert t.status == PipelineStatus.NEEDS_REVIEW, (t.status, t.failure_detail)
-        assert t.extraction_meta["auto_accept"]["accepted"] is True
+        assert t.extraction_meta["auto_accept"]["accepted"] is True, t.extraction_meta["auto_accept"]
         assert t.record_id is None
         assert t.raw_path is not None
         recs = (await db.execute(select(TimesheetRecord).where(
@@ -97,23 +82,26 @@ async def test_pipeline_list_filters_ai_recommendation(client, admin_token):
     async with SessionLocal() as db:
         emp = await _employee(db)
         await _clean_records(db, emp)
+        groups = await group_sheets(db, None, [_clean_sheet(emp)])
         staged = await stage_groups(
             db, source_kind="email", source_id="autotest-filter-1",
             raw_bytes=b"%PDF-fake", raw_name="bhargavi.pdf", content_type="application/pdf",
-            groups=[_group(emp, {"public_holiday": ["2026-06-15"]}, _adr_text())],
-            approval={"detected": False, "detail": "No approval."},
-            run_meta={"method": "vision", "model": "gpt-4o", "calls": 1})
+            groups=groups, approval={"detected": False, "detail": "No approval."},
+            run_meta={"method": "thread-two-pass", "model": "test-model", "calls": 2})
         recommended_id = staged[0].id
         assert staged[0].extraction_meta["auto_accept"]["accepted"] is True
 
+        held_sheet = _clean_sheet(emp)
+        # Break the day grid — one working day silently dropped.
+        held_sheet["working_days"] = held_sheet["working_days"][:-1]
+        held_groups = await group_sheets(db, None, [held_sheet])
         held = await stage_groups(
             db, source_kind="email", source_id="autotest-filter-2",
             raw_bytes=b"%PDF-fake", raw_name="held.pdf", content_type="application/pdf",
-            groups=[_group(emp, {"public_holiday": ["2026-06-15"]}, _adr_text(),
-                           overlap=["Date 2026-06-15 claimed by two files — verify."])],
-            approval={"detected": False, "detail": "No approval."},
-            run_meta={"method": "vision", "model": "gpt-4o", "calls": 1})
+            groups=held_groups, approval={"detected": False, "detail": "No approval."},
+            run_meta={"method": "thread-two-pass", "model": "test-model", "calls": 2})
         held_id = held[0].id
+        assert held[0].extraction_meta["auto_accept"]["accepted"] is False
 
     h = auth_headers(admin_token)
     r = await client.get(
@@ -133,19 +121,20 @@ async def test_pipeline_list_filters_ai_recommendation(client, admin_token):
         await _clean_records(db, emp)
 
 
-async def test_group_with_validation_flag_is_held_for_review():
+async def test_group_with_unaccounted_day_is_held_for_review():
     async with SessionLocal() as db:
         emp = await _employee(db)
         await _clean_records(db, emp)
-        g = _group(emp, {"public_holiday": ["2026-06-15"], "sick": ["2026-06-19"]},
-                   _adr_text(), overlap=["Date 2026-06-15 claimed by two files — verify."])
+        sheet = _clean_sheet(emp)
+        sheet["working_days"] = sheet["working_days"][:-1]   # one day silently unaccounted
+        groups = await group_sheets(db, None, [sheet])
         staged = await stage_groups(
             db, source_kind="email", source_id="autotest-msg-2",
             raw_bytes=b"%PDF-fake", raw_name="bhargavi.pdf", content_type="application/pdf",
-            groups=[g], approval={"detected": False, "detail": "No approval."},
-            run_meta={"method": "vision", "model": "gpt-4o", "calls": 1})
+            groups=groups, approval={"detected": False, "detail": "No approval."},
+            run_meta={"method": "thread-two-pass", "model": "test-model", "calls": 2})
         t = staged[0]
         assert t.status == PipelineStatus.NEEDS_REVIEW
         assert t.extraction_meta["auto_accept"]["accepted"] is False
-        assert any("validation" in b for b in t.extraction_meta["auto_accept"]["blockers"])
+        assert any("not accounted for" in b for b in t.extraction_meta["auto_accept"]["blockers"])
         await _clean_records(db, emp)

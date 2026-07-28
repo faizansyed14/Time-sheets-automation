@@ -16,17 +16,35 @@ import datetime as dt
 from collections import Counter
 
 BUCKETS = ["annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday"]
+# Not leave — day-accounting fields (worked / off) — but persisted, editable,
+# and validated the same way as the leave buckets above.
+DAY_FIELDS = ["working", "weekend"]
 _LABEL = {
     "annual": "Annual leave", "remote": "Remote/WFH", "sick": "Sick leave",
     "maternity": "Maternity leave",
     "unpaid": "Unpaid leave", "absent": "Absent", "public_holiday": "Public holiday",
+    "working": "Working day", "weekend": "Weekend",
 }
 
 
 _SHORT = {
     "annual": "annual", "remote": "WFH", "sick": "sick", "maternity": "maternity",
     "unpaid": "unpaid", "absent": "absent", "public_holiday": "public holiday",
+    "working": "working", "weekend": "weekend",
 }
+
+# A date legitimately belonging to BOTH categories in a pair is two true facts
+# about one day, not a conflict — mirrors grouping.py's
+# _COMPATIBLE_WITH_WORKING (a worked-remote day, or worked on a public
+# holiday, is still a working day too).
+_COMPATIBLE_PAIRS = {
+    frozenset({"working", "remote"}),
+    frozenset({"working", "public_holiday"}),
+}
+
+
+def _compatible(a: str, b: str) -> bool:
+    return frozenset({a, b}) in _COMPATIBLE_PAIRS
 
 
 def _parse(d: str) -> dt.date | None:
@@ -110,9 +128,10 @@ def validate(
 ):
     flags: list[str] = []
     cleaned: dict[str, list[str]] = {}
+    all_fields = BUCKETS + DAY_FIELDS
 
     # 1) within-bucket duplicates
-    for b in BUCKETS:
+    for b in all_fields:
         raw = buckets.get(b, []) or []
         seen, dupes, ordered = set(), set(), []
         for d in raw:
@@ -125,24 +144,29 @@ def validate(
         for d in sorted(dupes):
             flags.append(f"Duplicate date {d} listed twice in {_LABEL[b]}.")
 
-    # 2) cross-bucket overlap
+    # 2) cross-bucket overlap — a date legitimately shared by a compatible
+    # pair (working+remote, working+public_holiday) is two true facts about
+    # one day, not a conflict; only a genuinely incompatible pair is flagged.
     by_date: dict[str, list[str]] = {}
-    for b in BUCKETS:
+    for b in all_fields:
         for d in cleaned[b]:
-            by_date.setdefault(d, []).append(_LABEL[b])
-    for d, labels in by_date.items():
-        if len(labels) > 1:
+            by_date.setdefault(d, []).append(b)
+    for d, keys in by_date.items():
+        conflicting = [k for k in keys
+                       if not all(_compatible(k, other) for other in keys if other != k)]
+        if len(set(conflicting)) > 1:
+            labels = [_LABEL[k] for k in dict.fromkeys(conflicting)]
             flags.append(f"Date {d} appears in multiple categories: {', '.join(labels)}.")
 
     # 3) out-of-month
-    for b in BUCKETS:
+    for b in all_fields:
         for d in cleaned[b]:
             pd = _parse(d)
             if pd and (pd.month != month or pd.year != year):
                 flags.append(f"Date {d} is outside the timesheet month ({_mname(month)} {year}) in {_LABEL[b]}.")
 
     # 4) header month vs actual dates
-    all_dates = [pd for b in BUCKETS for d in cleaned[b] if (pd := _parse(d))]
+    all_dates = [pd for b in all_fields for d in cleaned[b] if (pd := _parse(d))]
     if all_dates:
         cy, cm = Counter((pd.year, pd.month) for pd in all_dates).most_common(1)[0][0]
         if header_month and (header_month, header_year or year) != (cm, cy):

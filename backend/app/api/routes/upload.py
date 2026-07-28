@@ -20,8 +20,12 @@ from app.schemas import PipelineFileOut, UploadResult
 from app.services.agents.full_email_extract import extract_upload
 from app.services.pipeline.ingestion import ingest_manual_entry
 
-# Leave buckets a manual entry may carry (matches the extraction buckets).
-_MANUAL_BUCKETS = ("annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday")
+# Leave buckets a manual entry may carry (matches the extraction buckets),
+# plus the day-accounting fields (not leave, same editable UI).
+_MANUAL_BUCKETS = (
+    "annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday",
+    "working", "weekend",
+)
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 

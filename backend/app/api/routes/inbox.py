@@ -671,13 +671,19 @@ async def _resolve_thread_anchor_and_prior(
 
 
 @router.post("/{provider_message_id}/extract-full")
-async def extract_full(provider_message_id: str,
+async def extract_full(provider_message_id: str, force_full: bool = False,
                        db: AsyncSession = Depends(get_db)):
     """Extract Email — the one-button flow: convert the whole email to a full
     .eml, analyse EVERY sheet inside it (attachments, forwarded emails and
     their attachments, pasted body grids) with the vision model (one call per
     sheet), detect manager signatures / approval screenshots, group the results
     per employee + month, and stage one pending-review pipeline item per group.
+
+    Incremental by default: an already-extracted thread only re-reads the new
+    message(s) + a couple of prior ones for context, reusing everything else
+    already extracted for this conversation. `force_full=true` bypasses that
+    and re-reads the whole thread from scratch — the "Re-read entire thread"
+    escape hatch, for a suspected stale/wrong past read.
 
     Thread-aware (narrow): when the selected message has no document
     attachments (e.g. an "Approved." reply), the message immediately before
@@ -690,7 +696,7 @@ async def extract_full(provider_message_id: str,
     row = await _email_row_or_404(db, provider_message_id)
     prior_row = await prior_message_for_merge(db, row)
     try:
-        res = await extract_full_email(db, row, prior_email=prior_row)
+        res = await extract_full_email(db, row, prior_email=prior_row, force_full=force_full)
     except HTTPException:
         raise
     except Exception as e:
@@ -708,7 +714,7 @@ async def extract_full(provider_message_id: str,
 
 @router.post("/{provider_message_id}/extract-full/stream")
 async def extract_full_streamed(
-    provider_message_id: str,
+    provider_message_id: str, force_full: bool = False,
 ):
     """Same as extract-full, but streams live progress (Server-Sent Events):
     one frame per pipeline stage — unpack, format detected, each LLM call,
@@ -727,7 +733,7 @@ async def extract_full_streamed(
         async with SessionLocal() as db:
             row = await _email_row_or_404(db, provider_message_id)
             prior_row = await prior_message_for_merge(db, row)
-            res = await extract_full_email(db, row, prior_email=prior_row)
+            res = await extract_full_email(db, row, prior_email=prior_row, force_full=force_full)
             await datacache.bust_pipeline()
             return {
                 "staged": [_pipeline_out(t).model_dump(mode="json") for t in res["staged"]],

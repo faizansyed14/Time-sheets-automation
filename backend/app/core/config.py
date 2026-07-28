@@ -98,23 +98,58 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com"
     openai_timeout: int = 120
     openai_vision_model: str = "gpt-4o"
-    # First-pass sheet type + date-completeness classifier (cheap / fast).
-    openai_classify_model: str = "gpt-4o-mini"
     extraction_model: str = "gpt-4o"
-    vision_image_detail: str = "high"   # low | high — used for SCANS/photos
+    # Pass 2 (extract) detail — keep at "low" (cost); Pass 1 (classify) has
+    # its own, separate setting below since judging "what is this" doesn't
+    # need full resolution either.
+    vision_image_detail: str = "low"   # low | high
+
+    # ----- Two-pass extraction (see services/extract_email/{triage,thread}_prompt.py) -----
+    # Pass 1 judges "what is this / is it approved", not exact digits — low
+    # detail is enough and far cheaper.
+    pass1_image_detail: str = "low"
+    # Items per pass-1 call on a long thread. Every batch still sees every
+    # message body (for approval context); only the attachment slice differs.
+    pass1_batch_size: int = 5
+    # Images per pass-2 call — a thread confirming many/long sheets is split
+    # across calls rather than exceeding one request.
+    max_images_per_call: int = 12
+    pdf_max_pages: int = 12
+    img_max_dim: int = 1600            # px, longest side, for images sent to the model
+    # Images smaller than this are logos/icons/signature stamps — dropped
+    # before either pass ever sees them, no API call spent.
+    min_image_bytes: int = 60 * 1024
+    # A standalone picture attachment that survives the size filter still gets
+    # OCR'd (see extraction/ocr.py) as a free local check: fewer than this many
+    # characters and it's almost certainly a banner/graphic, not a document.
+    # Never applied to PDF pages — a scanned/image-only PDF can legitimately
+    # have almost no OCR-able text and still be real.
+    ocr_min_chars: int = 20
+    # How ATTACHMENTS reach the model (conversation text is always plain text
+    # regardless of this setting):
+    #   "image"  - render to page image(s) — scans, photos, screenshots, or
+    #              simply the configured default.
+    #   "native" - send only the file's own extracted text (embedded PDF text /
+    #              xlsx / docx) — cheaper, exact; falls back to an image
+    #              automatically if a PDF has no real text layer.
+    # Raster image attachments always go as images either way.
+    attachment_mode: str = "image"
+    # Convert xlsx/docx to page images via headless LibreOffice (already
+    # installed in this image) when ATTACHMENT_MODE is "image". Off by default
+    # upstream (source lab environment may not have LibreOffice); on here.
+    use_libreoffice: bool = True
 
     # ----- Cost / accuracy tuning -----
-    # Render PDFs at a lower DPI for the LLM: vision models gain nothing above
-    # ~150 DPI, and a smaller image = fewer tokens (esp. at high detail).
+    # Render PDFs at this DPI for both the LLM and human previews: vision
+    # models gain nothing above ~150 DPI, and a smaller image = fewer tokens.
     pdf_render_dpi: int = 150
-    # Born-digital sheets (text present) always send images at "low" detail in
-    # full_email_extract; scans/photos keep `vision_image_detail`.
     # Force valid JSON from supported OpenAI models (response_format json_object)
     # so a stray markdown fence / trailing text can't break parsing.
     vision_json_mode: bool = True
-    # Optional OCR "reader" to give scans/photos a text layer (none|tesseract).
-    # tesseract runs locally (pytesseract + tesseract-ocr) and is completely free.
-    ocr_provider: str = "none"
+    # OCR "reader" backing ocr_min_chars above and scan/photo text layers
+    # (none|tesseract). tesseract runs locally (pytesseract + tesseract-ocr),
+    # completely free.
+    ocr_provider: str = "tesseract"
     # Model for the Agentic Chat assistant (text → safe DB actions).
     agent_chat_model: str = "gpt-4o-mini"
     # Mask PII (email addresses, unambiguous phone numbers) in everything sent

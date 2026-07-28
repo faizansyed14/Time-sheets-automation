@@ -1,427 +1,749 @@
-"""Whole-thread extraction — TWO OpenAI calls for an entire conversation.
+"""Whole-thread extraction — a two-pass vision read over an entire conversation.
 
-Extract Email sends the complete thread: every message body (PII-scrubbed),
-every attachment, every image over MIN_IMAGE_BYTES, and any email attached
-inside an email, opened recursively. Then:
+Ported from the prompt lab (docs/timesheet_strong_prompt.ipynb): every message
+body, every attachment, and any email/message attached inside another one
+becomes its own `Item` with a stable [A#] key. Then:
 
-  PASS 1 — UNDERSTAND (triage_prompt.py). The vision model decides which items
-  are really timesheets, whose each one is, which client template it follows,
-  whether a manager approved (signature on the sheet, a screenshot, or wording
-  in the conversation), and what the thread is about. Logos and banners are
-  named as noise here so they never reach extraction.
+  PASS 1 — CLASSIFY (triage_prompt.py). Judges what each item IS: timesheet,
+  leave evidence, approval evidence, other, or noise — by structure, not by
+  matching a catalogue of known client templates. Also writes the one
+  plain-English thread summary.
 
-  PASS 2 — EXTRACT (thread_prompt.py). Only the sheets pass 1 validated are
-  read again, by a prompt that does nothing but transcribe names and leave
-  dates, with explicit handling for partial months, missing days and empty
-  columns.
+  PASS 2 — EXTRACT (thread_prompt.py). Reads only the items pass 1 confirmed,
+  transcribing not just leave but EVERY day of the period (working, weekend,
+  leave, or genuinely uncertain) — a full day-by-day account, not just a scan
+  for leave.
 
-One call asked to do both did neither well: sheets were invented from passing
-mentions while genuine grids were skimmed. Two focused prompts beat one that
-has to divide its attention.
+Pass 1 batches by ITEM COUNT (PASS1_BATCH_SIZE); pass 2 batches by IMAGE COUNT
+(MAX_IMAGES_PER_CALL) — a long thread with many confirmed sheets is split
+across several calls per pass rather than overflowing one request.
 
-The conversation summary is a product of pass 1 — there is no separate
-summarisation call.
-
-The result is normalised into the same sheet shape the existing grouping,
-staging and auto-accept path already consumes, so filing, the vault and the
-review queue are unchanged.
+There is no fallback: a vision model is mandatory (see the RuntimeError below
+if none is configured) and no per-sheet/template/mock pipeline exists anymore.
 """
 from __future__ import annotations
 
+import calendar
 import email as _email
 import email.policy
+import hashlib
+import os
+import re
 from dataclasses import dataclass, field
 
 from app.core.config import settings
-from app.core.pii import scrub_email_for_llm, scrub_text
-from app.models.email_message import EmailMessage
-from app.services.extract_email.constants import BUCKETS
+from app.core.pii import scrub_text
 from app.services.extract_email.progress import count_llm, emit
-from app.services.extract_email.sheet_cache import content_key
-from app.services.extract_email.sheet_normalizer import clean_dates
 
-# Hard ceilings so one pathological thread can't build an unsendable request.
-MAX_FILES = 25
-MAX_IMAGES = 25
-MAX_BODY_CHARS = 60_000
-IMAGE_TYPES = ("png", "jpg", "jpeg", "gif", "webp", "bmp")
-# How deep to open emails-inside-emails. A forward of a forward of a forward is
-# real; beyond this it is a mail loop, not a timesheet.
+# A forward of a forward of a forward is real; beyond this it is a mail loop,
+# not a timesheet. Applies to .eml/.msg attached as a FILE (not MIME-nested —
+# those are unwrapped for free by the normal MIME walk).
 MAX_EML_DEPTH = 4
-# A real screenshot of a leave-history/attendance app, a signed page, or an
-# approval message runs well into six figures of bytes. Anything under this is
-# a signature icon, a social-media button or a tracking pixel — never a
-# document worth a vision call. This is a size FLOOR only, applied to real
-# attachment/inline images; it never touches the body grid we render ourselves
-# (that is only ever rendered when a real <table> was found).
-MIN_IMAGE_BYTES = 30 * 1024
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff")
 
-# Where a conversation stands. Produced by pass 1 and shown in the inbox — the
-# reason there is no separate summarisation call any more.
 SUMMARY_STATUSES = (
-    "sheet_submitted",       # a timesheet arrived, nothing else yet
-    "awaiting_approval",     # someone has been ASKED to approve
-    "approved",              # a manager has approved
-    "correction_requested",  # a change was asked for
-    "chasing",               # reminder / follow-up, no new sheet
-    "other",
+    "sheet_submitted", "awaiting_approval", "approved",
+    "correction_requested", "chasing", "other",
 )
 
 
 @dataclass
-class ThreadPayload:
-    """Everything from one conversation, ready for a single model call."""
+class Item:
+    """One analysable thing in the thread: an attachment, or a message body."""
 
-    files: list[tuple[str, bytes, str]] = field(default_factory=list)   # (name, bytes, ftype)
-    images: list[tuple[str, bytes]] = field(default_factory=list)       # (name, bytes)
-    bodies: str = ""
-    manifest: list[str] = field(default_factory=list)
-    format_ids: list[str] = field(default_factory=list)
-    # name -> extracted text, kept for the deterministic coverage/auto-accept
-    # gate downstream (which reads sheet text, not the model's answer).
-    texts: dict[str, str] = field(default_factory=dict)
-    # (name, reason) — NOT sent to the model. Two different reasons that must
-    # not be conflated: "unsupported" (we can't read this type at all) vs
-    # "over_capacity" (a real file that would extract fine, but this thread
-    # already has MAX_FILES/MAX_IMAGES). The second one is a genuine capacity
-    # problem the user needs to know about, not a shrug-worthy filetype issue.
-    skipped: list[tuple[str, str]] = field(default_factory=list)
-    # name -> sha256 of its bytes. Drives the Extracted/New badge (see
-    # sheet_cache.py) — NOT a cache key; nothing is reused from a past run.
-    digests: dict[str, str] = field(default_factory=dict)
+    key: str                                  # "A1", "A2", ... — stable, model must echo it back
+    name: str                                 # filename, or "email body (message N)"
+    mime: str
+    msg_index: int                            # which message in the thread it came from
+    text: str = ""                            # extracted/native text (body, xlsx, docx, embedded PDF text)
+    images: list[bytes] = field(default_factory=list)   # rendered page JPEGs
+    inline: bool = False                      # embedded in body (cid) vs a real attachment
+    size: int = 0
+    send_mode: str = "n/a"
+    digest: str = ""                          # sha256 of the original bytes — Extracted/New badge only
 
 
-def _walk_parts(msg):
-    """Every leaf part, descending INTO forwarded mail so a timesheet attached
-    to a forwarded message is collected too."""
-    if msg.get_content_maintype() == "multipart":
-        for sub in msg.get_payload():
-            if hasattr(sub, "walk"):
-                yield from _walk_parts(sub)
-        return
-    if msg.get_content_maintype() == "message":
-        payload = msg.get_payload()
-        inner = payload[0] if isinstance(payload, list) and payload else None
-        if inner is not None:
-            yield from _walk_parts(inner)
-        return
-    yield msg
+@dataclass
+class Message:
+    index: int
+    depth: int
+    subject: str
+    frm: str
+    to: str
+    date: str
+    body: str = ""
 
 
-def collect_thread_payload(messages: list[tuple[str, bytes]]) -> ThreadPayload:
-    """Build the single-call payload from raw .eml bytes per thread message.
+@dataclass
+class Thread:
+    subject: str
+    messages: list[Message] = field(default_factory=list)
+    items: list[Item] = field(default_factory=list)
+    dropped: list[dict] = field(default_factory=list)   # items filtered out (size/OCR noise)
 
-    `messages` is [(label, eml_bytes)] oldest first. Everything attached is
-    kept for the MODEL to judge what is a signature icon and what is a pasted
-    approval screenshot — a filename or content-type heuristic is deliberately
-    not used for that call. The one exception is size: real images (leave-app
-    screenshots, signed pages) are never under MIN_IMAGE_BYTES, so images
-    below it are filtered before the call, not left for the model to decide.
-    """
-    from app.services.extraction.file_processor import (
-        _html_to_text,
-        detect_file_type,
-        eml_body_to_images,
-        extract_document_text,
-    )
-    from app.services.extract_email.formats import detect_format
+    @property
+    def n_images(self) -> int:
+        return sum(len(i.images) for i in self.items)
 
-    p = ThreadPayload()
-    body_chunks: list[str] = []
-    seen: set[bytes] = set()          # content hashes — a re-sent file goes once
-    import hashlib
 
-    def absorb(label: str, eml_bytes: bytes, depth: int = 0) -> None:
-        """Pull everything out of ONE message: body, attachments, and any
-        email attached inside it.
+def resolve_source(source: str, items: list[Item]) -> Item | None:
+    """Map a pass-1/pass-2 `source` label ("[A#] name" or a bare name) back to
+    its Item. The [A#] key is unambiguous by construction; the name-matching
+    fallbacks only cover a model that dropped the key from its answer."""
+    if not source:
+        return None
 
-        Recursive because a forwarded timesheet can be buried arbitrarily
-        deep — an .eml attached to an .eml attached to the thread. MIME-nested
-        forwards are handled by _walk_parts, but an .eml attached as a FILE
-        (Outlook sends these as application/octet-stream) is just bytes, so it
-        has to be re-parsed here or the sheet inside is lost entirely.
-        """
-        if depth > MAX_EML_DEPTH:
-            return
+    s = str(source).strip()
+    m = re.search(r"A(\d+)", s)
+    if m:
+        for it in items:
+            if it.key.lower() == f"a{m.group(1)}":
+                return it
+    low = s.lower()
+    for it in items:
+        if it.name.lower() == low:
+            return it
+    for it in items:
+        if it.name.lower() in low or low in it.name.lower():
+            return it
+    return None
+
+
+def _content_digest(payload: bytes) -> str:
+    return hashlib.sha256(payload or b"").hexdigest()
+
+
+def msg_to_eml_bytes(payload: bytes) -> bytes | None:
+    """Outlook .msg -> raw .eml bytes, via extract-msg. Returns None if the
+    file can't be parsed (corrupt / not really a .msg)."""
+    import tempfile
+
+    try:
+        import extract_msg
+    except ImportError:
+        return None
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".msg", delete=False) as f:
+            f.write(payload)
+            path = f.name
+        msg = extract_msg.Message(path)
         try:
-            msg = _email.message_from_bytes(eml_bytes, policy=_email.policy.compat32)
-        except Exception:
-            return
-
-        subject = msg.get("Subject") or ""
-
-        # Body text. The plain-text alternative is often just the covering note
-        # while the TIMESHEET ITSELF is a pasted HTML table — measured on real
-        # mail: 10 <table> elements in the HTML part, zero in the plain part.
-        # Sending only text/plain would drop the sheet entirely, so the HTML is
-        # flattened (rows → lines, cells → " | ") and used when it is richer.
-        plain, html = "", ""
-        for part in _walk_parts(msg):
-            disp = str(part.get("Content-Disposition", "")).lower()
-            if "attachment" in disp:
-                continue
-            ct = part.get_content_type()
-            if ct not in ("text/plain", "text/html"):
-                continue
+            return msg.export()
+        finally:
+            msg.close()
+    except Exception:
+        return None
+    finally:
+        if path:
             try:
-                raw = part.get_payload(decode=True) or b""
-                text = raw.decode(part.get_content_charset() or "utf-8", "replace")
-            except Exception:
-                continue
-            if ct == "text/plain" and not plain:
-                plain = text
-            elif ct == "text/html" and not html:
-                html = text
-
-        body_for_model = plain
-        has_grid = "<table" in (html or "").lower()
-        if html:
-            flat = _html_to_text(html)
-            if len(flat.strip()) > len((plain or "").strip()):
-                body_for_model = flat
-
-        subj_s, body_s = scrub_email_for_llm(subject, body_for_model)
-        body_chunks.append(f"===== MESSAGE: {label} =====\nSubject: {subj_s}\n\n{body_s}".strip())
-
-        # A real pasted grid also goes up as a picture: flattening can run
-        # cells together, and the rendered image keeps the visual layout
-        # (colour-coded leave legends included). Rendered AFTER scrubbing, so
-        # redacted values are pixels, never recoverable text.
-        if has_grid and len(p.images) < MAX_IMAGES:
-            try:
-                for idx, img in enumerate(eml_body_to_images(eml_bytes)[:2], 1):
-                    if len(p.images) >= MAX_IMAGES:
-                        break
-                    iname = f"{label} — body grid {idx}"
-                    p.images.append((iname, img))
-                    p.manifest.append(f"{iname} (rendered email body, {len(img) // 1024} KB)")
-                    p.texts[iname] = body_s
-            except Exception:
+                os.unlink(path)
+            except OSError:
                 pass
 
-        for part in _walk_parts(msg):
-            disp = str(part.get("Content-Disposition", "")).lower()
-            ct = part.get_content_type()
-            fname = part.get_filename() or ""
-            if ct in ("text/plain", "text/html") and "attachment" not in disp:
+
+def _pdf_pages(payload: bytes) -> tuple[list[bytes], str]:
+    """Per-page JPEGs (one image per page, never stitched) + the PDF's own
+    concatenated text layer, both capped at settings.pdf_max_pages."""
+    import fitz
+
+    from app.services.extraction.file_processor import pdf_to_page_images
+
+    texts: list[str] = []
+    try:
+        doc = fitz.open(stream=payload, filetype="pdf")
+        try:
+            for i in range(min(doc.page_count, settings.pdf_max_pages)):
+                texts.append(doc.load_page(i).get_text("text") or "")
+        finally:
+            doc.close()
+    except Exception:
+        texts = []
+    try:
+        images = pdf_to_page_images(payload, dpi=settings.pdf_render_dpi, max_pages=settings.pdf_max_pages)
+    except Exception:
+        images = []
+    text = scrub_text("\n\n".join(t.strip() for t in texts if t.strip()))
+    return images, text
+
+
+def _fill_pdf_item(it: Item, payload: bytes) -> None:
+    images, text = _pdf_pages(payload)
+    it.text = text
+    if settings.attachment_mode == "native":
+        if len(text.strip()) >= 20:
+            it.send_mode = "native"
+            return
+        it.images = images
+        it.send_mode = "image (fallback - no text layer)"
+        return
+    it.images = images
+    it.send_mode = "image"
+
+
+def _office_pages(payload: bytes, ext: str) -> list[bytes]:
+    """xlsx/docx -> page images via headless LibreOffice (PDF as the
+    intermediate step, then the same per-page renderer as a native PDF).
+    Only attempted when ATTACHMENT_MODE is 'image' and USE_LIBREOFFICE is on."""
+    if settings.attachment_mode != "image" or not settings.use_libreoffice:
+        return []
+    from app.services.extraction.file_processor import _office_to_pdf_bytes, pdf_to_page_images
+
+    body = payload
+    if ext.lstrip(".") == "xlsx":
+        from app.services.extraction.file_processor import _autofit_xlsx_columns
+        body = _autofit_xlsx_columns(body)
+    try:
+        pdf = _office_to_pdf_bytes(body, ext.lstrip("."))
+    except Exception:
+        pdf = None
+    if not pdf:
+        return []
+    try:
+        return pdf_to_page_images(pdf, dpi=settings.pdf_render_dpi, max_pages=settings.pdf_max_pages)
+    except Exception:
+        return []
+
+
+def _fill_office_item(it: Item, payload: bytes, ftype: str, ext: str) -> None:
+    from app.services.extraction.file_processor import extract_document_text
+
+    try:
+        it.text = scrub_text(extract_document_text(ftype, payload) or "")
+    except Exception:
+        it.text = ""
+    images = _office_pages(payload, ext)
+    it.images = images
+    it.send_mode = "image + native text" if images else "native"
+
+
+def _image_jpeg(payload: bytes) -> bytes | None:
+    from app.services.extraction.file_processor import image_to_images
+
+    try:
+        out = image_to_images(payload, max_side=settings.img_max_dim)
+        return out[0] if out else None
+    except Exception:
+        return None
+
+
+def _thumb_uri(jpeg_bytes: bytes | None, *, max_side: int = 96) -> str | None:
+    """Tiny JPEG data-URI for the live Extract UI. Returns None on failure."""
+    if not jpeg_bytes:
+        return None
+    import base64
+    import io
+
+    from PIL import Image
+
+    try:
+        img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+        w, h = img.size
+        scale = min(1.0, max_side / max(w, h))
+        if scale < 1.0:
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=45, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return None
+
+
+def _item_thumb(it: Item) -> str | None:
+    return _thumb_uri(it.images[0]) if it.images else None
+
+
+# A whole "Approved By: <name>" / "Approval Date: <date>" line (either word
+# order) is approval metadata end-to-end — strip the label AND its value, or
+# the approver's name/date leaks through as content the unsigned copy never
+# had. Matched and stripped before the standalone-word pass below.
+_APPROVAL_LINE_RE = re.compile(
+    r"(?i)\b(?:approved\s*by|approval\s*date|date\s*(?:of\s*)?approval)\s*:?\s*[^\n]*"
+)
+# Standalone tokens that flip between an unsigned timesheet and the same
+# sheet after manager approval / regenerate — strip before near-dup compare.
+# Includes generic workflow-status words (status/submitted/pending/present)
+# since those are exactly what differs between "awaiting sign-off" and
+# "signed" copies of one sheet, the same way approved/signed/manager are.
+_APPROVAL_NOISE_RE = re.compile(
+    r"(?i)\b("
+    r"approval|approved|approver|"
+    r"signature|signed|signatory|stamp|"
+    r"line\s*manager|manager|\blm\b|"
+    r"status|submitted|pending|present"
+    r")\b"
+)
+
+
+def _is_email_body(it: Item) -> bool:
+    return (it.name or "").lower().startswith("email body")
+
+
+def _sheet_text_fingerprint(text: str) -> str:
+    """Normalize OCR/PDF text for near-dup: collapse whitespace, drop
+    approval/sign/manager/workflow-status noise that differs between unsigned
+    vs signed regenerations of the same timesheet."""
+    t = (text or "").lower()
+    t = _APPROVAL_LINE_RE.sub(" ", t)
+    t = _APPROVAL_NOISE_RE.sub(" ", t)
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    return " ".join(t.split())
+
+
+def _texts_near_match(a: str, b: str, *, min_chars: int = 40, ratio: float = 0.92) -> bool:
+    """True when two sheets share the same core content after approval-noise
+    strip (exact fingerprint or very high SequenceMatcher ratio)."""
+    from difflib import SequenceMatcher
+
+    fa, fb = _sheet_text_fingerprint(a), _sheet_text_fingerprint(b)
+    if not fa or not fb:
+        return False
+    if fa == fb:
+        return True
+    if min(len(fa), len(fb)) < min_chars:
+        return False
+    return SequenceMatcher(None, fa, fb).ratio() >= ratio
+
+
+def _approval_signal_score(it: Item) -> tuple:
+    """Prefer the copy that carries manager approval / sign. Higher = keep."""
+    t = (it.text or "").lower()
+    score = 0
+    for kw, w in (
+        ("approved by", 8),
+        ("date of approval", 4),
+        ("approved", 3),
+        ("signature", 3),
+        ("signed", 3),
+        ("approver", 3),
+        ("line manager", 2),
+        ("manager", 1),
+    ):
+        if kw in t:
+            score += w
+    # Later reply often has the regenerated signed PDF.
+    score += it.msg_index * 2
+    # Signatures add a few KB; cap so size alone cannot dominate.
+    score += min(max(it.size, 0) // 2000, 40)
+    return (score, len(it.text or ""), it.msg_index, it.key)
+
+
+def _record_dropped(th: Thread, entry: dict, image: bytes | None) -> None:
+    """Append to th.dropped (unchanged, powers the live Extract UI's ≤96px
+    thumbnail) and — only when a debug capture is active (see
+    debug_capture.py) — also save the FULL-resolution image so a debug run
+    can show what was actually dropped, not just a thumbnail."""
+    th.dropped.append(entry)
+    from app.services.extract_email import debug_capture
+    cap = debug_capture.get_capture()
+    if cap is None:
+        return
+    image_path = None
+    if image:
+        from app.services.pipeline import raw_store
+        fname = f"dropped-{len(cap.dropped_items)}-{entry.get('name') or 'item'}"
+        image_path = raw_store.save_raw(f"debug/{cap.run_id}", fname, image)
+    debug_capture.record_dropped(**entry, image_path=image_path)
+
+
+def _dedupe_sheet_items(th: Thread) -> None:
+    """Collapse byte-identical and near-identical sheet attachments.
+
+    Exact same bytes → keep one. Same core OCR/PDF text with only small
+    manager-sign / Approved By diffs → keep the stronger approval copy,
+    drop the other into ``th.dropped`` with ``filter=dup`` for the Extract UI.
+    Email bodies are never merged.
+    """
+    keepers: list[Item] = []
+    for it in th.items:
+        if _is_email_body(it):
+            keepers.append(it)
+            continue
+        matched_idx: int | None = None
+        exact = False
+        for i, kept in enumerate(keepers):
+            if _is_email_body(kept):
                 continue
+            if it.digest and kept.digest and it.digest == kept.digest:
+                matched_idx = i
+                exact = True
+                break
+            if _texts_near_match(it.text, kept.text):
+                matched_idx = i
+                exact = False
+                break
+        if matched_idx is None:
+            keepers.append(it)
+            continue
+        kept = keepers[matched_idx]
+        if _approval_signal_score(it) > _approval_signal_score(kept):
+            winner, loser = it, kept
+            keepers[matched_idx] = it
+        else:
+            winner, loser = kept, it
+        reason = (
+            f"duplicate of [{winner.key}] {winner.name} (identical bytes)"
+            if exact
+            else (
+                f"duplicate of [{winner.key}] {winner.name} "
+                "(same sheet text; kept version with stronger approval/sign)"
+            )
+        )
+        _record_dropped(th, {
+            "name": loser.name,
+            "mime": loser.mime,
+            "size": loser.size,
+            "msg_index": loser.msg_index,
+            "key": loser.key,
+            "filter": "dup",
+            "reason": reason,
+            "kept_key": winner.key,
+            "kept_name": winner.name,
+            "thumb": _item_thumb(loser),
+        }, loser.images[0] if loser.images else None)
+    th.items = keepers
+
+
+def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
+    """Build the Item/Message/Thread model for a whole conversation.
+
+    `messages` is [(label, eml_bytes)] oldest first — every message of the
+    conversation already fetched as its own raw .eml (see
+    thread_collect.collect_thread_emls). Each is walked for its MIME tree,
+    descending into forwarded messages (MIME-nested message/rfc822 parts, or
+    an .eml/.msg attached as a plain FILE — Outlook does both) up to
+    MAX_EML_DEPTH, so a timesheet buried inside a forward-of-a-forward is
+    never silently dropped.
+    """
+    from app.services.extraction.file_processor import _html_to_text, detect_file_type
+
+    th = Thread(subject=messages[0][0] if messages else "(no subject)")
+    counter = {"n": 0}
+
+    def new_key() -> str:
+        counter["n"] += 1
+        return f"A{counter['n']}"
+
+    def add_attachment(name: str, payload: bytes, ctype: str, msg_index: int,
+                        inline: bool, depth: int) -> None:
+        if not payload:
+            return
+        ext = os.path.splitext(name)[1].lower()
+        is_image = ext in IMAGE_EXTS or (ctype or "").startswith("image/")
+
+        # Size filter FIRST — logos, signature icons and social buttons never
+        # reach any further processing (no OCR call spent on them either).
+        if is_image and settings.min_image_bytes and len(payload) < settings.min_image_bytes:
+            size_jpeg = _image_jpeg(payload)
+            _record_dropped(th, {
+                "name": name, "mime": ctype, "size": len(payload), "msg_index": msg_index,
+                "filter": "size",
+                "reason": f"image under {settings.min_image_bytes // 1024}KB",
+                "thumb": _thumb_uri(size_jpeg),
+            }, size_jpeg)
+            return
+
+        # An email attached as a FILE (not MIME-nested) — unwrap recursively,
+        # same as a forward the mail structure already nests for free.
+        if ext in (".eml", ".msg"):
+            if depth + 1 > MAX_EML_DEPTH:
+                return
+            sub_bytes = msg_to_eml_bytes(payload) if ext == ".msg" else payload
+            if not sub_bytes:
+                return
+            try:
+                sub = _email.message_from_bytes(sub_bytes, policy=_email.policy.default)
+            except Exception:
+                return
+            walk(sub, depth + 1)
+            return
+
+        ftype = detect_file_type(name, payload)
+        it = Item(key=new_key(), name=name or "unnamed", mime=ctype or "", msg_index=msg_index,
+                  inline=inline, size=len(payload), digest=_content_digest(payload))
+
+        if ext == ".pdf" or ftype == "pdf":
+            _fill_pdf_item(it, payload)
+        elif is_image or ftype == "image":
+            jpeg = _image_jpeg(payload)
+            if jpeg is None:
+                return
+            from app.services.extraction.ocr import ocr_status, ocr_text
+            # Only apply the noise filter when OCR can actually run — the
+            # reader returns "" (not an error) on a missing engine binary,
+            # which would otherwise read as "no text, drop it" and silently
+            # discard every real picture attachment. No reader available =
+            # every picture attachment is kept, exactly like the notebook.
+            if ocr_status() == "ready":
+                ocr = ocr_text([jpeg], payload, "image")
+                if len(ocr.strip()) < settings.ocr_min_chars:
+                    _record_dropped(th, {
+                        "name": name, "mime": ctype, "size": len(payload), "msg_index": msg_index,
+                        "filter": "ocr",
+                        "ocr_chars": len(ocr.strip()),
+                        "reason": f"OCR found only {len(ocr.strip())} char(s) "
+                                  f"(<{settings.ocr_min_chars}) - likely a logo/icon",
+                        "thumb": _thumb_uri(jpeg),
+                    }, jpeg)
+                    return
+            it.images = [jpeg]
+            it.send_mode = "image (only option for a picture)"
+        elif ext in (".xlsx", ".xlsm", ".xls") or ftype == "xlsx":
+            _fill_office_item(it, payload, "xlsx", ext or ".xlsx")
+        elif ext == ".csv":
+            it.text = scrub_text(payload.decode("utf-8", "replace")[:20000])
+            it.send_mode = "native"
+        elif ext == ".docx" or ftype == "docx":
+            _fill_office_item(it, payload, "docx", ext or ".docx")
+        elif ext == ".txt":
+            it.text = scrub_text(payload.decode("utf-8", "replace")[:20000])
+            it.send_mode = "native"
+        else:
+            it.text = f"[unsupported attachment type {ctype or ftype or 'unknown'}]"
+        th.items.append(it)
+
+    def walk(msg, depth: int) -> None:
+        msg_index = len(th.messages)
+        m = Message(index=msg_index, depth=depth,
+                    subject=str(msg.get("Subject") or ""),
+                    frm=scrub_text(str(msg.get("From") or "")),
+                    to=scrub_text(str(msg.get("To") or "")),
+                    date=str(msg.get("Date") or ""))
+        th.messages.append(m)
+        plain: list[str] = []
+        html_parts: list[str] = []
+
+        def handle(part) -> None:
+            ctype = part.get_content_type()
+            disp = part.get_content_disposition()
+            if ctype == "message/rfc822":
+                payload = part.get_payload()
+                sub = payload[0] if isinstance(payload, list) and payload else payload
+                if sub is not None and depth + 1 <= MAX_EML_DEPTH:
+                    walk(sub, depth + 1)
+                return
+            if part.is_multipart():
+                for p in part.iter_parts():
+                    handle(p)
+                return
+            if ctype == "text/plain" and disp != "attachment":
+                try:
+                    plain.append(part.get_content())
+                except Exception:
+                    pass
+                return
+            if ctype == "text/html" and disp != "attachment":
+                try:
+                    html_parts.append(part.get_content())
+                except Exception:
+                    pass
+                return
+            fname = part.get_filename() or "unnamed"
             try:
                 payload = part.get_payload(decode=True) or b""
             except Exception:
-                continue
-            if not payload:
-                continue
+                payload = b""
+            is_inline = (disp == "inline") or bool(part.get("Content-Id"))
+            add_attachment(fname, payload, ctype, msg_index, is_inline, depth)
 
-            digest = hashlib.sha256(payload).digest()
-            if digest in seen:
-                continue
-            seen.add(digest)
+        handle(msg)
+        # Conversation text is always plain text, never rendered to an image.
+        # A pasted timesheet grid usually lives in the HTML alternative, not
+        # the plain one — prefer whichever carries more content.
+        body = "\n".join(plain).strip()
+        html_flat = _html_to_text("\n".join(html_parts)) if html_parts else ""
+        if html_flat and len(html_flat.strip()) > len(body):
+            body = html_flat
+        m.body = scrub_text(body)[:12000]
 
-            ftype = detect_file_type(fname, payload)
-            name = fname or f"part-{len(p.manifest) + 1}"
+    for _label, eml_bytes in messages:
+        try:
+            root = _email.message_from_bytes(eml_bytes, policy=_email.policy.default)
+        except Exception:
+            continue
+        walk(root, 0)
 
-            if ftype in ("pdf", "docx", "xlsx"):
-                if len(p.files) >= MAX_FILES:
-                    p.skipped.append((name, "over_capacity"))
-                    continue
-                p.digests[name] = content_key(payload)
-                p.files.append((name, payload, ftype))
-                p.manifest.append(f"{name} ({ftype}, {len(payload) // 1024} KB)")
-                try:
-                    text = extract_document_text(ftype, payload) or ""
-                except Exception:
-                    text = ""
-                p.texts[name] = text
-                spec = detect_format(text, name, subject)
-                if spec.id != "generic":
-                    p.format_ids.append(spec.id)
-            elif ftype == "image" or (ct or "").startswith("image/") or \
-                    fname.lower().endswith(tuple(f".{e}" for e in IMAGE_TYPES)):
-                if len(payload) < MIN_IMAGE_BYTES:
-                    p.skipped.append((name, "too_small"))
-                    continue
-                if len(p.images) >= MAX_IMAGES:
-                    p.skipped.append((name, "over_capacity"))
-                    continue
-                p.digests[name] = content_key(payload)
-                p.images.append((name, payload))
-                p.manifest.append(f"{name} (image, {len(payload) // 1024} KB)")
-            elif ftype == "eml" or fname.lower().endswith(".eml"):
-                # An email attached as a FILE. Not MIME-nested, so _walk_parts
-                # never sees inside it — re-parse it here or the timesheet it
-                # carries is silently dropped (measured: it was).
-                p.manifest.append(f"{name} (attached email — opened, contents below)")
-                absorb(f"{label} › {name}", payload, depth + 1)
-            else:
-                # Unknown type: still tell the model it existed.
-                p.manifest.append(f"{name} ({ftype or ct}, not sent — unsupported type)")
-                p.skipped.append((name, "unsupported_type"))
-
-    for label, eml_bytes in messages:
-        absorb(label, eml_bytes)
-
-    p.bodies = scrub_text("\n\n".join(body_chunks))[:MAX_BODY_CHARS]
-    p.format_ids = list(dict.fromkeys(p.format_ids))
-    return p
+    # Every message's body becomes its own item too, so pass 1 can classify a
+    # pasted grid or a pasted approval note the same as any attachment — as
+    # plain text, never as an image.
+    for m in th.messages:
+        if m.body.strip():
+            th.items.append(Item(key=new_key(), name=f"email body (message {m.index + 1})",
+                                 mime="text/plain", msg_index=m.index, text=m.body))
+    # Collapse re-attached / regenerated copies of the same timesheet before
+    # pass 1 — identical bytes or same core OCR with only manager-sign diffs.
+    _dedupe_sheet_items(th)
+    return th
 
 
-def thread_call_available() -> bool:
-    """True when the one-call thread read can actually run.
+def require_vision_configured() -> tuple[str, str]:
+    """(api_key, model) — raises a clear error if no vision model is set up.
 
-    It has no local equivalent — the whole design is "one model reads the whole
-    conversation" — so callers must check this and fall back to the per-sheet
-    pipeline (which has a local engine) instead of reporting an empty email.
-    """
+    There is no fallback pipeline: extraction only runs against the
+    configured vision model."""
     from app.services.extraction import vision_client
 
-    key = vision_client.openai_api_key() or ""
-    return (settings.extraction_engine == "vision"
-            and bool(key) and key.lower() != "change-me")
+    api_key = vision_client.openai_api_key()
+    if not api_key or api_key.lower() == "change-me":
+        raise RuntimeError(
+            "AI extraction is not configured — set OPENAI_API_KEY (and LLM_PROVIDER) "
+            "in the environment before running Extract Email or Upload.")
+    model = vision_client.model_for(vision_client.vision_provider(), "vision")
+    return api_key, model
 
 
-BODY_ALIASES = ("email body", "body", "message body", "(email body)")
+_KINDS = ("timesheet", "leave_certificate", "approval", "other")
 
 
-def resolve_source(source: str, payload: "ThreadPayload") -> list[str]:
-    """Payload item name(s) a pass-1 `source` refers to.
-
-    Pass 1 is told to name the email body "email body", but the rendered body
-    grid is stored under a per-message name ("<subject>.eml — body grid 1").
-    Matching those two strings literally found nothing, so pass 2 was handed an
-    empty attachment list and reported no leave at all for body-pasted sheets —
-    silently, because an empty answer looks like a clean one.
-    """
-    name = (source or "").strip()
-    if not name:
-        return []
-    known = {n for n, _, _ in payload.files} | {n for n, _ in payload.images}
-    if name in known:
-        return [name]
-    if name.lower() in BODY_ALIASES:
-        return [n for n, _ in payload.images if "body grid" in n]
-    # Last resort: the model shortened or lengthened the label slightly.
-    lowered = name.lower()
-    return [n for n in known if lowered in n.lower() or n.lower() in lowered]
-
-
-def normalise_triage(raw: dict, payload: "ThreadPayload") -> tuple[list[dict], dict, dict, list[str]]:
-    """Pass-1 JSON -> (items, approval, summary, noise).
-
-    `items` keeps only what pass 1 could evidence as a real document. A
-    "timesheet" with no quoted dated row is downgraded here rather than
-    trusted: the prompt asks for evidence, but a prompt is a request, and this
-    decides what reaches payroll.
-    """
-    items: list[dict] = []
-    for it in raw.get("items") or []:
+def _normalise_pass1_items(raw_items: list) -> list[dict]:
+    out: list[dict] = []
+    for it in raw_items:
         if not isinstance(it, dict):
             continue
-        source = str(it.get("source") or "").strip() or "(unknown)"
         kind = str(it.get("kind") or "other").lower()
-        if kind not in ("timesheet", "leave_certificate", "approval", "other"):
+        if kind not in _KINDS:
             kind = "other"
-        evidence = str(it.get("evidence") or "").strip()
-
-        # A timesheet claim must come with a row the model actually read.
-        if kind == "timesheet" and not evidence:
-            kind = "other"
-
-        items.append({
-            "source": source,
+        out.append({
+            "source": str(it.get("source") or "").strip() or "(unknown)",
             "kind": kind,
-            "format_id": str(it.get("format_id") or "generic"),
             "employee_name": (str(it.get("employee_name")).strip() or None)
             if it.get("employee_name") else None,
             "employee_id": (str(it.get("employee_id")).strip() or None)
             if it.get("employee_id") else None,
             "period_hint": str(it.get("period_hint") or "").strip(),
-            "evidence": evidence,
+            "evidence": str(it.get("evidence") or "").strip(),
             "manager_signature": bool(it.get("manager_signature")),
             "signature_evidence": str(it.get("signature_evidence") or "").strip(),
+            "signature_is_named_only": bool(it.get("signature_is_named_only")),
             "notes": str(it.get("notes") or "").strip(),
         })
+    return out
 
-    ap = raw.get("approval") or {}
-    detected = bool(ap.get("detected"))
-    evidence = str(ap.get("evidence") or "").strip()
-    where = str(ap.get("where") or ("none" if not detected else "")).strip()
-    source = str(ap.get("source") or "")
 
-    # A signed sheet IS an approval. The prompt says so, but the model has
-    # reported `manager_signature: true` on an item while leaving
-    # `approval.detected` false in the same answer — and that inconsistency
-    # holds an already-approved timesheet for review. Its own per-item finding
-    # is the more specific observation, so it wins.
-    if not detected:
-        signed = next((i for i in items if i["manager_signature"]), None)
-        if signed:
-            detected = True
-            where = "sheet"
-            evidence = (signed["signature_evidence"]
-                        or f"manager signature on {signed['source']}")
-            source = signed["source"]
+def _derive_approval(triage: list[dict]) -> dict:
+    """Approval is derived from the model's own per-item verdicts, not
+    re-detected separately: either an item IS approval evidence
+    (kind == "approval"), or a timesheet/leave_certificate carries its own
+    approval signal (manager_signature).
 
-    approval = {
-        "detected": detected,
-        "detail": (f"Approval found: {evidence[:200]}" if detected and evidence
-                   else "Approval found." if detected
-                   else "No manager approval found in this thread."),
-        "evidence": evidence,
-        "source": source,
-        "where": where,
-    }
+    A name typed next to "Approved by:" with no signature/stamp/status mark
+    (signature_is_named_only) is NOT enough on its own to detect approval -
+    anyone can type a name into a field. It still gets recorded and surfaced
+    to the reviewer (weak_evidence + a note naming what was found), but only
+    a real signal (a stamp, a chain of approvers, a manager's own reply)
+    flips `detected`. A genuinely strong signal elsewhere in the same thread
+    still wins regardless of a weak one also being present."""
+    approval = {"detected": False, "evidence": "", "source": "", "where": "none", "weak_evidence": False}
+    rank = {"sheet": 2, "conversation": 1, "none": 0}
+    weak_detail = ""
+    for m in triage:
+        sig = bool(m.get("manager_signature"))
+        ev = m.get("signature_evidence") or m.get("evidence") or ""
+        if sig and m.get("signature_is_named_only"):
+            if not approval["weak_evidence"]:
+                approval["weak_evidence"] = True
+                weak_detail = (
+                    f"Only a name was found ({ev[:200] or 'no detail given'}) near an "
+                    f"approval field on {m.get('source')} - no signature, stamp, or "
+                    "status mark. Needs manual verification.")
+            continue
+        if m.get("kind") == "approval" or sig:
+            where = "sheet" if sig else "conversation"
+            if rank[where] >= rank[approval["where"]]:
+                approval = {**approval, "detected": True, "evidence": ev,
+                           "source": m.get("source"), "where": where}
+    approval["detail"] = (
+        f"Approval found: {approval['evidence'][:200]}" if approval["detected"] and approval["evidence"]
+        else "Approval found." if approval["detected"]
+        else weak_detail if approval["weak_evidence"]
+        else "No manager approval found in this thread.")
+    return approval
 
-    s = raw.get("summary") or {}
-    status = str(s.get("status") or "other").lower()
-    if status not in SUMMARY_STATUSES:
-        status = "other"
-    summary = {
-        "headline": str(s.get("headline") or "").strip(),
+
+def _build_summary(triage: list[dict], approval: dict, thread_summary: str, n_batches: int) -> dict:
+    n_ts = sum(1 for m in triage if m["kind"] == "timesheet")
+    n_cert = sum(1 for m in triage if m["kind"] == "leave_certificate")
+    if n_ts + n_cert == 0:
+        headline, status = "No timesheet or leave evidence identified.", "other"
+    elif approval["detected"]:
+        headline, status = f"{n_ts} timesheet(s), {n_cert} leave record(s) — approval detected.", "approved"
+    else:
+        headline, status = (f"{n_ts} timesheet(s), {n_cert} leave record(s) — "
+                            f"no approval detected yet."), "awaiting_approval"
+    # `narrative` is what ThreadSummaryBox shows as the prose body — use the
+    # model's thread_summary (2–4 sentences). Call-count stays as a footnote.
+    prose = (thread_summary or "").strip() or (
+        f"Pass 1 ({n_batches} call(s)): {len(triage)} item(s) reviewed.")
+    return {
+        "headline": headline,
         "status": status,
-        "narrative": str(s.get("narrative") or "").strip(),
-        "action_needed": str(s.get("action_needed") or "").strip(),
+        "thread_summary": prose,
+        "narrative": prose,
+        "pass1_note": f"Pass 1 ({n_batches} call(s)): {len(triage)} item(s) reviewed.",
+        "action_needed": "Spot-check any 'other' items and any verdict you disagree with.",
     }
 
-    noise = [str(n) for n in (raw.get("noise") or []) if str(n).strip()]
-    return items, approval, summary, noise
+
+def _enrich_thread_summary(
+    summary_obj: dict, *, triage: list[dict], approval: dict,
+    message_count: int, model: str,
+) -> dict:
+    """Full ThreadSummary shape the Inbox / Extract UI both render."""
+    from datetime import datetime, timezone
+
+    data_items = [t for t in triage if t.get("kind") in ("timesheet", "leave_certificate")]
+    employees = [t.get("employee_name") for t in data_items if t.get("employee_name")]
+    periods = [t.get("period_hint") for t in data_items if t.get("period_hint")]
+    return {
+        **summary_obj,
+        "timesheet_sent": bool(data_items),
+        "approval_requested": summary_obj.get("status") == "awaiting_approval",
+        "approval_given": bool(approval.get("detected")),
+        "employee": ", ".join(dict.fromkeys(e for e in employees if e)),
+        "period": next(iter(dict.fromkeys(p for p in periods if p)), ""),
+        "message_count": message_count,
+        "model": model,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
-def _match_triage_item(source: str, triage: list[dict], payload: "ThreadPayload") -> dict:
-    """Map a pass-2 sheet label back to its pass-1 triage row."""
-    by_source = {t["source"]: t for t in triage}
-    if source in by_source:
-        return by_source[source]
-    hits = set(resolve_source(source, payload))
-    if hits:
-        for t in triage:
-            if set(resolve_source(t["source"], payload)) & hits:
-                return t
-    lowered = source.lower()
-    for t in triage:
-        ts = t["source"].lower()
-        if lowered in ts or ts in lowered:
-            return t
-    return {}
+def _ui_pass_item(t: dict, items: list[Item]) -> dict:
+    it = resolve_source(t.get("source") or "", items)
+    return {
+        # "source" stays the raw [A#] label (matches the model's own JSON,
+        # useful for debugging); "name" is the real attachment/body name for
+        # the live Extract UI to show instead — "[A11]" means nothing to a
+        # reviewer watching the run happen.
+        "source": t["source"], "name": it.name if it is not None else t["source"],
+        "kind": t["kind"],
+        "employee": t.get("employee_name"), "employee_id": t.get("employee_id"),
+        "period": t.get("period_hint"),
+        "signature": bool(t.get("manager_signature")),
+        "notes": t.get("notes") or "",
+        "thumb": _item_thumb(it) if it is not None else None,
+        "key": it.key if it is not None else None,
+    }
 
 
-def normalise_extraction(
-    raw: dict, triage: list[dict], payload: "ThreadPayload",
-) -> list[dict]:
-    """Pass-2 JSON -> the sheet shape grouping/staging already consume.
-
-    Identity and kind come from pass 1 (which had the whole conversation in
-    view); dates and leave come from pass 2 (which read the sheet closely).
-    Where pass 2 reports a different printed name, it wins — it was looking
-    straight at the header.
+def _normalise_pass2_sheets(raw_sheets: list, triage: list[dict], items: list[Item]) -> list[dict]:
+    """Pass-2 JSON -> the sheet shape grouping.py consumes. Identity/kind come
+    from pass 1 (whole-conversation context); the day-by-day account comes
+    from pass 2 (which read the item closely). Where pass 2 reports a
+    different printed name, it wins — it was looking straight at the header.
     """
     by_source = {t["source"]: t for t in triage}
     sheets: list[dict] = []
-
-    for s in raw.get("sheets") or []:
+    for s in raw_sheets:
         if not isinstance(s, dict):
             continue
         source = str(s.get("source") or "").strip() or "(unknown)"
-        t = by_source.get(source) or _match_triage_item(source, triage, payload)
+        t = by_source.get(source)
+        if t is None:
+            it = resolve_source(source, items)
+            if it is not None:
+                t = next((tt for tt in triage if resolve_source(tt["source"], items) is it), {})
+            else:
+                t = {}
 
         try:
             month = int(s.get("month")) if s.get("month") else None
@@ -434,237 +756,294 @@ def normalise_extraction(
         except (TypeError, ValueError):
             year = None
 
-        buckets = {b: clean_dates(s.get(b), month, year) for b in BUCKETS}
-        try:
-            days_covered = max(0, int(s.get("days_covered") or 0))
-        except (TypeError, ValueError):
-            days_covered = 0
-        missing = []
-        for d in s.get("missing_days") or []:
-            try:
-                n = int(d)
-                if 1 <= n <= 31:
-                    missing.append(n)
-            except (TypeError, ValueError):
-                pass
-        period_type = str(s.get("period_type") or "unknown").lower()
-        if period_type not in ("full_month", "half_month", "week", "partial", "unknown"):
-            period_type = "unknown"
-
-        kind = t.get("kind", "timesheet")
-        notes = " ".join(x for x in (t.get("notes", ""), str(s.get("notes") or "")) if x).strip()
-
+        it = resolve_source(source, items)
         sheets.append({
-            "name": source,
-            "kind": kind,
-            # Pass 2 read the header directly; fall back to pass 1's answer.
+            # The real attachment/body name for humans (Inbox, Compare & Fix,
+            # missing/uncertain-day flags, the debug view) — "[A5]" meant
+            # nothing to a reviewer. `_source_key` keeps the raw [A#] label
+            # so this run's OWN resolve_source(..., th.items) calls (see
+            # `_fresh_by_digest` below) still match by key, not by a name
+            # that might not be unique (two attachments both called
+            # "image.png") or stable across a later run's fresh numbering.
+            "name": it.name if it is not None else source,
+            "_source_key": source,
+            "kind": t.get("kind", "timesheet"),
             "employee_name": (str(s.get("employee_name")).strip() or None)
             if s.get("employee_name") else t.get("employee_name"),
             "employee_id": (str(s.get("employee_id")).strip() or None)
             if s.get("employee_id") else t.get("employee_id"),
             "month": month,
             "year": year,
-            "buckets": buckets,
+            "days_covered": max(0, int(s.get("days_covered") or 0)) if str(s.get("days_covered") or "").strip() else 0,
+            "period_type": str(s.get("period_type") or "unknown").lower()
+            if str(s.get("period_type") or "").lower() in
+               ("full_month", "half_month", "week", "partial", "unknown") else "unknown",
+            "missing_days": [int(d) for d in (s.get("missing_days") or [])
+                            if str(d).strip().lstrip("-").isdigit()
+                            and 1 <= int(d) <= (
+                                calendar.monthrange(year, month)[1]
+                                if month and year else 31)],
+            "working_days": s.get("working_days") or [],
+            "weekend_days": s.get("weekend_days") or [],
+            "uncertain_days": s.get("uncertain_days") or [],
+            "annual": s.get("annual") or [],
+            "remote": s.get("remote") or [],
+            "sick": s.get("sick") or [],
+            "maternity": s.get("maternity") or [],
+            "unpaid": s.get("unpaid") or [],
+            "absent": s.get("absent") or [],
+            "public_holiday": s.get("public_holiday") or [],
             "manager_signature": bool(t.get("manager_signature")),
             "approval_evidence": t.get("signature_evidence", ""),
-            "format_id": t.get("format_id", "generic"),
-            # Deterministic gates downstream (auto-accept day coverage) read the
-            # sheet's OWN text, not the model's claim about it. Resolved the
-            # same way as the attachments — "email body" is not a literal key.
-            "text": next((payload.texts[n] for n in resolve_source(source, payload)
-                          if n in payload.texts), ""),
-            "days_covered": days_covered,
-            "period_type": period_type,
-            "missing_days": sorted(set(missing)),
-            "dates_complete": period_type == "full_month" and not missing,
-            "incomplete_sheet": kind == "timesheet" and period_type != "full_month",
-            "evidence": str(s.get("evidence") or "").strip() or t.get("evidence", ""),
-            "notes": notes,
+            "approval_named_only": bool(t.get("signature_is_named_only")),
+            "text": it.text if it is not None else "",
+            "notes": " ".join(x for x in (t.get("notes", ""), str(s.get("notes") or "")) if x).strip(),
         })
     return sheets
 
 
+def _synthetic_triage_from_sheet(s: dict) -> dict:
+    """A reused (cached) sheet's own fields, shaped like a pass-1 triage entry
+    — so approval/summary logic can treat "already known from a past run" the
+    same as "freshly classified this run", without spending a vision call to
+    re-confirm what a past run already established."""
+    return {
+        "source": s.get("name", ""),
+        "kind": s.get("kind", "other"),
+        "employee_name": s.get("employee_name"),
+        "employee_id": s.get("employee_id"),
+        "period_hint": "",
+        "evidence": "",
+        "manager_signature": bool(s.get("manager_signature")),
+        "signature_evidence": s.get("approval_evidence", ""),
+        "signature_is_named_only": bool(s.get("approval_named_only")),
+        "notes": "",
+    }
+
+
 async def extract_thread_sheets(
     messages: list[tuple[str, bytes]],
+    *, cached_sheets: dict[str, dict] | None = None,
+    calendars: dict[tuple[int, int], dict] | None = None,
 ) -> tuple[list[dict], dict, list[dict], dict]:
-    """Two passes over one conversation.
+    """Two passes over one conversation. See the module docstring.
 
-      1. UNDERSTAND — the whole thread (bodies, attachments, images, emails
-         inside emails) goes to the vision model, which decides what is a
-         timesheet, whose it is, which template it follows, whether a manager
-         approved, and what the thread is about. Logos and banners are named as
-         noise here so they never reach extraction.
-      2. EXTRACT — only the sheets pass 1 validated are read again, by a prompt
-         that does nothing but transcribe names and leave dates.
+    `cached_sheets` (digest -> stored entry, see sheet_cache.thread_cached_sheets)
+    is what makes an incremental window (new + a couple of context messages,
+    see thread_collect.collect_thread_emls' `since`) safe to use: an item in
+    this run's window whose digest is already cached skips vision entirely —
+    its stored sheet is reused as-is. Anything cached for a message OUTSIDE
+    this window (never fetched at all this run) is merged in too, so the
+    result is always a complete answer for the whole conversation, never just
+    "whatever this run happened to look at." `cached_sheets=None`/`{}` (the
+    default) is exactly today's behaviour — everything gets a fresh read.
 
-    Splitting them is the point: one call asked to both classify and transcribe
-    did neither well — sheets were invented from passing mentions while real
-    grids were skimmed.
+    `calendars` (keyed by (month, year), see admin's /admin/calendars) is
+    handed to Pass 2 as ground truth for that item's weekend dates + public
+    holidays instead of the model inferring them — see
+    thread_prompt._calendar_block. Kept as a plain dict handed in (like
+    `cached_sheets`) rather than queried here, so this function stays
+    DB-free. `None`/`{}` (the default) is a pure no-op fallback to today's
+    self-inferred behaviour.
 
-    Returns (sheets, approval, conflicts, run_meta). `run_meta["summary_obj"]`
-    carries pass 1's conversation summary — there is no separate summary call.
+    Returns (sheets, approval, conflicts, run_meta). `conflicts` is always []
+    — cross-sheet duplicate/complementary detection lives in grouping.py,
+    which sees every sheet already grouped by employee+month.
+    `run_meta["summary_obj"]` carries pass 1's conversation summary.
     """
-    from app.services.extract_email.thread_prompt import build_extraction_prompt
-    from app.services.extract_email.triage_prompt import build_triage_prompt
-    from app.services.extraction import vision_client
-    from app.services.extraction.parser import extract_json_from_llm_response
+    from app.services.extract_email import thread_prompt, triage_prompt
 
     emit("unpack", "spin", "Collecting the whole thread…")
-    payload = collect_thread_payload(messages)
+    th = collect_thread(messages)
     emit("unpack", "ok",
-         f"{len(payload.files)} file(s), {len(payload.images)} image(s) from "
-         f"{len(messages)} message(s).",
-         files=[n for n, _, _ in payload.files],
-         images=[n for n, _ in payload.images])
+         f"{len(th.items)} item(s), {th.n_images} image(s) from {len(messages)} message(s)"
+         + (f", {len(th.dropped)} auto-dropped" if th.dropped else "") + ".",
+         items=[{"key": it.key, "name": it.name, "mime": it.mime,
+                 "size": it.size, "send_mode": it.send_mode,
+                 "thumb": _item_thumb(it)} for it in th.items],
+         dropped=[{"name": d.get("name"), "reason": d.get("reason"),
+                   "size": d.get("size"), "mime": d.get("mime"),
+                   "filter": d.get("filter") or (
+                       "ocr" if "OCR" in str(d.get("reason") or "") else "size"),
+                   "ocr_chars": d.get("ocr_chars"),
+                   "kept_key": d.get("kept_key"),
+                   "kept_name": d.get("kept_name"),
+                   "thumb": d.get("thumb")} for d in th.dropped])
+
+    # ---- reuse whatever this thread already had extracted -------------------
+    cached_sheets = cached_sheets or {}
+    all_window_digests = {it.digest for it in th.items if it.digest}
+    window_cached_sheets: list[dict] = []
+    if cached_sheets:
+        fresh_items = []
+        for it in th.items:
+            entry = cached_sheets.get(it.digest) if it.digest else None
+            if entry is not None:
+                window_cached_sheets.append(entry["sheet"])
+            else:
+                fresh_items.append(it)
+        th.items = fresh_items
+    external_sheets = [
+        entry["sheet"] for digest, entry in cached_sheets.items()
+        if digest not in all_window_digests
+    ]
+    reused_sheets = window_cached_sheets + external_sheets
+    if reused_sheets:
+        emit("unpack", "ok",
+             f"{len(reused_sheets)} sheet(s) reused from a previous read — not re-sent to the model.",
+             reused=[{"name": s.get("name"), "employee": s.get("employee_name")} for s in reused_sheets])
+    reused_triage = [_synthetic_triage_from_sheet(s) for s in reused_sheets]
 
     empty_meta = {
         "method": "thread-two-pass", "model": None, "calls": 0,
-        "sheet_count": 0, "errors": [], "skipped": payload.skipped,
+        "sheet_count": len(reused_sheets), "errors": [], "skipped": th.dropped,
         "conflicts": [], "summary": "", "summary_obj": None,
     }
-    if not payload.files and not payload.images and not payload.bodies.strip():
+    if not th.items and not any(m.body.strip() for m in th.messages):
+        if reused_sheets:
+            approval = _derive_approval(reused_triage)
+            return reused_sheets, approval, [], {
+                **empty_meta, "reused_sheets": len(reused_sheets),
+                "summary": "Nothing new in this thread — showing what was already extracted."}
         return [], {"detected": False, "detail": "Nothing readable in this thread."}, [], {
             **empty_meta, "errors": ["empty thread"]}
 
-    if not thread_call_available():
-        # Callers gate on thread_call_available() first; this is belt-and-braces.
-        return [], {"detected": False, "detail": "AI extraction is not configured."}, [], {
-            **empty_meta, "method": "disabled",
-            "errors": ["extraction engine is not set to vision"]}
+    api_key, model = require_vision_configured()
 
-    api_key = vision_client.openai_api_key()
-    model = vision_client.model_for(vision_client.vision_provider(), "vision")
-
-    # ---- PASS 1: understand the conversation -----------------------------
-    sys1, user1 = build_triage_prompt(manifest=payload.manifest, bodies=payload.bodies)
+    # ---- PASS 1: classify every item ---------------------------------------
+    batches = triage_prompt.chunk_items_by_count(th.items, settings.pass1_batch_size)
     emit("pass1", "spin",
-         f"Pass 1 of 2 — {model} is reading the whole conversation…",
-         pass_no=1, model=model,
-         files=[n for n, _, _ in payload.files],
-         images=[n for n, _ in payload.images],
-         message_count=len(messages),
-         body_chars=len(payload.bodies))
-    raw1 = await vision_client._openai_thread_call(
-        payload.files, payload.images, user1, sys1, model, api_key,
-        image_detail=settings.vision_image_detail)
-    count_llm()
+         f"Pass 1 of 2 — {model} is reading the whole conversation "
+         f"({len(batches)} call(s))…",
+         pass_no=1, model=model, message_count=len(messages))
 
-    parsed1 = extract_json_from_llm_response(raw1)
-    if not isinstance(parsed1, dict):
-        raise ValueError("pass 1 reply was not a JSON object")
-    triage, approval, summary_obj, noise = normalise_triage(parsed1, payload)
+    all_items: list = []
+    thread_summary = ""
+    for bi, batch in enumerate(batches, 1):
+        note = (f"This is batch {bi} of {len(batches)}. You are seeing SOME of the thread's "
+                f"items below; classify ONLY those. Other batches cover the rest, but all "
+                f"message bodies are included so you have full approval context."
+                if len(batches) > 1 else "")
+        data = await triage_prompt.run_pass1_batch(th, batch, note, model, api_key, label=f"pass1-batch{bi}")
+        count_llm()
+        all_items += (data.get("items") or [])
+        if not thread_summary:
+            thread_summary = (data.get("thread_summary") or "").strip()
 
+    def _noise_label(source: str) -> str:
+        it = resolve_source(source, th.items)
+        return it.name if it is not None else source
+
+    noise = [_noise_label(str(m.get("source"))) for m in all_items
+             if isinstance(m, dict) and (m.get("kind") or "").lower() == "noise"]
+    triage = _normalise_pass1_items(
+        [m for m in all_items if isinstance(m, dict) and (m.get("kind") or "").lower() != "noise"])
+
+    # Approval/summary reason over fresh AND reused sheets together, so a
+    # signature found on a message outside this run's window (or already
+    # confirmed on a cached item inside it) is never forgotten just because
+    # this run didn't re-read it.
+    combined_triage = triage + reused_triage
+    approval = _derive_approval(combined_triage)
+    summary_obj = _build_summary(combined_triage, approval, thread_summary, len(batches))
     data_items = [t for t in triage if t["kind"] in ("timesheet", "leave_certificate")]
+    full_summary = _enrich_thread_summary(
+        summary_obj, triage=combined_triage, approval=approval,
+        message_count=len(messages), model=model)
+
     emit("pass1", "ok",
          f"Pass 1 done — {len(data_items)} timesheet/certificate(s) identified"
-         + (f", {len(noise)} logo/banner(s) ignored" if noise else "") + ".",
+         + (f", {len(noise)} noise item(s) ignored" if noise else "") + ".",
          pass_no=1,
-         # Everything the UI shows for pass 1: what it decided, per item.
-         items=[{
-             "source": t["source"],
-             "kind": t["kind"],
-             "employee": t.get("employee_name"),
-             "employee_id": t.get("employee_id"),
-             "format_id": t.get("format_id"),
-             "period": t.get("period_hint"),
-             "signature": bool(t.get("manager_signature")),
-         } for t in triage],
+         items=[_ui_pass_item(t, th.items) for t in triage],
+         confirmed=[_ui_pass_item(t, th.items) for t in data_items],
          employees=[t.get("employee_name") for t in data_items if t.get("employee_name")],
-         noise=noise,
-         approval=approval,
-         summary=summary_obj)
+         noise=noise, approval=approval,
+         summary=full_summary,
+         thread_summary=full_summary)
 
     meta = {
-        "method": "thread-two-pass",
-        "model": model,
-        "calls": 1,
-        "sheet_count": 0,
-        "errors": [],
-        "formats_detected": payload.format_ids,
-        "files_sent": [n for n, _, _ in payload.files],
-        "images_sent": [n for n, _ in payload.images],
-        "skipped": payload.skipped,
-        "conflicts": [],
-        "noise": noise,
-        "summary": summary_obj.get("headline", ""),
-        "summary_obj": summary_obj,
-        "triage": triage,
+        "method": "thread-two-pass", "model": model, "calls": len(batches),
+        "sheet_count": 0, "errors": [], "skipped": th.dropped, "conflicts": [],
+        "noise": noise, "summary": full_summary.get("headline", ""),
+        "summary_obj": full_summary, "triage": triage,
+        "thread_summary": full_summary,
     }
 
     if not data_items:
-        # Nothing to extract from — pass 2 would have nothing to read.
+        if reused_sheets:
+            meta["sheet_count"] = len(reused_sheets)
+            meta["reused_sheets"] = len(reused_sheets)
+            return reused_sheets, approval, [], meta
         return [], approval, [], meta
 
-    # ---- PASS 2: read only the validated sheets --------------------------
-    # Resolve each triaged source to the actual payload item(s) — the body
-    # sheet is called "email body" by pass 1 but stored under a per-message
-    # render name, and a literal match silently sent pass 2 nothing.
-    keep: set[str] = set()
-    unresolved: list[str] = []
-    for t in data_items:
-        hits = resolve_source(t["source"], payload)
-        if hits:
-            keep.update(hits)
-        else:
-            unresolved.append(t["source"])
-
-    files2 = [(n, b, f) for (n, b, f) in payload.files if n in keep]
-    images2 = [(n, b) for (n, b) in payload.images if n in keep]
-    formats2 = [t.get("format_id", "generic") for t in data_items]
-
-    if not files2 and not images2:
-        # Nothing resolved — extracting would return an empty answer that reads
-        # like a clean one. Say so instead.
-        meta["errors"] = [
-            "pass 1 named sheets that could not be matched to any attachment: "
-            + ", ".join(unresolved[:4])]
+    # ---- PASS 2: read only the confirmed items -----------------------------
+    pairs = thread_prompt.confirmed_sheets(data_items, th.items)
+    if not pairs:
+        if reused_sheets:
+            meta["sheet_count"] = len(reused_sheets)
+            meta["reused_sheets"] = len(reused_sheets)
+            return reused_sheets, approval, [], meta
+        meta["errors"] = ["pass 1 confirmed sheets that could not be resolved to any item"]
         emit("extract", "warn", meta["errors"][0])
         return [], approval, [], meta
 
-    # A body-pasted grid needs its text as well as its picture — the flattened
-    # HTML carries rows that a rendered image can crop or blur.
-    body_text = payload.bodies if any("body grid" in n for n in keep) else ""
+    batches2: list[list] = []
+    cur: list = []
+    n = 0
+    for pair in pairs:
+        k = max(len(pair[0].images), 1)
+        if cur and n + k > settings.max_images_per_call:
+            batches2.append(cur)
+            cur, n = [], 0
+        cur.append(pair)
+        n += k
+    if cur:
+        batches2.append(cur)
 
-    sys2, user2 = build_extraction_prompt(
-        sheets=data_items, format_ids=formats2, body_text=body_text)
+    needs_body_context = any(it.name.startswith("email body") for it, _ in pairs)
+    body_text = "\n".join(m.body for m in th.messages)[:8000] if needs_body_context else ""
+
     emit("pass2", "spin",
-         f"Pass 2 of 2 — extracting leave from {len(data_items)} confirmed sheet(s)…",
-         pass_no=2, model=model,
-         sheets=[t["source"] for t in data_items],
-         sent=sorted(keep))
-    raw2 = await vision_client._openai_thread_call(
-        files2, images2, user2, sys2, model, api_key,
-        image_detail=settings.vision_image_detail)
-    count_llm()
+         f"Pass 2 of 2 — extracting {len(pairs)} confirmed sheet(s) ({len(batches2)} call(s))…",
+         pass_no=2, model=model, sheets=[it.name for it, _ in pairs])
 
-    parsed2 = extract_json_from_llm_response(raw2)
-    if not isinstance(parsed2, dict):
-        raise ValueError("pass 2 reply was not a JSON object")
-    sheets = normalise_extraction(parsed2, data_items, payload)
+    raw_sheets: list = []
+    for bi, batch in enumerate(batches2, 1):
+        data = await thread_prompt.run_pass2_batch(
+            batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}")
+        count_llm()
+        raw_sheets += (data.get("sheets") or [])
 
-    total_days = sum(sum(len(v) for v in s["buckets"].values()) for s in sheets)
-    emit("pass2", "ok",
-         f"Pass 2 done — {len(sheets)} sheet(s), {total_days} leave day(s).",
-         pass_no=2,
-         # Per-sheet result the UI lists live, so the reviewer sees exactly
-         # what was pulled out before the record is ever staged.
-         results=[{
-             "source": s["name"],
-             "employee": s.get("employee_name"),
-             "employee_id": s.get("employee_id"),
-             "month": s.get("month"),
-             "year": s.get("year"),
-             "days_covered": s.get("days_covered"),
-             "period_type": s.get("period_type"),
-             "leaves": {k: len(v) for k, v in s["buckets"].items() if v},
-             "total_days": sum(len(v) for v in s["buckets"].values()),
-         } for s in sheets])
-
-    # Record WHICH attachments were read (for the Extracted/New badge).
-    meta["calls"] = 2
-    meta["sheet_count"] = len(sheets)
+    fresh_sheets = _normalise_pass2_sheets(raw_sheets, data_items, th.items)
     meta["_fresh_by_digest"] = {
-        payload.digests[s["name"]]: s
-        for s in sheets if s.get("name") in payload.digests
+        it.digest: s for s in fresh_sheets
+        if (it := resolve_source(s["_source_key"], th.items)) is not None and it.digest
     }
+    meta["reused_sheets"] = len(reused_sheets)
+    sheets = fresh_sheets + reused_sheets
+    total_days = sum(
+        len(s["working_days"]) + len(s["weekend_days"])
+        + sum(len(s[b]) for b in ("annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday"))
+        for s in sheets)
+    # UI gets the model JSON + normalised sheets (minus bulky OCR text).
+    ui_sheets = [{k: v for k, v in s.items() if k != "text"} for s in sheets]
+    emit("pass2", "ok", f"Pass 2 done — {len(sheets)} sheet(s), {total_days} day(s) accounted for.",
+         pass_no=2,
+         raw={"sheets": raw_sheets},
+         sheets=ui_sheets,
+         results=[{"source": s["name"], "employee": s.get("employee_name"),
+                   "employee_id": s.get("employee_id"), "month": s.get("month"), "year": s.get("year"),
+                   "days_covered": s.get("days_covered"), "period_type": s.get("period_type"),
+                   "leaves": {b: len(s.get(b) or []) for b in
+                              ("annual", "remote", "sick", "maternity", "unpaid",
+                               "absent", "public_holiday") if s.get(b)},
+                   "total_days": (len(s.get("working_days") or []) + len(s.get("weekend_days") or [])
+                                  + sum(len(s.get(b) or []) for b in
+                                        ("annual", "remote", "sick", "maternity",
+                                         "unpaid", "absent", "public_holiday")))}
+                  for s in sheets])
+
+    meta["calls"] = len(batches) + len(batches2)
+    meta["sheet_count"] = len(sheets)
     return sheets, approval, [], meta

@@ -177,22 +177,6 @@ def test_none_and_disabled_passthrough(monkeypatch):
     assert scrub_email_for_llm("S", "Thanks\nPassword: x") == ("S", "Thanks\nPassword: x")
 
 
-def test_extract_prompt_has_no_sender_address():
-    from app.models.email_message import EmailMessage
-    from app.services.agents import full_email_extract as fx
-
-    mail = EmailMessage(
-        provider_message_id="X", sender_name="Kevin Dsouza",
-        sender_email="kevin.dsouza@acme.com",
-        subject="TIMESHEET June 2026 | Kevin Dsouza | E2507067",
-        body_text="", attachments=[])
-    unit = fx.SheetUnit(name="sheet.pdf", ftype="pdf", payload=b"", images=[b"x"], text="")
-    prompt = fx._extract_prompt(mail, unit)
-    assert "kevin.dsouza@acme.com" not in prompt
-    assert "EMAIL FROM" not in prompt
-    assert "E2507067" in prompt and "June 2026" in prompt
-
-
 def test_assert_no_plaintext_pii_helper():
     clean = scrub_text("hi leak@example.com Password: Secret99")
     assert assert_no_plaintext_pii(clean, canaries=["leak@example.com", "Secret99"]) == []

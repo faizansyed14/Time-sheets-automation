@@ -18,11 +18,13 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models.email_message import EmailMessage
+from app.models.pipeline_file import PipelineFile
+from app.services.extract_email.constants import TAG_PREFIX
 
 # Recorded alongside each entry so it is always clear which prompt produced a
 # stored reading. Nothing is served back from it — it is provenance, not a key.
@@ -68,3 +70,55 @@ def extracted_filenames(row: EmailMessage) -> list[str]:
         if fn and fn not in names:
             names.append(fn)
     return names
+
+
+async def thread_cached_sheets(
+    db: AsyncSession, conversation_id: str | None, message_ids: list[str] | None = None,
+) -> dict[str, dict]:
+    """Every previously-extracted attachment for a whole conversation, keyed by
+    content hash — {digest: {filename, at, model, prompt_version, sheet}}.
+
+    `extracted_sheets` is written to whichever single message happened to be a
+    past run's anchor, so it is scattered across rows of the same conversation
+    rather than aggregated. This unions all of them (newest `at` wins on a
+    collision) so incremental re-extraction can reuse anything ever read for
+    this thread, not just what happens to be on one row.
+
+    Returns {} immediately for a falsy `conversation_id`/`message_ids` (e.g.
+    Upload, which has no conversation) — no query, no caching overhead."""
+    if conversation_id:
+        stmt = select(EmailMessage.extracted_sheets).where(
+            EmailMessage.conversation_id == conversation_id)
+    elif message_ids:
+        stmt = select(EmailMessage.extracted_sheets).where(
+            EmailMessage.provider_message_id.in_(message_ids))
+    else:
+        return {}
+
+    merged: dict[str, dict] = {}
+    for (sheets,) in (await db.execute(stmt)).all():
+        for digest, entry in (sheets or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            existing = merged.get(digest)
+            if existing is None or str(entry.get("at", "")) > str(existing.get("at", "")):
+                merged[digest] = entry
+    return merged
+
+
+async def last_extraction_at(db: AsyncSession, thread_key: str | None) -> datetime | None:
+    """When Extract Email last ran on this thread (any run started from any
+    message in it counts), or None if it never has. Drives incremental
+    windowing — messages received after this point are "new"; everything
+    before is presumed already read (and reusable from the cache above).
+
+    Returns None immediately for a falsy `thread_key` (Upload has none)."""
+    if not thread_key:
+        return None
+    return (await db.execute(
+        select(func.max(PipelineFile.updated_at)).where(
+            PipelineFile.source_kind == "email",
+            PipelineFile.thread_key == thread_key,
+            PipelineFile.attachment_id.like(f"{TAG_PREFIX}%"),
+        )
+    )).scalar_one_or_none()

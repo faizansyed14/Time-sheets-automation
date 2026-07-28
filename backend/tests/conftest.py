@@ -48,7 +48,14 @@ os.environ.update(
     GRAPH_CLIENT_SECRET="",
     GRAPH_MAILBOX="",
     GRAPH_OTP_SENDER="",
-    OPENAI_API_KEY="",
+    # "missing" is a non-empty key so require_vision_configured() doesn't
+    # block the thread pipeline in tests — the vision call itself is
+    # monkeypatched per-test (see mock_vision_calls below), so nothing ever
+    # reaches the network. It's also the sentinel llm_provider.active_config
+    # treats as "no key configured", so the agentic-chat no-key-degrades test
+    # still sees has_key=False as it did before this pipeline needed a key.
+    OPENAI_API_KEY="missing",
+    LLM_PROVIDER="openrouter",
 )
 
 from httpx import ASGITransport, AsyncClient  # noqa: E402
@@ -140,3 +147,31 @@ async def admin_token(client) -> str:
 
 def auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "X-Fingerprint": "fp-test"}
+
+
+@pytest.fixture
+def mock_vision_calls(monkeypatch):
+    """Script the two-pass vision pipeline without any network call.
+
+    Usage: `install = mock_vision_calls; install([pass1_reply, pass2_reply])`
+    Each call to vision_client.chat_call pops the next scripted reply, in
+    order (pass 1 may issue several batched calls before pass 2's).
+    Raises loudly if a test's pipeline run needs more calls than scripted,
+    rather than hanging on a real HTTP request."""
+    from app.services.extraction import vision_client
+
+    def install(responses: list[dict]):
+        queue = list(responses)
+
+        async def _fake_chat_call(system_prompt, content_blocks, model, api_key,
+                                  *, label="", retries=3, force_json=True, enable_thinking=True):
+            if not queue:
+                raise AssertionError(f"mock_vision_calls exhausted — unexpected extra call ({label})")
+            return queue.pop(0)
+
+        monkeypatch.setattr(vision_client, "chat_call", _fake_chat_call)
+        monkeypatch.setattr("app.services.extract_email.triage_prompt.chat_call", _fake_chat_call)
+        monkeypatch.setattr("app.services.extract_email.thread_prompt.chat_call", _fake_chat_call)
+        return queue
+
+    return install

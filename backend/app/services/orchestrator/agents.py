@@ -1,19 +1,16 @@
-"""The agent line-up.
+"""The agent line-up for the (single) thread pipeline.
 
-Each agent wraps ONE responsibility. Where solid, tested logic already exists
-(unpacking, vision extraction, approval, grouping, auto-accept) the agent calls
-it rather than reimplementing — the agents give that pipeline structure,
-observability and clean seams, not a rewrite.
+Extract Email and Upload both run the SAME two-pass vision read over the
+whole conversation/submission (ThreadAgent), then a deterministic tail:
+resolve identity, report multi-sheet consolidation, check duplicates, decide
+auto-accept vs review, then file.
 
-What is genuinely NEW here (audited against the existing code so nothing is
-duplicated):
-  * DuplicateAgent    — warns when a month is ALREADY filed, so the reviewer
-    knows the sheets will merge into it. (Byte-identical attachments are NOT
-    re-checked: the .eml collector and merge_thread_units already content-hash
-    de-duplicate upstream.)
-  * ConversationAgent — reports which sheets were consolidated into each month.
-    (It does NOT re-merge: group_sheets already keys by employee+month+year, so
-    1–15 + 16–30 / weekly partials arrive already unioned — verified by test.)
+There is no per-sheet fallback pipeline and no separate Validation/Approval
+agent — cross-bucket/date validation now happens inside
+grouping.normalise_sheet() (called from EmployeeAgent's group_sheets), and
+approval is read straight off pass 1's own per-item verdicts (see
+thread_extract._derive_approval), so a second, less-informed detector would
+only second-guess it.
 """
 from __future__ import annotations
 
@@ -28,107 +25,17 @@ def _now_iso() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 1. Email Agent — unpack the message, keep the hierarchy
-# --------------------------------------------------------------------------- #
-class EmailAgent(Agent):
-    info = AgentInfo("email", "Email Agent",
-                     "unpacking the message, attachments and nested emails")
-
-    async def run(self, ctx: AgentContext) -> str:
-        from app.services.extract_email.collector import collect_units, merge_thread_units
-        from app.services.extract_email.upload import units_from_upload
-
-        if ctx.source_kind == "upload":
-            # A plain uploaded file (PDF/DOCX/XLSX) or an uploaded .eml — this
-            # helper handles both and gives the context its subject/body.
-            ctx.source, ctx.units = units_from_upload(ctx.raw_name, ctx.raw_bytes)
-        else:
-            ctx.units = collect_units(ctx.source, ctx.raw_bytes)
-        if ctx.prior_source is not None:
-            from app.services.email_provider import get_email_provider
-            from app.services.inbox.eml_export import build_full_eml
-            prior_bytes, _ = await build_full_eml(get_email_provider(), ctx.prior_source)
-            prior_units = collect_units(ctx.prior_source, prior_bytes)
-            before = len(ctx.units)
-            ctx.units = merge_thread_units(ctx.units, prior_units)
-            if len(ctx.units) > before:
-                ctx.notes.append(
-                    f"Pulled {len(ctx.units) - before} sheet(s) from the previous "
-                    "message in this conversation.")
-        if not ctx.units:
-            ctx.abort("no readable sheets")
-            return "no readable sheets found"
-        return f"{len(ctx.units)} sheet(s): " + ", ".join(u.name for u in ctx.units[:4])
-
-
-# --------------------------------------------------------------------------- #
-# 2. Attachment Agent — route each document by type (deterministic)
-# --------------------------------------------------------------------------- #
-class AttachmentAgent(Agent):
-    info = AgentInfo("attachment", "Attachment Agent",
-                     "routing PDFs, Excel, Word and images, and detecting the client template")
-
-    async def run(self, ctx: AgentContext) -> str:
-        from app.services.extract_email.formats import get_format
-        from app.services.extraction import vision_client
-
-        native = images = text_only = 0
-        for u in ctx.units:
-            if u.ftype in vision_client.NATIVE_FILE_TYPES:
-                native += 1
-            elif u.images:
-                images += 1
-            else:
-                text_only += 1
-        templates = sorted({get_format(u.format_id).label
-                            for u in ctx.units if u.format_id != "generic"})
-        bits = []
-        if native:
-            bits.append(f"{native} sent as native file(s)")
-        if images:
-            bits.append(f"{images} as image(s)")
-        if text_only:
-            bits.append(f"{text_only} as text")
-        if templates:
-            bits.append("template: " + ", ".join(templates))
-        return "; ".join(bits) or "nothing to route"
-
-
-# --------------------------------------------------------------------------- #
-# 3. Vision Agent — the LLM read (batched)
-# --------------------------------------------------------------------------- #
-class VisionAgent(Agent):
-    info = AgentInfo("vision", "OCR / Vision Agent",
-                     "reading every sheet with the vision model", uses_llm=True)
-
-    async def run(self, ctx: AgentContext) -> str:
-        from app.services.extract_email.analyser import analyse_units
-
-        ctx.sheets, ctx.run_meta = await analyse_units(ctx.source, ctx.units)
-        kinds: dict[str, int] = {}
-        for s in ctx.sheets:
-            kinds[s["kind"]] = kinds.get(s["kind"], 0) + 1
-        breakdown = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
-        # `calls` is the two-stage (classify + extract) counter; `batches` is
-        # the older single-stage name — support both.
-        calls = ctx.run_meta.get("calls", ctx.run_meta.get("batches", 0))
-        return f"read {len(ctx.sheets)} sheet(s) in {calls} extraction call(s) — {breakdown}"
-
-
-# --------------------------------------------------------------------------- #
-# Thread Agent — the WHOLE conversation in ONE model call
+# 1. Thread Agent — the whole conversation, two focused passes
 # --------------------------------------------------------------------------- #
 class ThreadAgent(Agent):
-    """Extract Email's reader: two focused passes over the whole conversation.
+    """Extract Email's (and Upload's) reader: two focused passes over the
+    whole conversation/submission.
 
-    Pass 1 understands the thread — which items are really timesheets, whose
-    each one is, whether a manager approved, and what the conversation is
-    about. Pass 2 reads only the sheets pass 1 validated, and does nothing but
-    transcribe leave.
-
-    Everything goes up: bodies, attachments, images (logos included), and
-    emails attached inside emails. The model decides what a pasted approval
-    screenshot is, rather than a size threshold deciding for it.
+    Pass 1 classifies every item — which are really timesheets, whose each
+    one is, whether a manager approved, and what the conversation is about.
+    Pass 2 reads only the items pass 1 confirmed, transcribing a full
+    day-by-day account (working/weekend/leave/uncertain), not just a scan
+    for leave.
     """
 
     info = AgentInfo("thread", "Thread Agent",
@@ -136,26 +43,87 @@ class ThreadAgent(Agent):
                      uses_llm=True)
 
     async def run(self, ctx: AgentContext) -> str:
+        from sqlalchemy import select
+
+        from app.models.month_calendar import MonthCalendar
         from app.services.extract_email import sheet_cache
         from app.services.extract_email.thread_extract import extract_thread_sheets
-        from app.services.extract_email.thread_summary import save_summary
+        from app.services.extract_email.thread_summary import load_summary, save_summary
         from app.services.extraction import vision_client
 
         messages = ctx.thread_messages or [(ctx.raw_name, ctx.raw_bytes)]
         model = vision_client.model_for(vision_client.vision_provider(), "vision")
 
-        # Every run re-reads every attachment. Reusing a previous result made
-        # a bad read permanent: a sheet marked "LEAVE (MEDICAL)" was booked as
-        # ANNUAL leave, and re-extracting served the same wrong answer back
-        # because the file had not changed. Fixing the prompt has to be enough
-        # to fix the data, so nothing is reused.
-        #
-        # What IS still recorded (below) is WHICH attachments have been read —
-        # that drives the Extracted/New badges, and reading it back is not the
-        # same as trusting it.
-        sheets, approval, conflicts, meta = await extract_thread_sheets(messages)
+        # Admin-configured (month, year) calendars (see /admin/calendars) —
+        # handed to Pass 2 as ground truth for weekends/public holidays
+        # instead of the model inferring them. Typically a handful of rows,
+        # so fetching all of them is cheap; which ones apply isn't known
+        # until Pass 1 gives each item a period_hint (see thread_prompt's
+        # _parse_period_hint), so this can't be a targeted per-month query.
+        calendar_rows = (await ctx.db.execute(select(MonthCalendar))).scalars().all()
+        calendars = {
+            (r.month, r.year): {"weekend_weekdays": r.weekend_weekdays or [],
+                                "public_holidays": r.public_holidays or []}
+            for r in calendar_rows
+        }
 
-        # Record WHICH attachments were read (not to reuse — to badge them).
+        # Incremental by default: an already-extracted thread only sends the
+        # new message(s) + a couple of context messages to the model (see
+        # email.py's windowing via collect_thread_emls' `since`). Whatever was
+        # already extracted from everything else is reused here from the
+        # per-attachment cache — never silently dropped, never re-sent either.
+        # `force_full` (the "Re-read entire thread" action) bypasses this
+        # entirely and re-reads everything fresh, exactly like before this
+        # existed — the fix for a suspected-stale read.
+        conversation_id = getattr(ctx.source, "conversation_id", None)
+        msg_id = getattr(ctx.source, "provider_message_id", None)
+        cached = {}
+        if not ctx.force_full and (conversation_id or msg_id):
+            cached = await sheet_cache.thread_cached_sheets(
+                ctx.db, conversation_id, [msg_id] if msg_id else None)
+
+        # Full debug trace of this run (raw prompts/responses per pass-1/
+        # pass-2 call, dropped-item images) — a temporary testing aid, see
+        # /admin/debug. Captured unconditionally for now; best-effort only,
+        # a debug-write failure must never break real extraction.
+        from app.services.extract_email import debug_capture
+        cap = debug_capture.DebugCapture()
+        cap_token = debug_capture.set_capture(cap)
+        try:
+            sheets, approval, conflicts, meta = await extract_thread_sheets(
+                messages, cached_sheets=cached, calendars=calendars)
+        finally:
+            debug_capture.reset_capture(cap_token)
+        try:
+            from app.models.extraction_debug_run import ExtractionDebugRun
+            ctx.db.add(ExtractionDebugRun(
+                id=cap.run_id, source_kind=ctx.source_kind, source_id=ctx.source_id,
+                thread_key=ctx.thread_key, subject=getattr(ctx.source, "subject", None),
+                model=model, calls=meta.get("calls", 0), reused_sheets=meta.get("reused_sheets", 0),
+                pass1_calls=cap.pass1_calls, pass2_calls=cap.pass2_calls,
+                dropped_items=cap.dropped_items, triage=meta.get("triage") or [],
+                sheets=sheets, errors=meta.get("errors") or [],
+            ))
+            await ctx.db.commit()
+        except Exception:
+            await ctx.db.rollback()
+
+        # A signature/approval found in an EARLIER run — possibly on a message
+        # outside this run's window — must never be forgotten just because
+        # this run didn't re-read that message. Merge with whatever this run
+        # found, keeping whichever is more specific (sheet > conversation >
+        # none); ties go to this run since it's the fresher read.
+        if not ctx.force_full:
+            prior_summary = await load_summary(
+                ctx.db, conversation_id, [msg_id] if msg_id else [])
+            prior_approval = (prior_summary or {}).get("approval")
+            if prior_approval and prior_approval.get("detected"):
+                rank = {"sheet": 2, "conversation": 1, "none": 0}
+                if rank.get(prior_approval.get("where"), 0) > rank.get(approval.get("where"), 0):
+                    approval = dict(prior_approval)
+
+        # Record WHICH attachments were freshly read (not to reuse — to badge
+        # them, and so the next run's cache lookup finds them).
         fresh = meta.pop("_fresh_by_digest", None) or {}
         if fresh:
             await sheet_cache.remember(ctx.db, ctx.source_id, model, fresh)
@@ -165,29 +133,41 @@ class ThreadAgent(Agent):
         # DERIVED from what pass 1 already reported rather than asked for
         # again: the model saying "a timesheet was sent" while its own items
         # list is empty is a contradiction we would then have to adjudicate.
-        summary_obj = meta.get("summary_obj")
+        summary_obj = meta.get("summary_obj") or meta.get("thread_summary")
         if summary_obj and summary_obj.get("headline"):
-            triage = meta.get("triage") or []
-            data_items = [t for t in triage
-                          if t.get("kind") in ("timesheet", "leave_certificate")]
-            employees = [t.get("employee_name") for t in data_items if t.get("employee_name")]
-            periods = [t.get("period_hint") for t in data_items if t.get("period_hint")]
+            # Prefer the already-enriched summary from extract_thread_sheets;
+            # only fill gaps if an older path left fields missing.
             thread_summary = {
-                **summary_obj,
-                "timesheet_sent": bool(data_items),
-                "approval_requested": summary_obj.get("status") == "awaiting_approval",
+                "timesheet_sent": False,
+                "approval_requested": False,
                 "approval_given": bool(approval.get("detected")),
-                "employee": ", ".join(dict.fromkeys(employees)),
-                "period": next(iter(dict.fromkeys(periods)), ""),
+                "employee": "",
+                "period": "",
                 "message_count": len(messages),
                 "model": model,
                 "at": _now_iso(),
+                **summary_obj,
             }
-            # On run_meta (not just saved to the EmailMessage row) so the
-            # Pipeline page's extraction_meta.full_email_extract — which
-            # spreads run_meta wholesale in staging.py — carries the SAME
-            # plain-English summary the Inbox thread view shows, with no
-            # second place computing it and no second query to fetch it.
+            if "timesheet_sent" not in summary_obj or "employee" not in summary_obj:
+                triage = meta.get("triage") or []
+                data_items = [t for t in triage
+                              if t.get("kind") in ("timesheet", "leave_certificate")]
+                employees = [t.get("employee_name") for t in data_items if t.get("employee_name")]
+                periods = [t.get("period_hint") for t in data_items if t.get("period_hint")]
+                thread_summary.update({
+                    "timesheet_sent": bool(data_items),
+                    "approval_requested": summary_obj.get("status") == "awaiting_approval",
+                    "approval_given": bool(approval.get("detected")),
+                    "employee": ", ".join(dict.fromkeys(employees)),
+                    "period": next(iter(dict.fromkeys(periods)), ""),
+                    "message_count": len(messages),
+                    "model": model,
+                    "at": _now_iso(),
+                })
+            # Carried forward by a later run's cache-aware read (see above) —
+            # without this, an approval found on a message that later falls
+            # outside the incremental window would be lost after one more reply.
+            thread_summary["approval"] = approval
             meta["thread_summary"] = thread_summary
             try:
                 await save_summary(ctx.db, ctx.source_id, thread_summary)
@@ -199,18 +179,10 @@ class ThreadAgent(Agent):
         if meta.get("summary"):
             ctx.notes.append(str(meta["summary"]))
         skipped = meta.get("skipped") or []
-        over_capacity = [n for n, reason in skipped if reason == "over_capacity"]
-        unsupported = [n for n, reason in skipped if reason == "unsupported_type"]
-        if over_capacity:
-            # A real, readable file that simply didn't fit under the cap —
-            # this is a capacity problem, not a filetype problem, and must not
-            # be mislabelled as one or the actual issue (raise MAX_FILES /
-            # split the thread) never gets noticed.
-            ctx.notes.append(
-                f"NOT sent — this thread has more attachments than one call "
-                f"handles ({len(over_capacity)} skipped): " + ", ".join(over_capacity[:4]))
-        if unsupported:
-            ctx.notes.append("Not sent (unsupported type): " + ", ".join(unsupported[:4]))
+        if skipped:
+            names = [s.get("name") for s in skipped if isinstance(s, dict) and s.get("name")]
+            if names:
+                ctx.notes.append("Not sent (size/noise filter): " + ", ".join(names[:4]))
         if not sheets:
             ctx.abort("no readable sheets")
             return meta.get("errors", ["nothing readable in this thread"])[0]
@@ -220,38 +192,15 @@ class ThreadAgent(Agent):
             kinds[s["kind"]] = kinds.get(s["kind"], 0) + 1
         breakdown = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
         return (f"read {len(sheets)} sheet(s) from {len(messages)} message(s) "
-                f"in 2 calls — {breakdown}")
+                f"in {meta.get('calls', 0)} call(s) — {breakdown}")
 
 
 # --------------------------------------------------------------------------- #
-# 4. Approval Agent — manager sign-off across the whole conversation
-# --------------------------------------------------------------------------- #
-class ApprovalAgent(Agent):
-    info = AgentInfo("approval", "Approval Agent",
-                     "searching the conversation, attachments and screenshots for a manager approval")
-
-    def skip_reason(self, ctx: AgentContext) -> str | None:
-        # The thread call already reports approval with quoted evidence from
-        # the whole conversation; re-running the text detector would only
-        # second-guess it with less context.
-        if ctx.approval and ctx.approval.get("evidence") is not None:
-            return "already answered by the thread call"
-        return None
-
-    async def run(self, ctx: AgentContext) -> str:
-        from app.services.extract_email.approval import detect_approval
-
-        used_vision = str(ctx.run_meta.get("method", "")).startswith("vision")
-        ctx.approval = detect_approval(ctx.source, ctx.sheets, used_vision=used_vision)
-        return ctx.approval["detail"]
-
-
-# --------------------------------------------------------------------------- #
-# 5. Employee Resolution Agent — identity → HR master (deterministic + fuzzy)
+# 2. Employee Resolution Agent — identity → HR master (deterministic + fuzzy)
 # --------------------------------------------------------------------------- #
 class EmployeeAgent(Agent):
     info = AgentInfo("employee", "Employee Resolution Agent",
-                     "matching each sheet to the HR master record")
+                     "matching each sheet to the HR master record, normalising every date")
 
     def skip_reason(self, ctx: AgentContext) -> str | None:
         return None if ctx.sheets else "no sheets"
@@ -270,7 +219,7 @@ class EmployeeAgent(Agent):
 
 
 # --------------------------------------------------------------------------- #
-# 6. Conversation Agent — merge partial periods into one monthly record
+# 3. Conversation Agent — merge partial periods into one monthly record
 # --------------------------------------------------------------------------- #
 class ConversationAgent(Agent):
     """Reports the partial-period consolidation for each month.
@@ -307,7 +256,7 @@ class ConversationAgent(Agent):
 
 
 # --------------------------------------------------------------------------- #
-# 7. Duplicate Agent — same sheet twice, or a month already filed
+# 4. Duplicate Agent — same sheet twice, or a month already filed
 # --------------------------------------------------------------------------- #
 class DuplicateAgent(Agent):
     info = AgentInfo("duplicate", "Duplicate Agent",
@@ -322,10 +271,9 @@ class DuplicateAgent(Agent):
         from app.models.timesheet_record import TimesheetRecord
 
         # NOTE: byte-identical attachments are NOT checked here — the .eml
-        # collector already content-hash de-duplicates them (and
-        # merge_thread_units does the same across thread messages), so a
-        # duplicate can never reach this point. What IS new is spotting a month
-        # that was already filed, so the reviewer knows this will MERGE.
+        # collector already content-hash de-duplicates them, so a duplicate
+        # can never reach this point. What IS new is spotting a month that
+        # was already filed, so the reviewer knows this will MERGE.
         found: list[str] = []
         for g in ctx.groups:
             pk, month, year = g.get("employee_pk"), g.get("month"), g.get("year")
@@ -342,27 +290,6 @@ class DuplicateAgent(Agent):
                 found.append(msg)
                 g.setdefault("fold_notes", []).append(msg)
 
-        # Conflicts the thread call reported ACROSS sheets — most importantly
-        # two sheets both claiming the same full month, which must never be
-        # filed unreviewed. Recorded as an overlap flag so auto-accept blocks.
-        for c in ctx.conflicts or []:
-            ctype = str(c.get("type") or "other")
-            if ctype == "partial_merge":
-                continue                      # complementary halves — fine, they merge
-            detail = str(c.get("detail") or "").strip()
-            names = ", ".join(str(n) for n in (c.get("sheets") or [])[:4])
-            who = str(c.get("employee") or "").strip().lower()
-            msg = (f"{'Two sheets claim the SAME full month' if ctype == 'duplicate_full_month' else 'Duplicate'}"
-                   f"{f' ({names})' if names else ''}"
-                   f"{f' — {detail}' if detail else ''}")
-            for g in ctx.groups:
-                gname = (g.get("name") or "").strip().lower()
-                gid = (g.get("employee_id") or "").strip().lower()
-                if not who or who in (gname, gid) or who in gname:
-                    if c.get("month") in (None, g.get("month")):
-                        g.setdefault("overlap_flags", []).append(msg)
-            found.append(msg)
-
         if not found:
             return "no duplicates found"
         ctx.notes.extend(found)
@@ -370,35 +297,7 @@ class DuplicateAgent(Agent):
 
 
 # --------------------------------------------------------------------------- #
-# 8. Validation Agent — business rules (deterministic)
-# --------------------------------------------------------------------------- #
-class ValidationAgent(Agent):
-    info = AgentInfo("validation", "Validation Agent",
-                     "checking dates, duplicates within the month and calendar limits")
-
-    def skip_reason(self, ctx: AgentContext) -> str | None:
-        return None if ctx.groups else "no records"
-
-    async def run(self, ctx: AgentContext) -> str:
-        from app.services.extraction.validation import validate
-
-        total_flags = 0
-        for g in ctx.groups:
-            month, year = g.get("month"), g.get("year")
-            if not (month and year):
-                g["validation_flags"] = ["No usable month/year on these sheets."]
-                total_flags += 1
-                continue
-            cleaned, flags = validate(g["buckets"], month, year)
-            g["buckets"] = cleaned
-            g["validation_flags"] = flags
-            total_flags += len(flags)
-        return ("all records passed validation" if not total_flags
-                else f"{total_flags} flag(s) raised for review")
-
-
-# --------------------------------------------------------------------------- #
-# 9. Decision Agent — auto-accept / review, then stage + file
+# 5. Decision Agent — auto-accept / review, then stage + file
 # --------------------------------------------------------------------------- #
 class DecisionAgent(Agent):
     info = AgentInfo("decision", "Decision Agent",
@@ -429,31 +328,13 @@ class DecisionAgent(Agent):
         return ", ".join(parts) or "nothing staged"
 
 
-def build_pipeline(*, stage: bool = True) -> list[Agent]:
-    """Per-sheet line-up — used by Upload and Manual entry, where there is one
-    file (or a handful) and no conversation to read.
-
-    `stage=False` stops before the Decision Agent — used by previews that
-    analyse a sheet without staging or filing anything."""
-    agents: list[Agent] = [
-        EmailAgent(), AttachmentAgent(), VisionAgent(), ApprovalAgent(),
-        EmployeeAgent(), ConversationAgent(), DuplicateAgent(), ValidationAgent(),
-    ]
-    if stage:
-        agents.append(DecisionAgent())
-    return agents
-
-
 def build_thread_pipeline(*, stage: bool = True) -> list[Agent]:
-    """Extract Email's line-up: ONE model call for the whole conversation,
-    then the same deterministic tail (identity, consolidation, duplicates,
-    validation, auto-accept) that Upload uses."""
-    # No ApprovalAgent: pass 1 already reports approval with quoted evidence
-    # from the whole conversation, so the text detector always skipped — it
-    # only added a permanently-greyed row to the live view.
+    """The ONE pipeline: read the whole conversation/submission (ThreadAgent),
+    then the deterministic tail (identity, consolidation, duplicates,
+    auto-accept)."""
     agents: list[Agent] = [
         ThreadAgent(),
-        EmployeeAgent(), ConversationAgent(), DuplicateAgent(), ValidationAgent(),
+        EmployeeAgent(), ConversationAgent(), DuplicateAgent(),
     ]
     if stage:
         agents.append(DecisionAgent())

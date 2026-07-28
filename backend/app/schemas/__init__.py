@@ -176,6 +176,8 @@ class TimesheetOut(BaseModel):
     unpaid_leave_dates: list[str]
     absent_dates: list[str]
     public_holiday_dates: list[str]
+    working_dates: list[str]
+    weekend_dates: list[str]
     annual_leave_count: int
     remote_work_count: int
     sick_leave_count: int
@@ -183,6 +185,8 @@ class TimesheetOut(BaseModel):
     unpaid_leave_count: int
     absent_count: int
     public_holiday_count: int
+    working_dates_count: int
+    weekend_dates_count: int
     validation_status: str
     llm_summary: str | None
     hr_flags: list[str]
@@ -257,6 +261,8 @@ class TimesheetUpdate(BaseModel):
     unpaid_leave_dates: list[str] | None = None
     absent_dates: list[str] | None = None
     public_holiday_dates: list[str] | None = None
+    working_dates: list[str] | None = None
+    weekend_dates: list[str] | None = None
     month: int | None = None
     year: int | None = None
 
@@ -368,4 +374,56 @@ class ImportSummary(BaseModel):
     inserted: int
     updated: int
     skipped: int
+
+
+class PublicHolidayIn(BaseModel):
+    date: str            # ISO YYYY-MM-DD
+    name: str = ""
+
+
+class MonthCalendarIn(BaseModel):
+    """Admin input for one (month, year)'s weekends + public holidays —
+    fed into Pass 2 as ground truth instead of the model inferring it."""
+    month: int
+    year: int
+    weekend_weekdays: list[str] = []    # e.g. ["Friday", "Saturday"]
+    public_holidays: list[PublicHolidayIn] = []
+
+
+class MonthCalendarOut(BaseModel):
+    id: str
+    month: int
+    year: int
+    weekend_weekdays: list[str]
+    public_holidays: list[PublicHolidayIn]
+    created_at: datetime
+    updated_at: datetime
+
+
+class DebugRunSummary(BaseModel):
+    """Lightweight row for the /admin/debug run list — full prompt/response
+    text, dropped items, and sheets JSON only load in DebugRunOut (detail)."""
+    id: str
+    created_at: datetime
+    source_kind: str | None
+    source_id: str | None
+    thread_key: str | None
+    subject: str | None
+    model: str | None
+    calls: int
+    reused_sheets: int
+    n_pass1_calls: int
+    n_pass2_calls: int
+    n_dropped: int
+    n_sheets: int
+    n_errors: int
+
+
+class DebugRunOut(DebugRunSummary):
+    pass1_calls: list[dict]
+    pass2_calls: list[dict]
+    dropped_items: list[dict]
+    triage: list[dict]
+    sheets: list[dict]
+    errors: list[str]
     skipped_details: list[SkipDetail] = []

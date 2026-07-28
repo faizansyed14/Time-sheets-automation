@@ -64,6 +64,9 @@ class TimesheetRecord(Base):
     unpaid_leave_dates: Mapped[list] = mapped_column(JSON, default=list)
     absent_dates: Mapped[list] = mapped_column(JSON, default=list)
     public_holiday_dates: Mapped[list] = mapped_column(JSON, default=list)
+    # ---- day-accounting fields (not leave — worked / off, same editable UI) ----
+    working_dates: Mapped[list] = mapped_column(JSON, default=list)
+    weekend_dates: Mapped[list] = mapped_column(JSON, default=list)
 
     # ---- machine validation ----
     validation_status: Mapped[str] = mapped_column(
@@ -120,6 +123,14 @@ class TimesheetRecord(Base):
     @property
     def public_holiday_count(self) -> int:
         return len(self.public_holiday_dates or [])
+
+    @property
+    def working_dates_count(self) -> int:
+        return len(self.working_dates or [])
+
+    @property
+    def weekend_dates_count(self) -> int:
+        return len(self.weekend_dates or [])
 
     @property
     def source_file_count(self) -> int:

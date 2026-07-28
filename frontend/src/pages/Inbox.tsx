@@ -1319,8 +1319,10 @@ export default function InboxPage() {
   const extractEmail = useMutation({
     // Streams live pipeline activity into the ExtractionActivityModal; the
     // resolved value is the same {staged, groups, message} payload as before.
-    mutationFn: (id: string) =>
-      extractRun.start((onEvent) => extractFullEmailStream(id, onEvent)) as Promise<{
+    // Incremental by default (only new + a couple of context messages are
+    // re-read); `forceFull` re-reads the whole thread from scratch.
+    mutationFn: ({ id, forceFull }: { id: string; forceFull?: boolean }) =>
+      extractRun.start((onEvent) => extractFullEmailStream(id, onEvent, forceFull)) as Promise<{
         staged: PipelineFile[]; groups: number; message: string;
       }>,
     onSuccess: (res) => {
@@ -1555,24 +1557,38 @@ export default function InboxPage() {
                               && new Date(detail.received_at) > new Date(at);
                             if (at && !isNewer) return null;
                             return (
-                              <Button
-                                size="sm"
-                                variant={isNewer ? "secondary" : undefined}
-                                disabled={extractEmail.isPending || loadingDetail}
-                                onClick={() => extractEmail.mutate(detail.provider_message_id)}
-                                title={isNewer
-                                  ? "This reply arrived after the last run — re-read the thread so its content (and any approval) is included."
-                                  : "Whole conversation to the model in one call — every attachment, approval detected, grouped per employee/month for Compare & Fix"}
-                              >
-                                {extractEmail.isPending ? (
-                                  <Spinner className="border-white/40 border-t-white h-3 w-3" />
-                                ) : (
-                                  <Wand2 className="h-3 w-3" />
+                              <>
+                                <Button
+                                  size="sm"
+                                  variant={isNewer ? "secondary" : undefined}
+                                  disabled={extractEmail.isPending || loadingDetail}
+                                  onClick={() => extractEmail.mutate({ id: detail.provider_message_id })}
+                                  title={isNewer
+                                    ? "This reply arrived after the last run — reads only the new message(s) + a couple of prior ones for context, reusing everything else already extracted."
+                                    : "Whole conversation to the model in one call — every attachment, approval detected, grouped per employee/month for Compare & Fix"}
+                                >
+                                  {extractEmail.isPending ? (
+                                    <Spinner className="border-white/40 border-t-white h-3 w-3" />
+                                  ) : (
+                                    <Wand2 className="h-3 w-3" />
+                                  )}
+                                  {extractEmail.isPending
+                                    ? "Extracting…"
+                                    : isNewer ? "Re-extract (new reply)" : "Extract Email"}
+                                </Button>
+                                {at && (
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    disabled={extractEmail.isPending || loadingDetail}
+                                    onClick={() => extractEmail.mutate(
+                                      { id: detail.provider_message_id, forceFull: true })}
+                                    title="Ignore the incremental cache and re-read the ENTIRE thread from scratch — use this if a past read looks stale or wrong."
+                                  >
+                                    Re-read entire thread
+                                  </Button>
                                 )}
-                                {extractEmail.isPending
-                                  ? "Extracting…"
-                                  : isNewer ? "Re-extract (new reply)" : "Extract Email"}
-                              </Button>
+                              </>
                             );
                           })()}
                           {detail.extract_email_at && (

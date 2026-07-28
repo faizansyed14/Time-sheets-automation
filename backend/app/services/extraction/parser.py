@@ -1,7 +1,5 @@
 """
-LLM response parsing for Extract Email (app.services.extract_email).
-
-The extraction PROMPTS live in app.services.extract_email.prompts.
+Shared date-parsing helpers used across the extraction pipeline.
 """
 from __future__ import annotations
 

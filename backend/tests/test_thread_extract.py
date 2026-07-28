@@ -1,25 +1,42 @@
-"""Two-pass thread extraction: what gets sent, and how each reply is used.
+"""The Item/Message/Thread collector (thread_extract.collect_thread) and the
+two-pass orchestration built on top of it.
 
-Extract Email runs TWO focused calls over one conversation:
-
-  Pass 1 — understand: which items are really timesheets, whose each one is,
-           whether a manager approved, what the thread is about, what is noise.
-  Pass 2 — extract: read ONLY the validated sheets, transcribing leave.
-
-One call asked to do both did neither well — sheets were invented from passing
-mentions while real grids were skimmed. These tests cover the parts that must
-hold without spending a call.
+Ported design (docs/timesheet_strong_prompt.ipynb): every attachment AND every
+message body becomes its own [A#] item; a stable key is unambiguous by
+construction, unlike matching on filename alone.
 """
 from email.message import EmailMessage as MimeMessage
 
 from app.services.extract_email.thread_extract import (
-    ThreadPayload,
-    collect_thread_payload,
-    normalise_extraction,
-    normalise_triage,
+    Item,
+    Thread,
+    _content_digest,
+    _dedupe_sheet_items,
+    collect_thread,
+    require_vision_configured,
+    resolve_source,
 )
-from app.services.extract_email.thread_prompt import build_extraction_prompt
-from app.services.extract_email.triage_prompt import build_triage_prompt
+
+
+def _png_bytes(*, big: bool) -> bytes:
+    """A real, decodable PNG — the collector actually opens every image with
+    PIL (to resize/re-encode it), so a fake byte string with a valid magic
+    number but garbage pixel data fails to decode and vanishes silently.
+    Random noise (not a solid colour) so PNG compression can't shrink a
+    "big" image back under the size floor."""
+    import io as _io
+    import random
+
+    from PIL import Image
+
+    side = 400 if big else 20
+    rng = random.Random(0)
+    img = Image.new("RGB", (side, side))
+    img.putdata([(rng.randrange(256), rng.randrange(256), rng.randrange(256))
+                 for _ in range(side * side)])
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _mail(*, subject="TIMESHEET June 2026", plain="", html=None, attachments=()):
@@ -36,109 +53,98 @@ def _mail(*, subject="TIMESHEET June 2026", plain="", html=None, attachments=())
 
 
 # --------------------------------------------------------------------------
-# What gets sent
+# What gets collected, and how it's labelled
 # --------------------------------------------------------------------------
 
-def test_over_capacity_files_are_skipped_with_the_right_reason():
-    """A file dropped for hitting MAX_FILES is a CAPACITY problem — a real,
-    readable document. It must never be reported as 'unsupported type', or the
-    actual fix (raise the cap / split the thread) never gets noticed."""
-    import app.services.extract_email.thread_extract as te
-
-    eml = _mail(attachments=[
-        (f"sheet{i}.pdf", f"%PDF-1.4 sheet {i}".encode(), "application", "pdf")
-        for i in range(te.MAX_FILES + 2)
+def test_every_attachment_and_body_gets_a_stable_a_key():
+    eml = _mail(plain="Here is my sheet.", attachments=[
+        ("sheet.pdf", b"%PDF-1.4 fake sheet", "application", "pdf"),
     ])
-    p = collect_thread_payload([("msg 1", eml)])
+    th = collect_thread([("msg 1", eml)])
+    keys = [it.key for it in th.items]
+    assert keys == sorted(keys, key=lambda k: int(k[1:])), "keys should be assigned in order"
+    assert len(set(keys)) == len(keys), "every item key must be unique"
+    names = [it.name for it in th.items]
+    assert "sheet.pdf" in names
+    assert any(n.startswith("email body") for n in names)
 
-    assert len(p.files) == te.MAX_FILES
-    reasons = {reason for _, reason in p.skipped}
-    assert reasons == {"over_capacity"}
-    assert len(p.skipped) == 2
+
+def test_resolve_source_matches_by_bracketed_key():
+    eml = _mail(attachments=[("sheet.pdf", b"%PDF-1.4 x", "application", "pdf")])
+    th = collect_thread([("msg 1", eml)])
+    sheet_item = next(it for it in th.items if it.name == "sheet.pdf")
+    assert resolve_source(f"[{sheet_item.key}] sheet.pdf", th.items) is sheet_item
+    assert resolve_source(sheet_item.key, th.items) is sheet_item
+    assert resolve_source("sheet.pdf", th.items) is sheet_item
+    assert resolve_source("nothing-like-this", th.items) is None
 
 
-def test_unsupported_type_is_a_different_reason_than_capacity():
+def test_tiny_images_are_dropped_before_any_ocr_or_model_call():
+    """A signature icon / tracking pixel never reaches the model — filtered by
+    size alone, before OCR is even attempted."""
     eml = _mail(attachments=[
-        ("archive.zip", b"PK\x03\x04 fake zip", "application", "zip"),
+        ("logo.png", _png_bytes(big=False), "image", "png"),
     ])
-    p = collect_thread_payload([("msg 1", eml)])
-    assert p.files == [] and p.images == []
-    assert p.skipped == [("archive.zip", "unsupported_type")]
+    th = collect_thread([("msg 1", eml)])
+    assert not any(it.name == "logo.png" for it in th.items)
+    assert any(d["name"] == "logo.png" for d in th.dropped)
 
 
-def test_documents_and_real_sized_images_are_all_sent():
-    """A real screenshot (well above MIN_IMAGE_BYTES) is sent untouched — pass 1
-    names it as noise or evidence itself, which is far safer than a heuristic
-    guessing 'signature icon' and dropping a real approval screenshot."""
-    import app.services.extract_email.thread_extract as te
+def test_real_sized_image_without_ocr_available_is_kept():
+    """When OCR can't actually run (no engine binary), the noise filter must
+    not treat that as "no text -> drop it" — every real picture attachment is
+    kept, exactly like the notebook does when its OCR check is unavailable."""
+    from app.services.extraction import ocr as ocr_mod
 
-    eml = _mail(attachments=[
-        ("timesheet.pdf", b"%PDF-1.4 fake sheet", "application", "pdf"),
-        ("screenshot.png", b"\x89PNG\r\n\x1a\n" + b"0" * (te.MIN_IMAGE_BYTES + 5000),
-         "image", "png"),
-    ])
-    p = collect_thread_payload([("msg 1", eml)])
+    eml = _mail(attachments=[("screenshot.png", _png_bytes(big=True), "image", "png")])
+    assert len(eml) > 0
 
-    assert [n for n, _, _ in p.files] == ["timesheet.pdf"]
-    assert [n for n, _ in p.images] == ["screenshot.png"], \
-        "images at/above the size floor must not be filtered out"
-
-
-def test_tiny_images_are_filtered_before_the_model_sees_them():
-    """A signature icon / social-media button / tracking pixel is never a
-    document worth a vision call — real screenshots run far larger than this.
-    Filtered here (by size) rather than left for the model, and reported with
-    its own skip reason so it is never confused with a capacity drop or an
-    unreadable filetype."""
-    import app.services.extract_email.thread_extract as te
-
-    eml = _mail(attachments=[
-        ("logo.png", b"\x89PNG\r\n\x1a\n" + b"0" * 200, "image", "png"),
-    ])
-    p = collect_thread_payload([("msg 1", eml)])
-
-    assert p.images == []
-    assert p.skipped == [("logo.png", "too_small")]
+    orig_status = ocr_mod.ocr_status
+    try:
+        ocr_mod.ocr_status = lambda: "not_installed"
+        th = collect_thread([("msg 1", eml)])
+    finally:
+        ocr_mod.ocr_status = orig_status
+    assert any(it.name == "screenshot.png" for it in th.items)
 
 
-def test_html_table_body_is_not_lost():
-    """The pasted grid lives in text/html; text/plain carries only the note."""
+def test_html_table_body_survives_as_text_never_as_an_image():
+    """Conversation text is always plain text — a pasted grid in the body
+    becomes a text item, never a rendered picture (unlike a real attachment)."""
     html = ("<html><body><p>Hi</p><table>"
             "<tr><td>1-June-26</td><td>Sick Leave</td></tr>"
             "<tr><td>2-June-26</td><td>Annual Leave</td></tr>"
             "</table></body></html>")
-    p = collect_thread_payload([("msg 1", _mail(plain="Hi team", html=html))])
-
-    assert "1-June-26" in p.bodies
-    assert "Sick Leave" in p.bodies
-    assert any("body grid" in n for n, _ in p.images), \
-        f"a real <table> body should also render to an image: {[n for n, _ in p.images]}"
-
-
-def test_plain_body_without_a_table_is_not_rendered():
-    """Ordinary mail must not pay for a body render it doesn't need."""
-    p = collect_thread_payload([("msg 1", _mail(plain="Approved. Thanks."))])
-    assert not any("body grid" in n for n, _ in p.images)
-    assert "Approved" in p.bodies
-
-
-def test_identical_attachment_across_messages_is_sent_once():
-    pdf = b"%PDF-1.4 the same sheet"
-    a = _mail(attachments=[("sheet.pdf", pdf, "application", "pdf")])
-    b = _mail(subject="RE: TIMESHEET", attachments=[("sheet-copy.pdf", pdf, "application", "pdf")])
-    p = collect_thread_payload([("msg 1", a), ("msg 2", b)])
-    assert len(p.files) == 1, [n for n, _, _ in p.files]
+    th = collect_thread([("msg 1", _mail(plain="Hi team", html=html))])
+    body_item = next(it for it in th.items if it.name.startswith("email body"))
+    assert "1-June-26" in body_item.text
+    assert "Sick Leave" in body_item.text
+    assert body_item.images == []
 
 
 def test_every_message_body_is_included_oldest_first():
     a = _mail(subject="TIMESHEET June", plain="Here is my sheet.")
     b = _mail(subject="RE: TIMESHEET June", plain="Approved by me.")
-    p = collect_thread_payload([("msg 1", a), ("msg 2", b)])
-    assert p.bodies.index("Here is my sheet") < p.bodies.index("Approved by me")
+    th = collect_thread([("msg 1", a), ("msg 2", b)])
+    assert [m.body for m in th.messages] == ["Here is my sheet.", "Approved by me."]
+
+
+def test_csv_and_txt_attachments_are_native_text():
+    eml = _mail(attachments=[
+        ("data.csv", b"date,status\n2026-06-01,present\n", "text", "csv"),
+        ("notes.txt", b"free-form notes about the month", "text", "plain"),
+    ])
+    th = collect_thread([("msg 1", eml)])
+    csv_item = next(it for it in th.items if it.name == "data.csv")
+    txt_item = next(it for it in th.items if it.name == "notes.txt")
+    assert "2026-06-01" in csv_item.text
+    assert csv_item.send_mode == "native"
+    assert "free-form notes" in txt_item.text
+    assert txt_item.send_mode == "native"
 
 
 # --------------------------------------------------------------------------
-# Emails inside emails
+# Emails/messages inside emails (forwarded)
 # --------------------------------------------------------------------------
 
 def _eml_attached(inner: bytes, *, filename="forwarded.eml", as_message=False) -> bytes:
@@ -150,23 +156,18 @@ def _eml_attached(inner: bytes, *, filename="forwarded.eml", as_message=False) -
         m.add_attachment(inner, maintype="message", subtype="rfc822", filename=filename)
     else:
         # How Outlook actually attaches a saved .eml — as an opaque file.
-        m.add_attachment(inner, maintype="application", subtype="octet-stream",
-                         filename=filename)
+        m.add_attachment(inner, maintype="application", subtype="octet-stream", filename=filename)
     return m.as_bytes()
 
 
 def test_eml_attached_as_a_file_is_opened():
     """An .eml attached as application/octet-stream is just bytes — MIME
-    walking never sees inside it. Before this was handled, the timesheet it
-    carried was silently dropped as an 'unsupported type'."""
+    walking never sees inside it unless unwrapped explicitly."""
     inner = _mail(subject="Inner", plain="inner body text",
                   attachments=[("hidden.pdf", b"%PDF-1.4 hidden", "application", "pdf")])
-    p = collect_thread_payload([("msg 1", _eml_attached(inner))])
-
-    assert [n for n, _, _ in p.files] == ["hidden.pdf"], \
-        "the sheet inside the attached email must be recovered"
-    assert "inner body text" in p.bodies
-    assert p.skipped == []
+    th = collect_thread([("msg 1", _eml_attached(inner))])
+    assert any(it.name == "hidden.pdf" for it in th.items)
+    assert any("inner body text" in m.body for m in th.messages)
 
 
 def test_eml_nested_several_levels_deep_is_opened():
@@ -175,8 +176,8 @@ def test_eml_nested_several_levels_deep_is_opened():
                     attachments=[("deep.pdf", b"%PDF-1.4 deep", "application", "pdf")])
     mid = _eml_attached(deepest, filename="level3.eml")
     top = _eml_attached(mid, filename="level2.eml")
-    p = collect_thread_payload([("msg 1", top)])
-    assert [n for n, _, _ in p.files] == ["deep.pdf"]
+    th = collect_thread([("msg 1", top)])
+    assert any(it.name == "deep.pdf" for it in th.items)
 
 
 def test_eml_recursion_is_depth_limited():
@@ -186,310 +187,378 @@ def test_eml_recursion_is_depth_limited():
     payload = _mail(subject="base", plain="base")
     for _ in range(te.MAX_EML_DEPTH + 3):
         payload = _eml_attached(payload)
-    collect_thread_payload([("msg 1", payload)])   # must simply return
+    collect_thread([("msg 1", payload)])   # must simply return, not recurse forever
 
 
 # --------------------------------------------------------------------------
-# Pass 1 — the triage prompt
+# require_vision_configured
 # --------------------------------------------------------------------------
 
-def test_triage_prompt_demands_evidence_and_allows_an_empty_answer():
-    _sys, user = build_triage_prompt(manifest=[], bodies="")
-    assert "A NAME AND A MONTH ARE NOT ENOUGH" in user
-    assert "empty `items` list" in user or '"items"' in user
-    assert "invoice" in user.lower()
+def test_require_vision_configured_passes_with_a_key():
+    # conftest sets a fake OPENAI_API_KEY so the thread pipeline can run in
+    # tests without a real network call (vision_client.chat_call is mocked
+    # per-test where needed).
+    api_key, model = require_vision_configured()
+    assert api_key
+    assert model
 
 
-def test_triage_prompt_covers_all_three_places_approval_can_hide():
-    _sys, user = build_triage_prompt(manifest=[], bodies="")
-    assert "ON THE SHEET" in user
-    assert "IN AN IMAGE" in user
-    assert "IN THE CONVERSATION" in user
-    assert "HANDWRITTEN SIGNATURE IMAGE COUNTS" in user
-    # ...and still refuses to read a request as an approval.
-    assert "please approve" in user.lower()
-
-
-def test_triage_prompt_asks_for_noise_and_multiple_employees():
-    _sys, user = build_triage_prompt(manifest=[], bodies="")
-    assert "noise" in user.lower()
-    assert "several employees" in user.lower() or "whole team" in user.lower()
-
-
-def test_triage_prompt_lists_the_known_templates():
-    _sys, user = build_triage_prompt(manifest=[], bodies="")
-    assert "alpha_adr_attendance" in user
+def test_require_vision_configured_raises_without_a_key(monkeypatch):
+    from app.core.config import settings as s
+    monkeypatch.setattr(s, "openai_api_key", "")
+    import pytest
+    with pytest.raises(RuntimeError):
+        require_vision_configured()
 
 
 # --------------------------------------------------------------------------
-# Pass 2 — the extraction prompt
+# Same-sheet dedupe (re-attached / regenerated with manager sign)
 # --------------------------------------------------------------------------
 
-_TRIAGED = [{
-    "source": "sheet.pdf", "kind": "timesheet", "format_id": "alpha_adr_attendance",
-    "employee_name": "Bhargavi Prabhu", "employee_id": "E2506943",
-    "period_hint": "June 2026", "evidence": "1-June-26 08:00 AM",
-    "manager_signature": True, "signature_evidence": "D. Shetty", "notes": "",
-}]
+_SHEET_CORE = (
+    "Employee: Ayaz Kardame\n"
+    "Period: June 2026\n"
+    "Project: Digital Platforms\n"
+    "Days: Mon-Fri present\n"
+    "Total hours: 176\n"
+)
 
 
-def test_extraction_prompt_is_told_not_to_reclassify():
-    """Pass 1 already decided these are timesheets. Re-litigating that is how
-    the single-call version ended up skimming real grids."""
-    _sys, user = build_extraction_prompt(sheets=_TRIAGED, format_ids=["alpha_adr_attendance"])
-    assert "ALREADY been confirmed" in user
-    assert "do not question whether they are timesheets" in user
-    assert "Bhargavi Prabhu" in user
+def test_exact_same_attachment_bytes_keep_one_sheet():
+    payload = b"%PDF-1.4 identical-timesheet-body"
+    digest = _content_digest(payload)
+    th = Thread(
+        subject="June",
+        items=[
+            Item(key="A1", name="June.pdf", mime="application/pdf",
+                 msg_index=0, text=_SHEET_CORE, size=len(payload), digest=digest),
+            Item(key="A2", name="June-1.pdf", mime="application/pdf",
+                 msg_index=2, text=_SHEET_CORE, size=len(payload), digest=digest),
+        ],
+    )
+    _dedupe_sheet_items(th)
+    assert [it.key for it in th.items] == ["A2"]
+    assert len(th.dropped) == 1
+    assert th.dropped[0]["filter"] == "dup"
+    assert th.dropped[0]["kept_key"] == "A2"
+    assert th.dropped[0]["name"] == "June.pdf"
 
 
-def test_extraction_prompt_carries_only_matching_template_rules():
-    _sys, user = build_extraction_prompt(sheets=_TRIAGED, format_ids=["alpha_adr_attendance"])
-    assert "alpha_adr_attendance" in user
-    assert "dewa_moro_smartoffice" not in user
-    assert "gpssa_daily_report" not in user
+def test_near_same_ocr_prefers_manager_signed_copy():
+    """Unsigned first send + later regen with Approved By → keep signed one."""
+    unsigned = _SHEET_CORE + "Status: Submitted\n"
+    signed = (
+        _SHEET_CORE
+        + "Approved By: Ahmed Shukri\n"
+        + "Approval Date: 08/07/2026\n"
+        + "Manager signature present\n"
+    )
+    th = Thread(
+        subject="June",
+        items=[
+            Item(key="A1", name="June.pdf", mime="application/pdf",
+                 msg_index=0, text=unsigned, size=100),
+            Item(key="A2", name="June-1.pdf", mime="application/pdf",
+                 msg_index=2, text=signed, size=110),
+        ],
+    )
+    _dedupe_sheet_items(th)
+    assert [it.key for it in th.items] == ["A2"]
+    assert th.dropped[0]["filter"] == "dup"
+    assert th.dropped[0]["kept_key"] == "A2"
+    assert "approval" in th.dropped[0]["reason"].lower() or "same" in th.dropped[0]["reason"].lower()
 
 
-def test_extraction_prompt_keeps_the_leave_mapping_and_medical_rule():
-    _sys, user = build_extraction_prompt(sheets=_TRIAGED, format_ids=[])
-    assert "MEDICAL" in user
-    assert "IS SICK LEAVE" in user.upper()
-    assert "NEVER DEFAULT TO ANNUAL" in user.upper()
-    for label in ("LWP", "AWOL", "WFH", "Vacation", "Maternity"):
-        assert label in user, f"{label} missing from the leave mapping"
+def test_email_bodies_are_never_deduped_against_attachments():
+    body = "Please find attached timesheets for June 2026."
+    th = Thread(
+        subject="June",
+        items=[
+            Item(key="A1", name="email body (message 1)", mime="text/plain",
+                 msg_index=0, text=body, size=40),
+            Item(key="A2", name="June.pdf", mime="application/pdf",
+                 msg_index=0, text=_SHEET_CORE + body, size=200),
+            Item(key="A3", name="email body (message 2)", mime="text/plain",
+                 msg_index=1, text=body, size=40),
+        ],
+    )
+    _dedupe_sheet_items(th)
+    assert {it.key for it in th.items} == {"A1", "A2", "A3"}
+    assert th.dropped == []
 
 
-def test_extraction_prompt_spells_out_the_messy_cases():
-    """Partial months, missing days and empty columns are the normal state of
-    a real sheet, not exceptions."""
-    _sys, user = build_extraction_prompt(sheets=_TRIAGED, format_ids=[])
-    for case in ("PARTIAL MONTH", "MISSING DAYS", "EMPTY COLUMNS",
-                 "TWO-DIGIT YEARS", "OVERLAPPING ENTRIES", "TOTALS ROWS"):
-        assert case in user, f"{case} not covered"
-
-
-def test_extraction_prompt_lets_the_sheet_override_the_triaged_name():
-    _sys, user = build_extraction_prompt(sheets=_TRIAGED, format_ids=[])
-    assert "the SHEET wins" in user
+def test_unrelated_sheets_are_not_merged():
+    th = Thread(
+        subject="mixed",
+        items=[
+            Item(key="A1", name="ayaz-june.pdf", mime="application/pdf",
+                 msg_index=0, text=_SHEET_CORE, size=100),
+            Item(key="A2", name="other-person.pdf", mime="application/pdf",
+                 msg_index=0,
+                 text=("Employee: Someone Else\nPeriod: May 2026\n"
+                       "Project: Other\nDays: leave only\nTotal hours: 8\n"),
+                 size=90),
+        ],
+    )
+    _dedupe_sheet_items(th)
+    assert {it.key for it in th.items} == {"A1", "A2"}
+    assert th.dropped == []
 
 
 # --------------------------------------------------------------------------
-# Normalising pass 1
+# Cache-aware extraction: reusing what a past run already found
 # --------------------------------------------------------------------------
 
-def test_triage_without_evidence_is_not_a_timesheet():
-    """"Please find my timesheet for June" with no grid used to open an empty
-    Compare & Fix that a human then had to delete."""
-    raw = {"items": [{
-        "source": "email body", "is_timesheet": True, "kind": "timesheet",
-        "employee_name": "Anfal Taj", "evidence": "",
-    }]}
-    items, _a, _s, _n = normalise_triage(raw, ThreadPayload())
-    assert items[0]["kind"] == "other", "a name + a month is not a timesheet"
+def _cached_entry(sheet: dict) -> dict:
+    return {"filename": sheet["name"], "at": "2026-01-01T00:00:00+00:00",
+            "model": "test-model", "prompt_version": "thread-v1", "sheet": sheet}
 
 
-def test_triage_with_a_quoted_row_is_a_timesheet():
-    raw = {"items": [{
-        "source": "sheet.pdf", "kind": "timesheet",
-        "evidence": "1-June-26 08:00 AM 5:00 PM",
-    }]}
-    items, _a, _s, _n = normalise_triage(raw, ThreadPayload())
-    assert items[0]["kind"] == "timesheet"
-
-
-def test_leave_certificate_needs_no_grid():
-    """Only the timesheet claim is policed — certificates legitimately have no
-    day rows."""
-    raw = {"items": [{"source": "cert.pdf", "kind": "leave_certificate", "evidence": ""}]}
-    items, _a, _s, _n = normalise_triage(raw, ThreadPayload())
-    assert items[0]["kind"] == "leave_certificate"
-
-
-def test_triage_captures_approval_and_where_it_came_from():
-    raw = {"approval": {"detected": True, "evidence": "Approved — D. Shetty",
-                        "source": "reply 2", "where": "conversation"}}
-    _i, approval, _s, _n = normalise_triage(raw, ThreadPayload())
-    assert approval["detected"] is True
-    assert "D. Shetty" in approval["detail"]
-    assert approval["where"] == "conversation"
-
-
-def test_a_signed_sheet_counts_as_approval():
-    """Observed: the model reported `manager_signature: true` on the sheet and
-    `approval.detected: false` in the same answer. That contradiction holds an
-    already-approved timesheet for review, so the per-item finding wins."""
-    raw = {
-        "items": [{"source": "sheet.pdf", "kind": "timesheet",
-                   "evidence": "1-June-26 08:00 AM",
-                   "manager_signature": True, "signature_evidence": "D. Shetty"}],
-        "approval": {"detected": False},
+def _sheet_dict(name: str, **overrides) -> dict:
+    base = {
+        "name": name, "kind": "timesheet", "employee_name": "Cached Person",
+        "employee_id": "C1", "month": 6, "year": 2026, "days_covered": 1,
+        "period_type": "partial", "missing_days": [], "working_days": [],
+        "weekend_days": [], "uncertain_days": [], "annual": ["2026-06-01"],
+        "remote": [], "sick": [], "maternity": [], "unpaid": [], "absent": [],
+        "public_holiday": [], "manager_signature": False, "approval_evidence": "",
+        "text": "", "notes": "",
     }
-    _i, approval, _s, _n = normalise_triage(raw, ThreadPayload())
+    base.update(overrides)
+    return base
+
+
+async def test_sheet_name_is_the_real_attachment_not_the_a_number_label(mock_vision_calls):
+    """The final sheet's "name" (shown in staging, Compare & Fix, and the
+    debug view) must be the real filename a reviewer recognises, not the
+    internal "[A#]" label the model echoes back — "[A1]" means nothing to a
+    human, "june-timesheet.pdf" does. Caching (which resolves the ORIGINAL
+    item back by that internal key, via the new `_source_key` field) must
+    still work correctly once "name" stops being that key."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    eml = _mail(plain="See attached.", attachments=[
+        ("june-timesheet.pdf", b"%PDF-1.4 fake sheet", "application", "pdf"),
+    ])
+    # Attachments get a key BEFORE the message body (added last, once every
+    # message is walked) — one attachment here means it's "[A1]", the body
+    # item is "[A2]".
+    mock_vision_calls([
+        {"thread_summary": "", "items": [{
+            "source": "[A1]", "is_timesheet": True, "kind": "timesheet",
+            "employee_name": "Test Person", "employee_id": "E1",
+            "period_hint": "June 2026", "evidence": "1-June-26 present",
+            "manager_signature": False, "signature_evidence": "", "notes": "",
+        }]},
+        {"sheets": [{
+            "source": "[A1]", "employee_name": "Test Person", "employee_id": "E1",
+            "month": 6, "year": 2026, "days_covered": 1, "period_type": "partial",
+            "missing_days": [], "working_days": ["2026-06-01"], "weekend_days": [],
+            "uncertain_days": [], "annual": [], "remote": [], "sick": [],
+            "maternity": [], "unpaid": [], "absent": [], "public_holiday": [], "notes": "",
+        }]},
+    ])
+
+    sheets, approval, conflicts, meta = await extract_thread_sheets([("msg 1", eml)])
+
+    assert len(sheets) == 1
+    assert sheets[0]["name"] == "june-timesheet.pdf"
+    assert sheets[0]["_source_key"] == "[A1]"
+    # Caching still resolves the item correctly via _source_key, not name.
+    assert len(meta["_fresh_by_digest"]) == 1
+
+
+def test_ui_pass_item_shows_the_real_name_not_the_a_number_label():
+    """The live Extract UI's Pass 1 / "Timesheets for Pass 2" panels must
+    show a name a reviewer recognises — "source" (the raw [A#] label) stays
+    for debugging, but "name" is what the UI now renders."""
+    from app.services.extract_email.thread_extract import _ui_pass_item
+
+    items = [Item(key="A1", name="june-timesheet.pdf", mime="application/pdf", msg_index=0)]
+    triage_item = {"source": "[A1]", "kind": "timesheet", "employee_name": "Test Person",
+                   "employee_id": "E1", "period_hint": "June 2026",
+                   "manager_signature": False, "notes": ""}
+
+    ui_item = _ui_pass_item(triage_item, items)
+
+    assert ui_item["source"] == "[A1]"       # unchanged — matches the model's own JSON
+    assert ui_item["name"] == "june-timesheet.pdf"
+
+
+async def test_noise_list_shows_real_names_not_a_number_labels(mock_vision_calls):
+    """meta["noise"] (the "Model noise: ..." line in the live UI) must show
+    real names too — a reviewer has no idea what "[A14]" refers to."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    eml = _mail(plain="See attached.", attachments=[
+        ("marketing-flyer.pdf", b"%PDF-1.4 fake noise doc", "application", "pdf"),
+    ])
+    # The attachment gets key "A1" (before the message body).
+    mock_vision_calls([{"thread_summary": "", "items": [{
+        "source": "[A1]", "is_timesheet": False, "kind": "noise",
+        "employee_name": None, "employee_id": None, "period_hint": "",
+        "evidence": "", "manager_signature": False, "signature_evidence": "", "notes": "",
+    }]}])
+
+    sheets, approval, conflicts, meta = await extract_thread_sheets([("msg 1", eml)])
+
+    assert meta["noise"] == ["marketing-flyer.pdf"]
+
+
+async def test_cached_attachment_never_reaches_the_vision_model(mock_vision_calls):
+    """A window-message attachment whose bytes are already cached is spliced
+    in directly — pass 1/pass 2 never see it, only the body item does."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    pdf_bytes = b"%PDF-1.4 fake sheet"
+    eml = _mail(plain="See attached.", attachments=[
+        ("sheet.pdf", pdf_bytes, "application", "pdf"),
+    ])
+    digest = _content_digest(pdf_bytes)
+    cached_sheet = _sheet_dict("sheet.pdf")
+    cached = {digest: _cached_entry(cached_sheet)}
+
+    # Only the body item can reach pass 1 this run — if the cached PDF leaked
+    # through, a second scripted reply would be needed and this queue would
+    # be exhausted (mock_vision_calls raises on an unscripted extra call).
+    mock_vision_calls([{"thread_summary": "", "items": []}])
+
+    sheets, approval, conflicts, meta = await extract_thread_sheets(
+        [("msg 1", eml)], cached_sheets=cached)
+
+    assert sheets == [cached_sheet]
+    assert meta["reused_sheets"] == 1
+    assert approval["detected"] is False
+
+
+async def test_sheet_cached_from_outside_the_window_still_merges_in(mock_vision_calls):
+    """A digest cached for a message that was never even fetched this run
+    (the window only covers new + a couple of context messages) still shows
+    up in the final result — coverage must never regress just because an
+    older message wasn't re-read."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    eml = _mail(plain="Approved, thanks.")   # no attachment in THIS window at all
+    external_sheet = _sheet_dict(
+        "old-week1.pdf", period_type="week", days_covered=7,
+        working_days=[f"2026-06-0{d}" for d in range(1, 8)], annual=[])
+    cached = {"a" * 64: _cached_entry(external_sheet)}
+
+    mock_vision_calls([{"thread_summary": "", "items": []}])
+    sheets, approval, conflicts, meta = await extract_thread_sheets(
+        [("msg 1", eml)], cached_sheets=cached)
+
+    assert external_sheet in sheets
+    assert meta["reused_sheets"] == 1
+
+
+async def test_approval_signal_on_a_reused_sheet_is_not_lost(mock_vision_calls):
+    """manager_signature on a cached sheet must still surface as a detected
+    approval this run, even though nothing fresh confirmed it."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    eml = _mail(plain="fyi")
+    signed_sheet = _sheet_dict(
+        "signed.pdf", manager_signature=True, approval_evidence="D. Shetty")
+    cached = {"b" * 64: _cached_entry(signed_sheet)}
+
+    mock_vision_calls([{"thread_summary": "", "items": []}])
+    sheets, approval, conflicts, meta = await extract_thread_sheets(
+        [("msg 1", eml)], cached_sheets=cached)
+
     assert approval["detected"] is True
-    assert approval["where"] == "sheet"
     assert "D. Shetty" in approval["evidence"]
 
 
-def test_an_unsigned_thread_stays_unapproved():
-    raw = {
-        "items": [{"source": "sheet.pdf", "kind": "timesheet",
-                   "evidence": "1-June-26", "manager_signature": False}],
-        "approval": {"detected": False},
+async def test_named_only_signature_does_not_auto_detect_approval(mock_vision_calls):
+    """A typed name next to 'Approved by:' with no signature/stamp/status mark
+    (approval_named_only) must NOT flip detected — anyone can type a name.
+    It still surfaces to the reviewer as weak evidence, not silence."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    eml = _mail(plain="fyi")
+    named_only_sheet = _sheet_dict(
+        "form.pdf", manager_signature=True, approval_evidence="John Smith",
+        approval_named_only=True)
+    cached = {"c" * 64: _cached_entry(named_only_sheet)}
+
+    mock_vision_calls([{"thread_summary": "", "items": []}])
+    sheets, approval, conflicts, meta = await extract_thread_sheets(
+        [("msg 1", eml)], cached_sheets=cached)
+
+    assert approval["detected"] is False
+    assert approval["weak_evidence"] is True
+    assert "John Smith" in approval["detail"]
+
+
+async def test_a_real_signature_still_wins_alongside_a_weak_named_only_one(mock_vision_calls):
+    """A genuinely strong signal elsewhere in the thread must not be
+    suppressed just because a weaker, name-only item also exists."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    eml = _mail(plain="fyi")
+    named_only_sheet = _sheet_dict(
+        "form.pdf", manager_signature=True, approval_evidence="John Smith",
+        approval_named_only=True)
+    signed_sheet = _sheet_dict(
+        "signed.pdf", manager_signature=True, approval_evidence="D. Shetty (stamped)")
+    cached = {
+        "c" * 64: _cached_entry(named_only_sheet),
+        "d" * 64: _cached_entry(signed_sheet),
     }
-    _i, approval, _s, _n = normalise_triage(raw, ThreadPayload())
-    assert approval["detected"] is False
+
+    mock_vision_calls([{"thread_summary": "", "items": []}])
+    sheets, approval, conflicts, meta = await extract_thread_sheets(
+        [("msg 1", eml)], cached_sheets=cached)
+
+    assert approval["detected"] is True
+    assert "D. Shetty" in approval["evidence"]
+    assert approval["weak_evidence"] is True, "the weak signal is still recorded, just not the deciding one"
 
 
-def test_triage_summary_status_is_validated():
-    raw = {"summary": {"headline": "x", "status": "nonsense", "narrative": "y"}}
-    _i, _a, summary, _n = normalise_triage(raw, ThreadPayload())
-    assert summary["status"] == "other"
+async def test_nothing_fresh_confirmed_but_cache_has_content_still_returns_it(mock_vision_calls):
+    """Pass 1 confirming zero NEW sheets must not make the run look empty when
+    reused sheets exist — this is the exact "new reply with no attachment,
+    everything else already extracted" scenario."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    eml = _mail(plain="Approved.")
+    reused = _sheet_dict("earlier.pdf")
+    cached = {"c" * 64: _cached_entry(reused)}
+
+    mock_vision_calls([{"thread_summary": "", "items": [
+        {"source": "email body (message 1)", "is_timesheet": False, "kind": "approval",
+         "evidence": "", "manager_signature": False, "signature_evidence": "", "notes": ""},
+    ]}])
+    sheets, approval, conflicts, meta = await extract_thread_sheets(
+        [("msg 1", eml)], cached_sheets=cached)
+
+    assert sheets == [reused]
+    assert meta["sheet_count"] == 1
 
 
-def test_no_approval_reads_as_not_approved():
-    _i, approval, _s, _n = normalise_triage({}, ThreadPayload())
-    assert approval["detected"] is False
-    assert "No manager approval" in approval["detail"]
+async def test_no_cache_behaves_exactly_like_before(mock_vision_calls):
+    """cached_sheets omitted (the default) must be identical to today: every
+    attachment in the window goes through pass 1 fresh."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
 
-
-def test_noise_is_reported():
-    raw = {"noise": ["logo.png", "banner.jpg"]}
-    _i, _a, _s, noise = normalise_triage(raw, ThreadPayload())
-    assert noise == ["logo.png", "banner.jpg"]
-
-
-# --------------------------------------------------------------------------
-# Normalising pass 2 (merged with pass 1)
-# --------------------------------------------------------------------------
-
-def _payload_with_text(name: str, text: str) -> ThreadPayload:
-    """A payload where `name` is a real attachment that also has extracted
-    text — the shape the collector actually produces."""
-    p = ThreadPayload()
-    p.files = [(name, b"%PDF-1.4", "pdf")]
-    p.texts[name] = text
-    return p
-
-
-# --------------------------------------------------------------------------
-# Matching pass 1's source names to real payload items
-# --------------------------------------------------------------------------
-
-def test_email_body_resolves_to_the_rendered_body_grid():
-    """Pass 1 is told to call the body "email body", but the render is stored
-    as "<subject>.eml — body grid 1". Matching those literally found nothing,
-    so pass 2 was handed no attachment and reported NO leave — silently,
-    because an empty answer looks like a clean one."""
-    from app.services.extract_email.thread_extract import resolve_source
-
-    p = ThreadPayload()
-    p.images = [("TIMESHEET June.eml — body grid 1", b"jpg"), ("logo.png", b"png")]
-
-    assert resolve_source("email body", p) == ["TIMESHEET June.eml — body grid 1"]
-    assert resolve_source("body", p) == ["TIMESHEET June.eml — body grid 1"]
-
-
-def test_exact_attachment_name_resolves_to_itself():
-    from app.services.extract_email.thread_extract import resolve_source
-
-    p = ThreadPayload()
-    p.files = [("sheet.pdf", b"x", "pdf")]
-    assert resolve_source("sheet.pdf", p) == ["sheet.pdf"]
-
-
-def test_unknown_source_resolves_to_nothing():
-    from app.services.extract_email.thread_extract import resolve_source
-
-    p = ThreadPayload()
-    p.files = [("sheet.pdf", b"x", "pdf")]
-    assert resolve_source("something-else.pdf", p) == []
-
-
-def test_body_sheet_text_reaches_the_deterministic_gate():
-    """auto-accept's day-coverage check reads the sheet's OWN text. With the
-    name mismatch it got "" for body sheets, so coverage could never verify."""
-    p = ThreadPayload()
-    p.images = [("June.eml — body grid 1", b"jpg")]
-    p.texts["June.eml — body grid 1"] = "1-June-26 08:00 AM"
-
-    triaged = [{"source": "email body", "kind": "timesheet", "format_id": "generic"}]
-    raw = {"sheets": [{"source": "email body", "month": 6, "year": 2026}]}
-    s = normalise_extraction(raw, triaged, p)[0]
-    assert s["text"] == "1-June-26 08:00 AM"
-
-
-def test_extraction_prompt_includes_body_text_when_the_sheet_is_pasted():
-    _sys, user = build_extraction_prompt(
-        sheets=_TRIAGED, format_ids=[], body_text="1-June-26 | Maternity Leave")
-    assert "PASTED INTO THE EMAIL BODY" in user
-    assert "Maternity Leave" in user
-
-
-def test_extraction_prompt_omits_the_body_block_when_not_needed():
-    _sys, user = build_extraction_prompt(sheets=_TRIAGED, format_ids=[])
-    assert "PASTED INTO THE EMAIL BODY" not in user
-
-
-def test_extraction_merges_with_triage_into_the_staging_shape():
-    raw = {"sheets": [{
-        "source": "sheet.pdf",
-        "employee_name": "Bhargavi Prabhu", "employee_id": "E2506943",
-        "month": 6, "year": 2026, "days_covered": 30, "period_type": "full_month",
-        "missing_days": [], "evidence": "1-June-26 08:00 AM",
-        "sick": ["2026-06-19"], "public_holiday": ["2026-06-15"],
-    }]}
-    sheets = normalise_extraction(raw, _TRIAGED, _payload_with_text("sheet.pdf", "1-June-26 ..."))
-
-    s = sheets[0]
-    assert s["kind"] == "timesheet"                 # from pass 1
-    assert s["format_id"] == "alpha_adr_attendance"  # from pass 1
-    assert s["manager_signature"] is True            # from pass 1
-    assert s["employee_id"] == "E2506943"
-    assert (s["month"], s["year"]) == (6, 2026)
-    assert s["buckets"]["sick"] == ["2026-06-19"]
-    assert s["buckets"]["annual"] == []              # every bucket present
-    assert s["dates_complete"] is True
-    # Deterministic gates downstream read the sheet's OWN text, not the model's
-    # claim about it — so it must be carried through.
-    assert s["text"] == "1-June-26 ..."
-
-
-def test_partial_sheet_is_flagged_incomplete():
-    raw = {"sheets": [{
-        "source": "sheet.pdf", "month": 6, "year": 2026,
-        "days_covered": 15, "period_type": "half_month", "missing_days": [16, 17],
-    }]}
-    s = normalise_extraction(raw, _TRIAGED, ThreadPayload())[0]
-    assert s["period_type"] == "half_month"
-    assert s["dates_complete"] is False
-    assert s["incomplete_sheet"] is True
-    assert s["missing_days"] == [16, 17]
-
-
-def test_garbage_values_are_rejected_not_passed_through():
-    """A bad month/year must become None — never a wrong period on a payroll
-    record."""
-    raw = {"sheets": [{
-        "source": "sheet.pdf", "month": 77, "year": 1200,
-        "period_type": "whatever", "days_covered": "abc", "missing_days": [99, "x", 3],
-    }]}
-    s = normalise_extraction(raw, _TRIAGED, ThreadPayload())[0]
-    assert s["month"] is None and s["year"] is None
-    assert s["period_type"] == "unknown"
-    assert s["days_covered"] == 0
-    assert s["missing_days"] == [3]
-
-
-def test_sheet_printed_name_overrides_the_triaged_one():
-    """Pass 2 was looking straight at the header."""
-    raw = {"sheets": [{"source": "sheet.pdf", "employee_name": "Someone Else"}]}
-    s = normalise_extraction(raw, _TRIAGED, ThreadPayload())[0]
-    assert s["employee_name"] == "Someone Else"
-
-
-def test_extraction_falls_back_to_the_triaged_identity():
-    """A sheet whose header pass 2 could not read still keeps pass 1's answer
-    rather than losing the employee entirely."""
-    raw = {"sheets": [{"source": "sheet.pdf", "employee_name": None}]}
-    s = normalise_extraction(raw, _TRIAGED, ThreadPayload())[0]
-    assert s["employee_name"] == "Bhargavi Prabhu"
-    assert s["employee_id"] == "E2506943"
+    eml = _mail(attachments=[("sheet.pdf", b"%PDF-1.4 x", "application", "pdf")])
+    mock_vision_calls([
+        {"thread_summary": "", "items": [{
+            "source": "sheet.pdf", "is_timesheet": True, "kind": "timesheet",
+            "employee_name": "Fresh Person", "employee_id": "F1",
+            "period_hint": "June 2026", "evidence": "1-June-26",
+            "manager_signature": False, "signature_evidence": "", "notes": "",
+        }]},
+        {"sheets": [{
+            "source": "sheet.pdf", "employee_name": "Fresh Person", "employee_id": "F1",
+            "month": 6, "year": 2026, "days_covered": 1, "period_type": "partial",
+            "missing_days": [], "working_days": [], "weekend_days": [], "uncertain_days": [],
+            "annual": ["2026-06-01"], "remote": [], "sick": [], "maternity": [],
+            "unpaid": [], "absent": [], "public_holiday": [], "notes": "",
+        }]},
+    ])
+    sheets, approval, conflicts, meta = await extract_thread_sheets([("msg 1", eml)])
+    assert len(sheets) == 1
+    assert sheets[0]["employee_name"] == "Fresh Person"
+    assert meta.get("reused_sheets", 0) == 0

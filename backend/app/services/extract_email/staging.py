@@ -1,13 +1,20 @@
 """Stage pipeline review items."""
 from __future__ import annotations
 
+import calendar
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.email_message import EmailMessage
 from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
-from app.services.extract_email.constants import TAG_PREFIX
+from app.services.extract_email.constants import BUCKETS, TAG_PREFIX
 from app.services.extract_email.results import now, now_iso
+
+_LEAVE_LABEL = {
+    "annual": "annual", "remote": "WFH", "sick": "sick", "maternity": "maternity",
+    "unpaid": "unpaid", "absent": "absent", "public_holiday": "public holiday",
+}
 
 
 def sheet_summaries(sheets: list[dict]) -> list[dict]:
@@ -19,13 +26,52 @@ def sheet_summaries(sheets: list[dict]) -> list[dict]:
         "employee_name": s["employee_name"], "employee_id": s["employee_id"],
         "month": s["month"], "year": s["year"],
         "manager_signature": s.get("manager_signature", False),
-        "leave_days": sum(len(v) for v in s["buckets"].values()),
-        "format_id": s.get("format_id"),
-        "incomplete_sheet": bool(s.get("incomplete_sheet")),
-        "dates_complete": s.get("dates_complete", True),
+        "leave_days": sum(len(s.get(b) or []) for b in BUCKETS),
+        "working_days": len(s.get("working_days") or []),
+        "weekend_days": len(s.get("weekend_days") or []),
+        "uncertain_days": len(s.get("uncertain_days") or []),
+        "days_covered": s.get("days_covered", 0),
+        "period_type": s.get("period_type", "unknown"),
         "missing_days": s.get("missing_days") or [],
-        "classify_confidence": s.get("classify_confidence"),
+        "unaccounted_days": s.get("_unaccounted_days") or [],
     } for s in sheets]
+
+
+def summarize_group(g: dict) -> str:
+    """A clean, readable one-paragraph summary of a month's extraction —
+    always available (no LLM needed)."""
+    month, year = g.get("month"), g.get("year")
+    if not (month and year):
+        return "Could not read a month/year — pick the period in Compare & Fix."
+    buckets = g.get("buckets") or {}
+    parts = [f"{len(buckets.get(b) or [])} {label}" for b, label in _LEAVE_LABEL.items() if buckets.get(b)]
+    leave_total = sum(len(v or []) for v in buckets.values())
+    head = f"{calendar.month_name[month]} {year} — " + (", ".join(parts) if parts else "no leave recorded")
+    n_sheets = len(g.get("sheets") or [])
+    head += f" ({leave_total} leave day{'s' if leave_total != 1 else ''}"
+    head += f", {n_sheets} files)." if n_sheets > 1 else ")."
+    working, weekend = len(g.get("working_days") or []), len(g.get("weekend_days") or [])
+    if working or weekend:
+        head += f" {working} worked, {weekend} weekend."
+    n_flags = len(g.get("issues") or []) + len(g.get("uncertain_days") or []) + len(g.get("unaccounted_days") or [])
+    if not n_flags:
+        return head + " No issues found — clean and ready for approval."
+    return head + f" {n_flags} issue{'s' if n_flags != 1 else ''} need review."
+
+
+def group_flags(g: dict) -> list[str]:
+    flags = list(dict.fromkeys(g.get("overlap_flags", []) + g.get("fold_notes", []) + g.get("issues", [])))
+    if not (g.get("month") and g.get("year")):
+        flags.append("No usable month/year on these sheets — pick the period.")
+    for s in g.get("sheets") or []:
+        miss = s.get("missing_days") or []
+        if miss and s.get("kind") == "timesheet":
+            shown = ", ".join(str(d) for d in miss[:8]) + (" …" if len(miss) > 8 else "")
+            flags.append(f'Sheet "{s.get("name")}" has {len(miss)} missing day(s): {shown}')
+        unc = s.get("uncertain_days") or []
+        if unc:
+            flags.append(f'Sheet "{s.get("name")}" has {len(unc)} uncertain day(s).')
+    return list(dict.fromkeys(flags))
 
 
 async def stage_groups(
@@ -35,16 +81,15 @@ async def stage_groups(
     thread_key: str | None = None,
 ) -> list[PipelineFile]:
     """One item per employee+month group — the SINGLE staging path for every
-    entry point (Extract Email, selected attachments, Upload, chat store).
+    entry point (Extract Email, Upload, chat store).
 
-    Each group is scored by the AI auto-accept engine. When every check passes
-    the item is still staged NEEDS_REVIEW with an "AI recommends accept" flag —
-    nothing is filed until a human presses Accept in Review. Groups with
-    blockers are staged the same way but without the recommendation."""
+    Each group is scored by the AI auto-accept engine (auto_accept.evaluate).
+    When every check passes the item is still staged NEEDS_REVIEW with an "AI
+    recommends accept" flag — nothing is filed until a human presses Accept in
+    Review. Groups with blockers are staged the same way but without the
+    recommendation."""
     from app.services.extract_email import auto_accept
     from app.services.extract_email.progress import emit
-    from app.services.extraction.validation import summarize as summarize_record
-    from app.services.extraction.validation import validate
     from app.services.pipeline import raw_store
 
     # Match on the CONVERSATION when we have one. Extract Email reads a whole
@@ -72,29 +117,10 @@ async def stage_groups(
     used: set[str] = set()
     for g in groups:
         month, year = g["month"], g["year"]
-        if month and year:
-            cleaned, val_flags = validate(g["buckets"], month, year)
-            summary = summarize_record(cleaned, val_flags, month, year, len(g["sheets"]))
-        else:
-            cleaned, val_flags = g["buckets"], ["No usable month/year on these sheets — pick the period."]
-            summary = "Could not read a month/year — pick the period in Compare & Fix."
-        flags = list(dict.fromkeys(g["overlap_flags"] + g["fold_notes"] + val_flags))
-        for s in g.get("sheets") or []:
-            if s.get("incomplete_sheet") or (
-                    s.get("kind") == "timesheet" and s.get("dates_complete") is False):
-                miss = s.get("missing_days") or []
-                miss_txt = (", ".join(str(d) for d in miss[:8]) if miss else "unknown days")
-                flags.append(
-                    f'Sheet "{s.get("name")}" incomplete day coverage '
-                    f'({s.get("observed_day_count", 0)}/{s.get("expected_day_count", 0)}; '
-                    f'missing: {miss_txt})')
-        flags = list(dict.fromkeys(flags))
-        summary = f"{summary} {approval['detail']}"
+        flags = group_flags(g)
+        summary = f"{summarize_group(g)} {approval['detail']}"
 
-        # AI auto-accept decision (uses the group's OWN buckets for coverage;
-        # validation flags block it).
-        g_for_eval = {**g, "buckets": cleaned}
-        decision = auto_accept.evaluate(g_for_eval, extra_flags=val_flags)
+        decision = auto_accept.evaluate(g)
 
         display = raw_name if len(groups) == 1 else \
             f"{g['name'] or 'Unassigned sheets'} — {raw_name}"
@@ -132,7 +158,11 @@ async def stage_groups(
                 "matched_name": g["name"],
                 "matched_employee_id": g["employee_id"],
                 "month": month, "year": year,
-                "buckets": cleaned,
+                "buckets": g["buckets"],
+                "working_days": g.get("working_days") or [],
+                "weekend_days": g.get("weekend_days") or [],
+                "uncertain_days": g.get("uncertain_days") or [],
+                "unaccounted_days": g.get("unaccounted_days") or [],
                 "validation_status": "manual_review" if flags else "verified",
                 "flags": flags,
                 "summary": summary,
@@ -147,7 +177,7 @@ async def stage_groups(
             },
             "source_kind": source_kind,
         }
-        total = sum(len(v) for v in cleaned.values())
+        total = sum(len(v) for v in g["buckets"].values())
         t.events = (t.events or []) + [{
             "stage": PipelineStage.EXTRACTION, "status": "ok",
             "detail": (f"Full-email extraction: {len(g['sheets'])} sheet(s) → {total} leave day(s)"

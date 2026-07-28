@@ -50,6 +50,8 @@ const BUCKETS: { key: keyof TimesheetRecord & string; field: string; label: stri
   { key: "unpaid_leave_dates", field: "unpaid_leave_dates", label: LEAVE_BUCKET_LABELS.unpaid!, tone: LEAVE_BUCKET_TONE.unpaid! },
   { key: "absent_dates", field: "absent_dates", label: LEAVE_BUCKET_LABELS.absent!, tone: LEAVE_BUCKET_TONE.absent! },
   { key: "public_holiday_dates", field: "public_holiday_dates", label: LEAVE_BUCKET_LABELS.public_holiday!, tone: LEAVE_BUCKET_TONE.public_holiday! },
+  { key: "working_dates", field: "working_dates", label: LEAVE_BUCKET_LABELS.working!, tone: LEAVE_BUCKET_TONE.working! },
+  { key: "weekend_dates", field: "weekend_dates", label: LEAVE_BUCKET_LABELS.weekend!, tone: LEAVE_BUCKET_TONE.weekend! },
 ];
 
 export default function RecordPage() {
@@ -154,7 +156,12 @@ export default function RecordPage() {
       </div>
     );
 
-  const totalDays = BUCKETS.reduce((a, b) => a + ((rec as any)[b.key]?.length ?? 0), 0);
+  // Working/weekend are day-accounting fields, not leave — excluded from
+  // this "leave/holiday days" total so it doesn't balloon with ordinary
+  // worked days.
+  const totalDays = BUCKETS
+    .filter((b) => b.key !== "working_dates" && b.key !== "weekend_dates")
+    .reduce((a, b) => a + ((rec as any)[b.key]?.length ?? 0), 0);
 
   return (
     <div className="mx-auto max-w-5xl animate-fade-up">

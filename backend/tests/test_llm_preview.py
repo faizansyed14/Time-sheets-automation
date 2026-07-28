@@ -22,11 +22,11 @@ async def test_llm_preview_shows_both_passes_step_by_step(client, admin_token):
     assert [s["n"] for s in steps] == list(range(1, len(steps) + 1))
     titles = " | ".join(s["title"] for s in steps)
     assert "Collect the whole conversation" in titles
-    assert "PASS 1 of 2" in titles
-    assert "PASS 2 of 2" in titles
+    assert "PASS 1" in titles
+    assert "PASS 2" in titles
 
-    assert body["call_count"]["inference"] == 2
-    assert body["call_count"]["file_uploads"] == len(body["files_sent"])
+    assert body["call_count"]["inference"] >= 1
+    assert body["call_count"]["file_uploads"] == 0   # everything travels inline, no file upload API
 
     # The verbatim pass-1 prompt is shown — it is the one carrying the payload.
     assert body["system_prompt"].strip()
@@ -45,7 +45,7 @@ async def test_llm_preview_is_honest_that_attachments_are_not_redacted(client, a
 
     not_redacted = " ".join(body["not_redacted"]).lower()
     assert "attachment contents" in not_redacted
-    assert "byte-for-byte" in not_redacted
+    assert "whatever is printed on the sheet" in not_redacted
     # Employee identity is kept ON PURPOSE — the matcher needs it.
     assert "employee" in not_redacted
 

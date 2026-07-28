@@ -15,7 +15,7 @@ async def _pdf(name="Tester", emp_id="E2E-1", month="March 2026", rows=(("2026-0
     return bytes(out) if isinstance(out, (bytes, bytearray)) else out.encode("latin-1")
 
 
-async def test_upload_pipeline_and_tracker(client, admin_token):
+async def test_upload_pipeline_and_tracker(client, admin_token, mock_vision_calls):
     h = auth_headers(admin_token)
     # add the employee to the matcher
     emp = await client.post("/api/v1/employee-matcher", headers=h,
@@ -23,6 +23,21 @@ async def test_upload_pipeline_and_tracker(client, admin_token):
     assert emp.status_code == 201, emp.text
 
     data = await _pdf()
+    mock_vision_calls([
+        {"thread_summary": "x", "items": [{
+            "source": "e2e.pdf", "is_timesheet": True, "kind": "timesheet",
+            "employee_name": "Tester", "employee_id": "E2E-1",
+            "period_hint": "March 2026", "evidence": "2026-03-03 Annual Leave",
+            "manager_signature": False, "signature_evidence": "", "notes": "",
+        }]},
+        {"sheets": [{
+            "source": "e2e.pdf", "employee_name": "Tester", "employee_id": "E2E-1",
+            "month": 3, "year": 2026, "days_covered": 1, "period_type": "partial",
+            "missing_days": [], "working_days": [], "weekend_days": [], "uncertain_days": [],
+            "annual": ["2026-03-03"], "remote": [], "sick": [], "maternity": [],
+            "unpaid": [], "absent": [], "public_holiday": [], "notes": "",
+        }]},
+    ])
     up = await client.post("/api/v1/upload", headers=h,
                            files={"files": ("e2e.pdf", data, "application/pdf")})
     assert up.status_code == 200, up.text

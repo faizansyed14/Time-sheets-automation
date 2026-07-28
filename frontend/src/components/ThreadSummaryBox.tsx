@@ -18,8 +18,14 @@ const SUMMARY_TONE: Record<ThreadSummary["status"], { label: string; cls: string
  *  have to open eight replies to learn whether the sheet arrived and whether
  *  anyone actually approved it. Produced by pass 1 of Extract Email — shown
  *  wherever that run's result is reviewed (Inbox thread view, Pipeline record). */
-export function ThreadSummaryBox({ summary }: { summary: ThreadSummary }) {
-  const [open, setOpen] = useState(false);
+export function ThreadSummaryBox({
+  summary, defaultOpen = false, className,
+}: {
+  summary: ThreadSummary;
+  defaultOpen?: boolean;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
   const tone = SUMMARY_TONE[summary.status] ?? SUMMARY_TONE.other;
   const facts: [string, boolean][] = [
     ["Timesheet sent", summary.timesheet_sent],
@@ -28,7 +34,7 @@ export function ThreadSummaryBox({ summary }: { summary: ThreadSummary }) {
   ];
 
   return (
-    <div className="mb-3 overflow-hidden rounded-lg border border-slate-200 bg-white">
+    <div className={cn("mb-3 overflow-hidden rounded-lg border border-slate-200 bg-white", className)}>
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
