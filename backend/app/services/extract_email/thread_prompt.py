@@ -134,14 +134,16 @@ PASS2_USER_RULES = """LEAVE TYPE - map whatever label is on the item to exactly 
     that's consistent - a remote day is still a working day, just not at the primary
     location. Put it in remote; you do NOT also need to put it in working_days (remote
     already marks it as accounted for), but doing both is fine too - it is not a conflict.
-  public_holiday -> Public Holiday / Public Leave / PH / Eid / "Unauthorized Absence
-    (Public Holyday)" (note the common misspelling "Holyday" - still public_holiday).
+  public_holiday -> Public Holiday / Public Leave / PH / Eid / "(Public Holyday)" (note the common misspelling "Holyday" - still public_holiday).
     Some sheets show someone actually clocking in and working ON what is otherwise a
     public holiday (e.g. "09:00 AM (Worked on Public Holiday)" with real hours logged) -
-    that date is still public_holiday (it names the calendar occasion), and being also
+    this date is a working_day (it names the calendar occasion), and being also
     worked that day is not a conflict, the same way a remote day both works and isn't at
     the office.
-  Mourning Leave (any degree) -> annual
+  other -> Mourning Leave (any degree), Paternity Leave - genuine, named leave types
+    that aren't one of the standard buckets above but ARE clearly leave (unlike the
+    "label that isn't one of the above" case below, which is for something you don't
+    recognise at all).
   "Unauthorized Absence (Emergency Leave)" -> absent (it's an absence record first;
     the "(Emergency Leave)" is the stated reason, not a different bucket)
 
@@ -151,20 +153,19 @@ whichever label you can map confidently (usually the English one). Public Leave/
 public_holiday, also never annual. Worked hours, weekends, and blank rows are NOT leave.
 
 A LABEL THAT ISN'T ONE OF THE ABOVE - do not force it into the nearest-sounding bucket and
-do not silently drop it either. Real sheets invent their own leave types constantly:
-"Balance Leave" (a day off owed for working a previous off-day - not the same as annual),
-"Happiness Leave" (a UAE wellbeing day, distinct from annual leave), or anything else
-client-specific. Put those dates in uncertain_days with the exact label quoted as the
-reason (e.g. "labelled 'Balance Leave' - not one of the standard categories, needs manual
-review for the correct bucket"). A guessed bucket that's wrong is worse than an honest
-"this needs a human to decide."
+do not silently drop it either. This is different from `other` above: `other` is for a
+leave type you DO recognise by name (mourning, paternity) that just has no dedicated
+bucket; this is for something you genuinely don't recognise as a leave type at all. Real
+sheets invent their own such labels constantly: "Balance Leave" (a day off owed for
+working a previous off-day - not the same as annual), "Happiness Leave" (a UAE wellbeing
+day, distinct from annual leave), or anything else client-specific. Put those dates in
+uncertain_days with the exact label quoted as the reason (e.g. "labelled 'Balance Leave' -
+not one of the standard categories, needs manual review for the correct bucket"). A
+guessed bucket that's wrong is worse than an honest "this needs a human to decide."
 
 A DATE SHOULD NOT APPEAR IN TWO GENUINELY CONFLICTING CATEGORIES - "sick" and "annual" on
 the same day is a real conflict (pick the one the sheet actually states, or use
-uncertain_days if you truly can't tell). The one deliberate exception: remote and
-public_holiday both describe a worked day under a particular circumstance rather than a
-true absence, so either can coexist with a day also being counted as worked - that's two
-true facts about one day, not a contradiction.
+uncertain_days if you truly can't tell).
 
 TWO KINDS OF ITEM, read differently:
 
@@ -324,6 +325,7 @@ PASS2_OUTPUT = """Return EXACTLY this JSON and nothing else (no markdown fence):
       "unpaid": [],
       "absent": [],
       "public_holiday": [],
+      "other": [],
       "notes": "<anything a reviewer must know, or ''>"
     }
   ]

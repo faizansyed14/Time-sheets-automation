@@ -176,6 +176,7 @@ class TimesheetOut(BaseModel):
     unpaid_leave_dates: list[str]
     absent_dates: list[str]
     public_holiday_dates: list[str]
+    other_leave_dates: list[str]
     working_dates: list[str]
     weekend_dates: list[str]
     annual_leave_count: int
@@ -185,6 +186,7 @@ class TimesheetOut(BaseModel):
     unpaid_leave_count: int
     absent_count: int
     public_holiday_count: int
+    other_leave_count: int
     working_dates_count: int
     weekend_dates_count: int
     validation_status: str
@@ -261,6 +263,7 @@ class TimesheetUpdate(BaseModel):
     unpaid_leave_dates: list[str] | None = None
     absent_dates: list[str] | None = None
     public_holiday_dates: list[str] | None = None
+    other_leave_dates: list[str] | None = None
     working_dates: list[str] | None = None
     weekend_dates: list[str] | None = None
     month: int | None = None

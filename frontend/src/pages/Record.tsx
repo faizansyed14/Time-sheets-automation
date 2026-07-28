@@ -50,6 +50,7 @@ const BUCKETS: { key: keyof TimesheetRecord & string; field: string; label: stri
   { key: "unpaid_leave_dates", field: "unpaid_leave_dates", label: LEAVE_BUCKET_LABELS.unpaid!, tone: LEAVE_BUCKET_TONE.unpaid! },
   { key: "absent_dates", field: "absent_dates", label: LEAVE_BUCKET_LABELS.absent!, tone: LEAVE_BUCKET_TONE.absent! },
   { key: "public_holiday_dates", field: "public_holiday_dates", label: LEAVE_BUCKET_LABELS.public_holiday!, tone: LEAVE_BUCKET_TONE.public_holiday! },
+  { key: "other_leave_dates", field: "other_leave_dates", label: LEAVE_BUCKET_LABELS.other!, tone: LEAVE_BUCKET_TONE.other! },
   { key: "working_dates", field: "working_dates", label: LEAVE_BUCKET_LABELS.working!, tone: LEAVE_BUCKET_TONE.working! },
   { key: "weekend_dates", field: "weekend_dates", label: LEAVE_BUCKET_LABELS.weekend!, tone: LEAVE_BUCKET_TONE.weekend! },
 ];

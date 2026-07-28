@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 
 from app.core.config import settings
 from app.core.pii import scrub_text
+from app.services.extract_email.constants import BUCKETS
 from app.services.extract_email.progress import count_llm, emit
 
 # A forward of a forward of a forward is real; beyond this it is a mail loop,
@@ -793,6 +794,7 @@ def _normalise_pass2_sheets(raw_sheets: list, triage: list[dict], items: list[It
             "unpaid": s.get("unpaid") or [],
             "absent": s.get("absent") or [],
             "public_holiday": s.get("public_holiday") or [],
+            "other": s.get("other") or [],
             "manager_signature": bool(t.get("manager_signature")),
             "approval_evidence": t.get("signature_evidence", ""),
             "approval_named_only": bool(t.get("signature_is_named_only")),
@@ -1024,7 +1026,7 @@ async def extract_thread_sheets(
     sheets = fresh_sheets + reused_sheets
     total_days = sum(
         len(s["working_days"]) + len(s["weekend_days"])
-        + sum(len(s[b]) for b in ("annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday"))
+        + sum(len(s[b]) for b in BUCKETS)
         for s in sheets)
     # UI gets the model JSON + normalised sheets (minus bulky OCR text).
     ui_sheets = [{k: v for k, v in s.items() if k != "text"} for s in sheets]
@@ -1035,13 +1037,9 @@ async def extract_thread_sheets(
          results=[{"source": s["name"], "employee": s.get("employee_name"),
                    "employee_id": s.get("employee_id"), "month": s.get("month"), "year": s.get("year"),
                    "days_covered": s.get("days_covered"), "period_type": s.get("period_type"),
-                   "leaves": {b: len(s.get(b) or []) for b in
-                              ("annual", "remote", "sick", "maternity", "unpaid",
-                               "absent", "public_holiday") if s.get(b)},
+                   "leaves": {b: len(s.get(b) or []) for b in BUCKETS if s.get(b)},
                    "total_days": (len(s.get("working_days") or []) + len(s.get("weekend_days") or [])
-                                  + sum(len(s.get(b) or []) for b in
-                                        ("annual", "remote", "sick", "maternity",
-                                         "unpaid", "absent", "public_holiday")))}
+                                  + sum(len(s.get(b) or []) for b in BUCKETS))}
                   for s in sheets])
 
     meta["calls"] = len(batches) + len(batches2)

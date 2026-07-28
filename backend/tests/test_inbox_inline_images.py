@@ -1,6 +1,4 @@
 """Inline cid: images in HTML email bodies render as self-contained data URIs."""
-import pytest
-
 from app.services.email_provider import get_email_provider
 from app.services.inbox.inline_images import (
     cid_ref_matches,

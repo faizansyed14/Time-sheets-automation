@@ -21,7 +21,6 @@ import {
   MoreVertical,
   Shield,
   Wand2,
-  PlayCircle,
   AlertTriangle,
   ExternalLink,
 } from "lucide-react";
@@ -31,7 +30,6 @@ import {
   decideEmail,
   emlUrl,
   extractFullEmailStream,
-  fetchAutoExtractStatus,
   fetchEmail,
   fetchEmployeeMatcher,
   fetchThread,
@@ -40,7 +38,6 @@ import {
   MONTHS_LONG,
   restoreEmail,
   saveEmlToVault,
-  startAutoExtract,
   type Attachment,
   type Employee,
   type EmailDetail,
@@ -70,25 +67,25 @@ import type { PreviewFile } from "../lib/filePreview";
 function StatusBadge({ status }: { status: EmailListItem["status"] }) {
   if (status === "ingested")
     return (
-      <Badge tone="success">
-        <CheckCircle2 className="h-3 w-3" /> Ingested
+      <Badge tone="success" className="px-1.5 py-0 text-[9px]">
+        <CheckCircle2 className="h-2.5 w-2.5" /> Ingested
       </Badge>
     );
   if (status === "archived")
     return (
-      <Badge tone="slate">
-        <Archive className="h-3 w-3" /> Archived
+      <Badge tone="slate" className="px-1.5 py-0 text-[9px]">
+        <Archive className="h-2.5 w-2.5" /> Archived
       </Badge>
     );
-  return <Badge tone="brand">New</Badge>;
+  return <Badge tone="brand" className="px-1.5 py-0 text-[9px]">New</Badge>;
 }
 
 function ExtractedBadge({ at }: { at: string | null | undefined }) {
   if (!at) return null;
   return (
     <span title={`Extract Email last run ${formatDateTime(at)}`}>
-      <Badge tone="success">
-        <Wand2 className="h-3 w-3" /> Extracted
+      <Badge tone="success" className="px-1.5 py-0 text-[9px]">
+        <Wand2 className="h-2.5 w-2.5" /> Extracted
       </Badge>
     </span>
   );
@@ -100,8 +97,8 @@ function NoSheetsBadge({ at, note }: { at: string | null | undefined; note: stri
   if (!at) return null;
   return (
     <span title={`Extract Email found nothing to stage ${formatDateTime(at)}${note ? ` — ${note}` : ""}`}>
-      <Badge tone="slate">
-        <FileX className="h-3 w-3" /> No sheets found
+      <Badge tone="slate" className="px-1.5 py-0 text-[9px]">
+        <FileX className="h-2.5 w-2.5" /> No sheets
       </Badge>
     </span>
   );
@@ -1116,53 +1113,41 @@ function InboxListAttachmentPreview({
   const [expanded, setExpanded] = useState(false);
   const atts = email.attachments ?? [];
   if (!atts.length) return null;
-  const shown = expanded ? atts : atts.slice(0, 2);
+  const shown = expanded ? atts : atts.slice(0, 1);
   const extra = atts.length - shown.length;
   return (
-    <span className="mt-2 flex flex-wrap items-end gap-1.5">
-      {shown.map((a) => {
-        const url = attachmentUrl(email.provider_message_id, a.attachment_id);
-        const isImg = isImageAttachment(a);
-        return isImg ? (
-          <span
-            key={a.attachment_id}
-            className="flex h-[44px] w-[96px] items-center justify-center overflow-hidden rounded border border-slate-200 bg-slate-50"
-            title={a.filename}
-          >
-            <img src={url} alt={a.filename} className="max-h-full max-w-full object-contain" loading="lazy" />
-          </span>
-        ) : (
-          <span
-            key={a.attachment_id}
-            className="inline-flex h-[44px] max-w-[122px] items-center gap-1.5 rounded border border-slate-200 bg-white px-2 text-[10px] text-slate-600"
-            title={a.filename}
-          >
-            <FileText className="h-3.5 w-3.5 shrink-0 text-brand-500" />
-            <span className="truncate font-medium">{a.filename}</span>
-          </span>
-        );
-      })}
+    <span className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
+      {shown.map((a) => (
+        <span
+          key={a.attachment_id}
+          className="inline-flex max-w-full items-center gap-1 rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[9px] text-slate-500"
+          title={a.filename}
+        >
+          <FileText className="h-2.5 w-2.5 shrink-0 text-brand-500" />
+          <span className="truncate">{a.filename}</span>
+        </span>
+      ))}
       {extra > 0 && (
         <span
           role="button"
           tabIndex={0}
-          title={`Show ${extra} more attachment${extra !== 1 ? "s" : ""}`}
+          title={`Show ${extra} more`}
           onClick={(e) => { e.stopPropagation(); setExpanded(true); }}
           onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); setExpanded(true); } }}
-          className="inline-flex h-[44px] items-center rounded border border-slate-200 bg-white px-3 text-sm font-medium text-slate-500 hover:bg-slate-50 hover:text-brand-600 cursor-pointer"
+          className="cursor-pointer text-[9px] font-semibold text-slate-400 hover:text-brand-600"
         >
-          +{extra} more
+          +{extra}
         </span>
       )}
-      {expanded && atts.length > 2 && (
+      {expanded && atts.length > 1 && (
         <span
           role="button"
           tabIndex={0}
           onClick={(e) => { e.stopPropagation(); setExpanded(false); }}
           onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); setExpanded(false); } }}
-          className="inline-flex h-[44px] items-center rounded border border-slate-200 bg-white px-3 text-[11px] font-medium text-slate-400 hover:bg-slate-50 hover:text-slate-600 cursor-pointer"
+          className="cursor-pointer text-[9px] font-medium text-slate-400 hover:text-slate-600"
         >
-          Show less
+          less
         </span>
       )}
     </span>
@@ -1190,29 +1175,7 @@ export default function InboxPage() {
   const [llmPreviewLoading, setLlmPreviewLoading] = useState(false);
   const [llmPreviewError, setLlmPreviewError] = useState<string | null>(null);
 
-  // Bulk Extract Email — every thread, one at a time, in the background.
-  // Live progress + Stop live in the app-wide AutoExtractWidget (Shell); this
-  // page only needs to know whether a run is already active, to disable the
-  // trigger and avoid starting a second overlapping one.
-  const { data: autoExtractStatus } = useQuery({
-    queryKey: ["auto-extract-status"],
-    queryFn: fetchAutoExtractStatus,
-    refetchInterval: (query) => {
-      const s = query.state.data?.state;
-      return s === "running" || s === "stopping" ? 2000 : 8000;
-    },
-  });
-  const autoExtractRunning =
-    autoExtractStatus?.state === "running" || autoExtractStatus?.state === "stopping";
-  const autoExtractStart = useMutation({
-    mutationFn: startAutoExtract,
-    onSuccess: (s) => {
-      qc.invalidateQueries({ queryKey: ["auto-extract-status"] });
-      toast("info", "Auto Extract started", `Processing ${s.total} thread(s) in the background.`);
-    },
-    onError: (e: any) =>
-      toast("error", "Couldn't start Auto Extract", e?.response?.data?.detail ?? String(e)),
-  });
+  // Bulk Auto Extract start/stop lives in Shell top bar (AutoExtractWidget).
 
   useEffect(() => setPreview(null), [selected]);
 
@@ -1367,24 +1330,28 @@ export default function InboxPage() {
      
 
       <div className={cn(
-        "grid min-h-0 flex-1 gap-5",
+        "grid min-h-0 flex-1 gap-3",
         fullscreen
           ? "grid-cols-1"
-          : "grid-cols-1 xl:grid-cols-[300px_1fr]",
+          : "grid-cols-1 md:grid-cols-[minmax(0,220px)_1fr] xl:grid-cols-[minmax(0,240px)_1fr]",
       )}>
         {/* ── Left: email list (hidden in fullscreen) ───────────── */}
-        <Card className={cn("flex min-h-0 flex-col", fullscreen && "hidden xl:hidden")}>
-          <div className="flex items-center gap-2 border-b border-slate-100 p-3">
-            <div className="relative flex-1">
-              <Search className="absolute left-2.5 top-2 h-4 w-4 text-slate-400" />
+        <Card className={cn(
+          "flex min-h-0 flex-col overflow-hidden",
+          fullscreen && "hidden",
+          selected && "hidden md:flex",
+        )}>
+          <div className="flex items-center gap-1.5 border-b border-slate-100 p-2">
+            <div className="relative min-w-0 flex-1">
+              <Search className="absolute left-2 top-1.5 h-3.5 w-3.5 text-slate-400" />
               <input
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                placeholder="Search sender name or email…"
-                className="w-full rounded-lg border border-slate-200 bg-slate-50 py-1.5 pl-8 pr-3 text-sm placeholder:text-slate-400 focus:border-brand-400 focus:bg-white focus:outline-none"
+                placeholder="Search…"
+                className="w-full rounded-md border border-slate-200 bg-slate-50 py-1 pl-7 pr-2 text-[11px] placeholder:text-slate-400 focus:border-brand-400 focus:bg-white focus:outline-none"
               />
             </div>
-            <Select value={status} onChange={(e) => setStatus(e.target.value)} className="py-1.5 text-xs">
+            <Select value={status} onChange={(e) => setStatus(e.target.value)} className="max-w-[88px] py-1 text-[10px]">
               <option value="">All</option>
               <option value="new">New</option>
               <option value="extracted">Extracted</option>
@@ -1392,77 +1359,67 @@ export default function InboxPage() {
               <option value="ingested">Ingested</option>
               <option value="archived">Archived</option>
             </Select>
-            <button
-              type="button"
-              onClick={() => autoExtractStart.mutate()}
-              disabled={autoExtractRunning || autoExtractStart.isPending}
-              title="Extract every thread in the inbox, one at a time, in the background — watch progress and Stop from the widget bottom-right"
-              className="flex shrink-0 items-center gap-1.5 rounded-lg border border-brand-200 bg-brand-50 px-2.5 py-1.5 text-xs font-semibold text-brand-700 transition-colors hover:bg-brand-100 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              <PlayCircle className="h-3.5 w-3.5" />
-              {autoExtractRunning ? "Running…" : "Auto Extract"}
-            </button>
           </div>
           {inboxTotal > 0 && (
-            <p className="border-b border-slate-100 px-4 py-1.5 text-[10px] text-slate-400">
-              Showing {emails.length} of {inboxTotal}
-              {hasNextPage ? " — scroll for more" : ""}
+            <p className="border-b border-slate-100 px-2 py-1 text-[9px] text-slate-400">
+              {emails.length}/{inboxTotal}
+              {hasNextPage ? " · scroll" : ""}
             </p>
           )}
           <div ref={setScrollRoot} className="min-h-0 flex-1 overflow-y-auto">
             {isLoading ? (
-              <div className="space-y-2 p-4">
-                <Skeleton className="h-16" />
-                <Skeleton className="h-16" />
-                <Skeleton className="h-16" />
+              <div className="space-y-1.5 p-2">
+                <Skeleton className="h-12" />
+                <Skeleton className="h-12" />
+                <Skeleton className="h-12" />
               </div>
             ) : !emails.length ? (
-              <EmptyState icon={<Mail className="h-6 w-6" />} title="No emails found" />
+              <EmptyState icon={<Mail className="h-5 w-5" />} title="No emails found" />
             ) : (
               emails.map((m) => (
                 <button
                   key={m.provider_message_id}
                   onClick={() => setSelected(m.provider_message_id)}
                   className={cn(
-                    "flex w-full items-start gap-3 border-b border-slate-100 px-4 py-3 text-left transition-colors",
+                    "flex w-full items-start gap-2 border-b border-slate-100 px-2 py-1.5 text-left transition-colors",
                     selected === m.provider_message_id ? "bg-brand-50/70" : "hover:bg-slate-50"
                   )}
                 >
                   <span
                     className={cn(
-                      "mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[11px] font-bold",
+                      "mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[9px] font-bold",
                       avatarColor(m.sender_name)
                     )}
                   >
                     {initials(m.sender_name)}
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className="flex items-baseline justify-between gap-2">
-                      <span className="flex min-w-0 items-baseline gap-1.5">
-                        <span className="truncate text-sm font-semibold text-slate-800">{m.sender_name}</span>
+                    <span className="flex items-baseline justify-between gap-1">
+                      <span className="flex min-w-0 items-baseline gap-1">
+                        <span className="truncate text-[11px] font-semibold text-slate-800">{m.sender_name}</span>
                         {m.thread_message_count > 1 && (
                           <span
                             title={`${m.thread_message_count} messages in this thread`}
-                            className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-500"
+                            className="shrink-0 rounded-full bg-slate-100 px-1 py-px text-[8px] font-bold text-slate-500"
                           >
                             {m.thread_message_count}
                           </span>
                         )}
                       </span>
-                      <span className="shrink-0 text-[11px] text-slate-400">
+                      <span className="shrink-0 text-[9px] text-slate-400">
                         {formatDateTime(m.received_at).split(",")[0]}
                       </span>
                     </span>
-                    <span className="block truncate text-xs text-slate-500">{m.subject}</span>
-                    <span className="mt-1 flex flex-wrap items-center gap-2">
+                    <span className="block truncate text-[10px] leading-snug text-slate-500">{m.subject}</span>
+                    <span className="mt-0.5 flex flex-wrap items-center gap-1">
                       <StatusBadge status={m.status} />
                       <ExtractedBadge at={m.extract_email_at} />
                       <NoSheetsBadge at={m.no_sheets_found_at} note={m.no_sheets_note} />
-                      <span className="flex items-center gap-0.5 text-[11px] text-slate-400">
-                        <Paperclip className="h-3 w-3" />
+                      <span className="flex items-center gap-0.5 text-[9px] text-slate-400">
+                        <Paperclip className="h-2.5 w-2.5" />
                         {m.attachment_count}
                       </span>
-                      {m.has_approval_screenshot && <BadgeCheck className="h-3.5 w-3.5 text-emerald-500" />}
+                      {m.has_approval_screenshot && <BadgeCheck className="h-3 w-3 text-emerald-500" />}
                     </span>
                     <InboxListAttachmentPreview email={m} />
                   </span>
@@ -1471,15 +1428,18 @@ export default function InboxPage() {
             )}
             <div ref={sentinelRef} />
             {isFetchingNextPage && (
-              <div className="flex items-center justify-center gap-2 py-3 text-xs text-slate-400">
-                <Spinner className="h-4 w-4" /> Loading more…
+              <div className="flex items-center justify-center gap-2 py-2 text-[10px] text-slate-400">
+                <Spinner className="h-3.5 w-3.5" /> More…
               </div>
             )}
           </div>
         </Card>
 
         {/* ── Right: email detail ───────────────────────────────── */}
-        <Card className="flex min-h-0 flex-col">
+        <Card className={cn(
+          "flex min-h-0 flex-col",
+          !selected && !fullscreen && "hidden md:flex",
+        )}>
           {!selected ? (
             <EmptyState
               icon={<Mail className="h-6 w-6" />}
@@ -1511,6 +1471,14 @@ export default function InboxPage() {
                   {/* ── Email header — subject + actions ───────────── */}
                   <div className="shrink-0 border-b border-slate-100 px-5 py-3">
                     <div className="flex items-start gap-3">
+                      <button
+                        type="button"
+                        title="Back to list"
+                        onClick={() => setSelected(null)}
+                        className="mt-0.5 rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 md:hidden"
+                      >
+                        <ChevronRight className="h-4 w-4 rotate-180" />
+                      </button>
                       <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2">
                           <h2 className="text-sm font-bold leading-snug text-slate-900">

@@ -45,6 +45,7 @@ BUCKET_FIELDS = {
     "unpaid": "unpaid_leave_dates",
     "absent": "absent_dates",
     "public_holiday": "public_holiday_dates",
+    "other": "other_leave_dates",
     # Not leave — day-accounting fields (worked / off) — but reviewer-editable
     # and multi-file-unioned exactly like the leave buckets above.
     "working": "working_dates",
@@ -75,20 +76,6 @@ def _event(t: PipelineFile, stage: str, status: str, detail: str) -> None:
     t.stage = stage
     t.events = (t.events or []) + [{"stage": stage, "status": status,
                                     "detail": detail, "at": _now_iso()}]
-
-
-def _fail(t: PipelineFile, stage: str, code: str, detail: str) -> None:
-    _event(t, stage, "fail", detail)
-    t.status = PipelineStatus.FAILED
-    t.failure_code = code
-    t.failure_detail = detail
-
-
-def _save_raw_copy(t: PipelineFile, filename: str, data: bytes) -> None:
-    """Keep the original bytes (OUTSIDE the File Vault) so Retry works. Stored in
-    S3 under settings.s3_raw_prefix when STORAGE_PROVIDER=s3, else on local disk
-    under data/pipeline_raw/<id>/ — see services/pipeline/raw_store.py."""
-    t.raw_path = raw_store.save_raw(t.id, filename, data)
 
 
 def read_raw_copy(t: PipelineFile) -> bytes | None:

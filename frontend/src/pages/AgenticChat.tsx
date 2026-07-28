@@ -477,7 +477,6 @@ export default function AgenticChatPage() {
     <div className="flex h-full animate-fade-up flex-col">
       <PageHeader
         title="Ask AI"
-        subtitle="Ask about timesheets and leaves, or make edits — the assistant only works on this database."
         actions={
           <div className="flex items-center gap-2">
             {suggest?.enabled && suggest.model && <Badge tone="slate"><Sparkles className="h-3 w-3" />{suggest.model}</Badge>}

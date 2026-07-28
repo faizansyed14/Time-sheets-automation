@@ -32,7 +32,7 @@ async def preview_llm_egress(
     from app.services.extract_email.thread_collect import collect_thread_emls
     from app.services.extract_email.thread_extract import collect_thread
     from app.services.extract_email.triage_prompt import (
-        build_bodies_block, build_item_manifest, chunk_items_by_count, pass1_blocks,
+        build_bodies_block, build_item_manifest, chunk_items_by_count,
     )
     from app.services.extraction import vision_client
 
@@ -56,10 +56,6 @@ async def preview_llm_egress(
 
     batches = chunk_items_by_count(th.items, settings.pass1_batch_size)
     first_batch = batches[0] if batches else []
-    note = (f"This is batch 1 of {len(batches)}. You are seeing SOME of the thread's "
-            f"items below; classify ONLY those. Other batches cover the rest, but all "
-            f"message bodies are included so you have full approval context."
-            if len(batches) > 1 else "")
 
     # Pass 1's prompt carries the whole payload (or the first batch of it on a
     # long thread), so it is what this view shows verbatim. Pass 2 is built

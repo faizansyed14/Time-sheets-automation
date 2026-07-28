@@ -22,6 +22,7 @@ _LEAVE_SPECS: list[tuple[str, str, str]] = [
     ("unpaid_leave_dates", "Unpaid Leave Count", "Unpaid Leave Dates"),
     ("absent_dates", "Absent Count", "Absent Dates"),
     ("public_holiday_dates", "Public Holiday Count", "Public Holiday Dates"),
+    ("other_leave_dates", "Other Leave Count", "Other Leave Dates"),
     ("working_dates", "Working Days Count", "Working Dates"),
     ("weekend_dates", "Weekend Days Count", "Weekend Dates"),
 ]
@@ -75,6 +76,7 @@ def _row_dict(record: Any, employee: Any | None, month: int, year: int) -> dict[
         "unpaid": "unpaid_leave_dates",
         "absent": "absent_dates",
         "public_holiday": "public_holiday_dates",
+        "other": "other_leave_dates",
         "working": "working_dates",
         "weekend": "weekend_dates",
     }
@@ -130,6 +132,7 @@ def build_timesheet_xlsx(rows: list[dict[str, Any]], month: int, year: int) -> b
         "unpaid_leave_dates": "unpaid",
         "absent_dates": "absent",
         "public_holiday_dates": "public_holiday",
+        "other_leave_dates": "other",
         "working_dates": "working",
         "weekend_dates": "weekend",
     }
@@ -182,13 +185,3 @@ def employees_grid_rows(
             out.append(_empty_row_dict(emp, month, year))
     out.sort(key=lambda r: (r.get("employee_name") or "").lower())
     return out
-
-
-def records_to_rows(records: list[Any], employees: dict[str, Any], month: int, year: int) -> list[dict[str, Any]]:
-    """Legacy helper — prefer `employees_grid_rows`."""
-    by_pk = {r.matched_employee_pk: r for r in records if r.matched_employee_pk}
-    emps = list(employees.values()) if employees else []
-    if not emps:
-        emps = list(by_pk.values())  # fallback: records only
-        return [_row_dict(r, employees.get(r.matched_employee_pk or ""), month, year) for r in emps]
-    return employees_grid_rows(emps, by_pk, month, year)

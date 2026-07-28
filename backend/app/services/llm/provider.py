@@ -9,7 +9,6 @@ openai_base_url is configured.
 """
 from __future__ import annotations
 
-import time
 from functools import lru_cache
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -58,35 +57,3 @@ async def active_config(db: AsyncSession, kind: str = "extraction") -> dict:
         "model": model,
         "has_key": bool(key) and key not in ("change-me", "missing"),
     }
-
-
-async def test_provider(db: AsyncSession, provider: str | None, prompt: str) -> dict:
-    del provider
-    from langchain_core.output_parsers import StrOutputParser
-    from langchain_core.prompts import ChatPromptTemplate
-
-    resolved_provider, model, base_url, api_key = _resolve("extraction")
-    if not api_key:
-        return {"ok": False, "provider": resolved_provider, "model": model,
-                "error": "No OPENAI_API_KEY in .env."}
-    t0 = time.time()
-    try:
-        llm = _build_model(model, base_url, api_key, 0.0)
-        chain = (
-            ChatPromptTemplate.from_messages([
-                ("system", "You are a connectivity test. Be terse."),
-                ("human", "{input}"),
-            ])
-            | llm
-            | StrOutputParser()
-        )
-        reply = await chain.ainvoke({"input": prompt})
-        return {"ok": True, "provider": resolved_provider, "model": model,
-                "latency_ms": int((time.time() - t0) * 1000), "reply": (reply or "").strip()[:200]}
-    except Exception as e:
-        err = str(e)[:300]
-        if "404" in err:
-            _, lb = openai_urls(base_url)
-            err += f" (base_url={lb!r} — use https://api.openai.com or https://api.openai.com/v1, " \
-                   f"or https://openrouter.ai/api/v1 for OpenRouter)"
-        return {"ok": False, "provider": resolved_provider, "model": model, "error": err}

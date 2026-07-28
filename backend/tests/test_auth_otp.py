@@ -1,6 +1,4 @@
 """End-to-end auth: admin 2FA, OTP lifecycle, RBAC (incl. viewer), rate limits."""
-import pytest
-
 from tests.conftest import _login, auth_headers, login_2fa
 
 
@@ -149,6 +147,40 @@ async def test_viewer_role_is_read_only(client, admin_token):
     assert w.status_code == 403, w.text
     # and cannot reach admin routes at all
     assert (await client.get("/api/v1/admin/users", headers=auth_headers(token))).status_code == 403
+
+
+async def test_month_calendars_readable_by_everyone_editable_by_non_viewers(client, admin_token):
+    """Month calendars are the one admin.py route NOT gated to admin-only —
+    every role can view them (relevant to normal timesheet review, not just
+    admin config), but only admin/user (not viewer) can edit."""
+    r = await client.post("/api/v1/admin/users", headers=auth_headers(admin_token),
+                          json={"username": "calviewer", "password": "Password123",
+                                "email": "cv@e.com", "role": "viewer", "auth_mode": "otp"})
+    assert r.status_code == 201, r.text
+    viewer_token = await login_2fa(client, "calviewer", "Password123")
+
+    user = await _make_user(client, admin_token, username="caluser", email="cu@e.com")
+    assert user["role"] == "user"
+    user_token = await login_2fa(client, "caluser", "Password123")
+
+    payload = {"month": 6, "year": 2031, "weekend_weekdays": ["Friday", "Saturday"],
+               "public_holidays": []}
+
+    # viewer: can read, cannot write, and still can't reach true admin-only routes
+    assert (await client.get("/api/v1/admin/calendars",
+                             headers=auth_headers(viewer_token))).status_code == 200
+    w = await client.put("/api/v1/admin/calendars", headers=auth_headers(viewer_token), json=payload)
+    assert w.status_code == 403, w.text
+    assert (await client.get("/api/v1/admin/users",
+                             headers=auth_headers(viewer_token))).status_code == 403
+
+    # user: can both read and write calendars, but still not true admin routes
+    assert (await client.get("/api/v1/admin/calendars",
+                             headers=auth_headers(user_token))).status_code == 200
+    created = await client.put("/api/v1/admin/calendars", headers=auth_headers(user_token), json=payload)
+    assert created.status_code == 200, created.text
+    assert (await client.get("/api/v1/admin/users",
+                             headers=auth_headers(user_token))).status_code == 403
 
 
 async def test_password_policy_enforced(client, admin_token):

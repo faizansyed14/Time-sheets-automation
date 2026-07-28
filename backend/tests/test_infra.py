@@ -1,10 +1,6 @@
 """Infrastructure: cache, sliding window, Celery eager, LangChain factory."""
 import base64
 
-import pytest
-
-from tests.conftest import auth_headers
-
 
 async def test_cache_set_get_ttl_incr():
     from app.core.cache import cache

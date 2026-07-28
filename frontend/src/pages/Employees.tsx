@@ -114,7 +114,6 @@ export default function EmployeesPage() {
     <div className="animate-fade-up">
       <PageHeader
         title="Employee matcher"
-        subtitle="The authoritative list extracted timesheets are matched against. The same ID can exist in both AUH and DXB — the name tells them apart."
         actions={
           <>
             <input

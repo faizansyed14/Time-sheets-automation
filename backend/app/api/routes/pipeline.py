@@ -170,7 +170,7 @@ async def delete_pipeline_file(pipeline_id: str, db: AsyncSession = Depends(get_
 
 
 _MANUAL_BUCKETS = (
-    "annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday",
+    "annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday", "other",
     "working", "weekend",
 )
 

@@ -53,7 +53,7 @@ export default function App() {
                 <Route path="/records/:id" element={<RecordPage />} />
                 <Route path="/admin/settings" element={<Protected adminOnly><AdminSettings /></Protected>} />
                 <Route path="/admin/users" element={<Protected adminOnly><AdminUsers /></Protected>} />
-                <Route path="/admin/calendars" element={<Protected adminOnly><AdminCalendars /></Protected>} />
+                <Route path="/admin/calendars" element={<Protected><AdminCalendars /></Protected>} />
                 <Route path="/admin/debug" element={<Protected adminOnly><AdminExtractionDebug /></Protected>} />
               </Routes>
             </Shell>

@@ -23,7 +23,7 @@ from app.services.pipeline.ingestion import ingest_manual_entry
 # Leave buckets a manual entry may carry (matches the extraction buckets),
 # plus the day-accounting fields (not leave, same editable UI).
 _MANUAL_BUCKETS = (
-    "annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday",
+    "annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday", "other",
     "working", "weekend",
 )
 

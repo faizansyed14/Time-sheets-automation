@@ -184,6 +184,7 @@ export interface TimesheetRecord {
   unpaid_leave_dates: string[];
   absent_dates: string[];
   public_holiday_dates: string[];
+  other_leave_dates: string[];
   working_dates: string[];
   weekend_dates: string[];
   annual_leave_count: number;
@@ -193,6 +194,7 @@ export interface TimesheetRecord {
   unpaid_leave_count: number;
   absent_count: number;
   public_holiday_count: number;
+  other_leave_count: number;
   working_dates_count: number;
   weekend_dates_count: number;
   validation_status: "verified" | "manual_review";
@@ -666,6 +668,7 @@ export interface TimesheetUpdate {
   unpaid_leave_dates?: string[];
   absent_dates?: string[];
   public_holiday_dates?: string[];
+  other_leave_dates?: string[];
   working_dates?: string[];
   weekend_dates?: string[];
   month?: number;

@@ -1,6 +1,6 @@
 /**
  * Single source of truth for UI colors.
- * Palette: brand (indigo) · slate (neutral) · emerald · amber · rose
+ * Palette: brand (teal) · slate (neutral/"ink") · emerald · amber · rose
  */
 
 export type BadgeTone = "slate" | "brand" | "success" | "warning" | "danger";
@@ -22,6 +22,7 @@ export const LEAVE_BUCKET_TONE: Record<string, string> = {
   unpaid: "bg-slate-200/60 text-slate-700 ring-slate-300",
   absent: "bg-rose-100 text-rose-800 ring-rose-300",
   public_holiday: "bg-emerald-50 text-emerald-800 ring-emerald-200",
+  other: "bg-indigo-50 text-indigo-800 ring-indigo-200",
   working: "bg-sky-50 text-sky-800 ring-sky-200",
   weekend: "bg-violet-50 text-violet-800 ring-violet-200",
 };
@@ -34,12 +35,13 @@ export const LEAVE_BUCKET_LABELS: Record<string, string> = {
   unpaid: "Unpaid leave",
   absent: "Absent",
   public_holiday: "Public holiday",
+  other: "Other leave",
   working: "Working days",
   weekend: "Weekend",
 };
 
 export const LEAVE_BUCKET_KEYS = [
-  "annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday",
+  "annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday", "other",
   "working", "weekend",
 ] as const;
 

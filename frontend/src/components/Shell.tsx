@@ -38,15 +38,18 @@ const NAV = [
 const TOOLS_NAV = [
   { to: "/chat", label: "Ask AI", icon: MessagesSquare },
   { to: "/upload", label: "Upload", icon: UploadCloud },
-  { to: "/employees", label: "Employees", icon: Users },
+  { to: "/employees", label: "Employee matcher", icon: Users },
   { to: "/export", label: "Export", icon: FileSpreadsheet },
   { to: "/files", label: "File Vault", icon: FolderOpen },
+  // Read by every extraction run and relevant to normal timesheet review, not
+  // just admin config — every role can view it (backend: require_write, same
+  // as the routes above), so it lives here rather than under Admin.
+  { to: "/admin/calendars", label: "Month calendars", icon: CalendarClock },
 ];
 
 const ADMIN_NAV = [
   { to: "/admin/users", label: "Users & access", icon: ShieldCheck },
   { to: "/admin/settings", label: "AI Settings", icon: Settings },
-  { to: "/admin/calendars", label: "Month calendars", icon: CalendarClock },
   { to: "/admin/debug", label: "Extraction debug", icon: Bug },
 ];
 
@@ -59,6 +62,14 @@ const TITLES: Record<string, string> = {
   "/employees": "Employee matcher",
   "/export": "Export",
   "/files": "File vault",
+};
+
+/** Short blurb shown beside "Workspace" — replaces long page subtitles. */
+const WORKSPACE_BLURBS: Record<string, string> = {
+  "/inbox": "Select a thread, then Extract Email",
+  "/pipeline": "Review, fix or view each pipeline file",
+  "/chat": "Ask or edit timesheets in this database",
+  "/employees": "Match list — same ID OK in AUH & DXB",
 };
 
 const COLLAPSE_KEY = "nav_collapsed";
@@ -96,32 +107,33 @@ export default function Shell({ children }: { children: ReactNode }) {
 
   const section = "/" + (location.pathname.split("/")[1] || "");
   const title = TITLES[section] ?? "Timesheets Automation";
+  const workspaceBlurb = WORKSPACE_BLURBS[section];
 
   const navLinkClass = ({ isActive }: { isActive: boolean }) =>
     cn(
       "group relative flex items-center rounded-lg py-2.5 text-sm font-medium transition-colors duration-150",
       collapsed ? "justify-center px-2" : "gap-3 px-3",
       isActive
-        ? "bg-brand-600 text-white shadow-sm"
-        : "text-sidebar-muted hover:bg-sidebar-hover hover:text-sidebar-text"
+        ? "bg-brand-600/10 text-brand-600 font-semibold"
+        : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
     );
 
   return (
     <div className="flex h-screen overflow-hidden app-canvas">
       <aside
         className={cn(
-          "relative flex shrink-0 flex-col bg-sidebar text-sidebar-text shadow-sidebar transition-[width] duration-200",
+          "relative flex shrink-0 flex-col border-r border-slate-200/80 bg-white/70 text-slate-700 backdrop-blur-md transition-[width] duration-200",
           collapsed ? "w-[72px]" : "w-60"
         )}
       >
-        <div className={cn("flex items-center border-b border-sidebar-border/60 py-5", collapsed ? "justify-center px-2" : "gap-3 px-4")}>
+        <div className={cn("flex items-center border-b border-slate-200/70 py-5", collapsed ? "justify-center px-2" : "gap-3 px-4")}>
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-brand-600 shadow-sm">
             <Zap className="h-5 w-5 text-white" />
           </div>
           {!collapsed && (
             <div className="min-w-0">
-              <p className="truncate text-sm font-bold leading-tight text-white">Timesheets</p>
-              <p className="text-[11px] font-medium text-sidebar-muted">Intelligence Portal</p>
+              <p className="truncate font-serif text-sm font-bold leading-tight text-slate-900">Timesheets</p>
+              <p className="text-[11px] font-medium text-slate-500">Intelligence Portal</p>
             </div>
           )}
         </div>
@@ -131,7 +143,7 @@ export default function Shell({ children }: { children: ReactNode }) {
             <NavLink key={to} to={to} end={end} title={collapsed ? label : undefined} className={navLinkClass}>
               {({ isActive }) => (
                 <>
-                  <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive ? "text-white" : "text-sidebar-muted group-hover:text-sidebar-text")} />
+                  <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive ? "text-brand-600" : "text-slate-400 group-hover:text-slate-700")} />
                   {!collapsed && <span className="flex-1">{label}</span>}
                   {showAttention && attention > 0 && (
                     <span
@@ -151,12 +163,12 @@ export default function Shell({ children }: { children: ReactNode }) {
           {!collapsed && (
             <p className="px-3 pb-1.5 pt-6 text-[10px] font-semibold uppercase tracking-widest text-slate-500">Tools</p>
           )}
-          {collapsed && <div className="my-3 border-t border-sidebar-border/60" />}
+          {collapsed && <div className="my-3 border-t border-slate-200/70" />}
           {TOOLS_NAV.filter((n) => canWrite || n.to !== "/upload").map(({ to, label, icon: Icon }) => (
             <NavLink key={to} to={to} title={collapsed ? label : undefined} className={navLinkClass}>
               {({ isActive }) => (
                 <>
-                  <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive ? "text-white" : "text-sidebar-muted group-hover:text-sidebar-text")} />
+                  <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive ? "text-brand-600" : "text-slate-400 group-hover:text-slate-700")} />
                   {!collapsed && <span className="flex-1">{label}</span>}
                 </>
               )}
@@ -168,12 +180,12 @@ export default function Shell({ children }: { children: ReactNode }) {
               {!collapsed && (
                 <p className="px-3 pb-1.5 pt-6 text-[10px] font-semibold uppercase tracking-widest text-slate-500">Admin</p>
               )}
-              {collapsed && <div className="my-3 border-t border-sidebar-border/60" />}
+              {collapsed && <div className="my-3 border-t border-slate-200/70" />}
               {ADMIN_NAV.map(({ to, label, icon: Icon }) => (
                 <NavLink key={to} to={to} title={collapsed ? label : undefined} className={navLinkClass}>
                   {({ isActive }) => (
                     <>
-                      <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive ? "text-white" : "text-sidebar-muted group-hover:text-sidebar-text")} />
+                      <Icon className={cn("h-[18px] w-[18px] shrink-0", isActive ? "text-brand-600" : "text-slate-400 group-hover:text-slate-700")} />
                       {!collapsed && <span className="flex-1">{label}</span>}
                     </>
                   )}
@@ -184,20 +196,20 @@ export default function Shell({ children }: { children: ReactNode }) {
         </nav>
 
         {!collapsed && (
-          <div className="mx-2 mb-4 rounded-lg border border-sidebar-border/60 bg-sidebar-hover/50 p-3">
+          <div className="mx-2 mb-4 rounded-lg border border-slate-200/70 bg-slate-100/50 p-3">
             <p className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-slate-500">System</p>
             <div className="space-y-2 text-xs">
               <div className="flex items-center justify-between">
-                <span className="text-sidebar-muted">Email</span>
-                <span className="flex items-center gap-1.5 font-medium text-sidebar-text">
-                  <CircleDot className="h-3 w-3 text-emerald-400" />
+                <span className="text-slate-500">Email</span>
+                <span className="flex items-center gap-1.5 font-medium text-slate-700">
+                  <CircleDot className="h-3 w-3 text-emerald-500" />
                   {health?.email_provider ?? "…"}
                 </span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-sidebar-muted">Extraction</span>
-                <span className="flex items-center gap-1.5 font-medium text-sidebar-text">
-                  <CircleDot className="h-3 w-3 text-emerald-400" />
+                <span className="text-slate-500">Extraction</span>
+                <span className="flex items-center gap-1.5 font-medium text-slate-700">
+                  <CircleDot className="h-3 w-3 text-emerald-500" />
                   {health?.extraction_engine ?? "…"}
                 </span>
               </div>
@@ -222,9 +234,16 @@ export default function Shell({ children }: { children: ReactNode }) {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 shrink-0 items-center justify-between surface-glass px-5 sm:px-6">
-          <div>
-            <p className="text-[10px] font-semibold uppercase tracking-widest text-slate-400">Workspace</p>
-            <p className="text-base font-bold tracking-tight text-slate-900">{title}</p>
+          <div className="min-w-0">
+            <p className="flex flex-wrap items-baseline gap-x-2 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
+              <span>Workspace</span>
+              {workspaceBlurb && (
+                <span className="normal-case tracking-normal font-medium text-slate-500">
+                  · {workspaceBlurb}
+                </span>
+              )}
+            </p>
+            <p className="font-serif text-base font-bold tracking-tight text-slate-900">{title}</p>
           </div>
           <div className="flex items-center gap-2.5 text-xs text-slate-500">
             {stats && (
