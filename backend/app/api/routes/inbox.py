@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 from sqlalchemy import func, or_, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import datacache
@@ -27,118 +26,24 @@ from app.schemas import (
     ThreadListItem,
 )
 from app.services.email_provider import get_email_provider
+from app.services.inbox.sync import sync_inbox, sync_message
 
 router = APIRouter(prefix="/inbox", tags=["inbox"])
 
 # Pipeline tag written by full_email_extract — used to detect prior Extract Email runs.
 _EXTRACT_EMAIL_TAG = "__email_extract__"
 
-
-async def _sync_message(db: AsyncSession, msg) -> EmailMessage:
-    """Upsert a provider message into EmailMessage.
-
-    Must be concurrency-safe: multiple requests may sync the same provider id at
-    the same time (open inbox, click AI check, ai-check-all, etc.). Use a single
-    INSERT .. ON CONFLICT .. DO UPDATE to avoid unique violations.
-    """
-    atts = [
-        {"attachment_id": a.attachment_id, "filename": a.filename,
-         "content_type": a.content_type, "size": a.size, "kind": a.kind, "cid": a.cid,
-         "is_inline": a.is_inline}
-        for a in msg.attachments
-    ]
-    has_approval = any(a["kind"] == "approval_screenshot" for a in atts)
-
-    insert_stmt = pg_insert(EmailMessage).values(
-        provider_message_id=msg.message_id,
-        conversation_id=msg.conversation_id,
-        sender_name=msg.sender_name,
-        sender_email=msg.sender_email,
-        to_recipients=msg.to_recipients or [],
-        cc_recipients=msg.cc_recipients or [],
-        subject=msg.subject,
-        received_at=msg.received_at,
-        body_text=msg.body_text,
-        body_html=msg.body_html,
-        attachments=atts,
-        has_approval_screenshot=has_approval,
-        status=EmailStatus.NEW,
-    )
-    stmt = (
-        insert_stmt
-        .on_conflict_do_update(
-            index_elements=["provider_message_id"],
-            set_={
-                # Preserve workflow fields (status/decided_at). Only refresh message data.
-                # COALESCE: never let a resync null out a previously-known
-                # conversation_id if this particular call somehow has none.
-                "conversation_id": func.coalesce(
-                    insert_stmt.excluded.conversation_id, EmailMessage.conversation_id),
-                "sender_name": msg.sender_name,
-                "sender_email": msg.sender_email,
-                "to_recipients": msg.to_recipients or [],
-                "cc_recipients": msg.cc_recipients or [],
-                "subject": msg.subject,
-                "received_at": msg.received_at,
-                "body_text": msg.body_text,
-                "body_html": func.coalesce(
-                    insert_stmt.excluded.body_html, EmailMessage.body_html),
-                "attachments": atts,
-                "has_approval_screenshot": has_approval,
-            },
-        )
-        .returning(EmailMessage.id)
-    )
-    await db.execute(stmt)
-    row = (
-        await db.execute(
-            select(EmailMessage).where(EmailMessage.provider_message_id == msg.message_id)
-        )
-    ).scalar_one()
-    return row
+# Per-conversation "already fetched live from Graph recently" flag — lets a
+# repeat open of the SAME thread skip the 2+ live Graph round-trips
+# (get_message + list_thread_messages) and serve straight from the local
+# mirror. Set only by get_thread's own live fetch, never by the background
+# sync (that keeps individual rows current but never asserts a whole
+# conversation — Sent-Items replies included — is fully caught up).
+_THREAD_FRESH_TTL = 60
 
 
-_SYNC_LOCK_KEY = "inbox:sync:lock"
-_SYNC_FRESH_KEY = "inbox:sync:fresh"
-_SYNC_LAST_KEY = "inbox:sync:last"   # epoch seconds of the last successful sync
-# Re-fetch window overlap: clock skew / out-of-order receivedDateTime; the
-# upsert dedupes anything fetched twice.
-_SYNC_OVERLAP = timedelta(minutes=10)
-
-
-async def _sync_inbox(db: AsyncSession) -> None:
-    """Throttled, incremental provider sync. Never blocks the UI on a full
-    mailbox download:
-
-    - fresh (synced < INBOX_SYNC_MIN_INTERVAL_SECONDS ago) → no-op, serve DB;
-    - otherwise ask the provider only for messages received after the LAST
-      SUCCESSFUL SYNC (one small request). A full folder crawl happens only
-      when there is no sync marker (first boot / cache flushed);
-    - any provider/cache error → serve existing DB rows, never raise.
-    """
-    try:
-        if await cache.exists(_SYNC_FRESH_KEY) or await cache.exists(_SYNC_LOCK_KEY):
-            return
-        await cache.set(_SYNC_LOCK_KEY, True, ttl=60)
-    except Exception:
-        return  # cache layer down → skip sync, DB rows still serve
-    try:
-        last = await cache.get(_SYNC_LAST_KEY)
-        since = (datetime.fromtimestamp(float(last), tz=timezone.utc) - _SYNC_OVERLAP) if last else None
-        started_at = datetime.now(timezone.utc).timestamp()
-        provider = get_email_provider()
-        for m in await provider.list_messages(None, since=since):
-            await _sync_message(db, m)
-        await db.commit()
-        await cache.set(_SYNC_LAST_KEY, started_at)
-        await cache.set(_SYNC_FRESH_KEY, True, ttl=settings.inbox_sync_min_interval_seconds)
-    except Exception:
-        await db.rollback()
-    finally:
-        try:
-            await cache.delete(_SYNC_LOCK_KEY)
-        except Exception:
-            pass
+def _thread_fresh_key(thread_id: str) -> str:
+    return f"inbox:thread:fresh:{thread_id}"
 
 
 # Document attachments that go through extraction. Images/logos/screenshots are
@@ -375,7 +280,7 @@ async def list_inbox(
     any caller that wants the flat view; the Inbox page itself uses
     GET /inbox/threads (one row per Outlook-style conversation)."""
     if offset == 0:
-        await _sync_inbox(db)
+        await sync_inbox(db)
 
     base = _apply_inbox_filters(select(EmailMessage), q, status)
     total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
@@ -403,7 +308,7 @@ async def list_threads(
     thread — e.g. searching a manager's name finds the thread even when the
     newest message is from the employee."""
     if offset == 0:
-        await _sync_inbox(db)
+        await sync_inbox(db)
 
     thread_key = func.coalesce(EmailMessage.conversation_id, EmailMessage.id)
 
@@ -518,10 +423,28 @@ async def get_email(
     msg = await provider.get_message(provider_message_id)
     if not msg:
         raise HTTPException(404, "Email not found")
-    row = await _sync_message(db, msg)
+    row = await sync_message(db, msg)
     await db.commit()
     await db.refresh(row)
     return await _build_email_detail(db, provider, row)
+
+
+async def _build_thread_detail(
+    db: AsyncSession, provider, anchor_row: EmailMessage, rows: list[EmailMessage],
+) -> ThreadDetail:
+    thread_id = anchor_row.conversation_id or anchor_row.id
+    messages = [await _build_email_detail(db, provider, r) for r in rows]
+    # Extraction keys a conversation-less message by its PROVIDER id, while
+    # thread_id falls back to the DB row id — look up what extraction actually
+    # wrote, or a singleton thread would never show as extracted.
+    extracted_sheets, extracted_at = await _thread_extraction_state(
+        db, anchor_row.conversation_id or anchor_row.provider_message_id)
+    from app.services.extract_email.thread_summary import load_summary
+    summary = await load_summary(
+        db, anchor_row.conversation_id, [r.provider_message_id for r in rows])
+    return ThreadDetail(thread_id=thread_id, messages=messages,
+                        extracted_sheets=extracted_sheets, extracted_at=extracted_at,
+                        summary=summary)
 
 
 @router.get("/{provider_message_id}/thread", response_model=ThreadDetail)
@@ -530,19 +453,41 @@ async def get_thread(
     db: AsyncSession = Depends(get_db),
 ):
     """Outlook-style conversation view: every message in this email's thread,
-    oldest first. Fetches live from the provider (not just the local DB) so a
-    message outside the incremental-sync window — e.g. the original message
-    with the timesheet attachment, replied to weeks later — is never silently
-    missing from the history."""
+    oldest first.
+
+    Fast path: if THIS conversation was live-fetched (below) within the last
+    _THREAD_FRESH_TTL seconds, serve straight from the local mirror — no
+    Graph calls at all — so re-opening a thread you (or another reviewer)
+    just looked at is instant instead of repeating the same round-trips.
+
+    Otherwise falls back to fetching live from the provider (not just the
+    local DB) so a message outside the incremental-sync window — e.g. the
+    original message with the timesheet attachment, replied to weeks later,
+    or a reply living in Sent Items that the background sync never
+    touches — is never silently missing from the history."""
     provider = get_email_provider()
+
+    anchor_row = (await db.execute(select(EmailMessage).where(
+        EmailMessage.provider_message_id == provider_message_id))).scalar_one_or_none()
+    if anchor_row is not None:
+        fresh_key = _thread_fresh_key(anchor_row.conversation_id or anchor_row.provider_message_id)
+        if await cache.exists(fresh_key):
+            if anchor_row.conversation_id:
+                rows = list((await db.execute(select(EmailMessage).where(
+                    EmailMessage.conversation_id == anchor_row.conversation_id
+                ))).scalars().all())
+            else:
+                rows = [anchor_row]
+            rows.sort(key=lambda r: r.received_at or anchor_row.received_at)
+            return await _build_thread_detail(db, provider, anchor_row, rows)
+
     anchor_msg = await provider.get_message(provider_message_id)
     if not anchor_msg:
         raise HTTPException(404, "Email not found")
-    anchor_row = await _sync_message(db, anchor_msg)
+    anchor_row = await sync_message(db, anchor_msg)
     await db.commit()
     await db.refresh(anchor_row)
 
-    thread_id = anchor_row.conversation_id or anchor_row.id
     if anchor_row.conversation_id:
         thread_msgs = await provider.list_thread_messages(anchor_row.conversation_id)
     else:
@@ -560,24 +505,20 @@ async def get_thread(
                 full = await provider.get_message(m.message_id)
                 if full:
                     m = full
-            rows.append(await _sync_message(db, m))
+            rows.append(await sync_message(db, m))
         await db.commit()
         for r in rows:
             await db.refresh(r)
         rows.sort(key=lambda r: r.received_at or anchor_row.received_at)
 
-    messages = [await _build_email_detail(db, provider, r) for r in rows]
-    # Extraction keys a conversation-less message by its PROVIDER id, while
-    # thread_id falls back to the DB row id — look up what extraction actually
-    # wrote, or a singleton thread would never show as extracted.
-    extracted_sheets, extracted_at = await _thread_extraction_state(
-        db, anchor_row.conversation_id or anchor_row.provider_message_id)
-    from app.services.extract_email.thread_summary import load_summary
-    summary = await load_summary(
-        db, anchor_row.conversation_id, [r.provider_message_id for r in rows])
-    return ThreadDetail(thread_id=thread_id, messages=messages,
-                        extracted_sheets=extracted_sheets, extracted_at=extracted_at,
-                        summary=summary)
+    try:
+        await cache.set(
+            _thread_fresh_key(anchor_row.conversation_id or anchor_row.provider_message_id),
+            True, ttl=_THREAD_FRESH_TTL)
+    except Exception:
+        pass
+
+    return await _build_thread_detail(db, provider, anchor_row, rows)
 
 
 async def _email_row_or_404(db: AsyncSession, provider_message_id: str) -> EmailMessage:
@@ -588,7 +529,7 @@ async def _email_row_or_404(db: AsyncSession, provider_message_id: str) -> Email
         msg = await get_email_provider().get_message(provider_message_id)
         if not msg:
             raise HTTPException(404, "Email not found")
-        row = await _sync_message(db, msg)
+        row = await sync_message(db, msg)
         await db.commit()
         await db.refresh(row)
     return row
@@ -844,7 +785,7 @@ async def decide(provider_message_id: str, body: DecisionIn, db: AsyncSession = 
     msg = await provider.get_message(provider_message_id)
     if not msg:
         raise HTTPException(404, "Email not found")
-    row = await _sync_message(db, msg)
+    row = await sync_message(db, msg)
     await db.commit()
     await db.refresh(row)
 

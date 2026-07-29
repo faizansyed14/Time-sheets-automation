@@ -55,22 +55,32 @@ async def coverage(
     )
 
     # ---- global headline counts (cached per focus month; busted on writes) ----
+    # Inactive employees are excluded from every headline count and from the
+    # "missing" roll-up — they're kept in the matcher (records/vault files
+    # intact) but no longer expected to submit.
     async def _aggregates() -> dict:
-        total = (await db.execute(select(func.count()).select_from(Employee))).scalar_one()
+        total = (await db.execute(
+            select(func.count()).select_from(Employee).where(Employee.active.is_(True)))).scalar_one()
         submitted = (await db.execute(
-            select(func.count()).select_from(submitted_subq.subquery()))).scalar_one()
+            select(func.count()).select_from(
+                select(Employee.id).where(Employee.active.is_(True), Employee.id.in_(submitted_subq)).subquery()
+            ))).scalar_one()
         nrev = (await db.execute(
             select(func.count(func.distinct(TimesheetRecord.matched_employee_pk)))
+            .select_from(TimesheetRecord).join(Employee, Employee.id == TimesheetRecord.matched_employee_pk)
             .where(TimesheetRecord.year == focus_year,
                    TimesheetRecord.validation_status == ValidationStatus.MANUAL_REVIEW,
-                   TimesheetRecord.matched_employee_pk.is_not(None)))).scalar_one()
+                   TimesheetRecord.matched_employee_pk.is_not(None),
+                   Employee.active.is_(True)))).scalar_one()
         pend = (await db.execute(
             select(func.count(func.distinct(TimesheetRecord.matched_employee_pk)))
+            .select_from(TimesheetRecord).join(Employee, Employee.id == TimesheetRecord.matched_employee_pk)
             .where(TimesheetRecord.year == focus_year,
                    TimesheetRecord.approval_status != ApprovalStatus.APPROVED,
-                   TimesheetRecord.matched_employee_pk.is_not(None)))).scalar_one()
+                   TimesheetRecord.matched_employee_pk.is_not(None),
+                   Employee.active.is_(True)))).scalar_one()
         sample = (await db.execute(
-            select(Employee.name).where(Employee.id.not_in(submitted_subq))
+            select(Employee.name).where(Employee.active.is_(True), Employee.id.not_in(submitted_subq))
             .order_by(Employee.name).limit(50))).scalars().all()
         return {"total_employees": total, "submitted_this_month": submitted,
                 "needs_review": nrev, "pending_approval": pend, "missing_sample": list(sample)}
@@ -85,7 +95,7 @@ async def coverage(
     missing_sample = agg["missing_sample"]
 
     # ---- filtered + paginated employee rows ----
-    emp_q = select(Employee)
+    emp_q = select(Employee).where(Employee.active.is_(True))
     if location:
         emp_q = emp_q.where(Employee.location == location)
     if q and q.strip():

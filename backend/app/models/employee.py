@@ -14,7 +14,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -43,5 +43,10 @@ class Employee(Base):
     contact_no: Mapped[str | None] = mapped_column(String, nullable=True)
     location: Mapped[str | None] = mapped_column(String, nullable=True)   # "DXB" | "AUH"
     all_emails: Mapped[str | None] = mapped_column(String, nullable=True)  # semicolon-separated
+
+    # Soft-delete: inactivating keeps the row (and every timesheet record /
+    # vault file that references it) intact — just excluded from active
+    # headline counts and matching going forward.
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     # many seconds. Between syncs the inbox (and search) serve straight from
     # the DB — instant, no Graph round-trip.
     inbox_sync_min_interval_seconds: int = 60
+    # Background inbox sync (Celery beat) — pulls new mail on this schedule
+    # regardless of whether anyone has the Inbox page open, so it's already
+    # in the DB by the time someone looks. Shares the same throttle/lock as
+    # the on-demand sync, so this never duplicates a request-triggered pull.
+    inbox_auto_sync_enabled: bool = True
+    inbox_auto_sync_interval_seconds: int = 60
     # Image attachments smaller than this are signature logos/icons in
     # practice: hidden from attachment lists/counts and never sent to the
     # vision model. Applies ONLY to images — documents of any size still flow.

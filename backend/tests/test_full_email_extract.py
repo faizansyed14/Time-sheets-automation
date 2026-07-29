@@ -19,10 +19,10 @@ async def _email(db, msg_id: str = "MSG-0001") -> EmailMessage:
     row = (await db.execute(select(EmailMessage).where(
         EmailMessage.provider_message_id == msg_id))).scalar_one_or_none()
     if row is None:
-        from app.api.routes.inbox import _sync_message
+        from app.services.inbox.sync import sync_message
         from app.services.email_provider import get_email_provider
         msg = await get_email_provider().get_message(msg_id)
-        row = await _sync_message(db, msg)
+        row = await sync_message(db, msg)
         await db.commit()
         await db.refresh(row)
     return row

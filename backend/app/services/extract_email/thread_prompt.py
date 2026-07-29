@@ -140,7 +140,7 @@ PASS2_USER_RULES = """LEAVE TYPE - map whatever label is on the item to exactly 
     this date is a working_day (it names the calendar occasion), and being also
     worked that day is not a conflict, the same way a remote day both works and isn't at
     the office.
-  other -> Mourning Leave (any degree), Paternity Leave - genuine, named leave types
+  other -> Mourning Leave (any degree), Paternity Leave, Happiness Leave - genuine, named leave types
     that aren't one of the standard buckets above but ARE clearly leave (unlike the
     "label that isn't one of the above" case below, which is for something you don't
     recognise at all).

@@ -280,6 +280,27 @@ def _is_email_body(it: Item) -> bool:
     return (it.name or "").lower().startswith("email body")
 
 
+# A staff/employee number embedded in a filename — either an explicit label
+# ("Staff No: 46533", "Emp ID 46533") or the bare "(46533)" convention a
+# forwarded-per-employee attachment is commonly renamed to. Used ONLY to STOP
+# a same-template dedup between two clearly different, named employees (a
+# bulk send of one identical timesheet layout per person scores as "near
+# duplicate" on text alone) — never to positively match, so a filename with
+# no such number falls through to today's text-only behaviour unchanged.
+_FILENAME_ID_RE = re.compile(
+    r"(?:staff\s*no\.?|staff\s*number|emp(?:loyee)?\s*(?:id|no)\.?)\s*[:#]?\s*(\d{3,})"
+    r"|\((\d{3,})\)",
+    re.I,
+)
+
+
+def _filename_identity(name: str) -> str | None:
+    m = _FILENAME_ID_RE.search(name or "")
+    if not m:
+        return None
+    return m.group(1) or m.group(2)
+
+
 def _sheet_text_fingerprint(text: str) -> str:
     """Normalize OCR/PDF text for near-dup: collapse whitespace, drop
     approval/sign/manager/workflow-status noise that differs between unsigned
@@ -369,6 +390,12 @@ def _dedupe_sheet_items(th: Thread) -> None:
                 matched_idx = i
                 exact = True
                 break
+            id_a, id_b = _filename_identity(it.name), _filename_identity(kept.name)
+            if id_a and id_b and id_a != id_b:
+                # Filenames name two different employees (e.g. a bulk send of
+                # one identical timesheet template per person) — never a
+                # duplicate no matter how similar the sheet text scores.
+                continue
             if _texts_near_match(it.text, kept.text):
                 matched_idx = i
                 exact = False
@@ -1011,11 +1038,28 @@ async def extract_thread_sheets(
          pass_no=2, model=model, sheets=[it.name for it, _ in pairs])
 
     raw_sheets: list = []
+    pass2_call_count = 0
     for bi, batch in enumerate(batches2, 1):
         data = await thread_prompt.run_pass2_batch(
             batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}")
         count_llm()
-        raw_sheets += (data.get("sheets") or [])
+        pass2_call_count += 1
+        sheets_out = data.get("sheets") or []
+        if not sheets_out and batch:
+            # Every item in this batch was already CONFIRMED by pass 1 (which
+            # read these same images successfully moments earlier), so a
+            # flatly empty reply here is far more likely a bad/degenerate
+            # model generation than "these are genuinely blank documents" —
+            # retry once before accepting nothing for real, confirmed items.
+            emit("pass2", "spin",
+                 f"Pass 2 batch {bi} returned nothing for {len(batch)} confirmed item(s) — retrying once…",
+                 pass_no=2)
+            data = await thread_prompt.run_pass2_batch(
+                batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}-retry")
+            count_llm()
+            pass2_call_count += 1
+            sheets_out = data.get("sheets") or []
+        raw_sheets += sheets_out
 
     fresh_sheets = _normalise_pass2_sheets(raw_sheets, data_items, th.items)
     meta["_fresh_by_digest"] = {
@@ -1042,6 +1086,6 @@ async def extract_thread_sheets(
                                   + sum(len(s.get(b) or []) for b in BUCKETS))}
                   for s in sheets])
 
-    meta["calls"] = len(batches) + len(batches2)
+    meta["calls"] = len(batches) + pass2_call_count
     meta["sheet_count"] = len(sheets)
     return sheets, approval, [], meta

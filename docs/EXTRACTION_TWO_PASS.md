@@ -432,7 +432,10 @@ LEAVE TYPE - map whatever label is on the item to exactly one bucket:
     that date is still public_holiday (it names the calendar occasion), and being also
     worked that day is not a conflict, the same way a remote day both works and isn't at
     the office.
-  Mourning Leave (any degree) -> annual
+  other -> Mourning Leave (any degree), Paternity Leave, Happiness Leave - genuine,
+    named leave types that aren't one of the standard buckets above but ARE clearly
+    leave (unlike the "label that isn't one of the above" case below, which is for
+    something you don't recognise at all).
   "Unauthorized Absence (Emergency Leave)" -> absent (it's an absence record first;
     the "(Emergency Leave)" is the stated reason, not a different bucket)
 
@@ -444,8 +447,7 @@ public_holiday, also never annual. Worked hours, weekends, and blank rows are NO
 A LABEL THAT ISN'T ONE OF THE ABOVE - do not force it into the nearest-sounding bucket and
 do not silently drop it either. Real sheets invent their own leave types constantly:
 "Balance Leave" (a day off owed for working a previous off-day - not the same as annual),
-"Happiness Leave" (a UAE wellbeing day, distinct from annual leave), or anything else
-client-specific. Put those dates in uncertain_days with the exact label quoted as the
+or anything else client-specific. Put those dates in uncertain_days with the exact label quoted as the
 reason (e.g. "labelled 'Balance Leave' - not one of the standard categories, needs manual
 review for the correct bucket"). A guessed bucket that's wrong is worse than an honest
 "this needs a human to decide."

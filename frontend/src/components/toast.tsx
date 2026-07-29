@@ -3,15 +3,17 @@ import { CheckCircle2, AlertTriangle, XCircle, X, Info } from "lucide-react";
 import { cn } from "../lib/utils";
 
 type ToastKind = "success" | "error" | "warning" | "info";
+type ToastAction = { label: string; onClick: () => void };
 interface Toast {
   id: number;
   kind: ToastKind;
   title: string;
   detail?: string;
+  action?: ToastAction;
 }
 
 interface ToastCtx {
-  toast: (kind: ToastKind, title: string, detail?: string) => void;
+  toast: (kind: ToastKind, title: string, detail?: string, action?: ToastAction) => void;
 }
 
 const Ctx = createContext<ToastCtx>({ toast: () => {} });
@@ -41,10 +43,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const toast = useCallback(
-    (kind: ToastKind, title: string, detail?: string) => {
+    (kind: ToastKind, title: string, detail?: string, action?: ToastAction) => {
       const id = nextId++;
-      setToasts((ts) => [...ts.slice(-4), { id, kind, title, detail }]);
-      window.setTimeout(() => dismiss(id), kind === "error" ? 8000 : 5000);
+      setToasts((ts) => [...ts.slice(-4), { id, kind, title, detail, action }]);
+      window.setTimeout(() => dismiss(id), kind === "error" || action ? 8000 : 5000);
     },
     [dismiss]
   );
@@ -66,6 +68,17 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             <div className="min-w-0 flex-1">
               <p className="text-sm font-semibold text-slate-800">{t.title}</p>
               {t.detail && <p className="mt-0.5 break-words text-xs leading-5 text-slate-500">{t.detail}</p>}
+              {t.action && (
+                <button
+                  onClick={() => {
+                    t.action!.onClick();
+                    dismiss(t.id);
+                  }}
+                  className="mt-1.5 text-xs font-semibold text-brand-600 hover:text-brand-700 hover:underline"
+                >
+                  {t.action.label}
+                </button>
+              )}
             </div>
             <button
               onClick={() => dismiss(t.id)}

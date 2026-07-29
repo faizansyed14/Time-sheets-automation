@@ -288,10 +288,15 @@ class EmployeeIn(BaseModel):
     contact_no: str | None = None
     location: str | None = None
     all_emails: str | None = None
+    active: bool = True
 
 
 class EmployeeOut(EmployeeIn):
     id: str
+
+
+class EmployeeStatusIn(BaseModel):
+    active: bool
 
 
 class UploadResult(BaseModel):
