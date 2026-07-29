@@ -183,10 +183,13 @@ def download_size(
     manager: str | None = Query(default=None),
     rel_path: str | None = Query(default=None),
     year: int | None = Query(default=None),
+    employee: list[str] = Query(default=[]),
+    month: str | None = Query(default=None),
 ):
     """Total {files, bytes} of a download scope, so the UI can show an accurate
     progress bar. Cheap: a single metadata listing, no file downloads."""
-    return scope_size(manager=manager, rel_prefix=(rel_path or None), year=year)
+    return scope_size(manager=manager, rel_prefix=(rel_path or None), year=year,
+                       employees=employee or None, month=month)
 
 
 @router.get("/download-zip")
@@ -195,15 +198,21 @@ def download_zip(
     rel_path: str | None = Query(default=None, description="Scope to a subtree, "
                                  "e.g. '<Manager>/<Employee>' or '.../<Month-Year>'"),
     year: int | None = Query(default=None, description="Scope to one calendar year"),
+    employee: list[str] = Query(
+        default=[], description="Repeat to pick specific employees under `manager` "
+                                "(1 or a few, instead of the whole team)"),
+    month: str | None = Query(default=None, description="A bare month name, e.g. 'March'"),
 ):
     """
     STREAM the storage tree as a ZIP (never buffered fully in memory, so it
     scales to multi-GB vaults and starts downloading immediately).
-      ?year=2026            → everything filed under 2026 (bounded ≈ ≤5 GB)
-      ?manager=X            → that account-manager's subtree (fast S3 prefix scan)
-      ?rel_path=A/B[/C]     → just one employee or month folder
-      (no query)            → the entire archive
-    Filters combine (e.g. ?manager=X&year=2026).
+      ?year=2026                    → everything filed under 2026 (bounded ≈ ≤5 GB)
+      ?manager=X                    → that account-manager's subtree (fast S3 prefix scan)
+      ?manager=X&employee=A&employee=B → just those employees under X
+      ?month=March                  → that month, every year (or one year with &year=)
+      ?rel_path=A/B[/C]             → just one employee or month folder
+      (no query)                    → the entire archive
+    Filters combine (e.g. ?manager=X&year=2026&employee=A).
     """
     scope = (rel_path or "").strip("/")
     name_bits = []
@@ -211,10 +220,17 @@ def download_zip(
         name_bits.append(_safe_filename(scope.split("/")[-1]))
     if manager and not scope:
         name_bits.append(_safe_filename(manager))
+    if employee:
+        name_bits.append(
+            "_".join(_safe_filename(e) for e in employee[:3])
+            + (f"_+{len(employee) - 3}more" if len(employee) > 3 else ""))
+    if month:
+        name_bits.append(_safe_filename(month))
     if year:
         name_bits.append(str(year))
     filename = ("_".join(name_bits) or "timesheets_archive") + ".zip"
-    stream = iter_zip(manager=manager, rel_prefix=(scope or None), year=year)
+    stream = iter_zip(manager=manager, rel_prefix=(scope or None), year=year,
+                       employees=employee or None, month=month)
     return StreamingResponse(
         stream,
         media_type="application/zip",

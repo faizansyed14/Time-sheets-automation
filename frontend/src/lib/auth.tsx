@@ -14,6 +14,10 @@ interface AuthCtx {
   isAdmin: boolean;
   isViewer: boolean;
   canWrite: boolean;        // false for the read-only "viewer" role
+  // "vault_matcher" — restricted role, full read/write but ONLY on the
+  // Employee Matcher and File Vault pages (enforced server-side too, see
+  // backend api/deps.require_full_access). Nav/routing hide everything else.
+  isVaultMatcherOnly: boolean;
   setSession: (token: string, user: AuthUser) => void;
   logout: () => void;
 }
@@ -24,6 +28,7 @@ const Ctx = createContext<AuthCtx>({
   isAdmin: false,
   isViewer: false,
   canWrite: false,
+  isVaultMatcherOnly: false,
   setSession: () => {},
   logout: () => {},
 });
@@ -67,7 +72,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         loading,
         isAdmin: role === "admin",
         isViewer: role === "viewer",
-        canWrite: role === "admin" || role === "user",
+        canWrite: role === "admin" || role === "user" || role === "vault_matcher",
+        isVaultMatcherOnly: role === "vault_matcher",
         setSession,
         logout,
       }}

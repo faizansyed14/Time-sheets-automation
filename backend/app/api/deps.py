@@ -75,6 +75,18 @@ async def require_write(request: Request, user: User = Depends(get_current_user)
     return user
 
 
+async def require_full_access(request: Request, user: User = Depends(get_current_user)) -> User:
+    """Same as require_write, but ALSO blocks the restricted `vault_matcher`
+    role outright — not just writes, GET too. That role's access is limited
+    to the Employee Matcher and File Vault routers (see main.py); every other
+    business router (inbox, pipeline, upload, timesheets, dashboard, chat)
+    uses this dependency instead of require_write so the restriction is
+    enforced at the API boundary, not just hidden in the frontend nav."""
+    if user.role == Role.VAULT_MATCHER:
+        raise HTTPException(403, "Your account only has access to the Employee Matcher and File Vault.")
+    return await require_write(request, user)
+
+
 async def require_admin(user: User = Depends(get_current_user)) -> User:
     if user.role != Role.ADMIN:
         raise HTTPException(403, "Admin privileges required")

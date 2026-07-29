@@ -329,8 +329,31 @@ async def delete_record(record_id: str, db: AsyncSession = Depends(get_db)):
     if not r:
         raise HTTPException(404, "Record not found")
     await db.delete(r)
+
+    # The pipeline tracker row that filed this record still points at it
+    # (record_id, status=success) — left alone, its "View record" link 404s
+    # forever (the record is gone) and the Pipeline page keeps reporting a
+    # success that no longer exists. Un-link it and report it honestly.
+    from datetime import datetime, timezone
+
+    from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStatus
+    trackers = (await db.execute(
+        select(PipelineFile).where(PipelineFile.record_id == record_id))).scalars().all()
+    for t in trackers:
+        t.record_id = None
+        t.status = PipelineStatus.FAILED
+        t.failure_code = FailureCode.RECORD_DELETED
+        t.failure_detail = "The timesheet record this file filed was deleted."
+        t.events = (t.events or []) + [{
+            "stage": "recorded", "status": "warn",
+            "detail": "Record deleted — no longer filed.",
+            "at": datetime.now(timezone.utc).isoformat(),
+        }]
+
     await db.commit()
     await datacache.bust_coverage()
+    if trackers:
+        await datacache.bust_pipeline()
     return {"deleted": record_id}
 
 

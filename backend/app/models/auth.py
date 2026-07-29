@@ -24,8 +24,13 @@ class Role:
     ADMIN = "admin"     # full access (users, config, all reads + writes)
     USER = "user"       # standard operator: all business reads + writes
     VIEWER = "viewer"   # read-only: may view everything, may not mutate anything
-    ALL = (ADMIN, USER, VIEWER)
-    WRITERS = (ADMIN, USER)   # roles allowed to perform mutations
+    # Restricted operator: full read + write, but ONLY on the Employee Matcher
+    # and File Vault routers — every other business route (inbox, pipeline,
+    # upload, timesheets, dashboard, chat) 403s for this role, even GET. See
+    # api/deps.require_full_access and main.py's router wiring.
+    VAULT_MATCHER = "vault_matcher"
+    ALL = (ADMIN, USER, VIEWER, VAULT_MATCHER)
+    WRITERS = (ADMIN, USER, VAULT_MATCHER)   # roles allowed to perform mutations
 
 
 class AuthMode:

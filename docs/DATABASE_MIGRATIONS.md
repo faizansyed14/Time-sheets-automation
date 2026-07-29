@@ -21,10 +21,12 @@ backend/
 │   ├── env.py                  # async-aware migration runner (reads DATABASE_URL)
 │   ├── script.py.mako          # template for new migration files
 │   └── versions/
-│       └── 0001_baseline.py    # baseline: creates all current tables
+│       ├── 0001_baseline.py    # baseline tables
+│       ├── …                   # incremental revisions
+│       └── 0022_employee_aco_number.py   # current head (adds aco_number)
 └── app/
-    ├── core/database.py        # Base + async engine (unchanged)
-    └── models/                 # SQLAlchemy models = the desired schema
+    ├── core/database.py
+    └── models/                 # SQLAlchemy models = desired schema
 ```
 
 `alembic/env.py` imports `app.models` so every table is registered on
@@ -119,10 +121,14 @@ DATABASE_URL=postgresql+asyncpg://USER:PASS@localhost:5432/timesheet \
 ```
 
 This writes the `alembic_version` row without touching your tables. From then
-on, `alembic upgrade head` only applies *new* migrations. The baseline
-(`0001_baseline`) already reflects the current schema
-(`timesheet_records.source_files` and the `uq_employee_id_name` composite
-unique), so a stamped legacy DB is consistent.
+on, `alembic upgrade head` only applies *new* migrations.
+
+**Important:** stamping `0001_baseline` alone is only correct if that DB’s
+schema truly matches the baseline. For databases that have already been
+upgraded (or created more recently), stamp / upgrade to the **current head**
+instead — today that is `0022_employee_aco_number` (adds `all_employee_data.aco_number`;
+`dco_number` existed earlier). Prefer `alembic upgrade head` on empty DBs;
+use `stamp` only for legacy DBs that already match a known revision.
 
 ---
 

@@ -5,20 +5,24 @@ import {
   createEmployee,
   fetchEmployeeMatcher,
   importEmployees,
+  previewEmployeeImport,
   setEmployeeStatus,
   updateEmployee,
   type Employee,
   type EmployeeInput,
+  type ImportPlan,
   type ImportSummary,
 } from "../api/client";
 import { locationBadgeTone } from "../lib/theme";
 import { avatarColor, cn, initials } from "../lib/utils";
 import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton } from "../components/ui";
+import EmployeeImportPlanModal from "../components/EmployeeImportPlanModal";
 import { useToast } from "../components/toast";
 
 const EMPTY: EmployeeInput = {
   employee_id: "",
   name: "",
+  aco_number: null,
   dco_number: null,
   account_manager: null,
   employee_email_id: null,
@@ -41,6 +45,10 @@ export default function EmployeesPage() {
   const [modal, setModal] = useState<{ mode: "create" } | { mode: "edit"; row: Employee } | null>(null);
   const [form, setForm] = useState<EmployeeInput>(EMPTY);
   const [importResult, setImportResult] = useState<ImportSummary | null>(null);
+  // Two-step import: preview the file (writes nothing) -> confirm -> apply.
+  // The chosen File is held so "Update matcher" can re-send the exact same
+  // bytes that produced the plan on screen.
+  const [importPlan, setImportPlan] = useState<{ plan: ImportPlan; file: File } | null>(null);
 
   const { data: rows, isLoading } = useQuery({
     queryKey: ["employee-matcher"],
@@ -75,11 +83,17 @@ export default function EmployeesPage() {
     },
     onError: (e: any) => toast("error", "Could not update status", e?.response?.data?.detail ?? String(e)),
   });
+  const previewMut = useMutation({
+    mutationFn: async (file: File) => ({ plan: await previewEmployeeImport(file), file }),
+    onSuccess: (r) => setImportPlan(r),
+    onError: (e: any) => toast("error", "Could not read that file", e?.response?.data?.detail ?? String(e)),
+  });
   const importMut = useMutation({
     mutationFn: importEmployees,
     onSuccess: (s) => {
+      setImportPlan(null);
       setImportResult(s);
-      toast("success", "Import finished", `${s.inserted} inserted · ${s.updated} updated · ${s.skipped} skipped`);
+      toast("success", "Import finished", `${s.inserted} added · ${s.updated} updated · ${s.skipped} skipped`);
       invalidate();
     },
     onError: (e: any) => toast("error", "Import failed", e?.response?.data?.detail ?? String(e)),
@@ -133,13 +147,18 @@ export default function EmployeesPage() {
               className="hidden"
               onChange={(e) => {
                 const f = e.target.files?.[0];
-                if (f) importMut.mutate(f);
+                if (f) previewMut.mutate(f);
                 e.target.value = "";
               }}
             />
-            <Button variant="secondary" onClick={() => fileRef.current?.click()} disabled={importMut.isPending}>
+            <Button
+              variant="secondary"
+              onClick={() => fileRef.current?.click()}
+              disabled={previewMut.isPending || importMut.isPending}
+              title="Preview what the file would change before anything is saved"
+            >
               <FileSpreadsheet className="h-4 w-4" />
-              {importMut.isPending ? "Importing…" : "Import Excel"}
+              {previewMut.isPending ? "Reading…" : importMut.isPending ? "Importing…" : "Import Excel"}
             </Button>
             <Button onClick={openCreate}>
               <Plus className="h-4 w-4" /> Add employee
@@ -233,8 +252,21 @@ export default function EmployeesPage() {
                         >
                           {initials(r.name)}
                         </span>
-                        <span className="truncate text-[11px] font-semibold text-slate-800" title={r.name}>
-                          {r.name}
+                        <span className="min-w-0">
+                          <span className="block truncate text-[11px] font-semibold text-slate-800" title={r.name}>
+                            {r.name}
+                          </span>
+                          {/* Mirrors the File Vault folder name for this person. */}
+                          {(r.aco_number || r.dco_number) && (
+                            <span
+                              className="block truncate font-mono text-[9px] text-slate-400"
+                              title="Written into this employee's File Vault folder name"
+                            >
+                              {[r.aco_number && `ACO-${r.aco_number}`, r.dco_number && `DCO-${r.dco_number}`]
+                                .filter(Boolean)
+                                .join(" · ")}
+                            </span>
+                          )}
                         </span>
                       </div>
                     </td>
@@ -361,6 +393,12 @@ export default function EmployeesPage() {
               onChange={(e) => setForm({ ...form, account_manager: e.target.value || null })}
             />
           </Field>
+          <Field label="ACO number" name="aco_number">
+            <Input
+              value={form.aco_number ?? ""}
+              onChange={(e) => setForm({ ...form, aco_number: e.target.value || null })}
+            />
+          </Field>
           <Field label="DCO number" name="dco_number">
             <Input
               value={form.dco_number ?? ""}
@@ -401,6 +439,17 @@ export default function EmployeesPage() {
         </div>
       </Modal>
 
+      {/* -------- import review (dry run) — shown BEFORE anything is saved -------- */}
+      {importPlan && (
+        <EmployeeImportPlanModal
+          plan={importPlan.plan}
+          fileName={importPlan.file.name}
+          pending={importMut.isPending}
+          onCancel={() => setImportPlan(null)}
+          onConfirm={() => importMut.mutate(importPlan.file)}
+        />
+      )}
+
       {/* -------- import result modal -------- */}
       <Modal
         open={!!importResult}
@@ -413,7 +462,7 @@ export default function EmployeesPage() {
             <div className="mb-4 grid grid-cols-3 gap-3 text-center">
               <div className="rounded-xl bg-emerald-50 p-3">
                 <p className="text-2xl font-bold text-emerald-600">{importResult.inserted}</p>
-                <p className="text-xs font-medium text-emerald-700">Inserted</p>
+                <p className="text-xs font-medium text-emerald-700">Added</p>
               </div>
               <div className="rounded-xl bg-brand-50 p-3 ring-1 ring-inset ring-brand-100">
                 <p className="text-2xl font-bold text-brand-700">{importResult.updated}</p>

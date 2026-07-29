@@ -34,6 +34,10 @@ class Employee(Base):
 
     employee_id: Mapped[str] = mapped_column(String, index=True)
     name: Mapped[str] = mapped_column(String, index=True)
+    # ACO / DCO reference numbers. Both are written into the employee's File
+    # Vault folder name at filing time (see storage_provider.employee_folder_label)
+    # so a folder identifies the person by contract number, not just by name.
+    aco_number: Mapped[str | None] = mapped_column(String, nullable=True)
     dco_number: Mapped[str | None] = mapped_column(String, nullable=True)
     account_manager: Mapped[str | None] = mapped_column(String, nullable=True)
     employee_email_id: Mapped[str | None] = mapped_column(String, nullable=True)

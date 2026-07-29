@@ -149,6 +149,36 @@ async def test_viewer_role_is_read_only(client, admin_token):
     assert (await client.get("/api/v1/admin/users", headers=auth_headers(token))).status_code == 403
 
 
+async def test_vault_matcher_role_is_restricted_to_its_two_pages(client, admin_token):
+    """The `vault_matcher` role exists for someone who should ONLY manage the
+    employee matcher list and the file vault — every other business route
+    (including reads) must 403 for them, not just writes."""
+    r = await client.post("/api/v1/admin/users", headers=auth_headers(admin_token),
+                          json={"username": "vaultonly", "password": "Password123",
+                                "email": "vm@e.com", "role": "vault_matcher", "auth_mode": "otp"})
+    assert r.status_code == 201, r.text
+    token = await login_2fa(client, "vaultonly", "Password123")
+    h = auth_headers(token)
+
+    # Full read+write on its two allowed routers.
+    assert (await client.get("/api/v1/employee-matcher", headers=h)).status_code == 200
+    assert (await client.get("/api/v1/files/managers", headers=h)).status_code == 200
+    bad_create = await client.post("/api/v1/employee-matcher", headers=h,
+                                   json={"employee_id": "", "name": ""})
+    assert bad_create.status_code != 403   # reached the handler (validation, not RBAC)
+
+    # Everywhere else 403s, including plain GETs — not just writes.
+    for path in ("/api/v1/pipeline", "/api/v1/inbox",
+                 "/api/v1/employees/coverage", "/api/v1/admin/calendars"):
+        resp = await client.get(path, headers=h)
+        assert resp.status_code == 403, f"{path}: {resp.status_code} {resp.text}"
+    # POST too (upload.py has no GET routes at all) — RBAC gate wins before body validation.
+    assert (await client.post("/api/v1/upload/manual", headers=h)).status_code == 403
+
+    # Still not a real admin route.
+    assert (await client.get("/api/v1/admin/users", headers=h)).status_code == 403
+
+
 async def test_month_calendars_readable_by_everyone_editable_by_non_viewers(client, admin_token):
     """Month calendars are the one admin.py route NOT gated to admin-only —
     every role can view them (relevant to normal timesheet review, not just

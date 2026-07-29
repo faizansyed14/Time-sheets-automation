@@ -2,78 +2,39 @@
 
 Email-driven timesheet leave extraction with manager approval.
 
-> **System architecture (auth, RBAC, OTP/CAPTCHA, Redis, Celery, LangChain,
-> admin config, Docker, tests):** see **[docs/SYSTEM.md](docs/SYSTEM.md)**.
-> Run the test suite with `bash scripts/test.sh`. Default admin: `admin` / `admin`.
+> **System architecture (auth, RBAC, OTP/CAPTCHA, Redis, Celery, Docker, tests):**
+> see **[docs/SYSTEM.md](docs/SYSTEM.md)**.  
+> **Extract / Accept / vault:** **[docs/EXTRACTION_FLOWS.md](docs/EXTRACTION_FLOWS.md)** ·
+> **[docs/EXTRACTION_TWO_PASS.md](docs/EXTRACTION_TWO_PASS.md)**.  
+> Run tests with `bash scripts/test.sh`. Default admin: `admin` / `admin`.
 
-## What's new in v2
+## Product flow (current)
 
-1. **Multiple files per month (weekly / 15-day timesheets).** Some clients send
-   a month as several files. Each file's extracted dates are stored as a
-   *contribution* on the monthly record (`source_files`) and the record's
-   buckets are the **union** of all contributions — a second file for the same
-   employee + month **merges** instead of being treated as a duplicate.
-   Re-uploading the same file replaces its own contribution (idempotent), and
-   dates claimed by two *different* files raise a review flag. A manual edit of
-   the record becomes the single source of truth for that month.
-
-2. **Duplicate employee IDs across AUH and DXB.** `employee_id` is no longer
-   globally unique — identity is **(employee_id, name)**. Matching resolves a
-   shared ID by the name on the sheet (exact, then fuzzy); if the name can't
-   pick a side the file fails as `ambiguous_id` instead of being filed under
-   the wrong person. The Excel importer also keys on (ID, name), so AUH rows
-   are no longer skipped as "duplicate ID".
-
-3. **Pipeline tracker.** Every file that enters the pipeline (email accept OR
-   upload) gets an audit row that walks through stages
-   `received → protection_check → extraction → identification → matching →
-   validation → filing → recorded` and ends as **success / needs_review /
-   failed / resolved**. Failures carry an exact reason: `protected_pdf`,
-   `llm_failed`, `name_not_found`, `month_not_found`, `employee_not_matched`,
-   `ambiguous_id`, `id_name_mismatch`, `validation_mismatch`,
-   `unsupported_type`, `storage_error`, … Nothing fails silently anymore.
-   The Pipeline page has a **Resolve** button (human sign-off with a note) and
-   a **Retry** button (re-runs the stored copy of the file after you fix the
-   cause — e.g. after adding the missing employee to the matcher).
-
-4. **New SaaS frontend.** Complete rewrite: sidebar app shell, KPI dashboard,
-   split-pane inbox, drag-and-drop upload with per-file outcomes, pipeline
-   tracker with stage timelines, employee matcher with AUH/DXB shared-ID
-   indicators, three-pane file vault and a full record page with editable
-   leave buckets. Works against the same mock/real provider seams.
-
-You review incoming timesheet emails **inside the app**, accept or reject each one,
-and accepted emails flow through an extraction pipeline that reads the leave data,
-validates it, matches the employee against your employee matcher list, and files everything into a
-per-employee / per-month folder. A dashboard rolls every employee up to a
-green (clear) / yellow (needs review) status.
-
-This build runs **end-to-end on mocks** out of the box (mock mailbox, mock LLM),
-and includes your **real prompts + vision client + file conversion** ported in, ready to
-activate with `EXTRACTION_ENGINE=vision`. Three clean seams swap mock → real:
-email (Graph), extraction (your LLM), and DB (Postgres).
+1. **Inbox** — sync mail, preview attachments, **Extract Email** (two-pass vision
+   over the thread). Status badges: **New** (dark blue), **Extracted** (yellow),
+   **Ingested** (green). Thread summary expands by default.
+2. **Pipeline / Compare & Fix** — one review row per **employee + month**. AI may
+   *recommend* Accept; nothing is filed until a human presses Accept.
+3. **Accept** — writes `timesheet_records` + File Vault under  
+   `Manager / Name (ACO-…, DCO-…) / Month-Year /`.  
+   - Multi-employee email → only that person’s attachment(s).  
+   - Same filename again → dated copy (never overwrite).
+4. **Upload / Manual Entry / Save .eml to Vault** — same extract core or direct filing.
 
 ## What's included
-- **Email Inbox** — read emails, preview attachments, Accept (→ pipeline) / Reject (→ archive).
-- **Upload page** — drop PDF/DOCX/XLSX/images; runs the *same* pipeline as Accept.
-- **Files page** — browse the `<Employee>/<Month-Year>/<files>` tree and create / rename /
-  delete folders from the UI (backed by the storage provider; mirrors to OneDrive once connected).
-- **Employee Matcher** — full CRUD over `all_employee_data` from the UI.
-- **Dashboard** — per-employee green/yellow roll-up, eye button → monthly detail, year filter.
-- **Employee record** — view & preview the stored source files (sheet, approval screenshot,
-  result JSON) inline; **edit** the leave buckets/dates; **Mark verified** to clear review;
-  **Approve / Not approved** sign-off; delete record. Editing re-runs validation automatically.
-- **Validation** catches duplicate dates, dates in multiple categories, out-of-month dates,
-  and header-month vs actual-dates mismatch — each shown as a plain-language flag.
-- **Pipeline** — extract → validate → match to employee matcher (id → name → fuzzy) → file under
-  `<Employee>/<Month-Year>/` → upsert record.
+- **Email Inbox** — read, Extract Email, Auto Extract, Save .eml to vault, archive.
+- **Upload** — PDF/DOCX/XLSX/images/`.eml`; same two-pass extract → review queue.
+- **Files** — File Vault browse / upload / ZIP download (ACO/DCO folder names).
+- **Employee Matcher** — CRUD + Excel import; ACO and DCO numbers.
+- **Dashboard / Records** — roll-ups, leave buckets, approval sign-off.
+- **Pipeline** — staged extracts, Compare & Fix, Retry from raw copy.
 
 ## Swappable providers (mock → real, all config-only)
 | Concern | Config | Now | Later |
 |---|---|---|---|
 | Email | `EMAIL_PROVIDER` | `mock` | `graph` (Microsoft Graph) |
-| Extraction | `EXTRACTION_ENGINE` | `mock` | `vision` (your real LLM) |
-| File store | `STORAGE_PROVIDER` | `local` | `s3` (AWS S3) · `onedrive` |
+| Extraction | `EXTRACTION_ENGINE` | `mock` | `vision` (OpenAI-compatible) |
+| File store | `STORAGE_PROVIDER` | `local` | `s3` · `onedrive` |
 | Database | `DATABASE_URL` | PostgreSQL (local/Docker) | AWS RDS |
 
 **Deleting mock entirely:** set the three providers to their real values, then remove
@@ -115,59 +76,40 @@ On first boot the backend creates its PostgreSQL tables, seeds the mock employee
 (`all_employee_data`), and the inbox shows 6 mock emails.
 
 ### Try the flow
-1. **Email Inbox** → click an email → preview the body + attachments (PDF / DOCX / approval screenshot).
-2. Click **Yes · Run extraction** (or **No · Archive**).
-3. **Dashboard** → each employee shows green/yellow. Click the **eye** to open the monthly detail.
-4. In the detail, set the **Approve / Not approved** sign-off; switch the **year** dropdown.
-
-Mock emails are designed to exercise every path:
-- clean + approved (Mohammed Ali, Jan)
-- **duplicate date** → yellow (Priya, Jan)
-- **out-of-month date** → yellow (Aisha, Jan)
-- **fuzzy name match** "Mohd Ali" → "Mohammed Ali" (Feb)
-- **one email → two people** fan-out (Sarah Khan forwards Carlos + Fatima)
-- no approval screenshot (John, Feb)
+1. **Inbox** → open a thread → **Extract Email**.
+2. **Pipeline** → open Compare & Fix → review leave → **Accept & file record**.
+3. **Files** → confirm vault folder uses ACO/DCO when set on the employee.
+4. **Dashboard / Record** → green/yellow roll-up; approve sign-off if needed.
 
 ---
 
 ## Architecture
 
-Full architecture, project structure, auth/RBAC, Redis/Celery, LangChain, admin
-config, Docker dev/prod and DB/storage portability (AWS RDS / S3) are documented
-in **[docs/SYSTEM.md](docs/SYSTEM.md)**. Security & privacy posture (2FA for all
-roles, the `admin`/`user`/`viewer` RBAC model, token revocation, OWASP/GDPR
-mapping) is in **[docs/SECURITY.md](docs/SECURITY.md)**. High level:
+Full architecture: **[docs/SYSTEM.md](docs/SYSTEM.md)**. Security: **[docs/SECURITY.md](docs/SECURITY.md)**.
+Extract / Accept / vault: **[docs/EXTRACTION_FLOWS.md](docs/EXTRACTION_FLOWS.md)**.
 
 ```
 backend/app/
-  core/      config · database (PostgreSQL/asyncpg) · cache · celery_app · security · crypto
-  models/    auth_users · app_config · all_employee_data · email · timesheet · pipeline
+  core/      config · database · cache · celery_app · security · crypto · pii
+  models/    auth_users · all_employee_data (aco_number, dco_number) · email · timesheet · pipeline
   api/       deps (RBAC) · routes/ (auth, admin, inbox, pipeline, employees, upload, files)
-  services/  auth/ · config/ · employee/ · extraction/ · llm/ · pipeline/ ·
+  services/  auth/ · employee/ · extract_email/ · extraction/ · llm/ · pipeline/ ·
              storage_provider/{local,s3,onedrive} · tasks (Celery)
-  seed/  alembic/ (migrations)  tests/
+  seed/  alembic/ (migrations through 0022+)  tests/
 frontend/src/  api/client.ts · components/ · pages/ (Dashboard, Inbox, Upload,
-               Pipeline, Employees, Files, Record, Login, admin/{Settings,Users})
+               Pipeline, Employees, Files, Record, Login, admin/…)
 ```
 
-### The pipeline (on Accept or Upload)
-1. Read the manager-approval screenshot once → detected approved? + detail.
-2. For **each** timesheet file (one email may carry several people — or several
-   weekly sheets for the same person), a `PipelineFile` tracker row is created
-   and the file walks through:
-   - **protection check** — type accepted? PDF password-protected? (`protected_pdf`)
-   - **extraction (LLM)** — engine errors become `llm_failed`, not 500s
-   - **identification** — usable name/ID (`name_not_found`) and month (`month_not_found`)?
-   - **matching** — employee_id **and** name vs `all_employee_data`; shared
-     AUH/DXB IDs resolved by name, otherwise `ambiguous_id`
-   - **validation** — duplicates, out-of-month, cross-file overlaps → flags
-   - **filing** — sheet + approval + `extraction_result.json` under
-     `<Manager>/<Employee>/<Month-Year>/`
-   - **record** — upsert into the month's `TimesheetRecord`, merging this
-     file's dates with any earlier weekly/15-day files for the same month
-3. Mark the email **ingested**. (Reject just archives it — never reaches the pipeline.)
-4. Failures appear on the **Pipeline** page with the exact stage + reason and
-   can be **Resolved** (sign-off) or **Retried** (re-run from the stored copy).
+### Extract → review → file
+
+1. **Extract Email / Upload** — two-pass vision (`extract_email/`) packs the
+   thread, classifies (Pass 1), extracts leave (Pass 2), groups by
+   **employee + month**, stages `PipelineFile` rows (`NEEDS_REVIEW`).
+2. **Compare & Fix Accept** — no LLM; `ingest_manual_entry` unions
+   `source_files`, validates, files under ACO/DCO folder (deduped names;
+   multi-employee isolates attachments), upserts `TimesheetRecord`, marks
+   email **ingested**.
+3. **Retry** re-reads pipeline-raw; **Archive** never extracts.
 
 ---
 
@@ -193,20 +135,15 @@ Everything below is config-only; **no caller code changes**.
    ```
    (uncomment `msal` + `httpx` in requirements.txt)
 
-### Activate your real LLM (already ported in)
-Your prompts, vision client, and file conversion live in
-`app/services/extraction/` (`parser.py`, `vision_client.py`, `file_processor.py`)
-and the shared pipeline in `app/services/agents/full_email_extract.py`. To turn them on:
+### Activate vision extract
+Two-pass prompts live in `app/services/extract_email/` (`triage_prompt.py`,
+`thread_prompt.py`); rendering in `extraction/file_processor.py`. Turn on:
 ```
 EXTRACTION_ENGINE=vision
 OPENAI_API_KEY=sk-...
-OPENAI_VISION_MODEL=gpt-4o        # or gpt-4.1 / gpt-5.4
+OPENAI_VISION_MODEL=gpt-4o
 ```
-The engine renders each document to ONE stitched JPEG (PDF via PyMuPDF;
-DOCX/XLSX via LibreOffice `soffice` if installed, else a text render), sends
-the extraction system prompt + per-batch request to your vision model, parses
-the JSON, then runs **deterministic** leave/date validation + summary
-(`validation.py` — no second LLM).
+Details: [`docs/EXTRACTION_TWO_PASS.md`](docs/EXTRACTION_TWO_PASS.md).
 
 ### Use your Postgres
 ```
@@ -215,14 +152,13 @@ docker compose -f docker-compose.postgres.yml up -d
 DATABASE_URL=postgresql+asyncpg://timesheet:timesheet@localhost:5432/timesheet_db
 # uncomment asyncpg in requirements.txt
 ```
-The schema uses JSON columns + string PKs on PostgreSQL (asyncpg); point DATABASE_URL at AWS RDS to use a managed instance.
-For production use Alembic migrations instead of `create_all`.
+Schema migrations: Alembic (`alembic upgrade head` — current head includes
+`0022_employee_aco_number`). See [`docs/DATABASE_MIGRATIONS.md`](docs/DATABASE_MIGRATIONS.md).
 
 ### Other production notes
 - Auth is built in (JWT + OTP / CAPTCHA / RBAC) — configure before exposing publicly.
-- For large mailboxes, ingestion already runs via Celery; Graph **delta** sync
-  pulls only new mail between polls.
-- Storage swaps to S3/MinIO via `STORAGE_PROVIDER=s3` and `services/storage_provider/`.
+- For large mailboxes, Graph **delta** sync + Celery; Auto Extract skips already-done threads.
+- Storage swaps to S3 via `STORAGE_PROVIDER=s3` — see [`docs/DATA_STORAGE.md`](docs/DATA_STORAGE.md).
 
 ---
 

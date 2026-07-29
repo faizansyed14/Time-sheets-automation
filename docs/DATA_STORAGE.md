@@ -15,7 +15,7 @@ and S3.
 | # | What | Where it goes | Backend that owns it |
 |---|------|---------------|----------------------|
 | 1 | **Relational data** — users, employee records, ingested-email IDs + state, pipeline audit rows, timesheet records, app config | **PostgreSQL** | RDS (managed) or the local `db` container |
-| 2 | **Filed timesheet files** — the File Vault: `Manager/Employee/Month/<file>` plus extracted `*.json` | **Object storage** | S3 (when `STORAGE_PROVIDER=s3`) or local disk |
+| 2 | **Filed timesheet files** — the File Vault: `Manager/<Employee (ACO-…, DCO-…)>/Month-Year/<file>` | **Object storage** | S3 (when `STORAGE_PROVIDER=s3`) or local disk |
 | 3 | **Raw retry copies** — a private byte-for-byte copy of each ingested file so a *failed* file can be retried (auto-deleted once it succeeds/resolves) | **S3** at `timesheets/_pipeline-raw/` when on S3, else local `data/pipeline_raw/` | S3 (hidden sub-folder) or container disk |
 
 ### 1. Relational data → **RDS** (this is the critical data)
@@ -41,12 +41,23 @@ out as critical (ingested-email IDs, pipeline data, employee records), so RDS
 When `STORAGE_PROVIDER=s3`, the File Vault is mapped onto S3 keys:
 
 ```
-s3://<S3_BUCKET>/<S3_PREFIX>/<Manager>/<Employee>/<Month-Year>/<file>
+s3://<S3_BUCKET>/<S3_PREFIX>/<Manager>/<Employee (ACO-…, DCO-…)>/<Month-Year>/<file>
 ```
 
-Uploads, the extracted JSON, browsing, download, ZIP export, rename, and delete
-all go straight to S3 (`backend/app/services/storage_provider/s3_provider.py`).
-Nothing is written to the local `storage/` folder in this mode.
+Employee folder labels are built at filing time from the matcher
+(`storage_provider.employee_folder_label` / `ensure_employee_folder`). Whichever
+of ACO / DCO exist are appended; with neither number the folder is the bare name.
+
+**Never overwrite:** `save_file` dedupes on collision — existing name stays;
+new write becomes `name — YYYY-MM-DD.ext`, then `(2)`, `(3)`, …
+
+**Multi-employee Accept:** when one email produced several employee groups,
+Accept files only that person’s attachment(s) into their folder — not the whole
+shared `.eml` (see [`EXTRACTION_FLOWS.md`](EXTRACTION_FLOWS.md) §3).
+
+Uploads, browsing, download, ZIP export, rename, and delete all go through the
+active storage provider (`backend/app/services/storage_provider/`).
+Nothing is written to the local `storage/` folder when on S3.
 
 ### 3. Raw retry copies → **S3 (separate prefix) when on S3, else local disk**
 

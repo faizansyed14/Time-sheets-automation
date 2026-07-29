@@ -175,6 +175,12 @@ async def stage_groups(
                 "match_note": g["note"],
                 "approval": approval,
                 "sheets": sheet_summaries(g["sheets"]),
+                # How many employees' groups this SAME run produced — e.g. a
+                # manager sending 8 people's sheets in one email. Read at
+                # Accept time (ingestion.py's _isolate_employee_attachments)
+                # to decide whether it's safe to file just this employee's
+                # own attachment(s) instead of the whole shared thread.
+                "group_count": len(groups),
             },
             "source_kind": source_kind,
         }

@@ -8,9 +8,21 @@ Redis is unreachable) under one key, polled by the UI. Stop is cooperative:
 it asks the loop to stop AFTER the thread currently in flight finishes — a
 clean stop point between threads, never a mid-extraction kill that could
 leave a half-written record.
+
+Turning it on is not just "run once": it also flips a separate, long-lived
+`enabled` flag (own Redis key, own TTL — independent of any one run's status
+blob). While enabled, app.services.tasks.sync_inbox_task re-triggers a run
+every time its ~60s background sync pulls in mail the mailbox didn't have
+before — so newly arrived mail gets extracted on its own, with nobody having
+to click Auto Extract again. Each re-trigger is cheap even across hundreds of
+already-done threads: the skip-eligible-first ordering below means anything
+already extracted costs one Redis-backed dict lookup, no model call. Turning
+it off (Stop) clears `enabled` too, so a later sync tick won't quietly turn
+it back on.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 
 from sqlalchemy import func, select
@@ -18,9 +30,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.cache import cache
 from app.models.email_message import EmailMessage, EmailStatus
+from app.models.pipeline_file import PipelineFile
+from app.services.extract_email.constants import TAG_PREFIX
 
 _STATUS_KEY = "auto_extract:status"
 _STOP_KEY = "auto_extract:stop"
+# Long-lived on/off switch — separate from _STATUS_KEY, which only describes
+# the CURRENT (or most recent) run. This is "should a background sync tick
+# start a new run on its own", and outlives any single run's completion.
+_ENABLED_KEY = "auto_extract:enabled"
+_ENABLED_TTL = 30 * 24 * 3600  # 30 days — a deliberate mode, not run bookkeeping
 # Refreshed on every update while running; just a safety net so a status blob
 # never lingers forever if a worker dies mid-run without cleaning up.
 _STATUS_TTL = 6 * 3600
@@ -31,6 +50,9 @@ _IDLE: dict = {
     "processed": 0,
     "succeeded": 0,
     "failed": 0,
+    # Already extracted, nothing new since — no Graph call, no model call,
+    # not counted as work done, just correctly recognised as already done.
+    "skipped": 0,
     "current": None,           # {"thread_id": provider_message_id, "subject": str}
     "started_at": None,
     "finished_at": None,
@@ -42,8 +64,24 @@ def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+async def is_enabled() -> bool:
+    """Whether Auto Extract's watch-for-new-mail mode is on — checked by
+    sync_inbox_task before it re-triggers a run off the back of a background
+    sync. Independent of whether a run happens to be in flight right now."""
+    return bool(await cache.get(_ENABLED_KEY))
+
+
+async def _set_enabled(value: bool) -> None:
+    if value:
+        await cache.set(_ENABLED_KEY, True, ttl=_ENABLED_TTL)
+    else:
+        await cache.delete(_ENABLED_KEY)
+
+
 async def get_status() -> dict:
-    return await cache.get(_STATUS_KEY) or dict(_IDLE)
+    status = dict(await cache.get(_STATUS_KEY) or _IDLE)
+    status["enabled"] = await is_enabled()
+    return status
 
 
 async def _set_status(status: dict) -> None:
@@ -58,7 +96,10 @@ async def _update_status(**changes) -> dict:
 
 
 async def request_stop() -> dict:
-    """Ask a running job to stop once its current thread finishes."""
+    """Turn Auto Extract off: ask a running job to stop once its current
+    thread finishes, AND clear the persistent `enabled` flag so a later
+    background sync tick doesn't silently start it running again."""
+    await _set_enabled(False)
     status = await get_status()
     if status.get("state") == "running":
         await cache.set(_STOP_KEY, True, ttl=_STATUS_TTL)
@@ -70,38 +111,116 @@ async def _stop_requested() -> bool:
     return bool(await cache.get(_STOP_KEY))
 
 
-async def _list_all_thread_anchors(db: AsyncSession) -> list[tuple[str, str]]:
-    """(provider_message_id, subject) for the newest message of every thread,
-    newest-first — one row per Outlook-style conversation, the same grouping
-    GET /inbox/threads uses, but every thread and no page limit. Archived
-    threads are excluded (archiving is an explicit "not this one")."""
-    thread_key = func.coalesce(EmailMessage.conversation_id, EmailMessage.id)
+async def _list_all_thread_anchors(db: AsyncSession) -> list[tuple[str, str, str, dt.datetime | None]]:
+    """(provider_message_id, subject, thread_key, newest received_at) for
+    every thread, newest-first — one row per Outlook-style conversation, the
+    same grouping GET /inbox/threads uses, but every thread and no page
+    limit. Archived threads are excluded (archiving is an explicit "not this
+    one").
+
+    `thread_key` is the SAME key sheet_cache.last_extraction_at() reads
+    (conversation_id, or this message's own id for a singleton thread) —
+    the caller uses it to recognise "nothing new since the last real
+    extraction" before touching the mailbox or the model at all.
+    """
+    group_key = func.coalesce(EmailMessage.conversation_id, EmailMessage.id)
     stmt = (
         select(EmailMessage)
         .where(EmailMessage.status != EmailStatus.ARCHIVED)
-        .distinct(thread_key)
-        .order_by(thread_key, EmailMessage.received_at.desc())
+        .distinct(group_key)
+        .order_by(group_key, EmailMessage.received_at.desc())
     )
     rows = list((await db.execute(stmt)).scalars().all())
     epoch = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
     rows.sort(key=lambda r: r.received_at or epoch, reverse=True)
-    return [(r.provider_message_id, r.subject or "(no subject)") for r in rows]
+    return [
+        (r.provider_message_id, r.subject or "(no subject)",
+         r.conversation_id or r.provider_message_id, r.received_at)
+        for r in rows
+    ]
+
+
+async def coverage(db: AsyncSession) -> dict:
+    """How many threads, mailbox-wide, show the Extracted badge right now —
+    computed live off the same PipelineFile tag the Inbox's own per-thread
+    badge and the skip check above both read, not a separately-maintained
+    counter that could drift from what's actually displayed. Backs the
+    small "Details" panel next to the Auto Extract button.
+
+    thread_key mirrors what's actually STORED on PipelineFile.thread_key —
+    conversation_id, or this message's own provider_message_id for a
+    singleton thread (NOT its internal db `id`; see _list_all_thread_anchors
+    above, which uses `id` only as a SQL-level dedup tiebreaker, never as
+    the thread_key value itself)."""
+    thread_key = func.coalesce(EmailMessage.conversation_id, EmailMessage.provider_message_id)
+    total = (await db.execute(
+        select(func.count(func.distinct(thread_key)))
+    )).scalar_one()
+    extracted = (await db.execute(
+        select(func.count(func.distinct(thread_key))).where(
+            select(PipelineFile.id).where(
+                PipelineFile.source_kind == "email",
+                PipelineFile.thread_key == thread_key,
+                PipelineFile.attachment_id.like(f"{TAG_PREFIX}%"),
+            ).exists()
+        )
+    )).scalar_one()
+    return {"extracted_threads": extracted, "total_threads": total}
 
 
 async def start() -> dict:
-    """Kick off the background run. Idempotent — if one is already running or
-    winding down, returns its current status instead of starting a second,
-    overlapping run."""
+    """Kick off the background run, and turn on the persistent watch-for-new-
+    mail mode (see module docstring) so this keeps happening on its own as
+    mail arrives, not just this one time. Idempotent — if one is already
+    running or winding down, returns its current status instead of starting
+    a second, overlapping run (still leaves `enabled` on either way)."""
+    await _set_enabled(True)
     status = await get_status()
     if status.get("state") in ("running", "stopping"):
         return status
     await cache.delete(_STOP_KEY)
     from app.services.tasks import auto_extract_all_task
 
-    running = {**_IDLE, "state": "running", "started_at": _now_iso()}
+    running = {**_IDLE, "state": "running", "started_at": _now_iso(), "enabled": True}
     await _set_status(running)
     auto_extract_all_task.delay()
     return running
+
+
+async def _extract_with_live_progress(db, row: EmailMessage, subject: str, prior) -> None:
+    """Run extract_full_email through the SAME ProgressSink mechanism the
+    manual "Extract Email" SSE stream uses (see streaming.py/progress.py) —
+    but instead of yielding each frame to an HTTP response, mirror it into
+    this thread's `current.events` in the shared Redis status blob. A
+    browser polling /auto-extract/status then sees the identical live
+    unpack/pass1/pass2/batch animation Extract Email shows when run by
+    hand, not just a coarse per-thread count. The pipeline code itself
+    needs no changes — progress.emit() already no-ops unless a sink is
+    installed for the current context, exactly like the SSE path."""
+    from app.services.agents.full_email_extract import extract_full_email
+    from app.services.extract_email.progress import ProgressSink, reset_sink, set_sink
+
+    sink = ProgressSink()
+    events: list[dict] = []
+
+    async def _drain() -> None:
+        while True:
+            event = await sink.queue.get()
+            if event is None:
+                break
+            events.append(event)
+            await _update_status(current={
+                "thread_id": row.provider_message_id, "subject": subject, "events": events,
+            })
+
+    token = set_sink(sink)
+    drain_task = asyncio.create_task(_drain())
+    try:
+        await extract_full_email(db, row, prior_email=prior)
+    finally:
+        reset_sink(token)
+        sink.close()
+        await drain_task
 
 
 async def run_auto_extract() -> dict:
@@ -110,11 +229,30 @@ async def run_auto_extract() -> dict:
     next one's transaction."""
     from app.core import datacache
     from app.core.database import SessionLocal
-    from app.services.agents.full_email_extract import extract_full_email
+    from app.services.extract_email import sheet_cache
     from app.services.extract_email.thread_scope import prior_message_for_merge
 
     async with SessionLocal() as db:
         anchors = await _list_all_thread_anchors(db)
+        last_at_by_thread = await sheet_cache.last_extraction_at_bulk(
+            db, [thread_key for _, _, thread_key, _ in anchors])
+
+    # Skip-eligible threads (already extracted, nothing new since) go FIRST.
+    # They're a single cheap check each, no mailbox fetch, no model call —
+    # running them before the genuinely-new ones means the backlog savings
+    # show up in `skipped` within seconds, instead of sitting behind however
+    # long the real (newest-first) extractions ahead of them take, which
+    # made a mailbox with hundreds of already-done threads look untouched
+    # for the whole time those ran.
+    skip_now, need_real = [], []
+    for anchor in anchors:
+        _, _, thread_key, newest_at = anchor
+        last_at = last_at_by_thread.get(thread_key)
+        if last_at is not None and newest_at is not None and last_at >= newest_at:
+            skip_now.append(anchor)
+        else:
+            need_real.append(anchor)
+    ordered_anchors = skip_now + need_real
 
     # started_at was already set by start(); keep it if present so the
     # displayed run duration is from the moment the button was pressed, not
@@ -122,18 +260,37 @@ async def run_auto_extract() -> dict:
     started_at = (await get_status()).get("started_at") or _now_iso()
     await _update_status(
         state="running", total=len(anchors), processed=0, succeeded=0,
-        failed=0, current=None, started_at=started_at, finished_at=None,
+        failed=0, skipped=0, current=None, started_at=started_at, finished_at=None,
     )
 
-    succeeded = failed = processed = 0
-    for pmid, subject in anchors:
+    succeeded = failed = processed = skipped = 0
+    for pmid, subject, thread_key, newest_at in ordered_anchors:
         if await _stop_requested():
             await _update_status(state="stopped", current=None, finished_at=_now_iso())
             await cache.delete(_STOP_KEY)
             return await get_status()
 
-        await _update_status(current={"thread_id": pmid, "subject": subject})
+        # Cheap, no-network, no-model, no-DB check FIRST (precomputed above):
+        # if this thread was already extracted at or after its newest
+        # message, there is nothing new to read. Skip it outright — no
+        # mailbox fetch, no vision call, not even a DB round trip — rather
+        # than falling into extract_full_email, which (by design, for a
+        # deliberate manual re-check) re-sends the whole thread when it
+        # finds nothing newer than its own last-extraction watermark. That
+        # fallback is right for a human clicking "re-check this one
+        # thread"; it is exactly wrong for an automated loop over hundreds
+        # of already-done threads.
+        last_at = last_at_by_thread.get(thread_key)
+        if last_at is not None and newest_at is not None and last_at >= newest_at:
+            skipped += 1
+            processed += 1
+            await _update_status(
+                processed=processed, succeeded=succeeded, failed=failed,
+                skipped=skipped, current=None)
+            continue
+
         async with SessionLocal() as db:
+            await _update_status(current={"thread_id": pmid, "subject": subject, "events": []})
             row = (await db.execute(
                 select(EmailMessage).where(EmailMessage.provider_message_id == pmid)
             )).scalar_one_or_none()
@@ -142,7 +299,7 @@ async def run_auto_extract() -> dict:
             else:
                 try:
                     prior = await prior_message_for_merge(db, row)
-                    await extract_full_email(db, row, prior_email=prior)
+                    await _extract_with_live_progress(db, row, subject, prior)
                     succeeded += 1
                 except Exception as e:
                     failed += 1
@@ -153,6 +310,8 @@ async def run_auto_extract() -> dict:
         # set to the just-finished thread (already counted in `processed`)
         # until the next one starts, so the UI would show a stale "processing
         # X" for a thread that's actually already been counted as done.
-        await _update_status(processed=processed, succeeded=succeeded, failed=failed, current=None)
+        await _update_status(
+            processed=processed, succeeded=succeeded, failed=failed,
+            skipped=skipped, current=None)
 
     return await _update_status(state="completed", current=None, finished_at=_now_iso())

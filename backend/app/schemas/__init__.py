@@ -281,6 +281,7 @@ class SourceFile(BaseModel):
 class EmployeeIn(BaseModel):
     employee_id: str
     name: str
+    aco_number: str | None = None
     dco_number: str | None = None
     account_manager: str | None = None
     employee_email_id: str | None = None
@@ -382,6 +383,59 @@ class ImportSummary(BaseModel):
     inserted: int
     updated: int
     skipped: int
+    skipped_details: list[SkipDetail] = []
+
+
+# ---- employee import DRY RUN (POST /employee-matcher/import/preview) ----
+class ImportFieldChange(BaseModel):
+    field: str
+    old: str | None = None
+    new: str | None = None
+
+
+class ImportPlanAdd(BaseModel):
+    employee_id: str
+    name: str
+    location: str | None = None
+    project: str | None = None
+    account_manager: str | None = None
+    employee_email_id: str | None = None
+    contact_no: str | None = None
+    aco_number: str | None = None
+    dco_number: str | None = None
+    sheet: str | None = None
+    row: int | None = None
+    # Same ID + office already exists under another name — likely a rename.
+    # Flagged for a human; never auto-merged.
+    possible_rename_of: str | None = None
+
+
+class ImportPlanUpdate(BaseModel):
+    id: str
+    employee_id: str
+    name: str
+    location: str | None = None
+    changes: list[ImportFieldChange]
+
+
+class ImportPlanExisting(BaseModel):
+    id: str
+    employee_id: str
+    name: str
+    location: str | None = None
+    account_manager: str | None = None
+    employee_email_id: str | None = None
+    active: bool = True
+
+
+class ImportPlan(BaseModel):
+    """What an uploaded file WOULD do — shown for confirmation before any
+    write. `missing_from_file` is informational only: import never deletes."""
+    to_add: list[ImportPlanAdd]
+    to_update: list[ImportPlanUpdate]
+    unchanged: list[ImportPlanExisting]
+    missing_from_file: list[ImportPlanExisting]
+    skipped: list[SkipDetail]
 
 
 class PublicHolidayIn(BaseModel):

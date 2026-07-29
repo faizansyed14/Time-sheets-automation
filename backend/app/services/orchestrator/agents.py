@@ -123,10 +123,14 @@ class ThreadAgent(Agent):
                     approval = dict(prior_approval)
 
         # Record WHICH attachments were freshly read (not to reuse — to badge
-        # them, and so the next run's cache lookup finds them).
+        # them, and so the next run's cache lookup finds them). Nested .eml
+        # containers are badge-only (Inbox lists them; analysable items are
+        # the PDFs/images inside).
         fresh = meta.pop("_fresh_by_digest", None) or {}
-        if fresh:
-            await sheet_cache.remember(ctx.db, ctx.source_id, model, fresh)
+        containers = meta.pop("_opened_containers", None) or []
+        if fresh or containers:
+            await sheet_cache.remember(
+                ctx.db, ctx.source_id, model, fresh, containers=containers)
 
         # Pass 1's conversation summary IS the thread summary — there is no
         # separate summarisation call any more. The at-a-glance facts are

@@ -18,7 +18,9 @@ Users (RBAC: admin only):
 Config (RBAC: admin only; read-only status from .env):
   GET    /admin/config/status        resolved models + key status
 
-Month calendars (RBAC: any role reads, admin/user writes):
+Month calendars (RBAC: any full-access role reads, admin/user writes — the
+restricted `vault_matcher` role has no access here, same as every other
+business route it's excluded from; see require_full_access):
   GET    /admin/calendars            list
   PUT    /admin/calendars            upsert (by month+year)
   DELETE /admin/calendars/{id}
@@ -35,7 +37,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_admin, require_write
+from app.api.deps import require_admin, require_full_access
 from app.core.database import get_db
 from app.core.security import hash_password
 from app.models.auth import AuthMode, Role, User
@@ -52,7 +54,7 @@ from app.schemas.auth import (
 from app.services.auth import totp as totp_svc
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
-calendars_router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_write)])
+calendars_router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_full_access)])
 
 
 MIN_PASSWORD_LEN = 8

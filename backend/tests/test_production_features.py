@@ -129,3 +129,49 @@ async def test_year_dropdown_size_and_scoped_download(client, admin_token):
         names = zf.namelist()
     assert names and all("-2026/" in n for n in names), names
     assert not any("-2025/" in n for n in names), names
+
+
+async def test_download_scoped_to_specific_employees_and_a_month(client, admin_token):
+    """A manager can have many employees — downloading the whole subtree just
+    to get one or two people's files doesn't scale. `employee=` (repeatable)
+    and `month=` narrow a manager-wide download without needing a rel_path
+    per person."""
+    h = auth_headers(admin_token)
+    mgr = "BigTeam"
+    await client.post("/api/v1/files/managers", headers=h, json={"name": mgr})
+    for emp in ("Alice", "Bob", "Carol"):
+        await client.post(f"/api/v1/files/managers/{mgr}/employees", headers=h, json={"name": emp})
+        for ml in ("March-2026", "April-2026"):
+            await client.post(f"/api/v1/files/managers/{mgr}/employees/{emp}/months", headers=h,
+                              json={"month_label": ml})
+            await client.post(
+                f"/api/v1/files/managers/{mgr}/employees/{emp}/months/{ml}/files",
+                headers=h, files={"files": (f"{emp}-{ml}.pdf", b"%PDF-1.4 x", "application/pdf")})
+
+    # Alice + Carol only, both months — Bob excluded entirely.
+    size = (await client.get(
+        f"/api/v1/files/download-size?manager={mgr}&employee=Alice&employee=Carol",
+        headers=h)).json()
+    assert size["files"] == 4   # 2 employees x 2 months
+
+    z = await client.get(
+        f"/api/v1/files/download-zip?manager={mgr}&employee=Alice&employee=Carol", headers=h)
+    assert z.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(z.content)) as zf:
+        names = zf.namelist()
+    assert names and all("/Bob/" not in n for n in names), names
+    assert any("/Alice/" in n for n in names) and any("/Carol/" in n for n in names), names
+
+    # month=March, every employee, that one month only.
+    z2 = await client.get(f"/api/v1/files/download-zip?manager={mgr}&month=March", headers=h)
+    with zipfile.ZipFile(io.BytesIO(z2.content)) as zf:
+        names2 = zf.namelist()
+    assert names2 and all("/March-2026/" in n for n in names2), names2
+    assert not any("/April-2026/" in n for n in names2), names2
+
+    # employee + month combine.
+    z3 = await client.get(
+        f"/api/v1/files/download-zip?manager={mgr}&employee=Bob&month=April", headers=h)
+    with zipfile.ZipFile(io.BytesIO(z3.content)) as zf:
+        names3 = zf.namelist()
+    assert names3 == [n for n in names3 if "/Bob/" in n and "/April-2026/" in n]

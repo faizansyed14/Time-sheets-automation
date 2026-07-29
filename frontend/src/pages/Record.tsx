@@ -61,15 +61,17 @@ export default function RecordPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
 
-  const { data: rec, isLoading } = useQuery({
+  const { data: rec, isLoading, isError } = useQuery({
     queryKey: ["record", id],
     queryFn: () => fetchRecord(id!),
     enabled: !!id,
+    retry: false, // 404 means the record is gone (e.g. deleted) — retrying won't change that
   });
   const { data: sources } = useQuery({
     queryKey: ["record-sources", id],
     queryFn: () => recordSources(id!),
     enabled: !!id,
+    retry: false,
   });
   const employeePk = rec?.matched_employee_pk
     || (rec?.employee_name ? `unmatched::${rec.employee_name.toLowerCase()}` : null);
@@ -149,6 +151,23 @@ export default function RecordPage() {
       navigate("/");
     },
   });
+
+  if (isError)
+    return (
+      <div className="mx-auto max-w-lg animate-fade-up py-16 text-center">
+        <p className="text-base font-semibold text-slate-700">This record no longer exists.</p>
+        <p className="mt-1 text-sm text-slate-500">
+          It was probably deleted after this link was created — the Activity log will
+          show it as failed with a "record deleted" reason instead of a broken link now.
+        </p>
+        <Link
+          to="/pipeline"
+          className="mt-4 inline-flex items-center gap-1 text-sm font-semibold text-brand-600 hover:underline"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" /> Back to Activity log
+        </Link>
+      </div>
+    );
 
   if (isLoading || !rec)
     return (

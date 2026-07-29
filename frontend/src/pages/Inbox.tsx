@@ -29,6 +29,7 @@ import {
   attachmentUrl,
   decideEmail,
   emlUrl,
+  fetchAutoExtractStatus,
   fetchEmail,
   fetchEmployeeMatcher,
   fetchThread,
@@ -113,16 +114,21 @@ function StatusBadge({ status }: { status: EmailListItem["status"] }) {
         <Archive className="h-2.5 w-2.5" /> Archived
       </Badge>
     );
-  return <Badge tone="brand" className="px-1.5 py-0 text-[9px]">New</Badge>;
+  // Dark blue — distinct from Extracted (yellow) and Ingested (green).
+  return (
+    <span className="inline-flex items-center gap-1 rounded-md px-1.5 py-0 text-[9px] font-semibold ring-1 ring-inset bg-blue-800 text-white ring-blue-900">
+      New
+    </span>
+  );
 }
 
 function ExtractedBadge({ at }: { at: string | null | undefined }) {
   if (!at) return null;
   return (
     <span title={`Extract Email last run ${formatDateTime(at)}`}>
-      <Badge tone="success" className="px-1.5 py-0 text-[9px]">
+      <span className="inline-flex items-center gap-1 rounded-md px-1.5 py-0 text-[9px] font-semibold ring-1 ring-inset bg-yellow-100 text-yellow-900 ring-yellow-400">
         <Wand2 className="h-2.5 w-2.5" /> Extracted
-      </Badge>
+      </span>
     </span>
   );
 }
@@ -464,9 +470,16 @@ function SaveEmlToVaultModal({
     setSaving(true);
     try {
       const manager = employee.account_manager;
-      const employeeName = employee.name;
-      const res = await saveEmlToVault(emailId, { manager, employee: employeeName, month, year });
-      toast("success", "Saved to File Vault", `${res.filename} → ${manager} / ${employeeName} / ${MONTHS_LONG[month]} ${year}`);
+      const res = await saveEmlToVault(emailId, {
+        manager,
+        employee: employee.name,
+        employee_pk: employee.id,
+        month,
+        year,
+      });
+      const folder = res.employee_folder || employee.name;
+      toast("success", "Saved to File Vault",
+        `${res.filename} → ${manager} / ${folder} / ${MONTHS_LONG[month]} ${year}`);
       onClose();
     } catch (e: any) {
       toast("error", "Could not save", e?.response?.data?.detail ?? String(e));
@@ -513,7 +526,11 @@ function SaveEmlToVaultModal({
                       <span className="min-w-0 flex-1">
                         <span className="block truncate font-medium text-slate-800">{e.name}</span>
                         <span className="block truncate text-xs text-slate-500">
-                          {e.employee_id}{e.location ? ` · ${e.location}` : ""}{e.account_manager ? ` · ${e.account_manager}` : ""}
+                          {e.employee_id}
+                          {e.location ? ` · ${e.location}` : ""}
+                          {e.account_manager ? ` · ${e.account_manager}` : ""}
+                          {e.aco_number ? ` · ACO-${e.aco_number}` : ""}
+                          {e.dco_number ? ` · DCO-${e.dco_number}` : ""}
                         </span>
                       </span>
                     </button>
@@ -910,13 +927,29 @@ function MessageExtractedBadge({ state }: { state: MsgExtractState }) {
       className={cn(
         "mb-1 inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide",
         extracted
-          ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-          : "border-amber-200 bg-amber-50 text-amber-700")}
+          ? "border-yellow-400 bg-yellow-100 text-yellow-900"
+          : "border-blue-800 bg-blue-800 text-white")}
     >
       {extracted ? <CheckCircle2 className="h-2.5 w-2.5" /> : <Wand2 className="h-2.5 w-2.5" />}
       {extracted ? "Extracted" : "Not extracted"}
     </span>
   );
+}
+
+function attachmentExtractBadge(
+  filename: string,
+  extractState: MsgExtractState,
+  extractedNames?: string[],
+): "extracted" | "new" | null {
+  // Message already covered by Extract Email — every attachment on it was in
+  // that run's window. Nested .eml files are unwrapped to inner PDFs, so the
+  // recorded names often won't match the outer .eml the Inbox lists; trust
+  // the message-level watermark instead of a brittle filename match.
+  if (extractState === "extracted") return "extracted";
+  if (extractState === "new") return "new";
+  if (extractedNames?.includes(filename)) return "extracted";
+  if (extractedNames && extractedNames.length > 0) return "new";
+  return null;
 }
 
 function OutlookAttachmentStrip({
@@ -925,14 +958,17 @@ function OutlookAttachmentStrip({
   providerId,
   setPreview,
   extractedNames,
+  extractState,
 }: {
   attachments: Attachment[];
   inlineIds: string[];
   providerId: string;
   setPreview: (f: PreviewFile) => void;
   /** Filenames already read by a previous run. Undefined = never extracted,
-   *  so no per-file badge is shown at all. */
+   *  so no per-file badge is shown at all (unless extractState says otherwise). */
   extractedNames?: string[];
+  /** Whether this message's received_at is at/before the thread's last extract. */
+  extractState?: MsgExtractState;
 }) {
   const files = visibleFileAttachments(attachments, inlineIds);
   const [showAll, setShowAll] = useState(files.length <= 2);
@@ -951,7 +987,9 @@ function OutlookAttachmentStrip({
   return (
     <div className="border-b border-slate-100 px-4 py-3">
       <div className="flex flex-col gap-2">
-        {visible.map((a) => (
+        {visible.map((a) => {
+            const badge = attachmentExtractBadge(a.filename, extractState ?? null, extractedNames);
+            return (
             <div
               key={a.attachment_id}
               className="flex items-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 hover:border-slate-300"
@@ -967,19 +1005,17 @@ function OutlookAttachmentStrip({
                     <span className="min-w-0 truncate text-sm font-medium text-slate-800">
                       {a.filename}
                     </span>
-                    {/* Extraction reuses attachments it has already read, so a
-                        re-run only pays for what is genuinely new. */}
-                    {extractedNames?.includes(a.filename) ? (
+                    {badge === "extracted" ? (
                       <span
-                        title="Already read by Extract Email — a re-run reuses this result instead of reading it again."
-                        className="shrink-0 rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-emerald-700"
+                        title="Already covered by Extract Email (including nested .eml contents)."
+                        className="shrink-0 rounded-full border border-yellow-400 bg-yellow-100 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-yellow-900"
                       >
                         Extracted
                       </span>
-                    ) : extractedNames && extractedNames.length > 0 ? (
+                    ) : badge === "new" ? (
                       <span
-                        title="Not read yet — the next Extract Email run will read this one."
-                        className="shrink-0 rounded-full border border-brand-200 bg-brand-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-brand-700"
+                        title="Arrived after the last Extract Email — the next run will read this one."
+                        className="shrink-0 rounded-full border border-blue-900 bg-blue-800 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-white"
                       >
                         New
                       </span>
@@ -999,7 +1035,8 @@ function OutlookAttachmentStrip({
                 <Download className="h-4 w-4" />
               </button>
             </div>
-          ))}
+            );
+        })}
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-brand-600">
         {!showAll && hiddenCount > 0 && (
@@ -1125,6 +1162,7 @@ function ThreadMessageCard({
             providerId={msg.provider_message_id}
             setPreview={setPreview}
             extractedNames={msg.extracted_filenames}
+            extractState={extractState}
           />
           <div className="px-4 py-3">
             <EmailBodyRenderer
@@ -1210,6 +1248,20 @@ export default function InboxPage() {
   // are NOT auto-opened here — the toast (with a "Review now" link) and the
   // Activity log's own Review button are how the user gets to Compare & Fix.
   const { tasks, enqueue, isBusy, taskFor, dismiss: dismissTask } = useExtractQueue();
+  // Auto Extract runs the whole mailbox in the background — a manual click
+  // here while it's live would mean two extractions racing the same
+  // pipeline/PipelineFile rows at once. Same query key as AutoExtractWidget/
+  // ExtractQueueWidget, so this shares their cached poll rather than firing
+  // a second request.
+  const { data: autoExtractStatus } = useQuery({
+    queryKey: ["auto-extract-status"],
+    queryFn: fetchAutoExtractStatus,
+    refetchInterval: (query) => {
+      const s = query.state.data?.state;
+      return s === "running" || s === "stopping" ? 2000 : 8000;
+    },
+  });
+  const autoExtractRunning = autoExtractStatus?.state === "running" || autoExtractStatus?.state === "stopping";
   const [focusTaskId, setFocusTaskId] = useState<string | null>(null);
   const focusTask = tasks.find((t) => t.id === focusTaskId) ?? null;
   const [llmPreviewOpen, setLlmPreviewOpen] = useState(false);
@@ -1326,7 +1378,7 @@ export default function InboxPage() {
   // to back without racing. Incremental by default (only new + a couple of
   // context messages re-read); `forceFull` re-reads the whole thread.
   const runExtract = (id: string, subject: string | null | undefined, forceFull = false) => {
-    if (isBusy(id)) return;
+    if (isBusy(id) || autoExtractRunning) return;
     const taskId = enqueue(id, subject ?? "(no subject)", forceFull);
     setFocusTaskId(taskId);
   };
@@ -1553,11 +1605,13 @@ export default function InboxPage() {
                                 <Button
                                   size="sm"
                                   variant={isNewer ? "secondary" : undefined}
-                                  disabled={busy || loadingDetail}
+                                  disabled={busy || loadingDetail || autoExtractRunning}
                                   onClick={() => runExtract(detail.provider_message_id, detail.subject)}
-                                  title={isNewer
-                                    ? "This reply arrived after the last run — reads only the new message(s) + a couple of prior ones for context, reusing everything else already extracted."
-                                    : "Whole conversation to the model in one call — every attachment, approval detected, grouped per employee/month for Compare & Fix"}
+                                  title={autoExtractRunning
+                                    ? "Auto Extract is running in the background right now — wait for it to finish (or Stop it) before extracting by hand, so the two don't race the same thread."
+                                    : isNewer
+                                      ? "This reply arrived after the last run — reads only the new message(s) + a couple of prior ones for context, reusing everything else already extracted."
+                                      : "Whole conversation to the model in one call — every attachment, approval detected, grouped per employee/month for Compare & Fix"}
                                 >
                                   {busy ? (
                                     <Spinner className="border-white/40 border-t-white h-3 w-3" />
@@ -1574,9 +1628,11 @@ export default function InboxPage() {
                                   <Button
                                     size="sm"
                                     variant="ghost"
-                                    disabled={busy || loadingDetail}
+                                    disabled={busy || loadingDetail || autoExtractRunning}
                                     onClick={() => runExtract(detail.provider_message_id, detail.subject, true)}
-                                    title="Ignore the incremental cache and re-read the ENTIRE thread from scratch — use this if a past read looks stale or wrong."
+                                    title={autoExtractRunning
+                                      ? "Auto Extract is running in the background right now — wait for it to finish (or Stop it) before extracting by hand."
+                                      : "Ignore the incremental cache and re-read the ENTIRE thread from scratch — use this if a past read looks stale or wrong."}
                                   >
                                     Re-read entire thread
                                   </Button>
@@ -1657,7 +1713,7 @@ export default function InboxPage() {
                     <Spinner className="h-3.5 w-3.5" /> Loading conversation…
                   </div>
                 )}
-                {thread?.summary && <ThreadSummaryBox summary={thread.summary} />}
+                {thread?.summary && <ThreadSummaryBox summary={thread.summary} defaultOpen />}
                 <div className="space-y-2">
                   {threadMessages.map((m) => (
                     <ThreadMessageCard

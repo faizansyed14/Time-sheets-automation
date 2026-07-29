@@ -69,6 +69,7 @@ class FailureCode:
     STORAGE_ERROR = "storage_error"
     DUPLICATE_FILE = "duplicate_file"          # identical file already processed (no-op)
     PENDING_REVIEW = "pending_review"          # AI-extracted, awaiting human accept (not a failure)
+    RECORD_DELETED = "record_deleted"          # the record this file filed was since deleted
     UNKNOWN = "unknown"
 
 
