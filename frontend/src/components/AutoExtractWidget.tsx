@@ -54,10 +54,10 @@ export default function AutoExtractWidget() {
 
   const startMut = useMutation({
     mutationFn: startAutoExtract,
-    onSuccess: (s) => {
+    onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["auto-extract-status"] });
       toast("info", "Auto Extract is on",
-        `Checking ${s.total} thread(s) now — already-extracted ones are skipped instantly, no cost. New mail is picked up automatically from here on.`);
+        "Already-extracted threads are skipped instantly (no model cost). New mail is extracted next, newest first.");
     },
     onError: (e: any) =>
       toast("error", "Couldn't start Auto Extract", e?.response?.data?.detail ?? String(e)),

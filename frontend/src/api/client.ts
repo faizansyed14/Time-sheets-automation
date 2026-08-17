@@ -209,6 +209,8 @@ export interface TimesheetRecord {
   source_file_count: number;
 }
 
+export type ExportStatus = "Received & Stored" | "Received & Not Stored" | "Not Received";
+
 export interface TimesheetExportRow extends Omit<TimesheetRecord, "validation_status" | "approval_status"> {
   validation_status: TimesheetRecord["validation_status"] | "";
   approval_status: TimesheetRecord["approval_status"] | "";
@@ -217,6 +219,7 @@ export interface TimesheetExportRow extends Omit<TimesheetRecord, "validation_st
   employee_email: string | null;
   contact_no: string | null;
   has_record: boolean;
+  status: ExportStatus;
 }
 
 export interface DashboardRow {
@@ -237,6 +240,7 @@ export interface DashboardRow {
   focus_record_id: string | null;
   focus_validation_status: "verified" | "manual_review" | null;
   focus_approval_status: "pending" | "approved" | "not_approved" | null;
+  awaiting_review_this_month: boolean;
 }
 
 export interface DashboardSummary {
@@ -245,6 +249,10 @@ export interface DashboardSummary {
   total_employees: number;
   submitted_this_month: number;
   missing_this_month: number;
+  awaiting_review_this_month: number;
+  submitted_pct: number;
+  missing_pct: number;
+  awaiting_review_pct: number;
   needs_review: number;
   pending_approval: number;
   missing_employees: string[];
@@ -610,6 +618,7 @@ export async function sendChatStream(
 export type CoverageStatus =
   | "submitted"
   | "missing"
+  | "awaiting_review"
   | "needs_review"
   | "approved"
   | "not_approved"

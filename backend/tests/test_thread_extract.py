@@ -668,3 +668,121 @@ async def test_pass2_does_not_retry_more_than_once(mock_vision_calls):
 
     assert sheets == []
     assert meta["calls"] == 3
+
+
+# --------------------------------------------------------------------------
+# Resilience — one batch's call ultimately failing (its OWN internal
+# retries in vision_client.chat_call already exhausted) must not discard
+# every OTHER batch's results for the same thread. A long "reminder + many
+# independent replies" thread needs several sequential pass-1/pass-2 calls;
+# losing everything because call #4 of 7 hit a transient error would mean a
+# 30-person thread interrupted once gets NOTHING staged, ever, until a
+# perfect uninterrupted run — exactly the "stuck, lost it all" symptom this
+# guards against.
+# --------------------------------------------------------------------------
+
+async def test_one_pass1_batch_failing_does_not_lose_other_batches_results(mock_vision_calls):
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    # 6 attachments -> chunk_items_by_count(items, pass1_batch_size=5) splits
+    # into batch 1 (items 1-5) and batch 2 (item 6 + the message body item).
+    eml = _mail(plain="See attached.", attachments=[
+        (f"sheet{i}.pdf", f"%PDF-1.4 fake sheet {i}".encode(), "application", "pdf")
+        for i in range(1, 7)
+    ])
+
+    mock_vision_calls([
+        RuntimeError("simulated transient failure"),  # batch 1 (sheet1..sheet5) — fails outright
+        {"thread_summary": "", "items": [{                              # batch 2 (sheet6 + body) — succeeds
+            "source": "[A6]", "is_timesheet": True, "kind": "timesheet",
+            "employee_name": "Test Person", "employee_id": "E1",
+            "period_hint": "June 2026", "evidence": "1-June-26 present",
+            "manager_signature": False, "signature_evidence": "", "notes": "",
+        }]},
+        {"sheets": [{
+            "source": "[A6]", "employee_name": "Test Person", "employee_id": "E1",
+            "month": 6, "year": 2026, "days_covered": 1, "period_type": "partial",
+            "missing_days": [], "working_days": ["2026-06-01"], "weekend_days": [],
+            "uncertain_days": [], "annual": [], "remote": [], "sick": [],
+            "maternity": [], "unpaid": [], "absent": [], "public_holiday": [], "notes": "",
+        }]},
+    ])
+
+    sheets, approval, conflicts, meta = await extract_thread_sheets([("msg 1", eml)])
+
+    # Batch 2's sheet is still returned — the failure in batch 1 didn't
+    # propagate and wipe out the whole run.
+    assert len(sheets) == 1
+    assert sheets[0]["name"] == "sheet6.pdf"
+    assert meta["errors"], "the failure must be recorded, not silently swallowed"
+    assert any("batch 1" in e for e in meta["errors"])
+    assert any("5 item" in e for e in meta["errors"])  # batch 1's own item count
+
+
+async def test_one_pass2_batch_failing_does_not_lose_other_batches_results(mock_vision_calls, monkeypatch):
+    from app.core.config import settings
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    # Force each confirmed sheet into its OWN pass-2 batch (1 image each),
+    # so batch 1 (sheet A) and batch 2 (sheet B) are independent calls.
+    monkeypatch.setattr(settings, "max_images_per_call", 1)
+
+    eml = _mail(plain="See attached.", attachments=[
+        ("sheetA.pdf", b"%PDF-1.4 fake sheet A", "application", "pdf"),
+        ("sheetB.pdf", b"%PDF-1.4 fake sheet B", "application", "pdf"),
+    ])
+
+    mock_vision_calls([
+        {"thread_summary": "", "items": [
+            {"source": "[A1]", "is_timesheet": True, "kind": "timesheet",
+             "employee_name": "Person A", "employee_id": "EA", "period_hint": "June 2026",
+             "evidence": "1-June-26 present", "manager_signature": False,
+             "signature_evidence": "", "notes": ""},
+            {"source": "[A2]", "is_timesheet": True, "kind": "timesheet",
+             "employee_name": "Person B", "employee_id": "EB", "period_hint": "June 2026",
+             "evidence": "1-June-26 present", "manager_signature": False,
+             "signature_evidence": "", "notes": ""},
+        ]},
+        RuntimeError("simulated pass2 failure for sheet A"),   # batch 1 (sheet A) — fails outright
+        {"sheets": [{                                          # batch 2 (sheet B) — succeeds
+            "source": "[A2]", "employee_name": "Person B", "employee_id": "EB",
+            "month": 6, "year": 2026, "days_covered": 1, "period_type": "partial",
+            "missing_days": [], "working_days": ["2026-06-01"], "weekend_days": [],
+            "uncertain_days": [], "annual": [], "remote": [], "sick": [],
+            "maternity": [], "unpaid": [], "absent": [], "public_holiday": [], "notes": "",
+        }]},
+    ])
+
+    sheets, approval, conflicts, meta = await extract_thread_sheets([("msg 1", eml)])
+
+    assert len(sheets) == 1
+    assert sheets[0]["employee_name"] == "Person B"
+    assert meta["errors"], "sheet A's failure must be recorded"
+    assert any("Pass 2 batch 1" in e for e in meta["errors"])
+
+
+async def test_pass2_batch_whose_retry_also_fails_is_recorded_not_raised(mock_vision_calls):
+    """The existing "empty result -> retry once" path can ALSO hit a real
+    failure on that retry attempt — must be caught the same way as a
+    first-attempt failure, not left to propagate and abort everything."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    eml = _mail(plain="See attached.", attachments=[
+        ("june-timesheet.pdf", b"%PDF-1.4 fake sheet", "application", "pdf"),
+    ])
+    mock_vision_calls([
+        {"thread_summary": "", "items": [{
+            "source": "[A1]", "is_timesheet": True, "kind": "timesheet",
+            "employee_name": "Test Person", "employee_id": "E1",
+            "period_hint": "June 2026", "evidence": "1-June-26 present",
+            "manager_signature": False, "signature_evidence": "", "notes": "",
+        }]},
+        {"sheets": []},                              # first attempt: empty -> triggers retry
+        RuntimeError("simulated retry failure"),      # retry: fails outright
+    ])
+
+    sheets, approval, conflicts, meta = await extract_thread_sheets([("msg 1", eml)])
+
+    assert sheets == []
+    assert meta["errors"]
+    assert any("retry failed" in e for e in meta["errors"])

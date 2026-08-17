@@ -15,13 +15,9 @@ import email as _email
 import email.policy
 import re
 
+from app.core.config import settings
 from app.models.email_message import EmailMessage
 from app.services.inbox.eml_export import eml_filename
-
-# A conversation longer than this is almost certainly a mailing-list style
-# thread; the newest messages carry the timesheet, so older ones are dropped
-# rather than sending an unbounded request.
-MAX_THREAD_MESSAGES = 15
 
 
 def build_thread_bundle(
@@ -187,15 +183,20 @@ async def collect_thread_emls(
             # behaviour below rather than silently sending nothing.
 
         # Keep the NEWEST slice when a thread is very long — that is where the
-        # current period's sheets and approvals live.
-        if len(thread_msgs) > MAX_THREAD_MESSAGES:
-            dropped = len(thread_msgs) - MAX_THREAD_MESSAGES
+        # current period's sheets and approvals live. A conversation longer
+        # than this is either a genuine long-running back-and-forth, or a
+        # manager's reminder that many people replied to independently (one
+        # employee per reply) — either way, the newest messages matter most
+        # and an unbounded request isn't safe to send in one call.
+        max_thread_messages = settings.max_thread_messages
+        if len(thread_msgs) > max_thread_messages:
+            dropped = len(thread_msgs) - max_thread_messages
             notes.append(
                 f"This conversation has {len(thread_msgs)} messages — only the "
-                f"newest {MAX_THREAD_MESSAGES} were sent for extraction; "
+                f"newest {max_thread_messages} were sent for extraction; "
                 f"{dropped} older message(s) (and any sheets attached only to "
                 f"them) were NOT read.")
-            thread_msgs = thread_msgs[-MAX_THREAD_MESSAGES:]
+            thread_msgs = thread_msgs[-max_thread_messages:]
         for m in thread_msgs:
             await add(m, getattr(m, "subject", None), _when(m))
 

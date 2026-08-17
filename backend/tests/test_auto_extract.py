@@ -222,14 +222,10 @@ async def test_live_progress_events_from_the_pipeline_are_mirrored_into_current_
     assert final["succeeded"] == 1
 
 
-async def test_skip_eligible_threads_are_processed_before_slower_real_ones(monkeypatch):
-    """Regression: with a mailbox where most threads are already extracted
-    (an old backlog mixed in with new mail), newest-first anchor order meant
-    every genuinely-new thread had to run its real, slow extraction BEFORE
-    any of the fast already-done ones ever got counted — so a large backlog
-    looked completely untouched for as long as the real work took.
-    Skip-eligible anchors must now run first, no matter where they sit in
-    the original (newest-first) ordering."""
+async def test_already_done_threads_are_counted_immediately_then_new_mail_runs(monkeypatch):
+    """Watch-mode re-trigger on 1 new mail in a large already-done mailbox
+    must NOT walk skip counters one-by-one (UI looking like 414/500). Skips
+    are booked in one shot, then real extracts run newest-first."""
     now = dt.datetime(2026, 7, 29, tzinfo=dt.timezone.utc)
     earlier = now - dt.timedelta(days=30)
 
@@ -269,13 +265,19 @@ async def test_skip_eligible_threads_are_processed_before_slower_real_ones(monke
         poll_task = asyncio.create_task(_poll_until_done(snapshots))
         await asyncio.gather(run_task, poll_task)
 
-    # The instant any real work is counted, both backlog skips must already
-    # be accounted for -- never the other way around.
+    # Skips land before any real extract is counted — and the first current
+    # thread is genuine new mail, not a backlog skip walking the counter.
+    saw_running = False
     for s in snapshots:
         if s["state"] == "idle":
             continue
-        if s["succeeded"] + s["failed"] > 0:
+        if s["total"] == 4:
+            saw_running = True
             assert s["skipped"] == 2, s
+        if s.get("current"):
+            assert s["current"]["thread_id"] in ("AE-real-1", "AE-real-2"), s
+            assert s["skipped"] == 2, s
+    assert saw_running
 
     final = snapshots[-1]
     assert final["skipped"] == 2

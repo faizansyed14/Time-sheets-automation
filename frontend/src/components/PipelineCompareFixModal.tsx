@@ -347,6 +347,12 @@ export default function PipelineCompareFixModal({
     thread_summary?: ThreadSummary;
     /** Fallback one-line headline for older runs without a thread_summary. */
     summary?: string;
+    /** One entry per batch/message this run could NOT read (a model call
+     * that failed after its own retries, or a long thread's older messages
+     * dropped by the size cap) — the rest of the thread was still read and
+     * staged normally; this just says what's missing so a reviewer knows to
+     * ask for a re-run instead of assuming the record is complete. */
+    errors?: string[];
   } | null;
   const sheetOnFile = useMemo(() => {
     const sheets = fullEmail?.sheets ?? [];
@@ -588,6 +594,21 @@ export default function PipelineCompareFixModal({
                 (kind, leave days, signature check) and the approval verdict. */}
             {fullEmail && (
               <div className="mb-4 space-y-3">
+                {(fullEmail.errors?.length ?? 0) > 0 && (
+                  <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <div>
+                      <p className="font-semibold">
+                        This thread was only partially read — {fullEmail.errors!.length} part
+                        {fullEmail.errors!.length === 1 ? "" : "s"} of it didn't make it into this run.
+                      </p>
+                      <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                        {fullEmail.errors!.map((e, i) => <li key={i}>{e}</li>)}
+                      </ul>
+                      <p className="mt-1">Re-running Extract Email on this thread will retry exactly what's missing.</p>
+                    </div>
+                  </div>
+                )}
                 {fullEmail.thread_summary ? (
                   <ThreadSummaryBox summary={fullEmail.thread_summary} defaultOpen />
                 ) : fullEmail.summary ? (

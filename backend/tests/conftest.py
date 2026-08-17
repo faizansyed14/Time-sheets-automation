@@ -157,7 +157,11 @@ def mock_vision_calls(monkeypatch):
     Each call to vision_client.chat_call pops the next scripted reply, in
     order (pass 1 may issue several batched calls before pass 2's).
     Raises loudly if a test's pipeline run needs more calls than scripted,
-    rather than hanging on a real HTTP request."""
+    rather than hanging on a real HTTP request.
+
+    Queue an `Exception` instance instead of a dict to simulate that specific
+    call failing (its own internal retries already exhausted) — for testing
+    that ONE batch failing doesn't take down every other batch's results."""
     from app.services.extraction import vision_client
 
     def install(responses: list[dict]):
@@ -167,7 +171,10 @@ def mock_vision_calls(monkeypatch):
                                   *, label="", retries=3, force_json=True, enable_thinking=True):
             if not queue:
                 raise AssertionError(f"mock_vision_calls exhausted — unexpected extra call ({label})")
-            return queue.pop(0)
+            item = queue.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
 
         monkeypatch.setattr(vision_client, "chat_call", _fake_chat_call)
         monkeypatch.setattr("app.services.extract_email.triage_prompt.chat_call", _fake_chat_call)

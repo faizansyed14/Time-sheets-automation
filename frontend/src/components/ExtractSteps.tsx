@@ -35,7 +35,7 @@ export function stepStatuses(events: ExtractionEvent[], overall: StepOverall): S
   return statuses;
 }
 
-type BatchPhase = "sent" | "received" | "retry";
+type BatchPhase = "sent" | "received" | "retry" | "failed";
 interface BatchInfo {
   index: number;
   total: number;
@@ -60,10 +60,20 @@ export function latestBatchInfo(events: ExtractionEvent[], stage: string): Batch
 }
 
 /** "Sending…" (pulsing) / "retrying…" (amber, pulsing) while waiting on the
- * network; nothing once the response is actually back — so a batch that's
- * genuinely in flight reads differently from one that just finished. */
+ * network; "failed — continuing" (rose, static) when a batch's own retries
+ * are exhausted and the run has moved on without it; nothing once the
+ * response is actually back — so a batch that's genuinely in flight reads
+ * differently from one that just finished. */
 export function BatchPhaseTag({ phase }: { phase: BatchPhase }) {
   if (phase === "received") return null;
+  if (phase === "failed") {
+    return (
+      <span className="flex items-center gap-1 whitespace-nowrap text-rose-600">
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-rose-500" />
+        failed — continuing with the rest
+      </span>
+    );
+  }
   const isRetry = phase === "retry";
   return (
     <span

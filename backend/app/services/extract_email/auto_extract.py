@@ -15,8 +15,8 @@ blob). While enabled, app.services.tasks.sync_inbox_task re-triggers a run
 every time its ~60s background sync pulls in mail the mailbox didn't have
 before — so newly arrived mail gets extracted on its own, with nobody having
 to click Auto Extract again. Each re-trigger is cheap even across hundreds of
-already-done threads: the skip-eligible-first ordering below means anything
-already extracted costs one Redis-backed dict lookup, no model call. Turning
+already-done threads: already-extracted ones are counted in one shot (no
+model call), then genuinely-new mail is extracted newest-first. Turning
 it off (Stop) clears `enabled` too, so a later sync tick won't quietly turn
 it back on.
 """
@@ -237,13 +237,11 @@ async def run_auto_extract() -> dict:
         last_at_by_thread = await sheet_cache.last_extraction_at_bulk(
             db, [thread_key for _, _, thread_key, _ in anchors])
 
-    # Skip-eligible threads (already extracted, nothing new since) go FIRST.
-    # They're a single cheap check each, no mailbox fetch, no model call —
-    # running them before the genuinely-new ones means the backlog savings
-    # show up in `skipped` within seconds, instead of sitting behind however
-    # long the real (newest-first) extractions ahead of them take, which
-    # made a mailbox with hundreds of already-done threads look untouched
-    # for the whole time those ran.
+    # Already-extracted threads (nothing newer than last extract) are counted
+    # in ONE shot — no per-thread loop, no Graph, no model. Then only the
+    # remaining ones run, newest-first, so a watch-mode tick on 1 new mail
+    # in a 500-thread mailbox jumps straight to that mail instead of walking
+    # 414…470 of already-done counters first.
     skip_now, need_real = [], []
     for anchor in anchors:
         _, _, thread_key, newest_at = anchor
@@ -252,42 +250,25 @@ async def run_auto_extract() -> dict:
             skip_now.append(anchor)
         else:
             need_real.append(anchor)
-    ordered_anchors = skip_now + need_real
 
     # started_at was already set by start(); keep it if present so the
     # displayed run duration is from the moment the button was pressed, not
     # from when this task actually got a worker slot.
     started_at = (await get_status()).get("started_at") or _now_iso()
+    skipped = len(skip_now)
+    processed = skipped
+    succeeded = failed = 0
     await _update_status(
-        state="running", total=len(anchors), processed=0, succeeded=0,
-        failed=0, skipped=0, current=None, started_at=started_at, finished_at=None,
+        state="running", total=len(anchors), processed=processed, succeeded=0,
+        failed=0, skipped=skipped, current=None, started_at=started_at,
+        finished_at=None,
     )
 
-    succeeded = failed = processed = skipped = 0
-    for pmid, subject, thread_key, newest_at in ordered_anchors:
+    for pmid, subject, _thread_key, _newest_at in need_real:
         if await _stop_requested():
             await _update_status(state="stopped", current=None, finished_at=_now_iso())
             await cache.delete(_STOP_KEY)
             return await get_status()
-
-        # Cheap, no-network, no-model, no-DB check FIRST (precomputed above):
-        # if this thread was already extracted at or after its newest
-        # message, there is nothing new to read. Skip it outright — no
-        # mailbox fetch, no vision call, not even a DB round trip — rather
-        # than falling into extract_full_email, which (by design, for a
-        # deliberate manual re-check) re-sends the whole thread when it
-        # finds nothing newer than its own last-extraction watermark. That
-        # fallback is right for a human clicking "re-check this one
-        # thread"; it is exactly wrong for an automated loop over hundreds
-        # of already-done threads.
-        last_at = last_at_by_thread.get(thread_key)
-        if last_at is not None and newest_at is not None and last_at >= newest_at:
-            skipped += 1
-            processed += 1
-            await _update_status(
-                processed=processed, succeeded=succeeded, failed=failed,
-                skipped=skipped, current=None)
-            continue
 
         async with SessionLocal() as db:
             await _update_status(current={"thread_id": pmid, "subject": subject, "events": []})

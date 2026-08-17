@@ -972,6 +972,11 @@ async def extract_thread_sheets(
          f"({len(batches)} call(s))…",
          pass_no=1, model=model, message_count=len(messages))
 
+    # Collected here rather than only inside `meta` so pass 2's own failures
+    # below can keep appending to the SAME list — one combined picture of
+    # what this run could not read, regardless of which pass hit it.
+    batch_errors: list[str] = []
+
     all_items: list = []
     thread_summary = ""
     for bi, batch in enumerate(batches, 1):
@@ -986,7 +991,22 @@ async def extract_thread_sheets(
         emit("pass1", "spin",
              f"Pass 1 — sending batch {bi} of {len(batches)} ({len(batch)} item(s)) to {model}…",
              pass_no=1, model=model, batch_index=bi, batch_total=len(batches), batch_phase="sent")
-        data = await triage_prompt.run_pass1_batch(th, batch, note, model, api_key, label=f"pass1-batch{bi}")
+        # A batch that ultimately fails (the model call's own internal
+        # retries already exhausted) must not throw away every OTHER batch's
+        # results — a long thread with, say, 6 pass-1 calls shouldn't lose
+        # all 6 because call #4 hit a transient error. Its items just don't
+        # get classified this run; everything else still proceeds normally,
+        # and a later re-run picks up exactly this gap (nothing here was
+        # marked as read, so it isn't skipped next time).
+        try:
+            data = await triage_prompt.run_pass1_batch(th, batch, note, model, api_key, label=f"pass1-batch{bi}")
+        except Exception as e:
+            msg = (f"Pass 1 batch {bi}/{len(batches)} failed ({str(e)[:160]}) — "
+                   f"its {len(batch)} item(s) were not classified this run.")
+            batch_errors.append(msg)
+            emit("pass1", "warn", msg, pass_no=1, model=model,
+                 batch_index=bi, batch_total=len(batches), batch_phase="failed")
+            continue
         count_llm()
         emit("pass1", "spin",
              f"Pass 1 — batch {bi} of {len(batches)} received.",
@@ -1029,7 +1049,7 @@ async def extract_thread_sheets(
 
     meta = {
         "method": "thread-two-pass", "model": model, "calls": len(batches),
-        "sheet_count": 0, "errors": [], "skipped": th.dropped, "conflicts": [],
+        "sheet_count": 0, "errors": batch_errors, "skipped": th.dropped, "conflicts": [],
         "noise": noise, "summary": full_summary.get("headline", ""),
         "summary_obj": full_summary, "triage": triage,
         "thread_summary": full_summary,
@@ -1050,8 +1070,8 @@ async def extract_thread_sheets(
             meta["sheet_count"] = len(reused_sheets)
             meta["reused_sheets"] = len(reused_sheets)
             return reused_sheets, approval, [], meta
-        meta["errors"] = ["pass 1 confirmed sheets that could not be resolved to any item"]
-        emit("extract", "warn", meta["errors"][0])
+        batch_errors.append("pass 1 confirmed sheets that could not be resolved to any item")
+        emit("extract", "warn", batch_errors[-1])
         return [], approval, [], meta
 
     batches2: list[list] = []
@@ -1083,10 +1103,22 @@ async def extract_thread_sheets(
         emit("pass2", "spin",
              f"Pass 2 — sending batch {bi} of {len(batches2)} ({len(batch)} sheet(s)) to {model}…",
              pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="sent")
-        data = await thread_prompt.run_pass2_batch(
-            batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}")
-        count_llm()
-        pass2_call_count += 1
+        # Same reasoning as pass 1: one batch's call ultimately failing must
+        # not discard every OTHER batch's already-confirmed sheets. Its own
+        # sheets just don't get extracted this run — noted below, and picked
+        # up by a later re-run since nothing here gets marked as read.
+        try:
+            data = await thread_prompt.run_pass2_batch(
+                batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}")
+            count_llm()
+            pass2_call_count += 1
+        except Exception as e:
+            msg = (f"Pass 2 batch {bi}/{len(batches2)} failed ({str(e)[:160]}) — "
+                   f"its {len(batch)} sheet(s) were not extracted this run.")
+            batch_errors.append(msg)
+            emit("pass2", "warn", msg, pass_no=2, model=model,
+                 batch_index=bi, batch_total=len(batches2), batch_phase="failed")
+            continue
         emit("pass2", "spin",
              f"Pass 2 — batch {bi} of {len(batches2)} received.",
              pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="received")
@@ -1101,14 +1133,21 @@ async def extract_thread_sheets(
                  f"Pass 2 batch {bi} of {len(batches2)} returned nothing for "
                  f"{len(batch)} confirmed item(s) — retrying once…",
                  pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="retry")
-            data = await thread_prompt.run_pass2_batch(
-                batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}-retry")
-            count_llm()
-            pass2_call_count += 1
-            emit("pass2", "spin",
-                 f"Pass 2 — batch {bi} of {len(batches2)} received (retry).",
-                 pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="received")
-            sheets_out = data.get("sheets") or []
+            try:
+                data = await thread_prompt.run_pass2_batch(
+                    batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}-retry")
+                count_llm()
+                pass2_call_count += 1
+                emit("pass2", "spin",
+                     f"Pass 2 — batch {bi} of {len(batches2)} received (retry).",
+                     pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="received")
+                sheets_out = data.get("sheets") or []
+            except Exception as e:
+                msg = (f"Pass 2 batch {bi}/{len(batches2)} retry failed ({str(e)[:160]}) — "
+                       f"its {len(batch)} sheet(s) were not extracted this run.")
+                batch_errors.append(msg)
+                emit("pass2", "warn", msg, pass_no=2, model=model,
+                     batch_index=bi, batch_total=len(batches2), batch_phase="failed")
         raw_sheets += sheets_out
 
     fresh_sheets = _normalise_pass2_sheets(raw_sheets, data_items, th.items)

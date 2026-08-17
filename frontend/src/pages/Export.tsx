@@ -5,6 +5,7 @@ import {
   fetchExportByPeriod,
   MONTHS_LONG,
   timesheetExportUrl,
+  type ExportStatus,
   type TimesheetExportRow,
 } from "../api/client";
 import { downloadFile } from "../lib/filePreview";
@@ -169,6 +170,12 @@ const COLUMNS: Col[] = [
     get: (r) => r.employee_name ?? "",
   },
   {
+    key: "status",
+    header: "Status",
+    width: "min-w-[150px]",
+    get: (r) => r.status,
+  },
+  {
     key: "dco_number",
     header: "DCO Number",
     width: "min-w-[100px]",
@@ -236,6 +243,22 @@ function cellValue(row: TimesheetExportRow, col: Col, rowIndex: number): string 
   return col.get(row);
 }
 
+// Row + sticky-cell background per status — red for nothing received,
+// yellow for received but not yet filed, plain zebra striping when it's
+// filed (nothing to flag).
+const STATUS_TONE: Record<ExportStatus, { row: string; sticky: string; badge: string }> = {
+  "Not Received": { row: "bg-rose-50/70", sticky: "bg-rose-50", badge: "bg-rose-100 text-rose-700" },
+  "Received & Not Stored": { row: "bg-amber-50/70", sticky: "bg-amber-50", badge: "bg-amber-100 text-amber-700" },
+  "Received & Stored": { row: "", sticky: "", badge: "bg-emerald-100 text-emerald-700" },
+};
+
+function rowTone(row: TimesheetExportRow, idx: number) {
+  const flagged = STATUS_TONE[row.status];
+  if (flagged.row) return { row: flagged.row, sticky: flagged.sticky };
+  const zebra = idx % 2 === 0 ? "bg-white" : "bg-slate-50/90";
+  return { row: zebra, sticky: idx % 2 === 0 ? "bg-white" : "bg-slate-50" };
+}
+
 function matchesName(name: string | null, query: string): boolean {
   const n = (name ?? "").toLowerCase();
   const terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
@@ -263,17 +286,20 @@ export default function ExportPage() {
   }, [data, year]);
 
   const rows = data ?? [];
-  const submittedCount = rows.filter((r) => r.has_record).length;
+  const submittedCount = rows.filter((r) => r.status === "Received & Stored").length;
+  const awaitingCount = rows.filter((r) => r.status === "Received & Not Stored").length;
+  const missingCount = rows.filter((r) => r.status === "Not Received").length;
   const filtered = useMemo(
     () => rows.filter((r) => matchesName(r.employee_name, debouncedNameQ)),
     [rows, debouncedNameQ],
   );
   const exportName = `timesheets_${year}-${String(month).padStart(2, "0")}.xlsx`;
   const exportXlsx = () => downloadFile(timesheetExportUrl(month, year), exportName);
+  const countsLabel = `${submittedCount} stored · ${awaitingCount} awaiting · ${missingCount} missing`;
   const subtitle =
     debouncedNameQ.trim() && filtered.length !== rows.length
-      ? `${MONTHS_LONG[month]} ${year} — showing ${filtered.length} of ${rows.length} · ${submittedCount} submitted`
-      : `${MONTHS_LONG[month]} ${year} — ${submittedCount} submitted · ${rows.length} employees`;
+      ? `${MONTHS_LONG[month]} ${year} — showing ${filtered.length} of ${rows.length} · ${countsLabel}`
+      : `${MONTHS_LONG[month]} ${year} — ${countsLabel} · ${rows.length} employees`;
 
   return (
     <div className="flex h-[calc(100vh-4rem)] animate-fade-up flex-col">
@@ -373,22 +399,18 @@ export default function ExportPage() {
                       </td>
                     </tr>
                   ) : (
-                    filtered.map((row, idx) => (
+                    filtered.map((row, idx) => {
+                      const tone = rowTone(row, idx);
+                      return (
                       <tr
                         key={row.id}
-                        className={cn(
-                          "group",
-                          idx % 2 === 0 ? "bg-white" : "bg-slate-50/90",
-                          !row.has_record && "opacity-80",
-                          "hover:bg-brand-50/60"
-                        )}
+                        className={cn("group", tone.row, "hover:bg-brand-50/60")}
                       >
                         {COLUMNS.map((col) => {
                           const val = cellValue(row, col, idx);
                           const isCount = col.key.endsWith("_count");
                           const isDates = col.key.endsWith("_dates");
                           const empty = val === "" || val === 0;
-                          const rowBg = idx % 2 === 0 ? "bg-white" : "bg-slate-50";
                           return (
                             <td
                               key={col.key}
@@ -397,18 +419,32 @@ export default function ExportPage() {
                                 col.width,
                                 isCount && "text-center font-semibold tabular-nums",
                                 isDates && "font-mono text-[11px] leading-relaxed whitespace-normal",
-                                col.sticky && cn("sticky z-20", rowBg, "group-hover:bg-brand-50"),
+                                col.sticky && cn("sticky z-20", tone.sticky || "bg-white", "group-hover:bg-brand-50"),
                                 empty && !col.sticky && col.key !== "row" && "text-slate-300"
                               )}
                               style={col.sticky ? { left: STICKY_LEFT[col.key] } : undefined}
                               title={typeof val === "string" && val.length > 40 ? val : undefined}
                             >
-                              {empty && !col.sticky && col.key !== "row" ? "—" : val}
+                              {col.key === "status" ? (
+                                <span
+                                  className={cn(
+                                    "inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold whitespace-nowrap",
+                                    STATUS_TONE[row.status].badge
+                                  )}
+                                >
+                                  {row.status}
+                                </span>
+                              ) : empty && !col.sticky && col.key !== "row" ? (
+                                "—"
+                              ) : (
+                                val
+                              )}
                             </td>
                           );
                         })}
                       </tr>
-                    ))
+                      );
+                    })
                   )}
                 </tbody>
               </table>

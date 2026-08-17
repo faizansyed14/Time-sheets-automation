@@ -15,7 +15,6 @@ import {
 import {
   fetchCoverage,
   fetchEmployeeRecords,
-  fetchPipelineStats,
   MONTHS,
   MONTHS_LONG,
   type CoverageStatus,
@@ -37,11 +36,13 @@ type QuickFilter = "all" | CoverageStatus;
 function StatCard({
   label,
   value,
+  pct,
   icon,
   accent = "brand",
 }: {
   label: string;
   value: number | string;
+  pct?: number;
   icon: React.ReactNode;
   accent?: "brand" | "success" | "danger" | "slate";
 }) {
@@ -63,7 +64,12 @@ function StatCard({
         {icon}
       </div>
       <div>
-        <p className="text-2xl font-bold leading-none tracking-tight text-slate-900">{value}</p>
+        <p className="flex items-baseline gap-1.5 leading-none tracking-tight text-slate-900">
+          <span className="text-2xl font-bold">{value}</span>
+          {pct !== undefined && (
+            <span className="text-xs font-semibold text-slate-400">{pct}%</span>
+          )}
+        </p>
         <p className="mt-1 text-xs font-medium text-slate-500">{label}</p>
       </div>
     </div>
@@ -75,6 +81,9 @@ function monthStatus(row: DashboardRow, month: number, year: number) {
   const submitted = row.submitted_months.includes(month);
   if (submitted) return { label: "Submitted", tone: "success" as const };
   if (future) return { label: "Not due", tone: "slate" as const };
+  // Focus month only: awaiting_review_this_month is scoped to whatever
+  // month/year this dashboard is currently showing (see employees.py).
+  if (row.awaiting_review_this_month) return { label: "Awaiting review", tone: "warning" as const };
   if (row.in_matcher) return { label: "Missing", tone: "danger" as const };
   return { label: "Unmatched", tone: "warning" as const };
 }
@@ -130,21 +139,29 @@ function resolveFocusRecord(
   return records?.find((r) => r.month === opts.month && r.year === opts.year) ?? null;
 }
 
-function ReviewStatCard({ count }: { count: number }) {
+function ReviewStatCard({
+  count, pct, month, onClick,
+}: {
+  count: number; pct: number; month: string; onClick: () => void;
+}) {
   return (
-    <Link
-      to="/pipeline?status=needs_review"
-      title="Open the Activity log to accept or fix extracted timesheets."
-      className="group flex items-center gap-3 rounded-xl border border-amber-200/80 bg-amber-50/30 p-4 shadow-card transition hover:border-amber-300 hover:bg-amber-50/50"
+    <button
+      type="button"
+      onClick={onClick}
+      title="Sent a sheet for this month that isn't filed into a record yet — filters the table below to show exactly these employees."
+      className="group flex items-center gap-3 rounded-xl border border-amber-200/80 bg-amber-50/30 p-4 text-left shadow-card transition hover:border-amber-300 hover:bg-amber-50/50"
     >
       <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white/80 ring-1 ring-black/[0.04]">
         <AlertTriangle className="h-5 w-5 text-amber-600" />
       </div>
       <div>
-        <p className="text-2xl font-bold leading-none text-slate-900">{count}</p>
-        <p className="mt-1 text-xs font-medium text-slate-500">Waiting for review</p>
+        <p className="flex items-baseline gap-1.5 leading-none text-slate-900">
+          <span className="text-2xl font-bold">{count}</span>
+          <span className="text-xs font-semibold text-slate-400">{pct}%</span>
+        </p>
+        <p className="mt-1 text-xs font-medium text-slate-500">Awaiting review · {month}</p>
       </div>
-    </Link>
+    </button>
   );
 }
 
@@ -213,12 +230,11 @@ export default function Dashboard() {
     initialPageParam: 0,
     getNextPageParam: (last) => (last.has_more ? last.offset + last.rows.length : undefined),
   });
-  const { data: stats } = useQuery({ queryKey: ["pipeline-stats"], queryFn: fetchPipelineStats });
 
   const cov = data?.pages[0];
   const rows = data?.pages.flatMap((p) => p.rows) ?? [];
   const filteredTotal = cov?.filtered_total ?? rows.length;
-  const reviewCount = (stats?.needs_review ?? 0) + (stats?.failed ?? 0);
+  const reviewCount = cov?.awaiting_review_this_month ?? 0;
 
   const years = useMemo(() => {
     const ys = new Set<number>([CUR_YEAR, CUR_YEAR - 1, CUR_YEAR - 2, year]);
@@ -240,6 +256,7 @@ export default function Dashboard() {
   const chips: { id: QuickFilter; label: string }[] = [
     { id: "all", label: "All" },
     { id: "submitted", label: "Submitted" },
+    { id: "awaiting_review", label: "Awaiting review" },
     { id: "missing", label: "Missing" },
     { id: "needs_review", label: "Needs review" },
   ];
@@ -261,16 +278,25 @@ export default function Dashboard() {
           <StatCard
             label={`Submitted · ${MONTHS[month]}`}
             value={cov?.submitted_this_month ?? "—"}
+            pct={cov?.submitted_pct}
             icon={<CalendarCheck className="h-5 w-5" />}
             accent="success"
           />
           <StatCard
             label={focusFuture ? `Missing · ${MONTHS[month]} (not due)` : `Missing · ${MONTHS[month]}`}
             value={focusFuture ? "—" : cov?.missing_this_month ?? "—"}
+            pct={focusFuture ? undefined : cov?.missing_pct}
             icon={<CalendarX className="h-5 w-5" />}
             accent="danger"
           />
-          {reviewCount > 0 && <ReviewStatCard count={reviewCount} />}
+          {reviewCount > 0 && (
+            <ReviewStatCard
+              count={reviewCount}
+              pct={cov?.awaiting_review_pct ?? 0}
+              month={MONTHS[month]}
+              onClick={() => setQuickFilter("awaiting_review")}
+            />
+          )}
         </div>
 
       <Card className="overflow-hidden p-0">

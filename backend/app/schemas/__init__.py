@@ -208,6 +208,10 @@ class TimesheetExportOut(TimesheetOut):
     employee_email: str | None = None
     contact_no: str | None = None
     has_record: bool = True
+    # "Received & Stored" | "Received & Not Stored" | "Not Received" — same
+    # three-way split as the dashboard's submitted/awaiting-review/missing
+    # (see app/services/export/timesheet_export.py's ExportStatus).
+    status: str = ""
 
 
 class DashboardRow(BaseModel):
@@ -231,14 +235,21 @@ class DashboardRow(BaseModel):
     focus_record_id: str | None = None
     focus_validation_status: str | None = None
     focus_approval_status: str | None = None
+    # True when this employee emailed a sheet for the focus month (the
+    # pipeline identified them) but it hasn't been accepted into a record yet.
+    awaiting_review_this_month: bool = False
 
 
 class DashboardSummary(BaseModel):
     year: int
     month: int                       # focus month for the "missing" figure
     total_employees: int             # employees in the matcher (global)
-    submitted_this_month: int        # global
-    missing_this_month: int          # global
+    submitted_this_month: int        # received AND filed into a record — global
+    missing_this_month: int          # sent NOTHING at all for this month — global
+    awaiting_review_this_month: int  # sent something, not yet filed — global
+    submitted_pct: float = 0.0
+    missing_pct: float = 0.0
+    awaiting_review_pct: float = 0.0
     needs_review: int                # employees with at least one flagged record (global)
     pending_approval: int            # employees with at least one unapproved record (global)
     missing_employees: list[str] = []  # sample of names missing the focus month
