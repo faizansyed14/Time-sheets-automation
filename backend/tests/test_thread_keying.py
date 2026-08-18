@@ -246,6 +246,81 @@ async def test_read_attachments_are_recorded_for_the_badge():
         await db.commit()
 
 
+def test_nested_eml_container_recorded_for_inbox_badge():
+    """Manager-batch style: outer attachment is an .eml; extract unwraps it.
+    Inbox lists the OUTER .eml name — that name must be recorded for the
+    Extracted badge, not only the inner PDF name."""
+    from email.message import EmailMessage
+
+    from app.services.extract_email.thread_extract import collect_thread
+
+    inner = EmailMessage()
+    inner["Subject"] = "June sheet - Shruti"
+    inner["From"] = "mgr@alpha.ae"
+    inner["To"] = "timesheet@alpha.ae"
+    inner.set_content("Attached.")
+    inner.add_attachment(b"%PDF-1.4 fake", maintype="application", subtype="pdf",
+                         filename="Shruti_June.pdf")
+    outer = EmailMessage()
+    outer["Subject"] = "Batch June"
+    outer["From"] = "mgr@alpha.ae"
+    outer["To"] = "timesheet@alpha.ae"
+    outer.set_content("Several sheets.")
+    from email import message_from_bytes, policy
+    outer.add_attachment(
+        message_from_bytes(inner.as_bytes(), policy=policy.default),
+        filename="June-2026 Timesheet Report - Shruti.eml",
+    )
+
+    th = collect_thread([("msg 1", outer.as_bytes())])
+    assert any(it.name == "Shruti_June.pdf" for it in th.items), [
+        it.name for it in th.items]
+    names = [c["name"] for c in th.opened_containers]
+    assert "June-2026 Timesheet Report - Shruti.eml" in names, names
+
+
+async def test_remember_records_opened_eml_containers_for_badge():
+    """badge_only container entries surface in extracted_filenames and must
+    never be treated as reusable sheet answers."""
+    from app.services.inbox.sync import sync_message
+    from app.models.email_message import EmailMessage
+    from app.services.email_provider.base import ProviderMessage
+    from app.services.extract_email import sheet_cache
+    from datetime import datetime, timezone
+
+    pdf_digest = sheet_cache.content_key(b"%PDF-1.4 inner")
+    eml_digest = sheet_cache.content_key(b"fake-eml-bytes")
+    sheet = {"name": "Shruti_June.pdf", "kind": "timesheet", "employee_id": "E1",
+             "month": 6, "year": 2026}
+
+    async with SessionLocal() as db:
+        msg = ProviderMessage(
+            message_id="nested-eml-badge-1", sender_name="E", sender_email="e@alpha.ae",
+            subject="Batch", received_at=datetime.now(timezone.utc), body_text="hi",
+            conversation_id=CONV + "-nested")
+        await sync_message(db, msg)
+        await db.commit()
+
+        await sheet_cache.remember(
+            db, "nested-eml-badge-1", "gpt-4o",
+            {pdf_digest: sheet},
+            containers=[{"name": "June-2026 Timesheet Report - Shruti.eml",
+                         "digest": eml_digest}],
+        )
+        row = (await db.execute(select(EmailMessage).where(
+            EmailMessage.provider_message_id == "nested-eml-badge-1"))).scalar_one()
+        names = sheet_cache.extracted_filenames(row)
+        assert "Shruti_June.pdf" in names
+        assert "June-2026 Timesheet Report - Shruti.eml" in names, names
+
+        cached = await sheet_cache.thread_cached_sheets(db, CONV + "-nested")
+        assert cached[eml_digest].get("badge_only") is True
+        assert not cached[eml_digest].get("sheet")
+
+        await db.delete(row)
+        await db.commit()
+
+
 async def test_reuse_is_explicit_and_opt_in_per_call():
     """Incremental reuse (see test_incremental_extraction.py) is deliberate and
     scoped to one parameter — extract_thread_sheets only reuses a sheet when a

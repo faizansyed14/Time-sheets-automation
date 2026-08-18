@@ -38,6 +38,7 @@ FAILURE_LABELS: dict[str, str] = {
     FailureCode.STORAGE_ERROR: "Storage error",
     FailureCode.DUPLICATE_FILE: "Duplicate file",
     FailureCode.PENDING_REVIEW: "Awaiting review",
+    FailureCode.RECORD_DELETED: "Record deleted",
     FailureCode.UNKNOWN: "Unknown error",
 }
 
@@ -64,6 +65,11 @@ def _out(t: PipelineFile) -> PipelineFileOut:
 @router.get("", response_model=Page[PipelineFileOut])
 async def list_pipeline_files(
     status: str | None = Query(default=None, description="processing|success|needs_review|failed|resolved"),
+    exclude_status: str | None = Query(
+        default=None,
+        description="Hide one or more statuses from the results, comma-separated "
+                    "(the Activity log hides 'success,resolved' by default — "
+                    "finished work isn't what the page is for)"),
     failure_code: str | None = Query(default=None),
     source_kind: str | None = Query(default=None, description="upload|email"),
     source_id: str | None = Query(default=None, description="Filter by PipelineFile.source_id"),
@@ -84,6 +90,10 @@ async def list_pipeline_files(
     base = select(PipelineFile)
     if status:
         base = base.where(PipelineFile.status == status)
+    if exclude_status:
+        excluded = [s.strip() for s in exclude_status.split(",") if s.strip()]
+        if excluded:
+            base = base.where(PipelineFile.status.not_in(excluded))
     if failure_code:
         base = base.where(PipelineFile.failure_code == failure_code)
     if source_kind:
@@ -219,17 +229,28 @@ async def pipeline_manual_fix(
             attachments.append((f.filename or "attachment",
                                  f.content_type or "application/octet-stream", data))
 
-    from app.services.pipeline.ingestion import ingest_manual_entry, purge_raw_copy, read_raw_copy
+    from app.services.pipeline.ingestion import (
+        ingest_manual_entry, isolate_employee_attachments, purge_raw_copy, read_raw_copy,
+    )
 
     # If the reviewer didn't attach a replacement file, carry the original raw
     # file forward as the record attachment so it is stored in the File Vault.
     if not attachments and t.raw_path:
         raw_bytes = read_raw_copy(t)
         if raw_bytes:
-            import mimetypes as _mt
-            fn = t.filename or "attachment"
-            ct = _mt.guess_type(fn)[0] or "application/octet-stream"
-            attachments.append((fn, ct, raw_bytes))
+            # One email carrying SEVERAL employees' sheets (a manager sending
+            # 8 people's timesheets at once) files each employee's OWN
+            # attachment(s), not the whole shared thread — see
+            # isolate_employee_attachments for exactly when this applies and
+            # when it safely falls back to the single-employee behaviour.
+            isolated = isolate_employee_attachments(t, raw_bytes)
+            if isolated:
+                attachments.extend(isolated)
+            else:
+                import mimetypes as _mt
+                fn = t.filename or "attachment"
+                ct = _mt.guess_type(fn)[0] or "application/octet-stream"
+                attachments.append((fn, ct, raw_bytes))
     approval = None
     if approval_status in ("approved", "not_approved"):
         approval = {"approved": approval_status == "approved",

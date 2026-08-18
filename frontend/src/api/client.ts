@@ -108,8 +108,8 @@ export interface EmailDetail extends EmailListItem {
   attachments: Attachment[];
   inline_attachment_ids: string[];
   /** Filenames on THIS message Extract Email has already read — for the
-   *  Extracted/New badge. Every run re-reads everything; this is a record of
-   *  what has been looked at, not a cache of answers. */
+   *  Extracted/New badge. Nested .eml containers are included once unwrapped.
+   *  The Inbox also trusts the thread extraction watermark per message. */
   extracted_filenames?: string[];
 }
 
@@ -209,6 +209,8 @@ export interface TimesheetRecord {
   source_file_count: number;
 }
 
+export type ExportStatus = "Received & Stored" | "Received & Not Stored" | "Not Received";
+
 export interface TimesheetExportRow extends Omit<TimesheetRecord, "validation_status" | "approval_status"> {
   validation_status: TimesheetRecord["validation_status"] | "";
   approval_status: TimesheetRecord["approval_status"] | "";
@@ -217,6 +219,7 @@ export interface TimesheetExportRow extends Omit<TimesheetRecord, "validation_st
   employee_email: string | null;
   contact_no: string | null;
   has_record: boolean;
+  status: ExportStatus;
 }
 
 export interface DashboardRow {
@@ -237,6 +240,7 @@ export interface DashboardRow {
   focus_record_id: string | null;
   focus_validation_status: "verified" | "manual_review" | null;
   focus_approval_status: "pending" | "approved" | "not_approved" | null;
+  awaiting_review_this_month: boolean;
 }
 
 export interface DashboardSummary {
@@ -245,6 +249,10 @@ export interface DashboardSummary {
   total_employees: number;
   submitted_this_month: number;
   missing_this_month: number;
+  awaiting_review_this_month: number;
+  submitted_pct: number;
+  missing_pct: number;
+  awaiting_review_pct: number;
   needs_review: number;
   pending_approval: number;
   missing_employees: string[];
@@ -408,9 +416,16 @@ export const fetchLlmPreview = (msgId: string) =>
     .then((r) => r.data);
 
 export const saveEmlToVault = (
-  msgId: string, body: { manager: string; employee: string; month: number; year: number },
+  msgId: string,
+  body: {
+    manager: string;
+    employee: string;
+    month: number;
+    year: number;
+    employee_pk?: string;
+  },
 ) =>
-  api.post<{ saved: boolean; path: string; filename: string }>(
+  api.post<{ saved: boolean; path: string; filename: string; employee_folder?: string }>(
     `/inbox/${encodeURIComponent(msgId)}/as-eml/save-to-vault`, body).then((r) => r.data);
 
 // ---------------------------------------------------------------------------
@@ -603,6 +618,7 @@ export async function sendChatStream(
 export type CoverageStatus =
   | "submitted"
   | "missing"
+  | "awaiting_review"
   | "needs_review"
   | "approved"
   | "not_approved"
@@ -691,6 +707,8 @@ export const recordSources = (id: string) =>
 // ---------------------------------------------------------------------------
 export const fetchPipeline = (params?: {
   status?: string;
+  /** Hide one status from the results — the Activity log hides "success". */
+  exclude_status?: string;
   failure_code?: string;
   source_kind?: string;
   source_id?: string;
@@ -707,6 +725,7 @@ export const fetchPipeline = (params?: {
     .get<Page<PipelineFile>>("/pipeline", {
       params: {
         status: params?.status || undefined,
+        exclude_status: params?.exclude_status || undefined,
         failure_code: params?.failure_code || undefined,
         source_kind: params?.source_kind || undefined,
         source_id: params?.source_id || undefined,
@@ -764,12 +783,22 @@ export type VaultYear = { year: number; files: number; bytes: number };
 export const fetchVaultYears = () =>
   api.get<VaultYear[]>("/files/years").then((r) => r.data);
 
-type ZipScope = { manager?: string; relPath?: string; year?: number };
+type ZipScope = {
+  manager?: string;
+  relPath?: string;
+  year?: number;
+  /** Pick just these employees under `manager` (1 or a few, not the whole team). */
+  employees?: string[];
+  /** Bare month name, e.g. "March" — every year unless `year` also narrows it. */
+  month?: string;
+};
 function zipScopeQuery(scope: ZipScope): string {
   const p = new URLSearchParams();
   if (scope.manager) p.set("manager", scope.manager);
   if (scope.relPath) p.set("rel_path", scope.relPath);
   if (scope.year) p.set("year", String(scope.year));
+  if (scope.month) p.set("month", scope.month);
+  (scope.employees ?? []).forEach((e) => p.append("employee", e));
   const q = p.toString();
   return q ? `?${q}` : "";
 }
@@ -914,6 +943,7 @@ export interface Employee {
   id: string;
   employee_id: string;
   name: string;
+  aco_number: string | null;
   dco_number: string | null;
   account_manager: string | null;
   employee_email_id: string | null;
@@ -947,6 +977,56 @@ export const importEmployees = (file: File) => {
     .post<ImportSummary>("/employee-matcher/import", form, {
       headers: { "Content-Type": "multipart/form-data" },
       timeout: 600_000, // large Excel + remote RDS can take several minutes
+    })
+    .then((r) => r.data);
+};
+
+/** Dry run of an employee import — what would change, before anything is written. */
+export interface ImportFieldChange { field: string; old: string | null; new: string | null; }
+export interface ImportPlanAdd {
+  employee_id: string;
+  name: string;
+  location: string | null;
+  project: string | null;
+  account_manager: string | null;
+  employee_email_id: string | null;
+  contact_no: string | null;
+  aco_number: string | null;
+  dco_number: string | null;
+  sheet: string | null;
+  row: number | null;
+  possible_rename_of: string | null;
+}
+export interface ImportPlanUpdate {
+  id: string;
+  employee_id: string;
+  name: string;
+  location: string | null;
+  changes: ImportFieldChange[];
+}
+export interface ImportPlanExisting {
+  id: string;
+  employee_id: string;
+  name: string;
+  location: string | null;
+  account_manager: string | null;
+  employee_email_id: string | null;
+  active: boolean;
+}
+export interface ImportPlan {
+  to_add: ImportPlanAdd[];
+  to_update: ImportPlanUpdate[];
+  unchanged: ImportPlanExisting[];
+  missing_from_file: ImportPlanExisting[];
+  skipped: SkipDetail[];
+}
+export const previewEmployeeImport = (file: File) => {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  return api
+    .post<ImportPlan>("/employee-matcher/import/preview", form, {
+      headers: { "Content-Type": "multipart/form-data" },
+      timeout: 600_000,
     })
     .then((r) => r.data);
 };
@@ -1002,7 +1082,7 @@ export const MONTHS_LONG = ["", "January", "February", "March", "April", "May", 
 // ===========================================================================
 // Auth
 // ===========================================================================
-export type AuthRole = "admin" | "user" | "viewer";
+export type AuthRole = "admin" | "user" | "viewer" | "vault_matcher";
 export type AuthModeT = "otp" | "totp" | "captcha";
 
 export interface AuthUser {
@@ -1177,10 +1257,25 @@ export interface AutoExtractStatus {
   processed: number;
   succeeded: number;
   failed: number;
-  current: { thread_id: string; subject: string } | null;
+  /** Already extracted, nothing new since — no model call was made for these. */
+  skipped: number;
+  /** `events` mirrors the SAME progress.emit() stream the manual Extract
+   * Email SSE flow shows (unpack/pass1/pass2/etc) — lets the nav widget
+   * render the identical live step animation for whichever thread Auto
+   * Extract is currently working on. */
+  current: { thread_id: string; subject: string; events: ExtractionEvent[] } | null;
   started_at: string | null;
   finished_at: string | null;
   last_error: string | null;
+  /** Watch-for-new-mail mode: stays true across a run's own completion —
+   * turned on by Start, off by Stop — independent of `state` above. While
+   * true, a new background sync tick that finds mail re-triggers a run on
+   * its own, with nobody needing to click Auto Extract again. */
+  enabled: boolean;
+}
+export interface AutoExtractCoverage {
+  extracted_threads: number;
+  total_threads: number;
 }
 export const startAutoExtract = () =>
   api.post<AutoExtractStatus>("/inbox/auto-extract/start").then((r) => r.data);
@@ -1188,3 +1283,5 @@ export const stopAutoExtract = () =>
   api.post<AutoExtractStatus>("/inbox/auto-extract/stop").then((r) => r.data);
 export const fetchAutoExtractStatus = () =>
   api.get<AutoExtractStatus>("/inbox/auto-extract/status").then((r) => r.data);
+export const fetchAutoExtractCoverage = () =>
+  api.get<AutoExtractCoverage>("/inbox/auto-extract/coverage").then((r) => r.data);

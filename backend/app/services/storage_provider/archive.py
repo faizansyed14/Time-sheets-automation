@@ -59,10 +59,21 @@ class _ChunkBuffer(io.RawIOBase):
         return out
 
 
-def _matches(zip_path: str, prefix: str | None, year: int | None) -> bool:
+def _matches(
+    zip_path: str, prefix: str | None, year: int | None,
+    employees: set[str] | None = None, month: str | None = None,
+) -> bool:
     if prefix and not (zip_path == prefix or zip_path.startswith(prefix + "/")):
         return False
     if year is not None and _year_of(zip_path) != year:
+        return False
+    parts = zip_path.split("/")
+    # "<Manager>/<Employee>/<Month-Year>/<file>" — employee is always index 1;
+    # a path that doesn't reach that depth (shouldn't happen in practice) never
+    # matches a filter that names specific people.
+    if employees and (len(parts) < 4 or parts[1] not in employees):
+        return False
+    if month and (len(parts) < 4 or not parts[-2].startswith(f"{month}-")):
         return False
     return True
 
@@ -71,6 +82,8 @@ def iter_zip(
     manager: str | None = None,
     rel_prefix: str | None = None,
     year: int | None = None,
+    employees: list[str] | None = None,
+    month: str | None = None,
 ) -> Iterator[bytes]:
     """Yield the vault as a stream of ZIP byte chunks.
 
@@ -80,6 +93,10 @@ def iter_zip(
     year        — limit to a calendar year (all managers/employees/months whose
                   Month-Year folder ends in that year). Keeps each export bounded
                   (a year is ≈ 5 GB at 600 employees) so it never gets unwieldy.
+    employees   — limit to specific employee names under `manager` (pick just
+                  the 1-2 people you actually need instead of the whole team).
+    month       — a bare month name ("March") — every year unless `year` also
+                  narrows it, matching that month's "<Month>-<Year>" folders.
 
     Stored (uncompressed) entries: vault files are PDFs/images that don't
     compress, so we skip deflate to save CPU and keep the stream fast.
@@ -87,9 +104,10 @@ def iter_zip(
     sp = get_storage_provider()
     sink = _ChunkBuffer()
     prefix = rel_prefix.strip("/") if rel_prefix else None
+    emp_set = {e for e in employees if e} if employees else None
     with zipfile.ZipFile(sink, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
         for zip_path, data in sp.iter_files(manager):
-            if not _matches(zip_path, prefix, year):
+            if not _matches(zip_path, prefix, year, emp_set, month):
                 continue
             zf.writestr(zip_path, data)
             chunk = sink.drain()
@@ -117,14 +135,16 @@ def year_summary() -> list[dict]:
 
 
 def scope_size(manager: str | None = None, rel_prefix: str | None = None,
-               year: int | None = None) -> dict:
+               year: int | None = None, employees: list[str] | None = None,
+               month: str | None = None) -> dict:
     """Total (files, bytes) of a download scope — so the client can show an
     accurate progress bar before/while streaming. Metadata only."""
     sp = get_storage_provider()
     prefix = rel_prefix.strip("/") if rel_prefix else None
+    emp_set = {e for e in employees if e} if employees else None
     files = total = 0
     for zip_path, size in sp.iter_file_meta(manager):
-        if not _matches(zip_path, prefix, year):
+        if not _matches(zip_path, prefix, year, emp_set, month):
             continue
         files += 1
         total += size

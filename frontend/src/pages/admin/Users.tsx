@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { UserPlus, Shield, Eye, User as UserIcon, Mail, KeyRound, Trash2, Power, Pencil, Smartphone } from "lucide-react";
+import { UserPlus, Shield, Eye, User as UserIcon, Mail, KeyRound, Trash2, Power, Pencil, Smartphone, FolderLock } from "lucide-react";
 import {
   adminCreateUser,
   adminDeleteUser,
@@ -29,6 +29,7 @@ function authModeLabel(mode: AuthModeT) {
 function RoleBadge({ role }: { role: AuthRole }) {
   if (role === "admin") return <Badge tone="brand"><Shield className="h-3 w-3" /> admin</Badge>;
   if (role === "viewer") return <Badge tone="warning"><Eye className="h-3 w-3" /> viewer</Badge>;
+  if (role === "vault_matcher") return <Badge tone="slate"><FolderLock className="h-3 w-3" /> vault &amp; matcher</Badge>;
   return <Badge tone="slate">user</Badge>;
 }
 
@@ -199,6 +200,7 @@ export default function AdminUsers() {
               <option value="admin">admin — full access</option>
               <option value="user">user — read &amp; write</option>
               <option value="viewer">viewer — read-only</option>
+              <option value="vault_matcher">vault &amp; matcher — Employee Matcher + File Vault only</option>
             </Select>
           </Field>
           <Field label="2-factor mode">

@@ -117,6 +117,14 @@ class Settings(BaseSettings):
     # Items per pass-1 call on a long thread. Every batch still sees every
     # message body (for approval context); only the attachment slice differs.
     pass1_batch_size: int = 5
+    # A thread longer than this only sends its newest N messages to the model
+    # (see extract_email/thread_collect.py) — keeps one run's payload bounded.
+    # 15 is enough for a normal back-and-forth; a manager's reminder that gets
+    # 20-30+ independent replies (one employee per reply, not a conversation
+    # building on itself) needs a higher ceiling or those older replies are
+    # silently never read. Raising this makes an oversized thread's own run
+    # slower (more sequential batches), not more likely to fail.
+    max_thread_messages: int = 40
     # Images per pass-2 call — a thread confirming many/long sheets is split
     # across calls rather than exceeding one request.
     max_images_per_call: int = 12
@@ -228,7 +236,7 @@ class Settings(BaseSettings):
     # CAPTCHA
     captcha_length: int = 6
     captcha_ttl_seconds: int = 180
-    totp_issuer: str = "TimeSight"
+    totp_issuer: str = "TimeSheets"
     totp_verify_rate_max: int = 20
     totp_verify_rate_window_seconds: int = 300
 

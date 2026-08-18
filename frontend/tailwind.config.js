@@ -78,6 +78,14 @@ export default {
           "0%": { backgroundPosition: "200% 0" },
           "100%": { backgroundPosition: "-200% 0" },
         },
+        "caret-blink": {
+          "0%, 49%": { opacity: "1" },
+          "50%, 100%": { opacity: "0" },
+        },
+        "feature-in": {
+          "0%": { opacity: "0", transform: "translateX(-12px)" },
+          "100%": { opacity: "1", transform: "translateX(0)" },
+        },
       },
       animation: {
         "fade-up": "fade-up .3s ease-out both",
@@ -85,6 +93,8 @@ export default {
         "scale-in": "scale-in .22s cubic-bezier(.16,1,.3,1) both",
         "overlay-in": "overlay-in .2s ease-out both",
         shimmer: "shimmer 1.6s linear infinite",
+        "caret-blink": "caret-blink 1s step-end infinite",
+        "feature-in": "feature-in .45s cubic-bezier(.16,1,.3,1) both",
       },
     },
   },

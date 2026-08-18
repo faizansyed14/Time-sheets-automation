@@ -38,9 +38,14 @@ def content_key(payload: bytes) -> str:
 
 async def remember(
     db: AsyncSession, message_id: str, model: str, sheets_by_digest: dict[str, dict],
+    *, containers: list[dict] | None = None,
 ) -> None:
-    """Record freshly extracted sheets against the message they arrived on."""
-    if not (message_id and sheets_by_digest):
+    """Record freshly extracted sheets against the message they arrived on.
+
+    `containers` are outer .eml/.msg filenames that were unwrapped to reach
+    inner sheets — badge-only entries so the Inbox can mark those attachments
+    Extracted (their names never appear as analysable items)."""
+    if not message_id or (not sheets_by_digest and not containers):
         return
     row = (await db.execute(select(EmailMessage).where(
         EmailMessage.provider_message_id == message_id))).scalar_one_or_none()
@@ -48,13 +53,29 @@ async def remember(
         return
     store = dict(row.extracted_sheets or {})
     now = datetime.now(timezone.utc).isoformat()
-    for digest, sheet in sheets_by_digest.items():
+    for digest, sheet in (sheets_by_digest or {}).items():
         store[digest] = {
             "filename": sheet.get("name"),
             "at": now,
             "model": model,
             "prompt_version": PROMPT_VERSION,
             "sheet": sheet,
+        }
+    for c in containers or []:
+        digest = (c or {}).get("digest")
+        name = (c or {}).get("name")
+        if not digest or not name:
+            continue
+        existing = store.get(digest)
+        # A real sheet entry for the same bytes wins over a badge-only marker.
+        if existing and existing.get("sheet") and not existing.get("badge_only"):
+            continue
+        store[digest] = {
+            "filename": name,
+            "at": now,
+            "model": model,
+            "prompt_version": PROMPT_VERSION,
+            "badge_only": True,
         }
     row.extracted_sheets = store
     flag_modified(row, "extracted_sheets")   # JSON column, mutated in place
@@ -122,3 +143,28 @@ async def last_extraction_at(db: AsyncSession, thread_key: str | None) -> dateti
             PipelineFile.attachment_id.like(f"{TAG_PREFIX}%"),
         )
     )).scalar_one_or_none()
+
+
+async def last_extraction_at_bulk(
+    db: AsyncSession, thread_keys: list[str],
+) -> dict[str, datetime]:
+    """Same lookup as last_extraction_at(), for every thread at once — one
+    query instead of one-per-thread. Built for Auto Extract's bulk loop,
+    which needs this for every thread in the mailbox up front (to know which
+    are skip-eligible before it starts) rather than one at a time as it goes.
+
+    A thread absent from the mailbox never appears in the returned dict —
+    callers use .get(thread_key) and treat a miss as "never extracted",
+    identical to last_extraction_at() returning None."""
+    if not thread_keys:
+        return {}
+    rows = (await db.execute(
+        select(PipelineFile.thread_key, func.max(PipelineFile.updated_at))
+        .where(
+            PipelineFile.source_kind == "email",
+            PipelineFile.thread_key.in_(thread_keys),
+            PipelineFile.attachment_id.like(f"{TAG_PREFIX}%"),
+        )
+        .group_by(PipelineFile.thread_key)
+    )).all()
+    return {thread_key: at for thread_key, at in rows}

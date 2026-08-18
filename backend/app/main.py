@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.deps import require_write
+from app.api.deps import require_full_access, require_write
 from app.api.routes import (
     admin,
     agentic_chat,
@@ -129,13 +129,19 @@ app.include_router(admin.calendars_router, prefix=settings.api_prefix)
 
 # business routes — authenticated; viewers may read but not mutate (require_write
 # allows safe methods for everyone and blocks writes for the read-only role).
-_protected = [Depends(require_write)]
+#
+# The `vault_matcher` role is further restricted to ONLY the Employee Matcher
+# and File Vault routers — everywhere else uses require_full_access, which
+# 403s that role even on GET. Keep new routers off `_protected` unless they
+# really belong in the restricted role's access list.
+_protected = [Depends(require_full_access)]
+_vault_and_matcher = [Depends(require_write)]
 app.include_router(inbox.router, prefix=settings.api_prefix, dependencies=_protected)
 app.include_router(timesheets.router, prefix=settings.api_prefix, dependencies=_protected)
 app.include_router(employees.router, prefix=settings.api_prefix, dependencies=_protected)
-app.include_router(employee_matcher.router, prefix=settings.api_prefix, dependencies=_protected)
+app.include_router(employee_matcher.router, prefix=settings.api_prefix, dependencies=_vault_and_matcher)
 app.include_router(upload.router, prefix=settings.api_prefix, dependencies=_protected)
-app.include_router(files.router, prefix=settings.api_prefix, dependencies=_protected)
+app.include_router(files.router, prefix=settings.api_prefix, dependencies=_vault_and_matcher)
 app.include_router(pipeline.router, prefix=settings.api_prefix, dependencies=_protected)
 app.include_router(agentic_chat.router, prefix=settings.api_prefix, dependencies=_protected)
 

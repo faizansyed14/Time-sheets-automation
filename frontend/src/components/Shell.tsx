@@ -80,7 +80,7 @@ const COLLAPSE_KEY = "nav_collapsed";
 export default function Shell({ children }: { children: ReactNode }) {
   const location = useLocation();
   const qc = useQueryClient();
-  const { user, isAdmin, canWrite, logout } = useAuth();
+  const { user, isAdmin, canWrite, isVaultMatcherOnly, logout } = useAuth();
   // While a run is actually working, its step bar takes over the whole
   // header — left corner to right corner, right up against the stats pill —
   // instead of squeezing in beside the page title.
@@ -90,6 +90,10 @@ export default function Shell({ children }: { children: ReactNode }) {
     queryKey: ["pipeline-stats"],
     queryFn: fetchPipelineStats,
     refetchInterval: 15_000,
+    // The restricted vault_matcher role has no access to /pipeline at all
+    // (403 server-side) — this page's stats/attention badge are irrelevant
+    // to it anyway, so skip the call entirely.
+    enabled: !isVaultMatcherOnly,
   });
   const attention = (stats?.failed ?? 0) + (stats?.needs_review ?? 0);
 
@@ -111,6 +115,13 @@ export default function Shell({ children }: { children: ReactNode }) {
       setRefreshing(false);
     }
   };
+
+  // The restricted vault_matcher role only ever sees Employee matcher + File
+  // Vault (server-side enforced too — see api/deps.require_full_access).
+  const visibleNav = isVaultMatcherOnly ? [] : NAV;
+  const visibleToolsNav = isVaultMatcherOnly
+    ? TOOLS_NAV.filter((n) => n.to === "/employees" || n.to === "/files")
+    : TOOLS_NAV.filter((n) => canWrite || n.to !== "/upload");
 
   const section = "/" + (location.pathname.split("/")[1] || "");
   const title = TITLES[section] ?? "Timesheets Automation";
@@ -147,7 +158,7 @@ export default function Shell({ children }: { children: ReactNode }) {
         </div>
 
         <nav className="flex-1 space-y-0.5 overflow-y-auto px-1.5 py-3">
-          {NAV.map(({ to, label, icon: Icon, end, attention: showAttention }) => (
+          {visibleNav.map(({ to, label, icon: Icon, end, attention: showAttention }) => (
             <NavLink key={to} to={to} end={end} title={collapsed ? label : undefined} className={navLinkClass}>
               {({ isActive }) => (
                 <>
@@ -168,11 +179,11 @@ export default function Shell({ children }: { children: ReactNode }) {
             </NavLink>
           ))}
 
-          {!collapsed && (
+          {!collapsed && visibleNav.length > 0 && (
             <p className="px-2 pb-1 pt-4 text-[9px] font-semibold uppercase tracking-widest text-slate-500">Tools</p>
           )}
-          {collapsed && <div className="my-3 border-t border-slate-200/70" />}
-          {TOOLS_NAV.filter((n) => canWrite || n.to !== "/upload").map(({ to, label, icon: Icon }) => (
+          {collapsed && visibleNav.length > 0 && <div className="my-3 border-t border-slate-200/70" />}
+          {visibleToolsNav.map(({ to, label, icon: Icon }) => (
             <NavLink key={to} to={to} title={collapsed ? label : undefined} className={navLinkClass}>
               {({ isActive }) => (
                 <>
@@ -241,7 +252,7 @@ export default function Shell({ children }: { children: ReactNode }) {
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-14 shrink-0 items-center gap-4 surface-glass px-5 sm:px-6">
+        <header className="relative z-20 flex h-14 shrink-0 items-center gap-4 surface-glass px-5 sm:px-6">
           {/* Page title steps aside while a run is actually in progress so
               the step bar can run edge to edge instead of squeezing beside it. */}
           {!extracting && (
@@ -258,8 +269,10 @@ export default function Shell({ children }: { children: ReactNode }) {
             </div>
           )}
           {/* Extract Email progress — full-width 3-step bar, renders nothing
-              when no run is active/recently finished. */}
-          <ExtractQueueWidget />
+              when no run is active/recently finished. Irrelevant (and would
+              403) for the restricted vault_matcher role — it has no /inbox
+              or /pipeline access. */}
+          {!isVaultMatcherOnly && <ExtractQueueWidget />}
           <div className="ml-auto flex shrink-0 items-center gap-2.5 text-xs text-slate-500">
             {stats && (
               <span className="hidden items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-1.5 lg:inline-flex">
@@ -272,7 +285,7 @@ export default function Shell({ children }: { children: ReactNode }) {
                 </span>
               </span>
             )}
-            <AutoExtractWidget />
+            {!isVaultMatcherOnly && <AutoExtractWidget />}
             <button
               onClick={reload}
               disabled={refreshing}

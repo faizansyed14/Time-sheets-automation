@@ -742,10 +742,15 @@ Full-month July 2026 timesheet: 22 working days, 8 weekend days (Sat–Sun), 1 s
 | Step | What |
 |------|------|
 | `_normalise_pass2_sheets` | Maps Pass 2 JSON + Pass 1 metadata into internal sheet dicts; clamps `missing_days` to valid day numbers for that month. |
-| `group_sheets` | Match employee, group by month, union buckets, `calendar_mismatch_flags` if admin calendar exists. |
-| `auto_accept.evaluate` | Recommends accept only if employee matched, full coverage, no uncertain days, no validation/calendar issues. |
-| `stage_groups` | Creates/updates `PipelineFile` for Compare & Fix review. |
-| Human Accept | `ingest_manual_entry` writes `timesheet_records` with `working_dates`, `weekend_dates`, and leave bucket columns. |
+| `group_sheets` | Match employee, group by **employee + month**, union buckets, calendar mismatch flags if admin calendar exists. |
+| `auto_accept.evaluate` | Recommends accept when matched + coverage/validation clean (never auto-files). |
+| `stage_groups` | One `PipelineFile` per group; stores shared raw `.eml` + `group_count` for Accept. |
+| Human Accept | `ingest_manual_entry`: ACO/DCO vault folder; multi-employee → isolate that person’s attachment(s); never overwrite existing filenames (dated suffix). Writes `timesheet_records`. |
+
+Full Accept / vault detail: [`EXTRACTION_FLOWS.md`](EXTRACTION_FLOWS.md) §3 and §5.
+
+**Auto Extract** skips threads where last extraction time ≥ newest message
+(`auto_extract.py`) — no model cost for already-done mail.
 
 ---
 

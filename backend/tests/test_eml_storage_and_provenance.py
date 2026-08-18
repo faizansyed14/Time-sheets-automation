@@ -106,6 +106,22 @@ def _eml_with_pdf_and_inline_logo(
     return msg.as_bytes()
 
 
+def _eml_with_two_pdfs(pdf1: bytes, name1: str, pdf2: bytes, name2: str, subject: str) -> bytes:
+    """A single manager email carrying TWO different employees' timesheet PDFs
+    at once — the "8 employees in one email" scenario, just with 2 for a
+    tractable test."""
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = "manager@example.com"
+    msg["To"] = "hr@example.com"
+    msg.set_content("Please find attached this batch of timesheets.")
+    msg.add_attachment(pdf1, maintype="application", subtype="pdf", filename=name1)
+    msg.add_attachment(pdf2, maintype="application", subtype="pdf", filename=name2)
+    return msg.as_bytes()
+
+
 def _pass1_reply(source: str, employee_name: str, employee_id: str) -> dict:
     return {
         "thread_summary": f"{employee_name} submitted a timesheet.",
@@ -323,3 +339,169 @@ async def test_nested_email_inside_email_pdf_is_extracted(client, admin_token, m
     assert result["status"] == "needs_review"
     assert result["failure_code"] == "pending_review"
     assert result["employee_name"] == "Nested Person"
+
+
+# ---------------------------------------------------------------------------
+# One EMAIL, several employees' sheets at once (a manager batching 8 people's
+# timesheets in one message) — each employee's own Accept must file ONLY
+# their own attachment, never the whole shared multi-employee email.
+# ---------------------------------------------------------------------------
+
+async def _employee(name: str, emp_id: str) -> "object":
+    from sqlalchemy import select
+
+    from app.core.database import SessionLocal
+    from app.models.employee import Employee
+
+    async with SessionLocal() as db:
+        row = (await db.execute(select(Employee).where(
+            Employee.employee_id == emp_id))).scalar_one_or_none()
+        if not row:
+            row = Employee(employee_id=emp_id, name=name, location="AUH")
+            db.add(row)
+            await db.commit()
+            await db.refresh(row)
+        return row
+
+
+def _batch_group(emp, sheet_name: str, tag: str) -> dict:
+    all_buckets = ("annual", "remote", "sick", "maternity", "unpaid", "absent", "public_holiday")
+    return {
+        "tag": tag,
+        "employee_pk": emp.id, "name": emp.name, "employee_id": emp.employee_id,
+        "note": "matched", "month": 5, "year": 2026,
+        "buckets": {**{b: [] for b in all_buckets}, "annual": ["2026-05-04"]},
+        "working_days": [], "weekend_days": [], "uncertain_days": [],
+        "issues": [], "missing_days": [], "unaccounted_days": [], "days_covered_total": 1,
+        "overlap_flags": [], "fold_notes": [],
+        "sheets": [{
+            "name": sheet_name, "kind": "timesheet",
+            "employee_name": emp.name, "employee_id": emp.employee_id,
+            "month": 5, "year": 2026, "manager_signature": False,
+            "approval_evidence": "", "text": "2026-05-04 annual leave",
+            "working_days": [], "weekend_days": [], "uncertain_days": [],
+            "days_covered": 1, "period_type": "partial", "missing_days": [],
+            **{b: [] for b in all_buckets}, "annual": ["2026-05-04"],
+        }],
+    }
+
+
+async def test_manager_batch_email_files_each_employees_own_sheet_only(client, admin_token):
+    """A manager sending SEVERAL employees' timesheets in ONE email must not
+    result in every employee's vault folder getting everyone else's sheet
+    too. Each employee's own Accept must file ONLY their own attachment —
+    not the whole shared batch email."""
+    from app.services.extract_email.constants import TAG_PREFIX
+    from app.services.extract_email.staging import stage_groups
+
+    h = auth_headers(admin_token)
+    emp_a = await _employee("Multi Test Aisha", "E9922001")
+    emp_b = await _employee("Multi Test Bilal", "E9922002")
+
+    pdf_a = _timesheet_pdf("Multi Test Aisha", "E9922001", "May 2026")
+    pdf_b = _timesheet_pdf("Multi Test Bilal", "E9922002", "May 2026")
+    name_a, name_b = "MultiTestAisha_May2026.pdf", "MultiTestBilal_May2026.pdf"
+    eml_name = "Batch timesheets - May 2026.eml"
+    eml = _eml_with_two_pdfs(pdf_a, name_a, pdf_b, name_b, "Batch timesheets - May 2026")
+
+    from app.core.database import SessionLocal
+    async with SessionLocal() as db:
+        staged = await stage_groups(
+            db, source_kind="email", source_id="BATCH-MSG-1",
+            raw_bytes=eml, raw_name=eml_name, content_type="message/rfc822",
+            groups=[
+                _batch_group(emp_a, name_a, f"{TAG_PREFIX}:batch-a"),
+                _batch_group(emp_b, name_b, f"{TAG_PREFIX}:batch-b"),
+            ],
+            approval={"detected": False, "detail": "No approval."},
+            run_meta={"method": "thread-single-call", "model": "test-model", "calls": 1},
+            thread_key="BATCH-CONV-1",
+        )
+    assert len(staged) == 2
+
+    try:
+        tracked_a = next(t for t in staged if t.employee_name == "Multi Test Aisha")
+        tracked_b = next(t for t in staged if t.employee_name == "Multi Test Bilal")
+        assert tracked_a.id != tracked_b.id
+        assert (tracked_a.extraction_meta["full_email_extract"]["group_count"] == 2)
+
+        async def _accept(tracked, emp_pk):
+            fix = await client.post(
+                f"/api/v1/pipeline/{tracked.id}/manual-fix", headers=h,
+                data={"employee_pk": emp_pk, "month": "5", "year": "2026",
+                      "buckets": json.dumps({"annual": ["2026-05-04"]})},
+            )
+            assert fix.status_code == 200, fix.text
+
+        await _accept(tracked_a, emp_a.id)
+        await _accept(tracked_b, emp_b.id)
+
+        files = _vault_files()
+        assert name_a in files, f"Aisha's own sheet must be filed: {files}"
+        assert name_b in files, f"Bilal's own sheet must be filed: {files}"
+        # Neither employee's folder gets the whole shared batch email.
+        assert eml_name not in files, f"the whole shared batch .eml must not be filed as-is: {files}"
+
+        from app.services import storage_provider as sp
+        provider = sp.get_storage_provider()
+        month_lbl = sp.month_label(5, 2026)
+        aisha_items = [i.name for i in provider.list_items("Unassigned", "Multi Test Aisha", month_lbl)]
+        bilal_items = [i.name for i in provider.list_items("Unassigned", "Multi Test Bilal", month_lbl)]
+        assert aisha_items == [name_a], f"Aisha's folder must contain ONLY her own sheet: {aisha_items}"
+        assert bilal_items == [name_b], f"Bilal's folder must contain ONLY his own sheet: {bilal_items}"
+    finally:
+        from sqlalchemy import delete
+
+        from app.models.pipeline_file import PipelineFile
+        async with SessionLocal() as db:
+            await db.execute(delete(PipelineFile).where(PipelineFile.thread_key == "BATCH-CONV-1"))
+            await db.commit()
+
+
+async def test_single_employee_email_still_files_the_whole_eml(client, admin_token):
+    """The ORIGINAL, deliberate behaviour for a single-employee email must be
+    unchanged: the whole .eml is filed (for provenance — approval, sender,
+    full context), never just the bare attachment. Only a genuinely
+    multi-employee run isolates a specific attachment."""
+    from app.services.extract_email.constants import TAG_PREFIX
+    from app.services.extract_email.staging import stage_groups
+
+    h = auth_headers(admin_token)
+    emp = await _employee("Multi Test Solo", "E9922003")
+    pdf = _timesheet_pdf("Multi Test Solo", "E9922003", "May 2026")
+    name = "MultiTestSolo_May2026.pdf"
+    eml_name = "Solo timesheet - May 2026.eml"
+    eml = _eml_with_pdf(pdf, name, "Solo timesheet - May 2026")
+
+    from app.core.database import SessionLocal
+    async with SessionLocal() as db:
+        staged = await stage_groups(
+            db, source_kind="email", source_id="SOLO-MSG-1",
+            raw_bytes=eml, raw_name=eml_name, content_type="message/rfc822",
+            groups=[_batch_group(emp, name, f"{TAG_PREFIX}:solo-a")],
+            approval={"detected": False, "detail": "No approval."},
+            run_meta={"method": "thread-single-call", "model": "test-model", "calls": 1},
+            thread_key="SOLO-CONV-1",
+        )
+    assert len(staged) == 1
+
+    try:
+        tracked = staged[0]
+        assert tracked.extraction_meta["full_email_extract"]["group_count"] == 1
+        fix = await client.post(
+            f"/api/v1/pipeline/{tracked.id}/manual-fix", headers=h,
+            data={"employee_pk": emp.id, "month": "5", "year": "2026",
+                  "buckets": json.dumps({"annual": ["2026-05-04"]})},
+        )
+        assert fix.status_code == 200, fix.text
+
+        files = _vault_files()
+        assert eml_name in files, f"single-employee email must still file the whole .eml: {files}"
+        assert name not in files, f"attachment must not be filed separately: {files}"
+    finally:
+        from sqlalchemy import delete
+
+        from app.models.pipeline_file import PipelineFile
+        async with SessionLocal() as db:
+            await db.execute(delete(PipelineFile).where(PipelineFile.thread_key == "SOLO-CONV-1"))
+            await db.commit()

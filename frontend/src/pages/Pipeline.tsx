@@ -447,6 +447,11 @@ export default function PipelinePage() {
     queryFn: ({ pageParam }) =>
       fetchPipeline({
         status: statusFilter || undefined,
+        // Succeeded and resolved files are finished work — they'd bury the
+        // rows that actually need someone. Hidden unless their own card is
+        // picked. ("Resolved" also covers backfilled backlog threads that
+        // were deliberately marked done without ever being extracted.)
+        exclude_status: statusFilter ? undefined : "success,resolved",
         source_kind: sourceFilter || undefined,
         thread_key: threadKeyFilter || undefined,
         q: dq || undefined,
@@ -542,9 +547,12 @@ export default function PipelinePage() {
       )}
 
       <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+        {/* Default view. Succeeded AND resolved files are hidden here
+            (finished work), so the count matches the rows actually listed
+            below — their own cards open them on demand. */}
         <StatCard
-          label="All files"
-          value={stats?.total ?? 0}
+          label="Open files"
+          value={Math.max(0, (stats?.total ?? 0) - (stats?.success ?? 0) - (stats?.resolved ?? 0))}
           icon={<Activity className="h-5 w-5 text-slate-600" />}
           tone="bg-slate-100"
           active={statusFilter === ""}
@@ -769,17 +777,10 @@ export default function PipelinePage() {
 
                       <ExtractionSummary staged={staged} fee={fee} />
 
-                      {f.failure_detail && (
-                        <div
-                          className={cn(
-                            "rounded-lg border p-3 text-sm",
-                            f.status === "failed"
-                              ? "border-rose-200 bg-rose-50 text-rose-700"
-                              : "border-amber-200 bg-amber-50 text-amber-800"
-                          )}
-                        >
+                      {f.failure_detail && f.status === "failed" && (
+                        <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
                           <p className="font-semibold">{f.failure_label ?? "Issue"}</p>
-                          <p className="mt-0.5 leading-5">{f.failure_detail}</p>
+                          <p className="mt-0.5 whitespace-pre-wrap leading-5">{f.failure_detail}</p>
                         </div>
                       )}
 

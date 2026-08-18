@@ -12,8 +12,10 @@ from app.api.routes.timesheets import to_out
 from app.core import datacache
 from app.core.database import get_db
 from app.models.employee import Employee
+from app.models.pipeline_file import PipelineFile
 from app.models.timesheet_record import ApprovalStatus, TimesheetRecord, ValidationStatus
 from app.schemas import DashboardRow, DashboardSummary, TimesheetOut
+from app.services.pipeline.coverage import received_subq as _received_subq, staged_employee_pk
 
 router = APIRouter(prefix="/employees", tags=["employees"])
 
@@ -26,7 +28,10 @@ async def coverage(
     location: str | None = Query(default=None, description="DXB | AUH"),
     status: str | None = Query(
         default=None,
-        description="submitted | missing | needs_review | approved | not_approved | pending_approval",
+        description=(
+            "submitted | missing | awaiting_review | needs_review | approved | "
+            "not_approved | pending_approval"
+        ),
     ),
     only_missing: bool = Query(default=False, description="only employees missing the focus month"),
     limit: int = Query(default=200, ge=1, le=500),
@@ -54,6 +59,18 @@ async def coverage(
         TimesheetRecord.year == focus_year, TimesheetRecord.month == focus_month
     )
 
+    # Distinct employee PKs the pipeline positively identified from an EMAILED
+    # sheet for the focus month/year — however far that item got (still
+    # awaiting accept, already filed, or later flagged). This is "sent
+    # something we could read the identity + period from", independent of
+    # whether a reviewer has accepted it into a TimesheetRecord yet — see
+    # services/pipeline/coverage.py (shared with the timesheet export so the
+    # two counts never drift apart). Staging keeps this key through Accept
+    # too, so a filed item still matches it, making `submitted_subq` a proper
+    # SUBSET of this one.
+    received_subq = _received_subq(focus_month, focus_year)
+    staged_pk = staged_employee_pk()
+
     # ---- global headline counts (cached per focus month; busted on writes) ----
     # Inactive employees are excluded from every headline count and from the
     # "missing" roll-up — they're kept in the matcher (records/vault files
@@ -64,6 +81,20 @@ async def coverage(
         submitted = (await db.execute(
             select(func.count()).select_from(
                 select(Employee.id).where(Employee.active.is_(True), Employee.id.in_(submitted_subq)).subquery()
+            ))).scalar_one()
+        received = (await db.execute(
+            select(func.count()).select_from(
+                select(Employee.id).where(Employee.active.is_(True), Employee.id.in_(received_subq)).subquery()
+            ))).scalar_one()
+        # Received but not yet a filed record — sitting in Compare & Fix /
+        # Activity awaiting a human Accept (or mid-reprocessing).
+        awaiting = (await db.execute(
+            select(func.count()).select_from(
+                select(Employee.id).where(
+                    Employee.active.is_(True),
+                    Employee.id.in_(received_subq),
+                    Employee.id.not_in(submitted_subq),
+                ).subquery()
             ))).scalar_one()
         nrev = (await db.execute(
             select(func.count(func.distinct(TimesheetRecord.matched_employee_pk)))
@@ -79,20 +110,34 @@ async def coverage(
                    TimesheetRecord.approval_status != ApprovalStatus.APPROVED,
                    TimesheetRecord.matched_employee_pk.is_not(None),
                    Employee.active.is_(True)))).scalar_one()
+        # Missing = genuinely never sent anything this month — NOT in the
+        # received set (not just "not yet filed").
         sample = (await db.execute(
-            select(Employee.name).where(Employee.active.is_(True), Employee.id.not_in(submitted_subq))
+            select(Employee.name).where(Employee.active.is_(True), Employee.id.not_in(received_subq))
             .order_by(Employee.name).limit(50))).scalars().all()
         return {"total_employees": total, "submitted_this_month": submitted,
+                "received_this_month": received, "awaiting_review_this_month": awaiting,
                 "needs_review": nrev, "pending_approval": pend, "missing_sample": list(sample)}
 
     agg = await datacache.get_or_set(
         datacache.NS_COVERAGE, f"agg:{focus_year}-{focus_month}", datacache.TTL_COVERAGE, _aggregates)
     total_employees = agg["total_employees"]
     submitted_this_month = agg["submitted_this_month"]
-    missing_this_month = max(0, total_employees - submitted_this_month)
+    received_this_month = agg["received_this_month"]
+    awaiting_review_this_month = agg["awaiting_review_this_month"]
+    # total = missing + submitted + awaiting_review, exactly (received =
+    # submitted ∪ awaiting_review, disjoint by construction above).
+    missing_this_month = max(0, total_employees - received_this_month)
     needs_review = agg["needs_review"]
     pending_approval = agg["pending_approval"]
     missing_sample = agg["missing_sample"]
+
+    def _pct(n: int) -> float:
+        return round(n / total_employees * 100, 1) if total_employees else 0.0
+
+    submitted_pct = _pct(submitted_this_month)
+    missing_pct = _pct(missing_this_month)
+    awaiting_review_pct = _pct(awaiting_review_this_month)
 
     # ---- filtered + paginated employee rows ----
     emp_q = select(Employee).where(Employee.active.is_(True))
@@ -107,7 +152,7 @@ async def coverage(
             func.lower(func.coalesce(Employee.location, "")).like(like),
         ))
     if only_missing:
-        emp_q = emp_q.where(Employee.id.not_in(submitted_subq))
+        emp_q = emp_q.where(Employee.id.not_in(received_subq))
 
     # Server-side status filter (applies across the WHOLE matcher, not just the
     # loaded page). Scoped to the focus year so it tracks the dashboard KPIs.
@@ -116,7 +161,9 @@ async def coverage(
         if s == "submitted":
             emp_q = emp_q.where(Employee.id.in_(submitted_subq))
         elif s == "missing":
-            emp_q = emp_q.where(Employee.id.not_in(submitted_subq))
+            emp_q = emp_q.where(Employee.id.not_in(received_subq))
+        elif s == "awaiting_review":
+            emp_q = emp_q.where(Employee.id.in_(received_subq), Employee.id.not_in(submitted_subq))
         elif s == "needs_review":
             emp_q = emp_q.where(Employee.id.in_(_pk_subq(
                 TimesheetRecord.year == focus_year,
@@ -149,6 +196,20 @@ async def coverage(
         for r in precs:
             by_pk.setdefault(r.matched_employee_pk, []).append(r)
 
+    # Same page's "received this month" set (see received_subq above) — lets
+    # each row distinguish "awaiting review" (sent, not yet filed) from a true
+    # "missing" without a second round trip per row.
+    page_received_pks: set[str] = set()
+    if page_pks:
+        page_received_pks = set((await db.execute(
+            select(staged_pk).where(
+                PipelineFile.source_kind == "email",
+                PipelineFile.month == focus_month,
+                PipelineFile.year == focus_year,
+                staged_pk.in_(page_pks),
+            ).distinct()
+        )).scalars().all())
+
     rows: list[DashboardRow] = []
     for e in page_emps:
         items = by_pk.get(e.id, [])
@@ -167,6 +228,7 @@ async def coverage(
             focus_record_id=focus_rec.id if focus_rec else None,
             focus_validation_status=focus_rec.validation_status if focus_rec else None,
             focus_approval_status=focus_rec.approval_status if focus_rec else None,
+            awaiting_review_this_month=bool(e.id in page_received_pks and not focus_rec),
         ))
 
     # missing_sample (for the KPI tooltip) is part of the cached aggregates above.
@@ -175,6 +237,8 @@ async def coverage(
         total_employees=total_employees,
         submitted_this_month=submitted_this_month,
         missing_this_month=missing_this_month,
+        awaiting_review_this_month=awaiting_review_this_month,
+        submitted_pct=submitted_pct, missing_pct=missing_pct, awaiting_review_pct=awaiting_review_pct,
         needs_review=needs_review, pending_approval=pending_approval,
         missing_employees=list(missing_sample),
         rows=rows, filtered_total=filtered_total, limit=limit, offset=offset,

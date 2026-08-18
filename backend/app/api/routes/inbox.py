@@ -128,9 +128,18 @@ async def _extract_email_times(
     """Latest Extract Email timestamp per inbox message.
 
     Extract Email reads the WHOLE conversation, so a run started from any
-    message counts as "this thread has been extracted" for every message in
-    it. Without that, a new reply looks unprocessed even though its thread was
-    just read — and re-running would only re-read the same conversation.
+    message counts as "this thread has been extracted" for every message that
+    existed AT THE TIME of that run. Without that, a reply already folded into
+    the run would look unprocessed even though its thread was just read — and
+    re-running would only re-read the same conversation.
+
+    But a message that arrives AFTER the last run is genuinely new — it must
+    NOT inherit that timestamp, or a fresh reply shows the same "Extracted"
+    badge as the old, already-read messages right up until someone opens the
+    thread (the one place this was compared correctly, client-side). Auto
+    Extract's own skip check already gets this right (thread_extract.py /
+    auto_extract.py compare per-message), so this brings the list/thread
+    badges the rest of the UI reads in line with the same rule.
     """
     if not msg_ids:
         return {}
@@ -165,7 +174,14 @@ async def _extract_email_times(
         }
         for r in (rows or []):
             at = by_conv.get(r.conversation_id)
-            if at and (r.provider_message_id not in out or out[r.provider_message_id] < at):
+            if not at:
+                continue
+            # This message arrived AFTER the thread's last extraction run —
+            # it wasn't part of what was read, so it stays "New", not
+            # "Extracted", regardless of what the rest of its thread shows.
+            if r.received_at is not None and r.received_at > at:
+                continue
+            if r.provider_message_id not in out or out[r.provider_message_id] < at:
                 out[r.provider_message_id] = at
     return out
 
@@ -383,6 +399,14 @@ async def auto_extract_status():
     """Live progress: state, processed/total, which thread is in flight."""
     from app.services.extract_email import auto_extract
     return await auto_extract.get_status()
+
+
+@router.get("/auto-extract/coverage")
+async def auto_extract_coverage(db: AsyncSession = Depends(get_db)):
+    """How many threads, mailbox-wide, show the Extracted badge right now —
+    see auto_extract.coverage() for exactly what's counted."""
+    from app.services.extract_email import auto_extract
+    return await auto_extract.coverage(db)
 
 
 async def _build_email_detail(db: AsyncSession, provider, row: EmailMessage) -> EmailDetail:
@@ -692,6 +716,9 @@ class SaveEmlToVaultIn(BaseModel):
     employee: str
     month: int
     year: int
+    # Matcher row id — when set, vault folder gets ACO/DCO in the name
+    # (same label Accept uses). Optional so older clients still work.
+    employee_pk: str | None = None
 
 
 @router.post("/{provider_message_id}/as-eml/save-to-vault")
@@ -699,17 +726,29 @@ async def save_eml_to_vault(
     provider_message_id: str, body: SaveEmlToVaultIn, db: AsyncSession = Depends(get_db),
 ):
     """Save the full .eml straight into the File Vault under the chosen
-    Manager / Employee / Month folder."""
+    Manager / Employee / Month folder. Employee folder name includes ACO/DCO
+    when the matcher row is known (same as Compare & Fix Accept)."""
     if not (1 <= body.month <= 12) or body.year < 2000:
         raise HTTPException(400, "Invalid month/year")
+    from app.models.employee import Employee
     from app.services import storage_provider as sp
     from app.services.inbox.eml_export import build_full_eml
     row = await _email_row_or_404(db, provider_message_id)
     data, fname = await build_full_eml(get_email_provider(), row)
-    rel = sp.save_file(body.manager.strip() or "Unknown",
-                       body.employee.strip() or "Unknown",
-                       body.month, body.year, fname, data)
-    return {"saved": True, "path": rel, "filename": fname}
+
+    mgr = (body.manager or "").strip() or "Unknown"
+    emp_folder = (body.employee or "").strip() or "Unknown"
+    if body.employee_pk:
+        emp = (await db.execute(
+            select(Employee).where(Employee.id == body.employee_pk)
+        )).scalar_one_or_none()
+        if emp is not None:
+            mgr = (emp.account_manager or "").strip() or mgr
+            emp_folder = sp.ensure_employee_folder(
+                mgr, emp.name, emp.aco_number, emp.dco_number)
+
+    rel = sp.save_file(mgr, emp_folder, body.month, body.year, fname, data)
+    return {"saved": True, "path": rel, "filename": fname, "employee_folder": emp_folder}
 
 
 # Server-side render of DOCX/XLSX attachments to page images (previews that

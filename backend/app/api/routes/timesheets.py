@@ -12,7 +12,8 @@ from app.core.http_headers import content_disposition
 from app.models.employee import Employee
 from app.models.timesheet_record import ApprovalStatus, TimesheetRecord
 from app.schemas import ApprovalIn, TimesheetExportOut, TimesheetOut, TimesheetUpdate
-from app.services.export.timesheet_export import build_timesheet_xlsx, employees_grid_rows
+from app.services.export.timesheet_export import build_timesheet_xlsx, employees_grid_rows, status_for
+from app.services.pipeline.coverage import received_employee_pks
 
 router = APIRouter(prefix="/timesheets", tags=["timesheets"])
 
@@ -71,10 +72,13 @@ def to_export_out(r: TimesheetRecord, emp: Employee | None) -> TimesheetExportOu
         employee_email=(emp.employee_email_id if emp else None),
         contact_no=(emp.contact_no if emp else None),
         has_record=True,
+        status=status_for(True, emp.id if emp else None, set()),
     )
 
 
-def empty_export_out(emp: Employee, month: int, year: int) -> TimesheetExportOut:
+def empty_export_out(
+    emp: Employee, month: int, year: int, received_pks: set[str] | None = None,
+) -> TimesheetExportOut:
     return TimesheetExportOut(
         id=emp.id,
         employee_id=emp.employee_id,
@@ -120,13 +124,16 @@ def empty_export_out(emp: Employee, month: int, year: int) -> TimesheetExportOut
         employee_email=emp.employee_email_id,
         contact_no=emp.contact_no,
         has_record=False,
+        status=status_for(False, emp.id, received_pks or set()),
     )
 
 
 async def _export_grid(
     db: AsyncSession, month: int, year: int,
-) -> tuple[list[Employee], dict[str, TimesheetRecord]]:
-    """All matcher employees + any filed record for that month keyed by employee PK."""
+) -> tuple[list[Employee], dict[str, TimesheetRecord], set[str]]:
+    """All matcher employees + any filed record for that month keyed by employee
+    PK, plus the set of employee PKs the pipeline received a sheet for (whether
+    or not it's been filed yet) — same source as the dashboard's coverage."""
     employees = (
         await db.execute(select(Employee).order_by(Employee.name))
     ).scalars().all()
@@ -140,7 +147,8 @@ async def _export_grid(
         )
     ).scalars().all()
     records_by_pk = {r.matched_employee_pk: r for r in period_records if r.matched_employee_pk}
-    return list(employees), records_by_pk
+    received_pks = await received_employee_pks(db, month, year)
+    return list(employees), records_by_pk, received_pks
 
 
 @router.get("/export")
@@ -150,8 +158,8 @@ async def export_period(
     db: AsyncSession = Depends(get_db),
 ):
     """Download all matcher employees for one month as XLSX (empty cells if not filed)."""
-    employees, records_by_pk = await _export_grid(db, month, year)
-    rows = employees_grid_rows(employees, records_by_pk, month, year)
+    employees, records_by_pk, received_pks = await _export_grid(db, month, year)
+    rows = employees_grid_rows(employees, records_by_pk, month, year, received_pks)
     data = build_timesheet_xlsx(rows, month, year)
     fname = f"timesheets_{year}-{month:02d}.xlsx"
     return Response(
@@ -168,14 +176,14 @@ async def list_by_period(
     db: AsyncSession = Depends(get_db),
 ):
     """All matcher employees for one month — filed rows filled, others empty."""
-    employees, records_by_pk = await _export_grid(db, month, year)
+    employees, records_by_pk, received_pks = await _export_grid(db, month, year)
     out: list[TimesheetExportOut] = []
     for emp in employees:
         rec = records_by_pk.get(emp.id)
         if rec:
             out.append(to_export_out(rec, emp))
         else:
-            out.append(empty_export_out(emp, month, year))
+            out.append(empty_export_out(emp, month, year, received_pks))
     return out
 
 
@@ -329,8 +337,31 @@ async def delete_record(record_id: str, db: AsyncSession = Depends(get_db)):
     if not r:
         raise HTTPException(404, "Record not found")
     await db.delete(r)
+
+    # The pipeline tracker row that filed this record still points at it
+    # (record_id, status=success) — left alone, its "View record" link 404s
+    # forever (the record is gone) and the Pipeline page keeps reporting a
+    # success that no longer exists. Un-link it and report it honestly.
+    from datetime import datetime, timezone
+
+    from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStatus
+    trackers = (await db.execute(
+        select(PipelineFile).where(PipelineFile.record_id == record_id))).scalars().all()
+    for t in trackers:
+        t.record_id = None
+        t.status = PipelineStatus.FAILED
+        t.failure_code = FailureCode.RECORD_DELETED
+        t.failure_detail = "The timesheet record this file filed was deleted."
+        t.events = (t.events or []) + [{
+            "stage": "recorded", "status": "warn",
+            "detail": "Record deleted — no longer filed.",
+            "at": datetime.now(timezone.utc).isoformat(),
+        }]
+
     await db.commit()
     await datacache.bust_coverage()
+    if trackers:
+        await datacache.bust_pipeline()
     return {"deleted": record_id}
 
 

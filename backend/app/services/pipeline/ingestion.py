@@ -90,6 +90,57 @@ def purge_raw_copy(t: PipelineFile) -> None:
     t.raw_path = None
 
 
+def isolate_employee_attachments(t: PipelineFile, raw_bytes: bytes) -> list[tuple[str, str, bytes]] | None:
+    """For an email that carried MULTIPLE employees' sheets at once (a manager
+    sending 8 people's timesheets in one message), pull out ONLY this
+    employee's own attachment(s) from the shared raw copy — instead of
+    filing the whole multi-employee bundle into every one of their vault
+    folders.
+
+    Returns None whenever it's not safe to guess, and the caller should file
+    the whole raw copy exactly as it always has:
+      - this wasn't a multi-employee run (single-employee email keeps its
+        existing, deliberate "file the whole .eml for provenance" behaviour
+        — see test_eml_attachment_not_stored_separately_with_provenance),
+      - or isolation can't find EVERY one of this employee's own sheets by
+        filename in the raw copy (ambiguous/altered/not an email at all).
+    Filing the full context is always safe; filing the wrong slice of
+    someone else's data is not, so any doubt falls back rather than guesses.
+    """
+    if t.source_kind != "email":
+        return None
+    meta = (t.extraction_meta or {}).get("full_email_extract") or {}
+    if int(meta.get("group_count") or 1) <= 1:
+        return None
+    wanted = [s.get("filename") for s in (meta.get("sheets") or []) if s.get("filename")]
+    if not wanted:
+        return None
+
+    from app.services.extraction.file_processor import eml_all_attachments
+    try:
+        found = eml_all_attachments(raw_bytes)
+    except Exception:
+        return None
+    by_name: dict[str, tuple[bytes, str]] = {}
+    for name, payload, ftype in found:
+        by_name.setdefault(name, (payload, ftype))
+
+    import mimetypes as _mt
+    matched: list[tuple[str, str, bytes]] = []
+    seen: set[str] = set()
+    for fn in wanted:
+        if fn in seen:
+            continue
+        hit = by_name.get(fn)
+        if hit is None:
+            return None  # any miss -> don't guess, file the whole thing instead
+        payload, _ftype = hit
+        ct = _mt.guess_type(fn)[0] or "application/octet-stream"
+        matched.append((fn, ct, payload))
+        seen.add(fn)
+    return matched or None
+
+
 def relocate_legacy_pipeline_raw() -> None:
     """One-time cleanup: older builds stored retry copies under
     storage/_pipeline/<id>/, which made them appear in the File Vault. Move any
@@ -207,6 +258,9 @@ async def ingest_manual_entry(
     matched = (await db.execute(select(Employee).where(Employee.id == employee_pk))).scalar_one_or_none()
     if not matched:
         raise ValueError("Selected employee was not found in the matcher list.")
+    # Fresh read so ACO/DCO added after the row was first loaded in this
+    # session (or via import) always land in the vault folder name.
+    await db.refresh(matched)
 
     employee_name = matched.name
     account_manager = matched.account_manager
@@ -259,14 +313,18 @@ async def ingest_manual_entry(
     folder_rel = None
     storage_warn = None
     try:
+        # Folder name carries the person's ACO/DCO numbers, and migrates an
+        # older folder of theirs if those numbers were added/corrected later.
+        emp_folder = sp.ensure_employee_folder(
+            account_manager, employee_name, matched.aco_number, matched.dco_number)
         for (fn, _ct, dat) in attachments:
             # Store exactly what was handed in — the .eml (or the uploaded
             # sheet) as one file. Nested attachments/inline images inside an
             # .eml are NOT filed separately: they already live inside the
             # .eml itself, and filing them again duplicated real sheets and
             # littered the vault with signature logos/banners.
-            sp.save_file(account_manager, employee_name, month, year, fn, dat)
-        folder_rel = sp.folder_rel(account_manager, employee_name, month, year)
+            sp.save_file(account_manager, emp_folder, month, year, fn, dat)
+        folder_rel = sp.folder_rel(account_manager, emp_folder, month, year)
         _event(tracker, PipelineStage.FILING, "ok", f"Filed under {folder_rel}.")
     except Exception as e:
         storage_warn = f"Could not file on disk: {str(e)[:200]}"

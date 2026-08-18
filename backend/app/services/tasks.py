@@ -151,13 +151,25 @@ def sync_inbox_task():
     already in the DB by the time someone looks, instead of only syncing
     as a side effect of loading the page. Shares the same throttle/lock as
     the on-demand sync in GET /inbox and /inbox/threads, so this never
-    duplicates a sync a request just did (or vice versa)."""
+    duplicates a sync a request just did (or vice versa).
+
+    Also the ONLY place Auto Extract's "watch for new mail" mode re-triggers
+    a run — deliberately not from the on-demand sync inside GET /inbox: that
+    path runs inline in the request, and with CELERY_TASK_ALWAYS_EAGER (dev/
+    tests) a triggered run would execute synchronously and block that page
+    load. This task is already background work either way, so triggering
+    from here costs a page-load nothing in any environment. Only bothers
+    checking when the provider actually returned something this tick — most
+    ticks find nothing new and skip the check entirely."""
     from app.core.database import SessionLocal
+    from app.services.extract_email import auto_extract
     from app.services.inbox.sync import sync_inbox
 
     async def _run():
         async with SessionLocal() as db:
-            await sync_inbox(db)
+            fetched = await sync_inbox(db)
+        if fetched and await auto_extract.is_enabled():
+            await auto_extract.start()
 
     return _run_coro(_run)
 

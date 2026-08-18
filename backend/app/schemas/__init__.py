@@ -208,6 +208,10 @@ class TimesheetExportOut(TimesheetOut):
     employee_email: str | None = None
     contact_no: str | None = None
     has_record: bool = True
+    # "Received & Stored" | "Received & Not Stored" | "Not Received" — same
+    # three-way split as the dashboard's submitted/awaiting-review/missing
+    # (see app/services/export/timesheet_export.py's ExportStatus).
+    status: str = ""
 
 
 class DashboardRow(BaseModel):
@@ -231,14 +235,21 @@ class DashboardRow(BaseModel):
     focus_record_id: str | None = None
     focus_validation_status: str | None = None
     focus_approval_status: str | None = None
+    # True when this employee emailed a sheet for the focus month (the
+    # pipeline identified them) but it hasn't been accepted into a record yet.
+    awaiting_review_this_month: bool = False
 
 
 class DashboardSummary(BaseModel):
     year: int
     month: int                       # focus month for the "missing" figure
     total_employees: int             # employees in the matcher (global)
-    submitted_this_month: int        # global
-    missing_this_month: int          # global
+    submitted_this_month: int        # received AND filed into a record — global
+    missing_this_month: int          # sent NOTHING at all for this month — global
+    awaiting_review_this_month: int  # sent something, not yet filed — global
+    submitted_pct: float = 0.0
+    missing_pct: float = 0.0
+    awaiting_review_pct: float = 0.0
     needs_review: int                # employees with at least one flagged record (global)
     pending_approval: int            # employees with at least one unapproved record (global)
     missing_employees: list[str] = []  # sample of names missing the focus month
@@ -281,6 +292,7 @@ class SourceFile(BaseModel):
 class EmployeeIn(BaseModel):
     employee_id: str
     name: str
+    aco_number: str | None = None
     dco_number: str | None = None
     account_manager: str | None = None
     employee_email_id: str | None = None
@@ -382,6 +394,59 @@ class ImportSummary(BaseModel):
     inserted: int
     updated: int
     skipped: int
+    skipped_details: list[SkipDetail] = []
+
+
+# ---- employee import DRY RUN (POST /employee-matcher/import/preview) ----
+class ImportFieldChange(BaseModel):
+    field: str
+    old: str | None = None
+    new: str | None = None
+
+
+class ImportPlanAdd(BaseModel):
+    employee_id: str
+    name: str
+    location: str | None = None
+    project: str | None = None
+    account_manager: str | None = None
+    employee_email_id: str | None = None
+    contact_no: str | None = None
+    aco_number: str | None = None
+    dco_number: str | None = None
+    sheet: str | None = None
+    row: int | None = None
+    # Same ID + office already exists under another name — likely a rename.
+    # Flagged for a human; never auto-merged.
+    possible_rename_of: str | None = None
+
+
+class ImportPlanUpdate(BaseModel):
+    id: str
+    employee_id: str
+    name: str
+    location: str | None = None
+    changes: list[ImportFieldChange]
+
+
+class ImportPlanExisting(BaseModel):
+    id: str
+    employee_id: str
+    name: str
+    location: str | None = None
+    account_manager: str | None = None
+    employee_email_id: str | None = None
+    active: bool = True
+
+
+class ImportPlan(BaseModel):
+    """What an uploaded file WOULD do — shown for confirmation before any
+    write. `missing_from_file` is informational only: import never deletes."""
+    to_add: list[ImportPlanAdd]
+    to_update: list[ImportPlanUpdate]
+    unchanged: list[ImportPlanExisting]
+    missing_from_file: list[ImportPlanExisting]
+    skipped: list[SkipDetail]
 
 
 class PublicHolidayIn(BaseModel):

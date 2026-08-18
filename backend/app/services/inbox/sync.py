@@ -95,34 +95,54 @@ async def sync_message(db: AsyncSession, msg) -> EmailMessage:
     return row
 
 
-async def sync_inbox(db: AsyncSession) -> None:
+async def _has_any_email(db: AsyncSession) -> bool:
+    return (
+        await db.execute(select(func.count()).select_from(EmailMessage))
+    ).scalar_one() > 0
+
+
+async def sync_inbox(db: AsyncSession) -> int | None:
     """Throttled, incremental provider sync. Never blocks the caller on a full
     mailbox download:
 
     - fresh (synced < INBOX_SYNC_MIN_INTERVAL_SECONDS ago) → no-op, serve DB;
     - otherwise ask the provider only for messages received after the LAST
       SUCCESSFUL SYNC (one small request). A full folder crawl happens only
-      when there is no sync marker (first boot / cache flushed);
+      when there is no sync marker (first boot / cache flushed) OR the table
+      is empty despite a marker existing (Postgres was wiped/restored without
+      also clearing the Redis cursor — trust the DB's actual content over a
+      stale cursor rather than silently syncing "nothing new" forever);
     - any provider/cache error → serve existing DB rows, never raise.
+
+    Returns how many messages the provider handed back this call, or None if
+    this call was skipped entirely (still fresh, or another sync already in
+    flight). `sync_inbox_task` uses that count to decide whether it's worth
+    re-triggering Auto Extract — no point checking on a tick that changed
+    nothing.
     """
     try:
         if await cache.exists(SYNC_FRESH_KEY) or await cache.exists(SYNC_LOCK_KEY):
-            return
+            return None
         await cache.set(SYNC_LOCK_KEY, True, ttl=60)
     except Exception:
-        return  # cache layer down → skip sync, DB rows still serve
+        return None  # cache layer down → skip sync, DB rows still serve
     try:
         last = await cache.get(SYNC_LAST_KEY)
         since = (datetime.fromtimestamp(float(last), tz=timezone.utc) - SYNC_OVERLAP) if last else None
+        if since is not None and not await _has_any_email(db):
+            since = None
         started_at = datetime.now(timezone.utc).timestamp()
         provider = get_email_provider()
-        for m in await provider.list_messages(None, since=since):
+        messages = await provider.list_messages(None, since=since)
+        for m in messages:
             await sync_message(db, m)
         await db.commit()
         await cache.set(SYNC_LAST_KEY, started_at)
         await cache.set(SYNC_FRESH_KEY, True, ttl=settings.inbox_sync_min_interval_seconds)
+        return len(messages)
     except Exception:
         await db.rollback()
+        return None
     finally:
         try:
             await cache.delete(SYNC_LOCK_KEY)

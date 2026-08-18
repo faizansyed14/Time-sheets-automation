@@ -8,7 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import datacache
 from app.core.database import get_db
 from app.models.employee import Employee
-from app.schemas import EmployeeIn, EmployeeOut, EmployeeStatusIn, ImportSummary
+from app.schemas import (
+    EmployeeIn,
+    EmployeeOut,
+    EmployeeStatusIn,
+    ImportPlan,
+    ImportSummary,
+)
 
 router = APIRouter(prefix="/employee-matcher", tags=["employee-matcher"])
 
@@ -18,6 +24,7 @@ def _out(e: Employee) -> EmployeeOut:
         id=e.id,
         employee_id=e.employee_id,
         name=e.name,
+        aco_number=e.aco_number,
         dco_number=e.dco_number,
         account_manager=e.account_manager,
         employee_email_id=e.employee_email_id,
@@ -91,12 +98,34 @@ async def set_employee_status(pk: str, body: EmployeeStatusIn, db: AsyncSession 
     return _out(e)
 
 
+@router.post("/import/preview", response_model=ImportPlan, status_code=200)
+async def preview_import_from_excel(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Dry run — exactly what this file would add/update/leave alone, plus who
+    is in the matcher but NOT in the file. Writes nothing; the UI shows this
+    for confirmation and only then POSTs the same file to /import."""
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(400, "Only .xlsx files are accepted.")
+    data = await file.read()
+    from app.services.employee.import_service import build_import_plan
+    try:
+        return await build_import_plan(db, data)
+    except Exception as exc:
+        raise HTTPException(500, f"Could not read this file: {exc}") from exc
+
+
 @router.post("/import", response_model=ImportSummary, status_code=200)
 async def import_from_excel(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
-    """Import/upsert employees from a .xlsx file containing DXB and AUH sheets."""
+    """Import employees from a .xlsx file containing DXB and AUH sheets.
+
+    Additive only: inserts new people and updates changed fields on existing
+    ones. Nobody is ever deleted or deactivated by an import, and a blank
+    cell never erases a stored value."""
     if not file.filename or not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(400, "Only .xlsx files are accepted.")
     data = await file.read()

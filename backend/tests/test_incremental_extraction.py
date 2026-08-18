@@ -119,6 +119,90 @@ async def test_since_with_nothing_newer_falls_back_to_full_thread():
 
 
 # --------------------------------------------------------------------------
+# The message cap — settings.max_thread_messages (configurable; a manager's
+# reminder that many people reply to independently needs a higher ceiling
+# than a normal back-and-forth, or the older replies are silently dropped).
+# --------------------------------------------------------------------------
+
+async def test_a_thread_longer_than_the_cap_keeps_only_the_newest_n(monkeypatch):
+    from app.core.config import settings
+    from app.services.extract_email.thread_collect import collect_thread_emls
+
+    monkeypatch.setattr(settings, "max_thread_messages", 3)
+
+    base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    msgs = [_provider_message(f"m{i}", f"msg {i}", base + dt.timedelta(days=i))
+            for i in range(1, 8)]   # 7 messages, cap is 3
+    raw = {m.message_id: _raw_eml(m.subject) for m in msgs}
+    provider = _FakeProvider(msgs, raw)
+
+    class _Anchor:
+        conversation_id = "conv-window"
+        provider_message_id = "m7"
+        subject = "msg 7"
+
+    fetched, notes = await collect_thread_emls(provider, _Anchor(), since=None)
+
+    subjects = [lbl.split(" — ", 1)[1] if " — " in lbl else lbl for lbl, _ in fetched]
+    assert subjects == ["msg 5", "msg 6", "msg 7"], "must keep the NEWEST 3, not the oldest"
+    assert any("only the newest 3" in n for n in notes), notes
+
+
+async def test_a_thread_at_or_under_the_cap_is_not_trimmed(monkeypatch):
+    from app.core.config import settings
+    from app.services.extract_email.thread_collect import collect_thread_emls
+
+    monkeypatch.setattr(settings, "max_thread_messages", 3)
+
+    base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    msgs = [_provider_message(f"m{i}", f"msg {i}", base + dt.timedelta(days=i))
+            for i in range(1, 4)]   # exactly 3 messages, cap is 3
+    raw = {m.message_id: _raw_eml(m.subject) for m in msgs}
+    provider = _FakeProvider(msgs, raw)
+
+    class _Anchor:
+        conversation_id = "conv-window"
+        provider_message_id = "m3"
+        subject = "msg 3"
+
+    fetched, notes = await collect_thread_emls(provider, _Anchor(), since=None)
+
+    assert len(fetched) == 3
+    assert not any("were NOT read" in n for n in notes)
+
+
+async def test_raising_the_cap_covers_a_mass_reply_thread_that_the_default_would_drop(monkeypatch):
+    """The exact scenario the configurable cap exists for: a manager's
+    reminder with ~30 independent replies. With the default cap (15) more
+    than half would be silently dropped; raising it (as done via
+    settings.max_thread_messages, matching production config) covers all of
+    them in one read."""
+    from app.core.config import settings
+    from app.services.extract_email.thread_collect import collect_thread_emls
+
+    base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    msgs = [_provider_message(f"m{i}", f"msg {i}", base + dt.timedelta(minutes=i))
+            for i in range(1, 32)]   # 1 reminder + 30 replies = 31 messages
+    raw = {m.message_id: _raw_eml(m.subject) for m in msgs}
+    provider = _FakeProvider(msgs, raw)
+
+    class _Anchor:
+        conversation_id = "conv-window"
+        provider_message_id = "m31"
+        subject = "msg 31"
+
+    monkeypatch.setattr(settings, "max_thread_messages", 15)
+    fetched_default, notes_default = await collect_thread_emls(provider, _Anchor(), since=None)
+    assert len(fetched_default) == 15
+    assert any("16 older message" in n for n in notes_default), notes_default
+
+    monkeypatch.setattr(settings, "max_thread_messages", 40)
+    fetched_raised, notes_raised = await collect_thread_emls(provider, _Anchor(), since=None)
+    assert len(fetched_raised) == 31, "every reply must be read once the cap covers the whole thread"
+    assert notes_raised == []
+
+
+# --------------------------------------------------------------------------
 # Thread-wide cache aggregation — sheet_cache.py
 # --------------------------------------------------------------------------
 

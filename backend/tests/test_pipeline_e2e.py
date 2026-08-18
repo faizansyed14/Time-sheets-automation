@@ -94,6 +94,68 @@ async def test_coverage_pagination_and_search(client, admin_token):
     assert any(r["employee_name"] == "Tester" for r in s.json()["rows"])
 
 
+async def test_coverage_missing_vs_awaiting_review_vs_submitted(client, admin_token):
+    """Missing / Submitted / Awaiting-review must exactly partition the active
+    roster for a focus month. An employee who emailed a sheet the pipeline
+    could read (a PipelineFile with extraction_meta.staged.employee_pk) but
+    that hasn't been accepted into a TimesheetRecord yet must show as
+    "awaiting review", never "missing" — missing means no email at all."""
+    from sqlalchemy import delete
+    from app.core import datacache
+    from app.core.database import SessionLocal
+    from app.models.pipeline_file import PipelineFile, PipelineStatus
+
+    h = auth_headers(admin_token)
+    YEAR, MONTH = 2031, 7  # a period no other test touches
+
+    emp = await client.post("/api/v1/employee-matcher", headers=h,
+                            json={"employee_id": "COV-1", "name": "Coverage Case", "location": "DXB"})
+    assert emp.status_code == 201, emp.text
+    pk = emp.json()["id"]
+
+    async def _cov(**params):
+        r = await client.get("/api/v1/employees/coverage", headers=h,
+                             params={"year": YEAR, "month": MONTH, "limit": 500, **params})
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    before = await _cov()
+    total = before["total_employees"]
+    assert before["missing_this_month"] + before["submitted_this_month"] + before["awaiting_review_this_month"] == total
+    row_before = next(r for r in before["rows"] if r["employee_pk"] == pk)
+    assert row_before["awaiting_review_this_month"] is False
+
+    async with SessionLocal() as db:
+        db.add(PipelineFile(
+            filename="sheet.pdf", source_kind="email", source_id="COV-msg-1",
+            thread_key="COV-msg-1", attachment_id="pass1:covtest",
+            status=PipelineStatus.NEEDS_REVIEW, employee_id="COV-1", employee_name="Coverage Case",
+            month=MONTH, year=YEAR,
+            extraction_meta={"staged": {"employee_pk": pk}},
+        ))
+        await db.commit()
+    await datacache.bust_coverage()  # direct DB write bypasses the usual bust_pipeline() call
+
+    try:
+        mid = await _cov()
+        assert mid["missing_this_month"] + mid["submitted_this_month"] + mid["awaiting_review_this_month"] == total
+        assert mid["awaiting_review_this_month"] == before["awaiting_review_this_month"] + 1
+        assert mid["missing_this_month"] == before["missing_this_month"] - 1
+        assert mid["submitted_this_month"] == before["submitted_this_month"]
+        row = next(r for r in mid["rows"] if r["employee_pk"] == pk)
+        assert row["awaiting_review_this_month"] is True
+
+        awaiting = await _cov(status="awaiting_review")
+        assert any(r["employee_pk"] == pk for r in awaiting["rows"])
+        missing = await _cov(status="missing")
+        assert not any(r["employee_pk"] == pk for r in missing["rows"])
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(delete(PipelineFile).where(PipelineFile.thread_key == "COV-msg-1"))
+            await db.commit()
+        await datacache.bust_coverage()
+
+
 async def test_inbox_pagination(client, admin_token):
     h = auth_headers(admin_token)
     r = await client.get("/api/v1/inbox?limit=3", headers=h)

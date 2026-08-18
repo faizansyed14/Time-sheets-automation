@@ -81,6 +81,10 @@ class Thread:
     messages: list[Message] = field(default_factory=list)
     items: list[Item] = field(default_factory=list)
     dropped: list[dict] = field(default_factory=list)   # items filtered out (size/OCR noise)
+    # Outer .eml/.msg filenames that were unwrapped (Inbox lists these; the
+    # analysable items are the PDFs/images inside). Recorded for Extracted/New
+    # badges so nested containers don't look "New" after a successful run.
+    opened_containers: list[dict] = field(default_factory=list)
 
     @property
     def n_images(self) -> int:
@@ -483,6 +487,12 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
                 sub = _email.message_from_bytes(sub_bytes, policy=_email.policy.default)
             except Exception:
                 return
+            # Inbox shows THIS outer filename; remember it so the Extracted
+            # badge matches what the user sees (inner PDF names alone don't).
+            th.opened_containers.append({
+                "name": name or "unnamed",
+                "digest": _content_digest(payload),
+            })
             walk(sub, depth + 1)
             return
 
@@ -548,6 +558,18 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
                 payload = part.get_payload()
                 sub = payload[0] if isinstance(payload, list) and payload else payload
                 if sub is not None and depth + 1 <= MAX_EML_DEPTH:
+                    # Outlook lists these as named .eml attachments — record
+                    # the outer filename for the Extracted badge.
+                    fname = part.get_filename()
+                    if fname:
+                        try:
+                            raw = sub.as_bytes() if hasattr(sub, "as_bytes") else b""
+                        except Exception:
+                            raw = b""
+                        th.opened_containers.append({
+                            "name": fname,
+                            "digest": _content_digest(raw or fname.encode()),
+                        })
                     walk(sub, depth + 1)
                 return
             if part.is_multipart():
@@ -907,7 +929,9 @@ async def extract_thread_sheets(
         fresh_items = []
         for it in th.items:
             entry = cached_sheets.get(it.digest) if it.digest else None
-            if entry is not None:
+            # badge_only entries mark nested .eml containers — never sheets.
+            if (entry is not None and entry.get("sheet")
+                    and not entry.get("badge_only")):
                 window_cached_sheets.append(entry["sheet"])
             else:
                 fresh_items.append(it)
@@ -915,6 +939,7 @@ async def extract_thread_sheets(
     external_sheets = [
         entry["sheet"] for digest, entry in cached_sheets.items()
         if digest not in all_window_digests
+        and entry.get("sheet") and not entry.get("badge_only")
     ]
     reused_sheets = window_cached_sheets + external_sheets
     if reused_sheets:
@@ -927,6 +952,7 @@ async def extract_thread_sheets(
         "method": "thread-two-pass", "model": None, "calls": 0,
         "sheet_count": len(reused_sheets), "errors": [], "skipped": th.dropped,
         "conflicts": [], "summary": "", "summary_obj": None,
+        "_opened_containers": list(th.opened_containers),
     }
     if not th.items and not any(m.body.strip() for m in th.messages):
         if reused_sheets:
@@ -946,6 +972,11 @@ async def extract_thread_sheets(
          f"({len(batches)} call(s))…",
          pass_no=1, model=model, message_count=len(messages))
 
+    # Collected here rather than only inside `meta` so pass 2's own failures
+    # below can keep appending to the SAME list — one combined picture of
+    # what this run could not read, regardless of which pass hit it.
+    batch_errors: list[str] = []
+
     all_items: list = []
     thread_summary = ""
     for bi, batch in enumerate(batches, 1):
@@ -953,8 +984,33 @@ async def extract_thread_sheets(
                 f"items below; classify ONLY those. Other batches cover the rest, but all "
                 f"message bodies are included so you have full approval context."
                 if len(batches) > 1 else "")
-        data = await triage_prompt.run_pass1_batch(th, batch, note, model, api_key, label=f"pass1-batch{bi}")
+        # Sent -> received bracket around the actual network call, so the live
+        # UI can show "waiting for a response" instead of a step that looks
+        # frozen for however long one vision call takes — and, with more than
+        # one batch, exactly which one is in flight right now.
+        emit("pass1", "spin",
+             f"Pass 1 — sending batch {bi} of {len(batches)} ({len(batch)} item(s)) to {model}…",
+             pass_no=1, model=model, batch_index=bi, batch_total=len(batches), batch_phase="sent")
+        # A batch that ultimately fails (the model call's own internal
+        # retries already exhausted) must not throw away every OTHER batch's
+        # results — a long thread with, say, 6 pass-1 calls shouldn't lose
+        # all 6 because call #4 hit a transient error. Its items just don't
+        # get classified this run; everything else still proceeds normally,
+        # and a later re-run picks up exactly this gap (nothing here was
+        # marked as read, so it isn't skipped next time).
+        try:
+            data = await triage_prompt.run_pass1_batch(th, batch, note, model, api_key, label=f"pass1-batch{bi}")
+        except Exception as e:
+            msg = (f"Pass 1 batch {bi}/{len(batches)} failed ({str(e)[:160]}) — "
+                   f"its {len(batch)} item(s) were not classified this run.")
+            batch_errors.append(msg)
+            emit("pass1", "warn", msg, pass_no=1, model=model,
+                 batch_index=bi, batch_total=len(batches), batch_phase="failed")
+            continue
         count_llm()
+        emit("pass1", "spin",
+             f"Pass 1 — batch {bi} of {len(batches)} received.",
+             pass_no=1, model=model, batch_index=bi, batch_total=len(batches), batch_phase="received")
         all_items += (data.get("items") or [])
         if not thread_summary:
             thread_summary = (data.get("thread_summary") or "").strip()
@@ -993,10 +1049,11 @@ async def extract_thread_sheets(
 
     meta = {
         "method": "thread-two-pass", "model": model, "calls": len(batches),
-        "sheet_count": 0, "errors": [], "skipped": th.dropped, "conflicts": [],
+        "sheet_count": 0, "errors": batch_errors, "skipped": th.dropped, "conflicts": [],
         "noise": noise, "summary": full_summary.get("headline", ""),
         "summary_obj": full_summary, "triage": triage,
         "thread_summary": full_summary,
+        "_opened_containers": list(th.opened_containers),
     }
 
     if not data_items:
@@ -1013,8 +1070,8 @@ async def extract_thread_sheets(
             meta["sheet_count"] = len(reused_sheets)
             meta["reused_sheets"] = len(reused_sheets)
             return reused_sheets, approval, [], meta
-        meta["errors"] = ["pass 1 confirmed sheets that could not be resolved to any item"]
-        emit("extract", "warn", meta["errors"][0])
+        batch_errors.append("pass 1 confirmed sheets that could not be resolved to any item")
+        emit("extract", "warn", batch_errors[-1])
         return [], approval, [], meta
 
     batches2: list[list] = []
@@ -1040,10 +1097,31 @@ async def extract_thread_sheets(
     raw_sheets: list = []
     pass2_call_count = 0
     for bi, batch in enumerate(batches2, 1):
-        data = await thread_prompt.run_pass2_batch(
-            batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}")
-        count_llm()
-        pass2_call_count += 1
+        # Same sent -> received bracket as pass 1: the UI shows "waiting for a
+        # response" for the actual duration of the network call, not a step
+        # that just looks stuck, and (with more than one batch) which one.
+        emit("pass2", "spin",
+             f"Pass 2 — sending batch {bi} of {len(batches2)} ({len(batch)} sheet(s)) to {model}…",
+             pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="sent")
+        # Same reasoning as pass 1: one batch's call ultimately failing must
+        # not discard every OTHER batch's already-confirmed sheets. Its own
+        # sheets just don't get extracted this run — noted below, and picked
+        # up by a later re-run since nothing here gets marked as read.
+        try:
+            data = await thread_prompt.run_pass2_batch(
+                batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}")
+            count_llm()
+            pass2_call_count += 1
+        except Exception as e:
+            msg = (f"Pass 2 batch {bi}/{len(batches2)} failed ({str(e)[:160]}) — "
+                   f"its {len(batch)} sheet(s) were not extracted this run.")
+            batch_errors.append(msg)
+            emit("pass2", "warn", msg, pass_no=2, model=model,
+                 batch_index=bi, batch_total=len(batches2), batch_phase="failed")
+            continue
+        emit("pass2", "spin",
+             f"Pass 2 — batch {bi} of {len(batches2)} received.",
+             pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="received")
         sheets_out = data.get("sheets") or []
         if not sheets_out and batch:
             # Every item in this batch was already CONFIRMED by pass 1 (which
@@ -1052,13 +1130,24 @@ async def extract_thread_sheets(
             # model generation than "these are genuinely blank documents" —
             # retry once before accepting nothing for real, confirmed items.
             emit("pass2", "spin",
-                 f"Pass 2 batch {bi} returned nothing for {len(batch)} confirmed item(s) — retrying once…",
-                 pass_no=2)
-            data = await thread_prompt.run_pass2_batch(
-                batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}-retry")
-            count_llm()
-            pass2_call_count += 1
-            sheets_out = data.get("sheets") or []
+                 f"Pass 2 batch {bi} of {len(batches2)} returned nothing for "
+                 f"{len(batch)} confirmed item(s) — retrying once…",
+                 pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="retry")
+            try:
+                data = await thread_prompt.run_pass2_batch(
+                    batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}-retry")
+                count_llm()
+                pass2_call_count += 1
+                emit("pass2", "spin",
+                     f"Pass 2 — batch {bi} of {len(batches2)} received (retry).",
+                     pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="received")
+                sheets_out = data.get("sheets") or []
+            except Exception as e:
+                msg = (f"Pass 2 batch {bi}/{len(batches2)} retry failed ({str(e)[:160]}) — "
+                       f"its {len(batch)} sheet(s) were not extracted this run.")
+                batch_errors.append(msg)
+                emit("pass2", "warn", msg, pass_no=2, model=model,
+                     batch_index=bi, batch_total=len(batches2), batch_phase="failed")
         raw_sheets += sheets_out
 
     fresh_sheets = _normalise_pass2_sheets(raw_sheets, data_items, th.items)
@@ -1066,6 +1155,8 @@ async def extract_thread_sheets(
         it.digest: s for s in fresh_sheets
         if (it := resolve_source(s["_source_key"], th.items)) is not None and it.digest
     }
+    # Nested .eml/.msg containers the Inbox lists as attachments — badge only.
+    meta["_opened_containers"] = list(th.opened_containers)
     meta["reused_sheets"] = len(reused_sheets)
     sheets = fresh_sheets + reused_sheets
     total_days = sum(
