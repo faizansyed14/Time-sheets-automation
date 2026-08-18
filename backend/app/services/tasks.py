@@ -135,13 +135,32 @@ def purge_pipeline_raw_task():
     return {"removed": removed}
 
 
-@celery_app.task(name="inbox.auto_extract_all")
-def auto_extract_all_task():
-    """Bulk Extract Email: every thread in the inbox, one at a time, in the
-    background. Started from POST /inbox/auto-extract/start; progress and
-    stop live in app.services.extract_email.auto_extract (Redis-backed)."""
+@celery_app.task(name="inbox.auto_extract_scan")
+def auto_extract_scan_task(run_id: str):
+    """The full-mailbox catch-up scan behind POST /inbox/auto-extract/start:
+    lists every thread, works out which ones actually need (re-)extraction,
+    then dispatches one extract_one_thread_task PER thread rather than
+    looping through them here — this task's only job is the scan + dispatch,
+    not the extraction work itself, so it returns quickly and the actual
+    thread-by-thread work runs in parallel across the worker pool."""
     from app.services.extract_email import auto_extract
-    return _run_coro(auto_extract.run_auto_extract)
+    return _run_coro(lambda: auto_extract._scan_and_dispatch(run_id))
+
+
+@celery_app.task(name="inbox.extract_one_thread", bind=True, max_retries=2, default_retry_delay=15)
+def extract_one_thread_task(self, pmid: str, subject: str, run_id: str):
+    """ONE thread's extraction — the actual unit of Auto Extract work.
+    Independent of every other thread's task: task_acks_late (see
+    celery_app.py) means a worker dying mid-extraction gets this task
+    redelivered to another worker instead of silently losing it, and one
+    slow/stuck thread no longer blocks anything queued behind it (there IS
+    nothing "behind it" in the old sense — every thread is its own task,
+    picked up by whichever worker is free)."""
+    from app.services.extract_email import auto_extract
+    try:
+        return _run_coro(lambda: auto_extract.run_one_thread(pmid, subject, run_id))
+    except Exception as exc:  # pragma: no cover - network/model dependent
+        raise self.retry(exc=exc)
 
 
 @celery_app.task(name="inbox.sync")
@@ -153,23 +172,25 @@ def sync_inbox_task():
     the on-demand sync in GET /inbox and /inbox/threads, so this never
     duplicates a sync a request just did (or vice versa).
 
-    Also the ONLY place Auto Extract's "watch for new mail" mode re-triggers
-    a run — deliberately not from the on-demand sync inside GET /inbox: that
-    path runs inline in the request, and with CELERY_TASK_ALWAYS_EAGER (dev/
-    tests) a triggered run would execute synchronously and block that page
-    load. This task is already background work either way, so triggering
-    from here costs a page-load nothing in any environment. Only bothers
-    checking when the provider actually returned something this tick — most
-    ticks find nothing new and skip the check entirely."""
+    Also the ONLY place Auto Extract's "watch for new mail" mode reacts to
+    new mail — deliberately not from the on-demand sync inside GET /inbox:
+    that path runs inline in the request, and with CELERY_TASK_ALWAYS_EAGER
+    (dev/tests) a triggered extraction would execute synchronously and block
+    that page load. This task is already background work either way.
+
+    Hands the exact rows sync_inbox just fetched to enqueue_new_threads,
+    which enqueues extraction for JUST those threads — no full-mailbox
+    rescan on every tick, unlike the old design. Most ticks find nothing new
+    and skip straight past this."""
     from app.core.database import SessionLocal
     from app.services.extract_email import auto_extract
     from app.services.inbox.sync import sync_inbox
 
     async def _run():
         async with SessionLocal() as db:
-            fetched = await sync_inbox(db)
-        if fetched and await auto_extract.is_enabled():
-            await auto_extract.start()
+            synced = await sync_inbox(db)
+            if synced and await auto_extract.is_enabled():
+                await auto_extract.enqueue_new_threads(db, synced)
 
     return _run_coro(_run)
 

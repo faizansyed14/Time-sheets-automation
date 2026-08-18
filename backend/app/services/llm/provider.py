@@ -22,6 +22,12 @@ def _build_model(model: str, base_url: str, api_key: str, temperature: float):
     from langchain_openai import ChatOpenAI
 
     _, langchain_base = openai_urls(base_url)
+    extra_body = {}
+    if (settings.llm_provider or "").strip().lower() == "openrouter":
+        # Same reasoning as vision_client.chat_call: route to whichever
+        # provider is currently cheapest for this exact model, no quality
+        # tradeoff (see that module for the quantization caveat).
+        extra_body["provider"] = {"sort": "price"}
     return ChatOpenAI(
         model=model,
         api_key=api_key or "missing",
@@ -29,6 +35,7 @@ def _build_model(model: str, base_url: str, api_key: str, temperature: float):
         temperature=temperature,
         timeout=60,
         max_retries=1,
+        extra_body=extra_body or None,
     )
 
 

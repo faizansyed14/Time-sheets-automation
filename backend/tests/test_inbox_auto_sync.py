@@ -96,12 +96,13 @@ async def test_valid_cursor_is_respected_when_the_db_has_rows(monkeypatch):
         await cache.delete(sync_module.SYNC_LAST_KEY, sync_module.SYNC_FRESH_KEY, sync_module.SYNC_LOCK_KEY)
 
 
-async def test_sync_inbox_returns_message_count_or_none_when_skipped(monkeypatch):
-    """sync_inbox_task uses this return value to decide whether it's even
-    worth checking Auto Extract's watch mode -- must be an int (message
-    count, possibly 0) whenever a sync actually ran, and None when this
-    particular call was a no-op (still fresh, or another sync holds the
-    lock) so a quiet tick never gets mistaken for "found new mail"."""
+async def test_sync_inbox_returns_synced_rows_or_none_when_skipped(monkeypatch):
+    """sync_inbox_task hands this return value straight to
+    auto_extract.enqueue_new_threads (which threads need extraction), so it
+    must be the actual synced rows (possibly an empty list) whenever a sync
+    ran, and None when this particular call was a no-op (still fresh, or
+    another sync holds the lock) so a quiet tick never gets mistaken for
+    "found new mail"."""
     await cache.delete(sync_module.SYNC_FRESH_KEY, sync_module.SYNC_LOCK_KEY, sync_module.SYNC_LAST_KEY)
 
     class _TwoMessageProvider:
@@ -109,7 +110,7 @@ async def test_sync_inbox_returns_message_count_or_none_when_skipped(monkeypatch
             return [object(), object()]
 
     async def _fake_sync_message(db, m):
-        return None
+        return object()  # stand-in EmailMessage row
 
     monkeypatch.setattr(sync_module, "sync_message", _fake_sync_message)
     monkeypatch.setattr(sync_module, "get_email_provider", lambda: _TwoMessageProvider())
@@ -117,7 +118,7 @@ async def test_sync_inbox_returns_message_count_or_none_when_skipped(monkeypatch
     try:
         async with SessionLocal() as db:
             result = await sync_module.sync_inbox(db)
-        assert result == 2
+        assert len(result) == 2
 
         # Right after a successful sync, the fresh-window means an
         # immediate second call is skipped outright.
@@ -128,51 +129,54 @@ async def test_sync_inbox_returns_message_count_or_none_when_skipped(monkeypatch
         await cache.delete(sync_module.SYNC_LAST_KEY, sync_module.SYNC_FRESH_KEY, sync_module.SYNC_LOCK_KEY)
 
 
-async def test_sync_inbox_task_triggers_auto_extract_when_enabled_and_new_mail_arrived(monkeypatch):
+async def test_sync_inbox_task_enqueues_new_threads_when_enabled_and_mail_arrived(monkeypatch):
     """The background sync tick is deliberately the ONLY place Auto
-    Extract's watch mode re-triggers a run (see sync_inbox_task's
-    docstring) -- must fire exactly when this tick both found new mail AND
-    the mode is on, and must stay quiet on an empty tick, a skipped tick,
-    or while the mode is off."""
+    Extract's watch mode reacts to new mail (see sync_inbox_task's
+    docstring) -- must hand the synced rows to enqueue_new_threads exactly
+    when this tick both found new mail AND the mode is on (enqueue_new_
+    threads itself checks `enabled`, but sync_inbox_task shouldn't even call
+    it on an empty/skipped tick), and must stay quiet otherwise. Note: since
+    Auto Extract's redesign, this NEVER does a full-mailbox rescan — it only
+    ever sees the specific rows this tick's sync fetched."""
     from app.services.extract_email import auto_extract
 
-    calls = {"n": 0}
+    calls: list[list] = []
 
-    async def _fake_start():
-        calls["n"] += 1
+    async def _fake_enqueue(db, rows):
+        calls.append(rows)
         return {}
 
     async def _found_mail(db):
-        return 3
+        return [object(), object(), object()]
 
     async def _quiet(db):
-        return 0
+        return []
 
     async def _tick_skipped(db):
         return None
 
-    monkeypatch.setattr(auto_extract, "start", _fake_start)
+    monkeypatch.setattr(auto_extract, "enqueue_new_threads", _fake_enqueue)
     await cache.delete(auto_extract._ENABLED_KEY)
 
     try:
-        # Mode off, mail arrived -> must not trigger.
+        # Mode off, mail arrived -> must not enqueue.
         monkeypatch.setattr(sync_module, "sync_inbox", _found_mail)
         tasks_module.sync_inbox_task()
-        assert calls["n"] == 0
+        assert len(calls) == 0
 
-        # Mode on, mail arrived -> triggers.
+        # Mode on, mail arrived -> enqueues exactly those rows.
         await cache.set(auto_extract._ENABLED_KEY, True)
         tasks_module.sync_inbox_task()
-        assert calls["n"] == 1
+        assert len(calls) == 1 and len(calls[0]) == 3
 
-        # Mode on, quiet tick (0 messages) -> does not trigger again.
+        # Mode on, quiet tick (no messages) -> does not enqueue again.
         monkeypatch.setattr(sync_module, "sync_inbox", _quiet)
         tasks_module.sync_inbox_task()
-        assert calls["n"] == 1
+        assert len(calls) == 1
 
-        # Mode on, tick skipped entirely (None) -> does not trigger.
+        # Mode on, tick skipped entirely (None) -> does not enqueue.
         monkeypatch.setattr(sync_module, "sync_inbox", _tick_skipped)
         tasks_module.sync_inbox_task()
-        assert calls["n"] == 1
+        assert len(calls) == 1
     finally:
         await cache.delete(auto_extract._ENABLED_KEY)

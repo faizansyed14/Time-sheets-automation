@@ -131,6 +131,14 @@ async def chat_call(
             payload["response_format"] = {"type": "json_object"}
         if not enable_thinking:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
+        if vision_provider() == "openrouter":
+            # OpenRouter hosts the same open model across several providers at
+            # different prices (e.g. Qwen3-VL: DeepInfra vs Alibaba Cloud vs
+            # NovitaAI can differ 30-50%). `sort: "price"` always routes to
+            # whichever is cheapest right now for THIS exact model — same
+            # weights, same quality, no accuracy tradeoff (unlike quantization
+            # filtering, which is not enabled here on purpose for that reason).
+            payload["provider"] = {"sort": "price"}
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(settings.openai_timeout)) as client:
                 r = await client.post(f"{api_root}/v1/chat/completions", json=payload, headers=headers)
