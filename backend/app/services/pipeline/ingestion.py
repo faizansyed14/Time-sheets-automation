@@ -300,6 +300,13 @@ async def ingest_manual_entry(
         "buckets": {b: list(buckets.get(b, []) or []) for b in BUCKET_FIELDS},
     }
     existing = await _find_existing(db, matched.id, matched.employee_id, employee_name, month, year)
+    # A late file joining an already-filed month (e.g. a sick-leave certificate
+    # arriving after this employee's manager was corrected) must land next to
+    # what's already vaulted for that month, not split off into a new manager's
+    # folder — so it keeps whichever manager the month was originally filed
+    # under. A brand-new month still picks up the employee's current manager.
+    if existing:
+        account_manager = existing.account_manager
     prior = (existing.source_files if existing else []) or []
     entries = _merge_source_files(prior, entry)
     merged, overlap_flags = _union_buckets(entries)
