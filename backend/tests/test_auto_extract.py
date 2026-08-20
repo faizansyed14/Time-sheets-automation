@@ -1,14 +1,23 @@
-"""Auto Extract (bulk background run) — progress must be reported one thread
-at a time, in real time, with `processed`/`succeeded`/`failed`/`skipped`/
-`current` always internally consistent. The per-thread pipeline itself
-(extract_full_email) is stubbed out here — it's covered by
-test_full_email_extract.py — so these tests isolate the
-orchestration/bookkeeping in auto_extract.run_auto_extract."""
+"""Auto Extract (per-thread background work) — progress must stay internally
+consistent (succeeded+failed+skipped+stopped_early == processed, never
+exceeding total) whether one thread finishes or several finish at once, the
+skip check must recognise BOTH "already extracted" and "already checked,
+found nothing" as already-done, and Stop must be race-free.
+
+The per-thread pipeline itself (extract_full_email) is stubbed out here —
+covered by test_full_email_extract.py — so these tests isolate the
+orchestration/bookkeeping in auto_extract.py. Unlike the old design (one
+sequential coroutine looping through every thread), work is now dispatched
+as independent Celery tasks (auto_extract._dispatch -> extract_one_thread_task
+.delay(...)), so these tests drive the underlying primitives directly
+(_partition_needs_extraction, run_one_thread, _scan_and_dispatch,
+enqueue_new_threads) rather than a single top-level coroutine — that's the
+actual point of the redesign: no single call you can just await-and-poll
+represents "the whole run" anymore, many independent tasks do."""
 import asyncio
 import datetime as dt
-from contextlib import asynccontextmanager
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.core.cache import cache
 from app.core.database import SessionLocal
@@ -17,19 +26,20 @@ from app.services.extract_email import auto_extract, progress, sheet_cache
 
 
 async def _never_extracted_bulk(db, thread_keys):
-    """sheet_cache.last_extraction_at_bulk stand-in: nothing on record for any
-    thread, so every anchor falls through to a real (stubbed) extraction —
-    these tests are about THAT path, not the new skip check (see
-    test_already_extracted_threads_are_skipped_without_touching_the_model
-    below for that one)."""
     return {}
 
 
-@asynccontextmanager
-async def _seeded_threads(pmids: list[str]):
-    """Insert throwaway EmailMessage rows for the run, then remove them —
-    this suite shares one DB with the rest of the session, so leaking rows
-    here would shift what other tests' /inbox queries see."""
+async def _fake_prior(db, row):
+    return None
+
+
+async def _cleanup_run(run_id: str) -> None:
+    for field in ("state", "total", "skipped", "succeeded", "failed", "stopped_early",
+                  "started_at", "finished_at", "last_error", "current", "stop"):
+        await cache.delete(f"auto_extract:run:{run_id}:{field}")
+
+
+async def _seed(pmids: list[str]) -> None:
     async with SessionLocal() as db:
         for pmid in pmids:
             db.add(EmailMessage(
@@ -38,54 +48,130 @@ async def _seeded_threads(pmids: list[str]):
                 to_recipients=[], cc_recipients=[],
             ))
         await db.commit()
+
+
+async def _unseed(pmids: list[str]) -> None:
+    async with SessionLocal() as db:
+        await db.execute(delete(EmailMessage).where(EmailMessage.provider_message_id.in_(pmids)))
+        await db.commit()
+
+
+async def test_already_extracted_threads_are_skipped_without_touching_the_model(monkeypatch):
+    """Regression: a thread already extracted at/after its newest message
+    (the normal "Extracted" state shown in the Inbox) must be skipped
+    outright — no extract_full_email call."""
+    now = dt.datetime(2026, 7, 29, tzinfo=dt.timezone.utc)
+    earlier = now - dt.timedelta(days=1)
+    later = now + dt.timedelta(days=1)
+
+    anchors = [
+        ("AE-done", "Already extracted", "AE-done", earlier),
+        ("AE-new", "Genuinely new reply", "AE-new", later),
+        ("AE-never", "Never touched", "AE-never", now),
+    ]
+
+    async def _fake_last_extraction_at_bulk(db, thread_keys):
+        full = {"AE-done": now, "AE-new": now}
+        return {tk: full[tk] for tk in thread_keys if tk in full}
+
+    monkeypatch.setattr(sheet_cache, "last_extraction_at_bulk", _fake_last_extraction_at_bulk)
+
+    pmids = [a[0] for a in anchors]
+    await _seed(pmids)
     try:
-        yield
-    finally:
         async with SessionLocal() as db:
-            await db.execute(delete(EmailMessage).where(EmailMessage.provider_message_id.in_(pmids)))
-            await db.commit()
+            skip_now, need_real = await auto_extract._partition_needs_extraction(db, anchors)
+    finally:
+        await _unseed(pmids)
+
+    assert {a[0] for a in skip_now} == {"AE-done"}
+    assert {a[0] for a in need_real} == {"AE-new", "AE-never"}
 
 
-async def _poll_until_done(snapshots: list[dict]) -> None:
-    while True:
-        s = await auto_extract.get_status()
-        snapshots.append(dict(s))
-        if s["state"] in ("completed", "stopped"):
-            break
-        await asyncio.sleep(0.005)
+async def test_no_sheets_found_threads_are_also_skipped_not_reprocessed_forever(monkeypatch):
+    """The actual bug fix: a thread genuinely checked and found to have NO
+    timesheet (EmailMessage.no_sheets_found_at) previously had no durable
+    marker at all in this skip check — only PipelineFile-backed extractions
+    counted — so it got re-sent through the vision model on every single
+    re-trigger, forever. It must now be recognised as already-checked the
+    same way a successful extraction is, as long as nothing newer arrived."""
+    now = dt.datetime(2026, 7, 29, tzinfo=dt.timezone.utc)
+    earlier = now - dt.timedelta(days=1)
+    later = now + dt.timedelta(days=1)
+
+    anchors = [
+        ("AE-empty-fresh", "Checked, nothing found", "AE-empty-fresh", earlier),
+        ("AE-empty-stale", "Checked, but newer reply since", "AE-empty-stale", later),
+    ]
+
+    monkeypatch.setattr(sheet_cache, "last_extraction_at_bulk", _never_extracted_bulk)
+
+    async with SessionLocal() as db:
+        for pmid, checked_at in (("AE-empty-fresh", now), ("AE-empty-stale", now)):
+            db.add(EmailMessage(
+                provider_message_id=pmid, sender_name="S", sender_email="s@x.y",
+                subject=f"Subject {pmid}", body_text="", attachments=[],
+                to_recipients=[], cc_recipients=[], no_sheets_found_at=checked_at,
+            ))
+        await db.commit()
+    try:
+        async with SessionLocal() as db:
+            skip_now, need_real = await auto_extract._partition_needs_extraction(db, anchors)
+    finally:
+        await _unseed([a[0] for a in anchors])
+
+    # fresh: checked_at (now) >= newest_at (earlier) -> already checked, skip.
+    assert {a[0] for a in skip_now} == {"AE-empty-fresh"}
+    # stale: a newer reply (later) arrived AFTER we checked -> must run again.
+    assert {a[0] for a in need_real} == {"AE-empty-stale"}
 
 
-async def test_progress_is_reported_one_thread_at_a_time_and_stays_accurate(monkeypatch):
+async def test_progress_stays_consistent_as_independent_tasks_complete(monkeypatch):
+    """Several threads' extractions completing (in any order, including
+    "simultaneously" from an external poller's view — that's the whole
+    point of dispatching them as independent tasks) must never leave
+    succeeded+failed+skipped+stopped_early inconsistent with processed, and
+    processed must never exceed total."""
     pmids = ["AE-1", "AE-2", "AE-3"]
-    anchors = [(p, f"Subject {p}", p, None) for p in pmids]
     fail_pmid = "AE-2"
 
-    async def _fake_anchors(db):
-        return anchors
-
-    async def _fake_prior(db, row):
-        return None
-
-    monkeypatch.setattr(auto_extract, "_list_all_thread_anchors", _fake_anchors)
-    monkeypatch.setattr(sheet_cache, "last_extraction_at_bulk", _never_extracted_bulk)
-    monkeypatch.setattr(
-        "app.services.extract_email.thread_scope.prior_message_for_merge", _fake_prior)
-
     async def _fake_extract(db, row, *, prior_email=None):
-        await asyncio.sleep(0.03)  # give the concurrent poller a chance to observe this step
+        await asyncio.sleep(0.02)
         if row.provider_message_id == fail_pmid:
             raise RuntimeError("boom")
         return {}
 
+    monkeypatch.setattr(
+        "app.services.extract_email.thread_scope.prior_message_for_merge", _fake_prior)
     monkeypatch.setattr("app.services.agents.full_email_extract.extract_full_email", _fake_extract)
 
-    await cache.delete("auto_extract:status", "auto_extract:stop")
-
-    async with _seeded_threads(pmids):
+    run_id = await auto_extract._new_run(total=3, skipped=0)
+    await _seed(pmids)
+    try:
         snapshots: list[dict] = []
-        run_task = asyncio.create_task(auto_extract.run_auto_extract())
-        poll_task = asyncio.create_task(_poll_until_done(snapshots))
-        await asyncio.gather(run_task, poll_task)
+
+        async def _poll():
+            while True:
+                s = await auto_extract.get_status()
+                snapshots.append(dict(s))
+                if s["state"] in ("completed", "stopped"):
+                    break
+                await asyncio.sleep(0.005)
+
+        # We're driving THIS run_id directly (not through the global
+        # auto_extract:run_id pointer), so poll a run-scoped status snapshot
+        # instead of get_status() for correctness during concurrent work —
+        # get_status() only reflects whichever run_id is globally "current".
+        await cache.set("auto_extract:run_id", run_id, ttl=60)
+        poll_task = asyncio.create_task(_poll())
+        await asyncio.gather(*(
+            auto_extract.run_one_thread(pmid, f"Subject {pmid}", run_id) for pmid in pmids
+        ))
+        await poll_task
+    finally:
+        await _unseed(pmids)
+        await _cleanup_run(run_id)
+        await cache.delete("auto_extract:run_id")
 
     final = snapshots[-1]
     assert final["state"] == "completed"
@@ -95,98 +181,16 @@ async def test_progress_is_reported_one_thread_at_a_time_and_stays_accurate(monk
     assert final["failed"] == 1
     assert final["current"] is None
 
-    # processed must climb 0 -> 1 -> 2 -> 3, one step at a time, never
-    # skipping straight to the end and never exceeding total.
-    processed_seq = [s["processed"] for s in snapshots if s["state"] != "idle"]
-    assert processed_seq == sorted(processed_seq)
-    assert sorted(set(processed_seq)) == [0, 1, 2, 3]
-
-    # succeeded+failed must equal processed at EVERY observed instant, not
-    # just at the end — a live viewer should never see inconsistent counts.
     for s in snapshots:
-        if s["state"] == "idle":
-            continue
-        assert s["succeeded"] + s["failed"] == s["processed"], s
-
-    # `current` must never still point at a thread that's already been
-    # counted into `processed` — it should be cleared the instant that
-    # thread's own count lands, not leak into the next thread's turn.
-    seen_current_pmids = {
-        s["current"]["thread_id"] for s in snapshots if s.get("current")
-    }
-    assert seen_current_pmids <= set(pmids)
-
-
-async def test_already_extracted_threads_are_skipped_without_touching_the_model(monkeypatch):
-    """Regression: a thread already extracted at/after its newest message
-    (the normal "Extracted" state shown in the Inbox) was still being sent
-    through extract_full_email on every bulk run — a real, paid model call
-    for a thread with nothing new to read. It must now be skipped outright:
-    no extract_full_email call, no succeeded/failed, counted as `skipped`."""
-    now = dt.datetime(2026, 7, 29, tzinfo=dt.timezone.utc)
-    earlier = now - dt.timedelta(days=1)
-    later = now + dt.timedelta(days=1)
-
-    anchors = [
-        ("AE-done", "Already extracted", "AE-done", earlier),   # last_at (now) >= earlier -> skip
-        ("AE-new", "Genuinely new reply", "AE-new", later),      # last_at (now) < later -> must run
-        ("AE-never", "Never touched", "AE-never", now),         # no watermark at all -> must run
-    ]
-
-    async def _fake_anchors(db):
-        return anchors
-
-    async def _fake_prior(db, row):
-        return None
-
-    async def _fake_last_extraction_at_bulk(db, thread_keys):
-        # "AE-never" has no watermark at all, so a real bulk query would
-        # never return a row for it — a miss, not an explicit None.
-        full = {"AE-done": now, "AE-new": now}
-        return {tk: full[tk] for tk in thread_keys if tk in full}
-
-    extracted_pmids: list[str] = []
-
-    async def _fake_extract(db, row, *, prior_email=None):
-        extracted_pmids.append(row.provider_message_id)
-        return {}
-
-    monkeypatch.setattr(auto_extract, "_list_all_thread_anchors", _fake_anchors)
-    monkeypatch.setattr(sheet_cache, "last_extraction_at_bulk", _fake_last_extraction_at_bulk)
-    monkeypatch.setattr(
-        "app.services.extract_email.thread_scope.prior_message_for_merge", _fake_prior)
-    monkeypatch.setattr("app.services.agents.full_email_extract.extract_full_email", _fake_extract)
-
-    await cache.delete("auto_extract:status", "auto_extract:stop")
-
-    pmids = [a[0] for a in anchors]
-    async with _seeded_threads(pmids):
-        final = await auto_extract.run_auto_extract()
-
-    assert final["state"] == "completed"
-    assert final["total"] == 3
-    assert final["processed"] == 3
-    assert final["skipped"] == 1
-    assert final["succeeded"] == 2
-    assert final["failed"] == 0
-    # The already-extracted thread's model call never happened at all.
-    assert extracted_pmids == ["AE-new", "AE-never"]
+        assert s["succeeded"] + s["failed"] + s["skipped"] == s["processed"], s
+        assert s["processed"] <= s["total"], s
 
 
 async def test_live_progress_events_from_the_pipeline_are_mirrored_into_current_status(monkeypatch):
     """The currently-processing thread must show the SAME live pass1/pass2
-    progress the manual Extract Email stream shows, not just a static
-    subject line — extract_full_email's ordinary progress.emit() calls
-    (a no-op everywhere else, unless something installed a ProgressSink)
-    must be captured into current["events"] as they happen."""
-    pmids = ["AE-live-1"]
-    anchors = [(p, f"Subject {p}", p, None) for p in pmids]
-
-    async def _fake_anchors(db):
-        return anchors
-
-    async def _fake_prior(db, row):
-        return None
+    progress the manual Extract Email stream shows — extract_full_email's
+    ordinary progress.emit() calls must land in current["events"]."""
+    pmid = "AE-live-1"
 
     async def _fake_extract(db, row, *, prior_email=None):
         progress.emit("unpack", "ok", "Reduced junk.")
@@ -195,37 +199,44 @@ async def test_live_progress_events_from_the_pipeline_are_mirrored_into_current_
         await asyncio.sleep(0.02)
         return {}
 
-    monkeypatch.setattr(auto_extract, "_list_all_thread_anchors", _fake_anchors)
-    monkeypatch.setattr(sheet_cache, "last_extraction_at_bulk", _never_extracted_bulk)
     monkeypatch.setattr(
         "app.services.extract_email.thread_scope.prior_message_for_merge", _fake_prior)
     monkeypatch.setattr("app.services.agents.full_email_extract.extract_full_email", _fake_extract)
 
-    await cache.delete("auto_extract:status", "auto_extract:stop")
+    run_id = await auto_extract._new_run(total=1, skipped=0)
+    await _seed([pmid])
+    try:
+        seen_stages: set[str] = set()
 
-    async with _seeded_threads(pmids):
-        snapshots: list[dict] = []
-        run_task = asyncio.create_task(auto_extract.run_auto_extract())
-        poll_task = asyncio.create_task(_poll_until_done(snapshots))
-        await asyncio.gather(run_task, poll_task)
+        async def _poll():
+            while True:
+                cur = await cache.get(f"auto_extract:run:{run_id}:current")
+                if cur:
+                    for e in cur.get("events", []):
+                        seen_stages.add(e["stage"])
+                state = await cache.get(f"auto_extract:run:{run_id}:state")
+                if state in ("completed", "stopped"):
+                    break
+                await asyncio.sleep(0.005)
 
-    seen_stages = set()
-    for s in snapshots:
-        cur = s.get("current")
-        if cur:
-            for e in cur.get("events", []):
-                seen_stages.add(e["stage"])
-    assert {"unpack", "pass1"} <= seen_stages, snapshots
+        poll_task = asyncio.create_task(_poll())
+        await auto_extract.run_one_thread(pmid, "Subject", run_id)
+        await poll_task
 
-    final = snapshots[-1]
-    assert final["current"] is None
-    assert final["succeeded"] == 1
+        assert {"unpack", "pass1"} <= seen_stages
+        assert await cache.get(f"auto_extract:run:{run_id}:current") is None
+        assert int(await cache.get(f"auto_extract:run:{run_id}:succeeded") or 0) == 1
+    finally:
+        await _unseed([pmid])
+        await _cleanup_run(run_id)
 
 
-async def test_already_done_threads_are_counted_immediately_then_new_mail_runs(monkeypatch):
+async def test_scan_and_dispatch_books_skips_in_one_shot_before_any_real_extract(monkeypatch):
     """Watch-mode re-trigger on 1 new mail in a large already-done mailbox
-    must NOT walk skip counters one-by-one (UI looking like 414/500). Skips
-    are booked in one shot, then real extracts run newest-first."""
+    must NOT walk skip counters one-by-one — skips are booked in a single
+    shot as soon as the scan finishes, before any real extraction even
+    starts, exactly the property the old design's inline loop had to fake by
+    pre-seeding `processed` before its first real iteration."""
     now = dt.datetime(2026, 7, 29, tzinfo=dt.timezone.utc)
     earlier = now - dt.timedelta(days=30)
 
@@ -239,116 +250,97 @@ async def test_already_done_threads_are_counted_immediately_then_new_mail_runs(m
     async def _fake_anchors(db):
         return anchors
 
-    async def _fake_prior(db, row):
-        return None
-
     async def _fake_last_extraction_at_bulk(db, thread_keys):
         full = {"AE-old-1": now, "AE-old-2": now}
         return {tk: full[tk] for tk in thread_keys if tk in full}
 
-    async def _fake_extract(db, row, *, prior_email=None):
-        await asyncio.sleep(0.03)  # slow enough for the poller to observe mid-flight
-        return {}
+    dispatched: list[tuple[str, str, str]] = []
+
+    def _fake_dispatch(pmid, subject, run_id):
+        dispatched.append((pmid, subject, run_id))
 
     monkeypatch.setattr(auto_extract, "_list_all_thread_anchors", _fake_anchors)
     monkeypatch.setattr(sheet_cache, "last_extraction_at_bulk", _fake_last_extraction_at_bulk)
-    monkeypatch.setattr(
-        "app.services.extract_email.thread_scope.prior_message_for_merge", _fake_prior)
-    monkeypatch.setattr("app.services.agents.full_email_extract.extract_full_email", _fake_extract)
+    monkeypatch.setattr(auto_extract, "_dispatch", _fake_dispatch)
 
-    await cache.delete("auto_extract:status", "auto_extract:stop")
-
+    run_id = await auto_extract._new_run(total=0, skipped=0)
     pmids = [a[0] for a in anchors]
-    async with _seeded_threads(pmids):
-        snapshots: list[dict] = []
-        run_task = asyncio.create_task(auto_extract.run_auto_extract())
-        poll_task = asyncio.create_task(_poll_until_done(snapshots))
-        await asyncio.gather(run_task, poll_task)
-
-    # Skips land before any real extract is counted — and the first current
-    # thread is genuine new mail, not a backlog skip walking the counter.
-    saw_running = False
-    for s in snapshots:
-        if s["state"] == "idle":
-            continue
-        if s["total"] == 4:
-            saw_running = True
-            assert s["skipped"] == 2, s
-        if s.get("current"):
-            assert s["current"]["thread_id"] in ("AE-real-1", "AE-real-2"), s
-            assert s["skipped"] == 2, s
-    assert saw_running
-
-    final = snapshots[-1]
-    assert final["skipped"] == 2
-    assert final["succeeded"] == 2
+    await _seed(pmids)
+    try:
+        await auto_extract._scan_and_dispatch(run_id)
+        total = int(await cache.get(f"auto_extract:run:{run_id}:total") or 0)
+        skipped = int(await cache.get(f"auto_extract:run:{run_id}:skipped") or 0)
+        assert total == 4
+        assert skipped == 2
+        assert {p for p, _, _ in dispatched} == {"AE-real-1", "AE-real-2"}
+        assert all(rid == run_id for _, _, rid in dispatched)
+    finally:
+        await _unseed(pmids)
+        await _cleanup_run(run_id)
 
 
-async def test_stop_is_accurate_mid_run(monkeypatch):
+async def test_stop_is_race_free_against_not_yet_started_tasks(monkeypatch):
+    """A task that hasn't started its real extraction yet when Stop is
+    requested must exit immediately without doing any work, and be counted
+    as `stopped_early` (still part of `processed`) rather than left
+    unaccounted for — the run must still be able to reach a terminal state
+    even though not everything actually ran."""
     pmids = ["AE-10", "AE-11", "AE-12"]
-    anchors = [(p, f"Subject {p}", p, None) for p in pmids]
 
-    async def _fake_anchors(db):
-        return anchors
-
-    async def _fake_prior(db, row):
-        return None
-
-    monkeypatch.setattr(auto_extract, "_list_all_thread_anchors", _fake_anchors)
-    monkeypatch.setattr(sheet_cache, "last_extraction_at_bulk", _never_extracted_bulk)
-    monkeypatch.setattr(
-        "app.services.extract_email.thread_scope.prior_message_for_merge", _fake_prior)
-
-    started = asyncio.Event()
+    ran: list[str] = []
 
     async def _fake_extract(db, row, *, prior_email=None):
-        started.set()
-        await asyncio.sleep(0.05)
+        ran.append(row.provider_message_id)
         return {}
 
+    monkeypatch.setattr(
+        "app.services.extract_email.thread_scope.prior_message_for_merge", _fake_prior)
     monkeypatch.setattr("app.services.agents.full_email_extract.extract_full_email", _fake_extract)
 
-    await cache.delete("auto_extract:status", "auto_extract:stop")
+    run_id = await auto_extract._new_run(total=3, skipped=0)
+    await _seed(pmids)
+    try:
+        # Stop requested before ANY of the three tasks have run — mirrors a
+        # worker picking up queued-but-not-started tasks after Stop.
+        await cache.set(f"auto_extract:run:{run_id}:stop", True, ttl=60)
+        await cache.set(f"auto_extract:run:{run_id}:state", "stopping", ttl=60)
 
-    async with _seeded_threads(pmids):
-        run_task = asyncio.create_task(auto_extract.run_auto_extract())
+        await asyncio.gather(*(
+            auto_extract.run_one_thread(pmid, f"Subject {pmid}", run_id) for pmid in pmids
+        ))
+    finally:
+        await _unseed(pmids)
 
-        # Ask it to stop WHILE the first thread is still in flight — it must
-        # finish that one thread cleanly (never abandon it mid-write) and stop
-        # before starting a second, rather than racing ahead.
-        await asyncio.wait_for(started.wait(), timeout=2)
-        await auto_extract.request_stop()
-
-        final = await run_task
-    assert final["state"] == "stopped"
-    assert final["current"] is None
-    # Never claims to have processed more than it actually could have, and
-    # never fabricates a total that doesn't match the real queue.
-    assert final["total"] == 3
-    assert final["processed"] == 1
-    assert final["succeeded"] + final["failed"] == final["processed"]
+    assert ran == []  # none of them actually extracted anything
+    state = await cache.get(f"auto_extract:run:{run_id}:state")
+    succeeded = int(await cache.get(f"auto_extract:run:{run_id}:succeeded") or 0)
+    failed = int(await cache.get(f"auto_extract:run:{run_id}:failed") or 0)
+    stopped_early = int(await cache.get(f"auto_extract:run:{run_id}:stopped_early") or 0)
+    assert state == "stopped"
+    assert succeeded == 0 and failed == 0
+    assert stopped_early == 3
+    await _cleanup_run(run_id)
 
 
 async def test_start_turns_on_the_persistent_enabled_flag_and_stop_turns_it_off(monkeypatch):
-    """The `enabled` flag is what lets a later background sync tick decide
-    whether to re-trigger a run on its own (see auto_extract's module
-    docstring) — it must survive a run's own completion (still on
-    afterward, since that's the whole point), and Stop must turn it off
-    even when nothing is currently running, not only mid-run."""
+    """The `enabled` flag lets a later background sync tick decide whether
+    to enqueue/extend a run on its own — it must survive a run's own
+    completion, and Stop must turn it off even when nothing is running."""
     async def _fake_anchors(db):
         return []
 
     monkeypatch.setattr(auto_extract, "_list_all_thread_anchors", _fake_anchors)
-    await cache.delete("auto_extract:status", "auto_extract:stop", "auto_extract:enabled")
+    await cache.delete("auto_extract:run_id", "auto_extract:enabled")
 
     assert await auto_extract.is_enabled() is False
 
     started = await auto_extract.start()
     assert started["enabled"] is True
 
-    # No anchors -> the run completes almost immediately. `enabled` is a
-    # separate, longer-lived switch than this one run's lifecycle, so it
-    # must still read True once the run is done.
+    # No anchors -> the dispatched scan completes almost immediately (Celery
+    # is eager in tests, so start() has already run the scan by the time it
+    # returns). `enabled` is a separate, longer-lived switch than this one
+    # run's lifecycle, so it must still read True once the run is done.
     final = await auto_extract.get_status()
     assert final["state"] == "completed"
     assert final["enabled"] is True
@@ -358,7 +350,7 @@ async def test_start_turns_on_the_persistent_enabled_flag_and_stop_turns_it_off(
     assert stopped["enabled"] is False
     assert await auto_extract.is_enabled() is False
 
-    await cache.delete("auto_extract:status", "auto_extract:stop", "auto_extract:enabled")
+    await cache.delete("auto_extract:run_id", "auto_extract:enabled")
 
 
 async def test_coverage_reports_live_extracted_vs_total_threads():
@@ -396,3 +388,38 @@ async def test_coverage_reports_live_extracted_vs_total_threads():
             await db.execute(delete(PipelineFile).where(PipelineFile.thread_key.in_(pmids)))
             await db.execute(delete(EmailMessage).where(EmailMessage.provider_message_id.in_(pmids)))
             await db.commit()
+
+
+async def test_enqueue_new_threads_never_rescans_the_whole_mailbox(monkeypatch):
+    """The steady-state new-mail path must resolve ONLY the given rows'
+    threads — never call the full-mailbox scan (_list_all_thread_anchors) —
+    that's the actual point of the redesign: O(new mail), not O(mailbox)."""
+    await auto_extract._set_enabled(True)
+    pmid = "AE-incr-1"
+
+    def _boom(db):
+        raise AssertionError("enqueue_new_threads must not do a full-mailbox scan")
+
+    monkeypatch.setattr(auto_extract, "_list_all_thread_anchors", _boom)
+
+    dispatched: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(auto_extract, "_dispatch",
+                        lambda pmid, subject, run_id: dispatched.append((pmid, subject, run_id)))
+
+    await _seed([pmid])
+    await cache.delete("auto_extract:run_id")
+    try:
+        async with SessionLocal() as db:
+            msg = (await db.execute(
+                select(EmailMessage).where(EmailMessage.provider_message_id == pmid)
+            )).scalar_one()
+            result = await auto_extract.enqueue_new_threads(db, [msg])
+        assert result is not None
+        assert len(dispatched) == 1
+        assert dispatched[0][0] == pmid
+    finally:
+        run_id = await auto_extract._current_run_id()
+        await _unseed([pmid])
+        await cache.delete("auto_extract:enabled", "auto_extract:run_id")
+        if run_id:
+            await _cleanup_run(run_id)

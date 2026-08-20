@@ -96,6 +96,22 @@ async def coverage(
                     Employee.id.not_in(submitted_subq),
                 ).subquery()
             ))).scalar_one()
+        # Missing = NOT submitted AND NOT received. Checked against BOTH sets
+        # explicitly rather than assuming submitted ⊆ received — a record can
+        # be filed via a path that never produces a "staged.employee_pk"
+        # PipelineFile (pure manual entry, source_kind="manual", or any
+        # resolve/accept flow that doesn't preserve that JSON key), so an
+        # employee can be fully submitted without ever showing up in
+        # received_subq. Deriving missing as total-received would then wrongly
+        # count them as missing even though submitted_subq already has them.
+        missing = (await db.execute(
+            select(func.count()).select_from(
+                select(Employee.id).where(
+                    Employee.active.is_(True),
+                    Employee.id.not_in(submitted_subq),
+                    Employee.id.not_in(received_subq),
+                ).subquery()
+            ))).scalar_one()
         nrev = (await db.execute(
             select(func.count(func.distinct(TimesheetRecord.matched_employee_pk)))
             .select_from(TimesheetRecord).join(Employee, Employee.id == TimesheetRecord.matched_employee_pk)
@@ -110,13 +126,16 @@ async def coverage(
                    TimesheetRecord.approval_status != ApprovalStatus.APPROVED,
                    TimesheetRecord.matched_employee_pk.is_not(None),
                    Employee.active.is_(True)))).scalar_one()
-        # Missing = genuinely never sent anything this month — NOT in the
-        # received set (not just "not yet filed").
+        # Sample for the KPI tooltip — same NOT-submitted-AND-NOT-received test as `missing` above.
         sample = (await db.execute(
-            select(Employee.name).where(Employee.active.is_(True), Employee.id.not_in(received_subq))
-            .order_by(Employee.name).limit(50))).scalars().all()
+            select(Employee.name).where(
+                Employee.active.is_(True),
+                Employee.id.not_in(submitted_subq),
+                Employee.id.not_in(received_subq),
+            ).order_by(Employee.name).limit(50))).scalars().all()
         return {"total_employees": total, "submitted_this_month": submitted,
                 "received_this_month": received, "awaiting_review_this_month": awaiting,
+                "missing_this_month": missing,
                 "needs_review": nrev, "pending_approval": pend, "missing_sample": list(sample)}
 
     agg = await datacache.get_or_set(
@@ -125,9 +144,10 @@ async def coverage(
     submitted_this_month = agg["submitted_this_month"]
     received_this_month = agg["received_this_month"]
     awaiting_review_this_month = agg["awaiting_review_this_month"]
-    # total = missing + submitted + awaiting_review, exactly (received =
-    # submitted ∪ awaiting_review, disjoint by construction above).
-    missing_this_month = max(0, total_employees - received_this_month)
+    # total = missing + submitted + awaiting_review, exactly — each computed
+    # as its own explicit disjoint condition (see _aggregates above), not
+    # derived from `received` alone.
+    missing_this_month = agg["missing_this_month"]
     needs_review = agg["needs_review"]
     pending_approval = agg["pending_approval"]
     missing_sample = agg["missing_sample"]
@@ -152,7 +172,7 @@ async def coverage(
             func.lower(func.coalesce(Employee.location, "")).like(like),
         ))
     if only_missing:
-        emp_q = emp_q.where(Employee.id.not_in(received_subq))
+        emp_q = emp_q.where(Employee.id.not_in(submitted_subq), Employee.id.not_in(received_subq))
 
     # Server-side status filter (applies across the WHOLE matcher, not just the
     # loaded page). Scoped to the focus year so it tracks the dashboard KPIs.
@@ -161,7 +181,7 @@ async def coverage(
         if s == "submitted":
             emp_q = emp_q.where(Employee.id.in_(submitted_subq))
         elif s == "missing":
-            emp_q = emp_q.where(Employee.id.not_in(received_subq))
+            emp_q = emp_q.where(Employee.id.not_in(submitted_subq), Employee.id.not_in(received_subq))
         elif s == "awaiting_review":
             emp_q = emp_q.where(Employee.id.in_(received_subq), Employee.id.not_in(submitted_subq))
         elif s == "needs_review":

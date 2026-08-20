@@ -101,7 +101,7 @@ async def _has_any_email(db: AsyncSession) -> bool:
     ).scalar_one() > 0
 
 
-async def sync_inbox(db: AsyncSession) -> int | None:
+async def sync_inbox(db: AsyncSession) -> list[EmailMessage] | None:
     """Throttled, incremental provider sync. Never blocks the caller on a full
     mailbox download:
 
@@ -114,11 +114,13 @@ async def sync_inbox(db: AsyncSession) -> int | None:
       stale cursor rather than silently syncing "nothing new" forever);
     - any provider/cache error → serve existing DB rows, never raise.
 
-    Returns how many messages the provider handed back this call, or None if
-    this call was skipped entirely (still fresh, or another sync already in
-    flight). `sync_inbox_task` uses that count to decide whether it's worth
-    re-triggering Auto Extract — no point checking on a tick that changed
-    nothing.
+    Returns the upserted EmailMessage rows (freshly re-selected, so IDs/
+    conversation_id are populated), or None if this call was skipped entirely
+    (still fresh, or another sync already in flight) or hit an error.
+    `sync_inbox_task` uses this list to enqueue extraction for EXACTLY these
+    threads — no point re-triggering Auto Extract on a tick that changed
+    nothing, and no need to rescan the whole mailbox to find what changed
+    when the sync itself already knows precisely which rows are new.
     """
     try:
         if await cache.exists(SYNC_FRESH_KEY) or await cache.exists(SYNC_LOCK_KEY):
@@ -134,12 +136,11 @@ async def sync_inbox(db: AsyncSession) -> int | None:
         started_at = datetime.now(timezone.utc).timestamp()
         provider = get_email_provider()
         messages = await provider.list_messages(None, since=since)
-        for m in messages:
-            await sync_message(db, m)
+        synced = [await sync_message(db, m) for m in messages]
         await db.commit()
         await cache.set(SYNC_LAST_KEY, started_at)
         await cache.set(SYNC_FRESH_KEY, True, ttl=settings.inbox_sync_min_interval_seconds)
-        return len(messages)
+        return synced
     except Exception:
         await db.rollback()
         return None
