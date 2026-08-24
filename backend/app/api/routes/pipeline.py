@@ -13,11 +13,20 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import require_full_access
 from app.core import datacache
 from app.core.http_headers import content_disposition
 from app.core.database import get_db
+from app.models.auth import User
 from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, PipelineStatus
 from app.schemas import Page, PipelineFileOut, PipelineStats
+from app.schemas.portal import (
+    PortalRosterMemberAdminOut,
+    PortalSendBackIn,
+    PortalSubmissionAdminOut,
+    PortalSubmissionFileOut,
+    PortalSubmissionPipelineFileRef,
+)
 from app.services.pipeline.ingestion import can_resolve_assign, retry_pipeline_file
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
@@ -71,7 +80,7 @@ async def list_pipeline_files(
                     "(the Activity log hides 'success,resolved' by default — "
                     "finished work isn't what the page is for)"),
     failure_code: str | None = Query(default=None),
-    source_kind: str | None = Query(default=None, description="upload|email"),
+    source_kind: str | None = Query(default=None, description="upload|email|manual|portal"),
     source_id: str | None = Query(default=None, description="Filter by PipelineFile.source_id"),
     thread_key: str | None = Query(
         default=None,
@@ -148,6 +157,224 @@ async def pipeline_stats(db: AsyncSession = Depends(get_db)):
     # Cached (short TTL) — the UI polls this every 15s from several screens.
     data = await datacache.get_or_set(datacache.NS_PIPELINE, "stats", datacache.TTL_STATS, _compute)
     return PipelineStats(**data)
+
+
+async def _portal_submission_admin_rows(db: AsyncSession, subs: list) -> list:
+    """Shared row-assembly for both the list and single-submission admin
+    views — review_state/record_id/pipeline_files are all computed HERE, on
+    read, never written back by Accept (see module docstring on the list
+    route below for why)."""
+    from app.models.employee import Employee
+    from app.models.portal_submission import PortalSubmissionFile
+
+    if not subs:
+        return []
+    emp_pks = {s.employee_pk for s in subs}
+    employees = {e.id: e for e in (await db.execute(
+        select(Employee).where(Employee.id.in_(emp_pks)))).scalars().all()}
+
+    sub_ids = [s.id for s in subs]
+    # Every PipelineFile a portal submission staged uses source_id
+    # "portal:<submission_id>:<kind>" — LIKE-match per submission id, since
+    # there's no FK (this repo's identity-by-lookup convention, not a schema
+    # gap — see the migration's own comment on why).
+    all_files = (await db.execute(select(PipelineFile).where(
+        PipelineFile.source_kind == "portal",
+        or_(*[PipelineFile.source_id.like(f"portal:{sid}:%") for sid in sub_ids]),
+    ))).scalars().all()
+    files_by_sub: dict[str, list[PipelineFile]] = {}
+    for f in all_files:
+        # "portal:<sub_id>:<kind>" -> sub_id (kind itself may contain no colons)
+        parts = (f.source_id or "").split(":", 2)
+        sid = parts[1] if len(parts) == 3 else None
+        if sid:
+            files_by_sub.setdefault(sid, []).append(f)
+
+    out: list[PortalSubmissionAdminOut] = []
+    for s in subs:
+        emp = employees.get(s.employee_pk)
+        files = (await db.execute(select(PortalSubmissionFile).where(
+            PortalSubmissionFile.submission_id == s.id))).scalars().all()
+        linked = files_by_sub.get(s.id, [])
+        record_id = next((f.record_id for f in linked if f.record_id), None)
+        if linked:
+            statuses = {f.status for f in linked}
+            review_state = ("accepted" if record_id and all(f.record_id for f in linked)
+                            else "needs_review" if PipelineStatus.NEEDS_REVIEW in statuses
+                            else "success" if statuses == {PipelineStatus.SUCCESS}
+                            else "processing")
+        else:
+            review_state = "pending" if s.extraction_state != "done" else "no_files_staged"
+        out.append(PortalSubmissionAdminOut(
+            id=s.id, employee_pk=s.employee_pk,
+            employee_name=emp.name if emp else None, employee_id=emp.employee_id if emp else None,
+            month=s.month, year=s.year, status=s.status,
+            approval_claimed=s.approval_claimed,
+            manager_decision=s.manager_decision, manager_note=s.manager_note,
+            decided_at=s.decided_at, employee_note=s.employee_note,
+            extraction_state=s.extraction_state, extraction_error=s.extraction_error,
+            review_state=review_state, record_id=record_id,
+            submitted_at=s.submitted_at, created_at=s.created_at, updated_at=s.updated_at,
+            files=[PortalSubmissionFileOut(id=f.id, kind=f.kind, filename=f.filename,
+                                            content_type=f.content_type, size_bytes=f.size_bytes,
+                                            created_at=f.created_at) for f in files],
+            pipeline_files=[PortalSubmissionPipelineFileRef(
+                kind=(f.source_id or "").rsplit(":", 1)[-1],
+                pipeline_file_id=f.id, pipeline_status=f.status,
+                record_id=f.record_id) for f in linked],
+        ))
+    return out
+
+
+@router.get("/portal-submissions", response_model=list[PortalSubmissionAdminOut])
+async def list_portal_submissions(
+    manager_decision: str | None = Query(
+        default=None,
+        description="pending|not_approved — \"accepted\" isn't tracked here, see review_state instead"),
+    month: int | None = Query(default=None, ge=1, le=12),
+    year: int | None = Query(default=None, ge=2000),
+    db: AsyncSession = Depends(get_db),
+):
+    """The internal 'Portal Submissions' view — browse portal activity by
+    manager-decision status (a dimension that lives on PortalSubmission, not
+    on individual PipelineFile rows). review_state/record_id/pipeline_files
+    are all computed HERE, on read — Accept never writes back to
+    PortalSubmission, so this endpoint is the only place that link exists."""
+    from app.models.portal_submission import PortalSubmission
+
+    base = select(PortalSubmission).where(PortalSubmission.status != "draft")
+    if manager_decision:
+        base = base.where(PortalSubmission.manager_decision == manager_decision)
+    if month:
+        base = base.where(PortalSubmission.month == month)
+    if year:
+        base = base.where(PortalSubmission.year == year)
+    subs = (await db.execute(base.order_by(PortalSubmission.submitted_at.desc()))).scalars().all()
+    return await _portal_submission_admin_rows(db, subs)
+
+
+@router.get("/portal-submissions/{submission_id}", response_model=PortalSubmissionAdminOut)
+async def get_portal_submission(submission_id: str, db: AsyncSession = Depends(get_db)):
+    """One submission's live, current state."""
+    from app.models.portal_submission import PortalSubmission
+
+    sub = (await db.execute(select(PortalSubmission).where(
+        PortalSubmission.id == submission_id))).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(404, "Submission not found")
+    rows = await _portal_submission_admin_rows(db, [sub])
+    return rows[0]
+
+
+@router.post("/portal-submissions/{submission_id}/send-back", response_model=PortalSubmissionAdminOut)
+async def send_back_portal_submission(
+    submission_id: str, body: PortalSendBackIn,
+    reviewer: User = Depends(require_full_access), db: AsyncSession = Depends(get_db),
+):
+    """The internal reviewer's rejection — distinct from the existing Delete
+    button (which stays a silent discard for every source). Requires a note,
+    sets the submission back to "rejected" so the employee sees exactly why
+    and can fix + resend (upload_file/delete_file already re-queue it
+    automatically once they do — see portal_employee.py). Never touches the
+    staged PipelineFile row(s) themselves; a reviewer who wants this off
+    their plate entirely can still use the ordinary Delete button too."""
+    from app.models.portal_submission import ManagerDecision, PortalSubmission, PortalSubmissionStatus
+
+    if not body.note.strip():
+        raise HTTPException(400, "A note is required so the employee knows what to fix.")
+    sub = (await db.execute(select(PortalSubmission).where(
+        PortalSubmission.id == submission_id))).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(404, "Submission not found")
+
+    sub.status = PortalSubmissionStatus.REJECTED
+    sub.manager_decision = ManagerDecision.NOT_APPROVED
+    sub.manager_note = body.note.strip()
+    sub.decided_at = datetime.now(timezone.utc)
+    sub.decided_by = reviewer.id
+    await db.commit()
+    await db.refresh(sub)
+    rows = await _portal_submission_admin_rows(db, [sub])
+    return rows[0]
+
+
+@router.get("/portal-roster", response_model=list[PortalRosterMemberAdminOut])
+async def portal_roster(
+    month: int = Query(ge=1, le=12), year: int = Query(ge=2000),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every employee with a portal login, for ONE month/year — submitted or
+    not, so 'who's missing' is as visible as 'who's already sent it in.'
+    Backs the internal Pipeline page's Portal Submissions tab."""
+    from app.models.employee import Employee
+    from app.models.portal_auth import PortalRole, PortalUser
+    from app.models.portal_submission import PortalSubmission, PortalSubmissionStatus
+
+    accounts = (await db.execute(select(PortalUser).where(
+        PortalUser.role == PortalRole.EMPLOYEE, PortalUser.employee_pk.isnot(None),
+    ))).scalars().all()
+    emp_pks = [a.employee_pk for a in accounts if a.employee_pk]
+    if not emp_pks:
+        return []
+    employees = {e.id: e for e in (await db.execute(
+        select(Employee).where(Employee.id.in_(emp_pks)))).scalars().all()}
+
+    subs = (await db.execute(select(PortalSubmission).where(
+        PortalSubmission.employee_pk.in_(emp_pks),
+        PortalSubmission.month == month, PortalSubmission.year == year,
+        PortalSubmission.status != PortalSubmissionStatus.DRAFT,
+    ))).scalars().all()
+    admin_rows = {r.employee_pk: r for r in await _portal_submission_admin_rows(db, subs)}
+
+    out: list[PortalRosterMemberAdminOut] = []
+    for pk in emp_pks:
+        emp = employees.get(pk)
+        if not emp:
+            continue
+        out.append(PortalRosterMemberAdminOut(
+            employee_pk=emp.id, employee_id=emp.employee_id, employee_name=emp.name,
+            has_portal_account=True, submission=admin_rows.get(pk),
+        ))
+    out.sort(key=lambda m: m.employee_name.lower())
+    return out
+
+
+@router.get("/portal-submissions/{submission_id}/files/{kind}/content")
+async def portal_submission_file_content(submission_id: str, kind: str, db: AsyncSession = Depends(get_db)):
+    """Preview a portal submission's uploaded file straight from
+    portal_store — works even before/if extraction ever staged anything, so
+    a reviewer isn't blocked from looking at what was sent in just because
+    extraction failed or hasn't run yet."""
+    from app.models.portal_submission import PortalSubmissionFile
+    from app.services.pipeline import portal_store
+
+    f = (await db.execute(select(PortalSubmissionFile).where(
+        PortalSubmissionFile.submission_id == submission_id, PortalSubmissionFile.kind == kind,
+    ))).scalar_one_or_none()
+    if not f:
+        raise HTTPException(404, "File not found")
+    data = portal_store.read_portal_file(f.stored_path)
+    if not data:
+        raise HTTPException(404, "File is no longer available")
+    return portal_store.content_response(f.filename, f.content_type, data)
+
+
+@router.get("/portal-submissions/{submission_id}/files/{kind}/render")
+async def portal_submission_file_render(submission_id: str, kind: str,
+                                        page: int = Query(default=1, ge=1, le=50),
+                                        db: AsyncSession = Depends(get_db)):
+    from app.models.portal_submission import PortalSubmissionFile
+    from app.services.pipeline import portal_store
+
+    f = (await db.execute(select(PortalSubmissionFile).where(
+        PortalSubmissionFile.submission_id == submission_id, PortalSubmissionFile.kind == kind,
+    ))).scalar_one_or_none()
+    if not f:
+        raise HTTPException(404, "File not found")
+    data = portal_store.read_portal_file(f.stored_path)
+    if not data:
+        raise HTTPException(404, "File is no longer available")
+    return portal_store.render_response(f.filename, data, page)
 
 
 @router.post("/{pipeline_id}/retry", response_model=PipelineFileOut)
@@ -356,18 +583,22 @@ async def pipeline_raw_render(
 
 @router.get("/{pipeline_id}/raw-eml-preview")
 async def pipeline_raw_eml_preview(pipeline_id: str, db: AsyncSession = Depends(get_db)):
-    """Parse the raw EML file and return structured content as JSON for the viewer."""
+    """Parse the raw EML (or Outlook .msg) file and return structured content
+    as JSON for the viewer."""
     t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
     if not t:
         raise HTTPException(404, "Pipeline file not found")
-    if not (t.filename or "").lower().endswith(".eml"):
-        raise HTTPException(400, "Not an EML file")
+    if not (t.filename or "").lower().endswith((".eml", ".msg")):
+        raise HTTPException(400, "Not an EML or .msg file")
     from app.services.pipeline.ingestion import read_raw_copy
     data = read_raw_copy(t)
     if not data:
         raise HTTPException(404, "Raw file copy is no longer available")
     from app.services.extraction.eml_parser import parse_eml
-    return parse_eml(data)
+    try:
+        return parse_eml(data, filename=t.filename)
+    except Exception:
+        raise HTTPException(422, "Could not parse this email file")
 
 
 @router.get("/meta/stages")

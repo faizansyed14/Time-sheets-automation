@@ -3,13 +3,24 @@ Microsoft Graph attachment classification — a forwarded email that carries a
 timesheet PDF must be treated as a TIMESHEET (so its nested PDF is extracted),
 never as a flat image / manager-approval screenshot.
 """
-from app.services.email_provider.graph_provider import _build, _classify
+from app.services.email_provider.graph_provider import _as_eml_name, _build, _classify
 
 
 def test_eml_attachment_classified_as_timesheet():
     # A forwarded email attached as a .eml file (contentType may be octet-stream).
     assert _classify("Sri Naachammai.eml", "application/octet-stream", has_doc=False) == "timesheet"
     assert _classify("forwarded.eml", "message/rfc822", has_doc=True) == "timesheet"
+
+
+def test_msg_attachment_classified_as_timesheet():
+    # A forwarded email saved and attached as a real Outlook .msg FILE (a
+    # fileAttachment, not an itemAttachment) — Graph typically reports its
+    # contentType as generic octet-stream, so the filename extension is what
+    # must carry it. Previously fell through to "other" and disappeared from
+    # both the Inbox attachment count and the visible attachment list.
+    assert _classify("General reminder - TIMESHEET - Varun Salian.msg",
+                     "application/octet-stream", has_doc=False) == "timesheet"
+    assert _classify("forwarded.msg", "application/vnd.ms-outlook", has_doc=True) == "timesheet"
 
 
 def test_eml_is_never_approval_even_with_keyword():
@@ -34,6 +45,16 @@ def test_item_attachment_forwarded_email_is_timesheet():
     assert kind == "timesheet"
     assert fn.endswith(".eml")
     assert ct == "message/rfc822"
+
+
+def test_item_attachment_name_already_ending_in_msg_is_not_double_extensioned():
+    """Outlook's own "save as" for an embedded message defaults to .msg, so
+    an itemAttachment's own `name` field often already ends in .msg even
+    though its bytes (fetched at /$value) are always real RFC822 — the old
+    naive `name + ".eml"` produced a confusing "X.msg.eml" double extension."""
+    assert _as_eml_name("Varun Salian - TIMESHEET.msg") == "Varun Salian - TIMESHEET.eml"
+    assert _as_eml_name("already.eml") == "already.eml"
+    assert _as_eml_name(None) == "forwarded-email.eml"
 
 
 def test_eml_file_plus_inline_image_does_not_hijack_as_timesheet():

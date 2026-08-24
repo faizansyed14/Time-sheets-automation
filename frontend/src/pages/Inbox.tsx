@@ -843,8 +843,9 @@ const DOC_TYPES = new Set([
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   "message/rfc822",
+  "application/vnd.ms-outlook",
 ]);
-const DOC_EXTS = new Set(["pdf", "docx", "xlsx", "eml"]);
+const DOC_EXTS = new Set(["pdf", "docx", "xlsx", "eml", "msg"]);
 
 function isDocAttachment(a: Attachment): boolean {
   if (a.is_inline) return false;

@@ -190,6 +190,58 @@ def test_eml_recursion_is_depth_limited():
     collect_thread([("msg 1", payload)])   # must simply return, not recurse forever
 
 
+def test_msg_to_eml_bytes_uses_asEmailMessage_not_export(monkeypatch):
+    """Real bug, found live: msg_to_eml_bytes used to call bare `msg.export()`.
+    export()/exportBytes() re-save the SAME .msg (OLE) format — never RFC822
+    — and export() also requires a destination path argument and returns
+    None, so calling it with none raised TypeError on EVERY .msg,
+    unconditionally. The broad except around it swallowed that silently, so
+    .msg conversion had never actually worked at all — every .msg fell back
+    to being wrapped as an opaque, unreadable blob. asEmailMessage() is the
+    correct call: it returns a real stdlib EmailMessage, which .as_bytes()
+    turns into genuine RFC822 bytes. A real .msg (OLE compound binary) can't
+    be constructed in a unit test, so extract_msg.Message itself is faked
+    here — this pins the WIRING, not the library's own parsing."""
+    import sys
+    import app.services.extract_email.thread_extract as te
+
+    real_eml = MimeMessage()
+    real_eml["Subject"] = "From a real .msg"
+    real_eml.set_content("Body recovered from the .msg file.")
+
+    calls = []
+
+    class _FakeMsg:
+        def asEmailMessage(self):
+            calls.append("asEmailMessage")
+            return real_eml
+
+        def export(self, *a, **kw):
+            raise AssertionError("export() must never be called — wrong format, wrong signature")
+
+        def exportBytes(self, *a, **kw):
+            raise AssertionError("exportBytes() must never be called — wrong format")
+
+        def close(self):
+            calls.append("close")
+
+    class _FakeExtractMsgModule:
+        @staticmethod
+        def Message(path):
+            return _FakeMsg()
+
+    monkeypatch.setitem(sys.modules, "extract_msg", _FakeExtractMsgModule())
+
+    result = te.msg_to_eml_bytes(b"fake ole compound bytes")
+    assert calls == ["asEmailMessage", "close"]
+    assert result is not None
+
+    import email as _email_mod
+    import email.policy as _policy_mod
+    parsed = _email_mod.message_from_bytes(result, policy=_policy_mod.compat32)
+    assert parsed["Subject"] == "From a real .msg"
+
+
 # --------------------------------------------------------------------------
 # require_vision_configured
 # --------------------------------------------------------------------------

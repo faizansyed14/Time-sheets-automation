@@ -19,6 +19,7 @@ import {
   Sparkles,
   Trash2,
   UploadCloud,
+  UserCheck,
   XCircle,
 } from "lucide-react";
 import {
@@ -30,6 +31,7 @@ import {
   type PipelineFile,
   type ThreadSummary,
 } from "../api/client";
+import PortalSubmissionsTable from "../components/PortalSubmissionsTable";
 import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
 import StoredFilesPreview from "../components/StoredFilesPreview";
 import { ThreadSummaryBox } from "../components/ThreadSummaryBox";
@@ -422,6 +424,10 @@ export default function PipelinePage() {
   );
   const [outcomeFilter, setOutcomeFilter] = useState<OutcomeFilter>("");
   const [sourceFilter, setSourceFilter] = useState("");
+  // "Pipeline" is the existing per-file table (unchanged); "Portal
+  // Submissions" is a submission-centric view filterable by the employee's
+  // manager's decision — a dimension PipelineFile rows don't carry.
+  const [tab, setTab] = useState<"pipeline" | "portal">("pipeline");
   const [q, setQ] = useState("");
   const [open, setOpen] = useState<string | null>(null);
   const [assigning, setAssigning] = useState<PipelineFile | null>(null);
@@ -532,6 +538,35 @@ export default function PipelinePage() {
 
   return (
     <div className="animate-fade-up">
+      <div className="mb-4 flex gap-1 rounded-lg border border-slate-200 bg-white p-1 text-sm w-fit">
+        <button
+          type="button"
+          onClick={() => setTab("pipeline")}
+          className={cn(
+            "rounded-md px-3 py-1.5 font-medium transition-colors",
+            tab === "pipeline" ? "bg-brand-50 text-brand-700" : "text-slate-500 hover:bg-slate-50"
+          )}
+        >
+          Pipeline
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab("portal")}
+          className={cn(
+            "rounded-md px-3 py-1.5 font-medium transition-colors",
+            tab === "portal" ? "bg-brand-50 text-brand-700" : "text-slate-500 hover:bg-slate-50"
+          )}
+        >
+          Portal Submissions
+        </button>
+      </div>
+
+      {tab === "portal" ? (
+        <Card>
+          <PortalSubmissionsTable onOpenPipelineFile={setAssigning} />
+        </Card>
+      ) : (
+        <>
       {threadKeyFilter && (
         <div className="mb-4 flex items-center gap-2 rounded-xl border border-brand-200 bg-brand-50 px-4 py-2.5 text-sm text-brand-800">
           <Columns2 className="h-4 w-4 shrink-0" />
@@ -614,6 +649,7 @@ export default function PipelinePage() {
             <option value="">All sources</option>
             <option value="email">Email</option>
             <option value="upload">Upload</option>
+            <option value="portal">Portal</option>
           </Select>
 
           <button
@@ -681,6 +717,10 @@ export default function PipelinePage() {
                     )}
                     {f.source_kind === "email" ? (
                       <Mail className="h-4 w-4 shrink-0 text-slate-400" />
+                    ) : f.source_kind === "portal" ? (
+                      <span title="Employee portal">
+                        <UserCheck className="h-4 w-4 shrink-0 text-brand-400" />
+                      </span>
                     ) : (
                       <UploadCloud className="h-4 w-4 shrink-0 text-slate-400" />
                     )}
@@ -848,6 +888,8 @@ export default function PipelinePage() {
           </div>
         )}
       </Card>
+        </>
+      )}
 
       <PipelineCompareFixModal
         file={assigning}

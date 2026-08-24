@@ -278,7 +278,7 @@ export interface PipelineFile {
   filename: string;
   content_type: string | null;
   size_bytes: number | null;
-  source_kind: "upload" | "email" | "manual";
+  source_kind: "upload" | "email" | "manual" | "portal";
   source_id: string | null;
   attachment_id: string | null;
   status: PipelineStatus;
@@ -753,7 +753,14 @@ export const deletePipelineFile = (id: string) =>
 export interface ManagerFolder { name: string; rel_path: string; employee_count: number; }
 export interface EmployeeFolder { name: string; rel_path: string; month_count: number; }
 export interface MonthFolder { name: string; rel_path: string; file_count: number; }
-export interface FileItem { name: string; rel_path: string; size: number; content_type: string; }
+export interface FileItem {
+  name: string;
+  rel_path: string;
+  size: number;
+  content_type: string;
+  /** When this file was written into the vault. */
+  stored_at: string | null;
+}
 
 export const listFileManagers = () => api.get<ManagerFolder[]>("/files/managers").then((r) => r.data);
 export const listFileEmployees = (manager: string) =>
@@ -769,6 +776,43 @@ export const listFileItems = (manager: string, emp: string, month: string) =>
     .get<FileItem[]>(
       `/files/managers/${encodeURIComponent(manager)}/employees/${encodeURIComponent(emp)}/months/${encodeURIComponent(month)}/items`
     )
+    .then((r) => r.data);
+
+// ---- alternate (project-wise / location-wise / search) navigation onto the
+// SAME vault files ----
+// Second, read-oriented lenses onto the identical Manager/Employee/Month
+// files: grouped by the Employee Matcher's own `project` or `location`
+// field, or found directly by a name/ID/project search. All resolve down to
+// the same rel_path-bearing FileItem rows the Manager view uses, so
+// preview/delete/upload/zip-download below all keep working unchanged.
+export interface ProjectFolder { name: string; employee_count: number; }
+export interface ProjectEmployee {
+  employee_pk: string;
+  employee_id: string;
+  name: string;
+  project: string | null;
+  location: string | null;
+  account_manager: string;
+  employee_folder: string;
+  month_count: number;
+}
+
+export const listFileProjects = () => api.get<ProjectFolder[]>("/files/projects").then((r) => r.data);
+export const listProjectEmployees = (project: string) =>
+  api.get<ProjectEmployee[]>(`/files/projects/${encodeURIComponent(project)}/employees`).then((r) => r.data);
+export const listFileLocations = () => api.get<ProjectFolder[]>("/files/locations").then((r) => r.data);
+export const listLocationEmployees = (location: string) =>
+  api.get<ProjectEmployee[]>(`/files/locations/${encodeURIComponent(location)}/employees`).then((r) => r.data);
+/** Employee name, employee ID, or project ("client name") — one search
+ *  across the whole Employee Matcher, used by each view's search bar to
+ *  jump straight into an employee's vault. */
+export const searchVaultEmployees = (q: string) =>
+  api.get<ProjectEmployee[]>("/files/search-employees", { params: { q } }).then((r) => r.data);
+export const listEmployeeVaultMonths = (employeePk: string) =>
+  api.get<MonthFolder[]>(`/files/employee-vault/${encodeURIComponent(employeePk)}/months`).then((r) => r.data);
+export const listEmployeeVaultItems = (employeePk: string, month: string) =>
+  api
+    .get<FileItem[]>(`/files/employee-vault/${encodeURIComponent(employeePk)}/months/${encodeURIComponent(month)}/items`)
     .then((r) => r.data);
 
 export const fileContentUrl = (relPath: string) =>
@@ -1285,3 +1329,217 @@ export const fetchAutoExtractStatus = () =>
   api.get<AutoExtractStatus>("/inbox/auto-extract/status").then((r) => r.data);
 export const fetchAutoExtractCoverage = () =>
   api.get<AutoExtractCoverage>("/inbox/auto-extract/coverage").then((r) => r.data);
+
+// ===========================================================================
+// Portal — employee/manager self-service (fully separate JWT namespace from
+// the internal `api` instance above: its own token key, its own interceptor,
+// its own 401 handling. A portal token is rejected by every internal route
+// and vice versa — see backend api/portal_deps.py.)
+// ===========================================================================
+export const portalApi = axios.create({ baseURL: "/api/v1" });
+
+const PORTAL_TOKEN_KEY = "portal_token";
+export function getPortalToken(): string | null {
+  return localStorage.getItem(PORTAL_TOKEN_KEY);
+}
+export function setPortalToken(token: string | null) {
+  if (token) localStorage.setItem(PORTAL_TOKEN_KEY, token);
+  else localStorage.removeItem(PORTAL_TOKEN_KEY);
+}
+portalApi.interceptors.request.use((config) => {
+  const token = getPortalToken();
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+let onPortalUnauthorized: (() => void) | null = null;
+export function setPortalUnauthorizedHandler(fn: () => void) {
+  onPortalUnauthorized = fn;
+}
+portalApi.interceptors.response.use(
+  (r) => r,
+  (error) => {
+    if (error?.response?.status === 401 && getPortalToken()) {
+      setPortalToken(null);
+      onPortalUnauthorized?.();
+    }
+    return Promise.reject(error);
+  }
+);
+
+export type PortalRole = "employee";
+
+export interface PortalUser {
+  id: string;
+  username: string;
+  role: PortalRole;
+  employee_pk: string | null;
+  employee_name: string | null;
+  employee_id: string | null;
+  is_active: boolean;
+  last_login_at: string | null;
+}
+export interface PortalTokenResult {
+  access_token: string;
+  user: PortalUser;
+}
+
+export const portalLogin = (username: string, password: string) =>
+  portalApi.post<PortalTokenResult>("/portal/auth/login", { username, password }).then((r) => r.data);
+export const portalMe = () => portalApi.get<PortalUser>("/portal/auth/me").then((r) => r.data);
+export const portalLogout = () => portalApi.post("/portal/auth/logout").then((r) => r.data);
+
+export type PortalSubmissionStatusT = "draft" | "submitted" | "rejected";
+export type PortalManagerDecision = "pending" | "not_approved";
+export type PortalExtractionState = "not_started" | "running" | "done" | "failed";
+export type PortalFileKind = "timesheet" | "sick_leave" | "other";
+
+export interface PortalSubmissionFile {
+  id: string;
+  kind: PortalFileKind;
+  filename: string;
+  content_type: string | null;
+  size_bytes: number | null;
+  created_at: string;
+}
+export interface PortalSubmission {
+  id: string;
+  employee_pk: string;
+  employee_name: string | null;
+  employee_id: string | null;
+  month: number;
+  year: number;
+  status: PortalSubmissionStatusT;
+  manager_decision: PortalManagerDecision;
+  manager_note: string | null;
+  decided_at: string | null;
+  approval_claimed: boolean;
+  employee_note: string | null;
+  extraction_state: PortalExtractionState;
+  extraction_error: string | null;
+  review_state: string | null;
+  record_id: string | null;
+  submitted_at: string | null;
+  created_at: string;
+  updated_at: string;
+  files: PortalSubmissionFile[];
+}
+export interface PortalSubmissionPrecheck {
+  submission: PortalSubmission | null;
+  already_filed_elsewhere: boolean;
+  filed_source_note: string | null;
+}
+
+// ---- employee ----
+export const portalPrecheck = (month: number, year: number) =>
+  portalApi.get<PortalSubmissionPrecheck>(`/portal/employee/submissions/${month}/${year}`).then((r) => r.data);
+export const portalListMySubmissions = () =>
+  portalApi.get<PortalSubmission[]>("/portal/employee/submissions").then((r) => r.data);
+export const portalUpsertSubmission = (body: { month: number; year: number; employee_note?: string }) =>
+  portalApi.post<PortalSubmission>("/portal/employee/submissions", body).then((r) => r.data);
+export const portalUploadFile = (submissionId: string, kind: PortalFileKind, file: File) => {
+  const form = new FormData();
+  form.append("file", file);
+  return portalApi
+    .post<PortalSubmission>(`/portal/employee/submissions/${submissionId}/files`, form, {
+      params: { kind },
+      headers: { "Content-Type": "multipart/form-data" },
+    })
+    .then((r) => r.data);
+};
+export const portalDeleteFile = (submissionId: string, kind: PortalFileKind) =>
+  portalApi.delete<PortalSubmission>(`/portal/employee/submissions/${submissionId}/files/${kind}`).then((r) => r.data);
+/** `approval_claimed` is the employee's mandatory yes/no answer to "does
+ *  this timesheet already carry manager approval evidence?" — required, no
+ *  default, so the submit call 422s if it's omitted. */
+export const portalSubmit = (submissionId: string, approvalClaimed: boolean) =>
+  portalApi
+    .post<PortalSubmission>(`/portal/employee/submissions/${submissionId}/submit`, {
+      approval_claimed: approvalClaimed,
+    })
+    .then((r) => r.data);
+/** Discard an abandoned draft (never a submitted one) entirely. */
+export const portalDiscardDraft = (submissionId: string) =>
+  portalApi.delete(`/portal/employee/submissions/${submissionId}`).then((r) => r.data);
+
+// ---- internal admin: portal user accounts ----
+export const adminListPortalUsers = () => api.get<PortalUser[]>("/admin/portal-users").then((r) => r.data);
+export const adminCreatePortalUser = (body: { username: string; password: string; employee_pk: string }) =>
+  api.post<PortalUser>("/admin/portal-users", body).then((r) => r.data);
+export const adminUpdatePortalUser = (id: string, body: Partial<{ is_active: boolean; password: string }>) =>
+  api.patch<PortalUser>(`/admin/portal-users/${id}`, body).then((r) => r.data);
+export const adminDeletePortalUser = (id: string) => api.delete(`/admin/portal-users/${id}`).then((r) => r.data);
+
+// ---- internal: the Pipeline page's "Portal Submissions" tab ----
+export interface PortalSubmissionPipelineFileRef {
+  kind: string;
+  pipeline_file_id: string | null;
+  pipeline_status: string | null;
+  /** Set once THIS file has been accepted into a filed TimesheetRecord —
+   *  nothing left to review for it. */
+  record_id: string | null;
+}
+export interface PortalSubmissionAdminRow extends PortalSubmission {
+  pipeline_files: PortalSubmissionPipelineFileRef[];
+}
+export const fetchPortalSubmissionsAdmin = (params?: {
+  managerDecision?: PortalManagerDecision;
+  month?: number;
+  year?: number;
+}) =>
+  api
+    .get<PortalSubmissionAdminRow[]>("/pipeline/portal-submissions", {
+      params: {
+        manager_decision: params?.managerDecision || undefined,
+        month: params?.month || undefined,
+        year: params?.year || undefined,
+      },
+    })
+    .then((r) => r.data);
+/** One submission's LIVE state — used by Compare & Fix so a portal item's
+ *  "Manager approval" reflects the employee's self-attestation
+ *  (`approval_claimed`) and any internal send-back decision, not a
+ *  staging-time snapshot (extraction runs on Submit, independent of
+ *  whether/when a reviewer has sent it back; see portal_extract.py). */
+export const fetchPortalSubmissionAdmin = (submissionId: string) =>
+  api.get<PortalSubmissionAdminRow>(`/pipeline/portal-submissions/${submissionId}`).then((r) => r.data);
+/** Send a portal submission back to the employee with a note explaining what
+ *  to fix — the internal reviewer's alternative to Accept in Compare & Fix.
+ *  Gated by internal auth (require_full_access), not the portal token. */
+export const portalSendBack = (submissionId: string, note: string) =>
+  api
+    .post<PortalSubmissionAdminRow>(`/pipeline/portal-submissions/${submissionId}/send-back`, { note })
+    .then((r) => r.data);
+
+/** Preview/download URL for one submission file's raw bytes — the browser
+ *  loads these directly (<iframe>/<img> src), so the token rides in the
+ *  query string, same pattern as withAuthParam but for the portal's own
+ *  token namespace. */
+export function withPortalAuthParam(url: string): string {
+  const t = getPortalToken();
+  if (!t) return url;
+  return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(t);
+}
+export const portalEmployeeFileUrl = (submissionId: string, kind: PortalFileKind) =>
+  withPortalAuthParam(`/api/v1/portal/employee/submissions/${submissionId}/files/${kind}/content`);
+export const portalEmployeeRenderUrl = (submissionId: string, kind: PortalFileKind) =>
+  withPortalAuthParam(`/api/v1/portal/employee/submissions/${submissionId}/files/${kind}/render`);
+/** Internal (Pipeline page) preview — uses the internal `api` instance's
+ *  own token namespace, not the portal's. */
+export const portalAdminFileUrl = (submissionId: string, kind: string) =>
+  withAuthParam(`/api/v1/pipeline/portal-submissions/${submissionId}/files/${kind}/content`);
+export const portalAdminRenderUrl = (submissionId: string, kind: string) =>
+  withAuthParam(`/api/v1/pipeline/portal-submissions/${submissionId}/files/${kind}/render`);
+
+/** Internal (Pipeline page) roster — every portal-enabled employee
+ *  system-wide, not scoped to one manager. Carries pipeline_files (the
+ *  manager-facing roster doesn't) so a reviewer can jump straight into
+ *  Compare & Fix from a roster row. */
+export interface PortalRosterMemberAdmin {
+  employee_pk: string;
+  employee_id: string;
+  employee_name: string;
+  has_portal_account: boolean;
+  submission: PortalSubmissionAdminRow | null;
+}
+export const fetchPortalRosterAdmin = (month: number, year: number) =>
+  api.get<PortalRosterMemberAdmin[]>("/pipeline/portal-roster", { params: { month, year } }).then((r) => r.data);

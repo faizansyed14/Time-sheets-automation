@@ -26,6 +26,7 @@ import {
   Search,
   Sparkles,
   Trash2,
+  Undo2,
   User,
   X,
 } from "lucide-react";
@@ -34,6 +35,8 @@ import {
   attachmentUrl,
   fetchThread,
   fetchEmployeeMatcher,
+  fetchPortalSubmissionAdmin,
+  portalSendBack,
   deletePipelineFile,
   pipelineManualFix,
   pipelineRawRenderUrl,
@@ -47,7 +50,7 @@ import { ATTACHABLE_FILE_RE, attachmentRenderUrlIfSupported } from "../lib/fileP
 import { isBodyJunkImage } from "../lib/attachmentFilters";
 import { SourcePreview } from "./FilePreview";
 import { ThreadSummaryBox } from "./ThreadSummaryBox";
-import { Button, Input, Select, Spinner } from "./ui";
+import { Button, Input, Modal, Select, Spinner } from "./ui";
 import { cn, filterEmployees, formatBytes } from "../lib/utils";
 import { useToast } from "./toast";
 
@@ -291,6 +294,8 @@ export default function PipelineCompareFixModal({
   const [approvalDetail, setApprovalDetail] = useState("");
   const [approvalWeak, setApprovalWeak] = useState(false);
   const [pending, setPending] = useState(false);
+  const [sendBackOpen, setSendBackOpen] = useState(false);
+  const [sendBackNote, setSendBackNote] = useState("");
 
   const { data: employees, isLoading } = useQuery({
     queryKey: ["employee-matcher"],
@@ -313,6 +318,20 @@ export default function PipelineCompareFixModal({
     queryFn: () => fetchThread(emailSourceId!),
     enabled: !!emailSourceId,
     staleTime: 60_000,
+  });
+
+  // A portal file's source_id is "portal:<submission_id>:<kind>" — the
+  // submission's manager decision lives on PortalSubmission, not in this
+  // file's own extraction_meta, and extraction runs on Submit independent of
+  // when (or whether yet) the manager has decided — so what got baked in at
+  // staging time is frequently stale or simply "not decided yet." Fetching
+  // live here is the only way "Manager approval" below can ever be right.
+  const portalSubmissionId = file?.source_kind === "portal" ? file.source_id?.split(":")[1] ?? null : null;
+  const { data: portalSubmission } = useQuery({
+    queryKey: ["portal-submission-admin", portalSubmissionId],
+    queryFn: () => fetchPortalSubmissionAdmin(portalSubmissionId!),
+    enabled: !!portalSubmissionId,
+    staleTime: 10_000,
   });
   const docTabs = useMemo(() => {
     if (!thread) return [] as {
@@ -416,6 +435,25 @@ export default function PipelineCompareFixModal({
     setPending(false);
     setActiveTab({ kind: "staged" });
   }, [file]);
+
+  // Once the LIVE portal submission loads (async, so this always runs after
+  // the reset effect above finishes initializing from the staging-time
+  // snapshot), override "Manager approval" only if THIS reviewer already
+  // sent it back — there's no "approved" manager_decision value anymore
+  // (accepting a record never writes back to PortalSubmission, see
+  // review_state); otherwise leave the employee's own self-attestation
+  // (approval_claimed, baked in via portal_extract.py) in place, same as any
+  // AI-detected approval elsewhere in this form — the reviewer can still
+  // change it manually either way.
+  useEffect(() => {
+    if (!portalSubmission || portalSubmission.id !== portalSubmissionId) return;
+    if (portalSubmission.manager_decision !== "not_approved") return;
+    setApproved(false);
+    setApprovalDetail(
+      "Sent back" + (portalSubmission.manager_note ? `: "${portalSubmission.manager_note}"` : ".")
+    );
+    setApprovalWeak(false);
+  }, [portalSubmission, portalSubmissionId]);
 
   // Land directly on THIS record's own source document, not the raw staged
   // wrapper — a bulk thread (many employees, many attachments) otherwise
@@ -529,6 +567,32 @@ export default function PipelineCompareFixModal({
     }
   };
 
+  // Distinct from Delete: Delete silently discards the staged item (used for
+  // every source), while Send back is portal-only — it leaves the staged
+  // file exactly as-is (still reviewable/acceptable later) but flips the
+  // submission to "rejected" with a mandatory note so the employee sees why
+  // and can fix/resubmit, reusing the always-editable/auto-requeue flow.
+  const openSendBack = () => {
+    if (!file || pending || !portalSubmissionId) return;
+    setSendBackNote("");
+    setSendBackOpen(true);
+  };
+
+  const confirmSendBack = async () => {
+    if (!portalSubmissionId || !sendBackNote.trim()) return;
+    setPending(true);
+    try {
+      await portalSendBack(portalSubmissionId, sendBackNote.trim());
+      toast("info", "Sent back", "The employee will see this note and can fix or replace their files.");
+      setSendBackOpen(false);
+      onDiscarded?.();
+      onClose();
+    } catch (e: any) {
+      toast("error", "Couldn't send back", e?.response?.data?.detail ?? String(e));
+      setPending(false);
+    }
+  };
+
   const handleSave = async () => {
     if (!file || !canSave) return;
     setPending(true);
@@ -560,6 +624,7 @@ export default function PipelineCompareFixModal({
   if (!file) return null;
 
   return createPortal(
+    <>
     <div className="fixed inset-0 z-50 flex flex-col p-2 sm:p-4">
       <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onClick={() => !pending && onClose()} />
       <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl bg-white shadow-pop">
@@ -811,7 +876,7 @@ export default function PipelineCompareFixModal({
                 ref={fileInputRef}
                 type="file"
                 multiple
-                accept=".pdf,.docx,.xlsx,.png,.jpg,.jpeg,.eml"
+                accept=".pdf,.docx,.xlsx,.png,.jpg,.jpeg,.eml,.msg"
                 className="hidden"
                 onChange={(e) => { addFiles(e.target.files); e.target.value = ""; }}
               />
@@ -920,6 +985,12 @@ export default function PipelineCompareFixModal({
                   "Cancel"
                 )}
               </Button>
+              {isStaged && file.source_kind === "portal" && portalSubmissionId && (
+                <Button variant="secondary" onClick={openSendBack} disabled={pending}>
+                  <Undo2 className="h-4 w-4" />
+                  Send back
+                </Button>
+              )}
               <Button disabled={!canSave} onClick={handleSave}>
                 {pending ? (
                   <Spinner className="border-white/40 border-t-white" />
@@ -999,7 +1070,35 @@ export default function PipelineCompareFixModal({
 
         </div>
       </div>
-    </div>,
+    </div>
+
+    <Modal
+      open={sendBackOpen}
+      onClose={() => !pending && setSendBackOpen(false)}
+      title="Send back to employee"
+      subtitle="They'll see this note on the submission and can fix or replace their files."
+    >
+      <div className="space-y-4">
+        <textarea
+          autoFocus
+          rows={4}
+          value={sendBackNote}
+          onChange={(e) => setSendBackNote(e.target.value)}
+          placeholder="e.g. 'Missing manager signature on page 2 — please re-upload with approval.'"
+          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10"
+        />
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={() => setSendBackOpen(false)} disabled={pending}>
+            Cancel
+          </Button>
+          <Button onClick={confirmSendBack} disabled={pending || !sendBackNote.trim()}>
+            {pending && <Spinner className="border-white/40 border-t-white" />}
+            Send back
+          </Button>
+        </div>
+      </div>
+    </Modal>
+    </>,
     document.body
   );
 }

@@ -38,11 +38,14 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_admin, require_full_access
+from app.api.routes.portal_auth import portal_user_out
 from app.core.database import get_db
 from app.core.security import hash_password
 from app.models.auth import AuthMode, Role, User
+from app.models.employee import Employee
 from app.models.extraction_debug_run import ExtractionDebugRun
 from app.models.month_calendar import MonthCalendar
+from app.models.portal_auth import PortalRole, PortalUser
 from app.schemas import DebugRunOut, DebugRunSummary, MonthCalendarIn, MonthCalendarOut
 from app.schemas.auth import (
     AdminUserCreate,
@@ -51,10 +54,16 @@ from app.schemas.auth import (
     TotpSetupOut,
     UserOut,
 )
+from app.schemas.portal import AdminPortalUserCreate, AdminPortalUserUpdate, PortalUserOut
 from app.services.auth import totp as totp_svc
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 calendars_router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_full_access)])
+# Portal-user accounts (employee/manager self-service logins) are routine
+# operational setup, not admin-only config — any full-access role (admin or
+# user; not the read-only viewer, not the restricted vault_matcher) can
+# create/manage them, same read/write split as calendars_router above.
+portal_users_router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_full_access)])
 
 
 MIN_PASSWORD_LEN = 8
@@ -192,6 +201,61 @@ async def delete_user(user_id: str, admin: User = Depends(require_admin), db: As
     u = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if not u:
         raise HTTPException(404, "User not found")
+    await db.delete(u)
+    await db.commit()
+    return {"deleted": user_id}
+
+
+# ----------------------------- portal users (employee self-service) -----
+# Admin-issued only — no self-registration, no second factor (see
+# models/portal_auth.py's module docstring for why a separate, simpler auth
+# model than auth_users is appropriate here). No manager accounts — approval
+# is the internal timesheet team's job via Compare & Fix, not a portal login.
+@portal_users_router.get("/portal-users", response_model=list[PortalUserOut])
+async def list_portal_users(db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(select(PortalUser).order_by(PortalUser.username))).scalars().all()
+    return [await portal_user_out(db, u) for u in rows]
+
+
+@portal_users_router.post("/portal-users", response_model=PortalUserOut, status_code=201)
+async def create_portal_user(body: AdminPortalUserCreate, db: AsyncSession = Depends(get_db)):
+    dup = (await db.execute(select(PortalUser).where(PortalUser.username == body.username))).scalar_one_or_none()
+    if dup:
+        raise HTTPException(409, "Username already exists")
+    _check_password(body.password)
+
+    emp = (await db.execute(select(Employee).where(Employee.id == body.employee_pk))).scalar_one_or_none()
+    if not emp:
+        raise HTTPException(400, "No employee found with that id in the Employee Matcher")
+
+    u = PortalUser(username=body.username, password_hash=hash_password(body.password),
+                    role=PortalRole.EMPLOYEE, employee_pk=emp.id)
+    db.add(u)
+    await db.commit()
+    await db.refresh(u)
+    return await portal_user_out(db, u)
+
+
+@portal_users_router.patch("/portal-users/{user_id}", response_model=PortalUserOut)
+async def update_portal_user(user_id: str, body: AdminPortalUserUpdate, db: AsyncSession = Depends(get_db)):
+    u = (await db.execute(select(PortalUser).where(PortalUser.id == user_id))).scalar_one_or_none()
+    if not u:
+        raise HTTPException(404, "Portal account not found")
+    if body.is_active is not None:
+        u.is_active = body.is_active
+    if body.password:
+        _check_password(body.password)
+        u.password_hash = hash_password(body.password)
+    await db.commit()
+    await db.refresh(u)
+    return await portal_user_out(db, u)
+
+
+@portal_users_router.delete("/portal-users/{user_id}")
+async def delete_portal_user(user_id: str, db: AsyncSession = Depends(get_db)):
+    u = (await db.execute(select(PortalUser).where(PortalUser.id == user_id))).scalar_one_or_none()
+    if not u:
+        raise HTTPException(404, "Portal account not found")
     await db.delete(u)
     await db.commit()
     return {"deleted": user_id}

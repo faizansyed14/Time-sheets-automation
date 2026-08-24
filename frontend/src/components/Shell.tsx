@@ -15,6 +15,7 @@ import {
   Settings,
   ShieldCheck,
   CalendarClock,
+  UserCog,
   Bug,
   LogOut,
   ChevronLeft,
@@ -48,6 +49,10 @@ const TOOLS_NAV = [
   // just admin config — every role can view it (backend: require_write, same
   // as the routes above), so it lives here rather than under Admin.
   { to: "/admin/calendars", label: "Month calendars", icon: CalendarClock },
+  // Same read/write split as calendars above (require_full_access, not
+  // admin-only) — issuing an employee/manager portal login is routine ops
+  // work, not admin config.
+  { to: "/admin/portal-users", label: "Portal accounts", icon: UserCog },
 ];
 
 const ADMIN_NAV = [

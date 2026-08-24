@@ -107,7 +107,8 @@ class S3StorageProvider(StorageProvider):
                     continue
                 out.append(FileItem(
                     name=name, rel_path=f"{m}/{e}/{mo}/{name}", size=obj["Size"],
-                    content_type=mimetypes.guess_type(name)[0] or "application/octet-stream"))
+                    content_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
+                    stored_at=obj.get("LastModified")))
         return sorted(out, key=lambda f: f.name)
 
     def iter_files(self, manager: str | None = None):

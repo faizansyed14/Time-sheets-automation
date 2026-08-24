@@ -15,7 +15,7 @@ export type PreviewFile = {
 };
 
 const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"]);
-const PREVIEW_EXTS = new Set([...IMAGE_EXTS, "pdf", "eml", "docx", "xlsx"]);
+const PREVIEW_EXTS = new Set([...IMAGE_EXTS, "pdf", "eml", "msg", "docx", "xlsx"]);
 
 const DOCX_CTS = new Set([
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -42,9 +42,13 @@ export function isPdf(filename: string, contentType?: string | null) {
   return ct === "application/pdf" || ext(filename) === "pdf";
 }
 
+/** Outlook .msg is a different binary format from .eml (OLE compound, not
+ *  RFC822 text), but the server-side parser (eml_parser.parse_eml) converts
+ *  it transparently — from here on the viewer treats both identically. */
 export function isEml(filename: string, contentType?: string | null) {
   const ct = contentType?.toLowerCase() ?? "";
-  return ext(filename) === "eml" || ct === "message/rfc822";
+  return ext(filename) === "eml" || ext(filename) === "msg"
+    || ct === "message/rfc822" || ct === "application/vnd.ms-outlook";
 }
 
 export function isDocx(filename: string, contentType?: string | null) {
@@ -58,7 +62,7 @@ export function isOfficeDoc(filename: string, contentType?: string | null) {
 }
 
 /** Extensions accepted for manual file attachment (Upload / Compare & Fix). */
-export const ATTACHABLE_FILE_RE = /\.(pdf|docx|xlsx|png|jpe?g|eml)$/i;
+export const ATTACHABLE_FILE_RE = /\.(pdf|docx|xlsx|png|jpe?g|eml|msg)$/i;
 
 /** The server page-image renderer only supports office docs and PDFs — this
  *  is the one gate FilePreviewModal checks (`useServerPages`), so any other
@@ -87,6 +91,7 @@ export function mimeFor(filename: string, contentType?: string | null): string {
   if (isXlsx(filename, ct)) {
     return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
   }
+  if (ext(filename) === "msg") return "application/vnd.ms-outlook";
   if (isEml(filename, ct)) return "message/rfc822";
   const e = ext(filename);
   if (["jpg", "jpeg", "png", "gif", "webp", "bmp"].includes(e)) {
@@ -97,7 +102,8 @@ export function mimeFor(filename: string, contentType?: string | null): string {
 
 export function isPreviewable(filename: string, contentType?: string | null) {
   const ct = contentType?.toLowerCase() ?? "";
-  if (ct.startsWith("image/") || ct === "application/pdf" || ct === "message/rfc822") return true;
+  if (ct.startsWith("image/") || ct === "application/pdf"
+      || ct === "message/rfc822" || ct === "application/vnd.ms-outlook") return true;
   if (DOCX_CTS.has(ct) || XLSX_CTS.has(ct)) return true;
   return PREVIEW_EXTS.has(ext(filename));
 }

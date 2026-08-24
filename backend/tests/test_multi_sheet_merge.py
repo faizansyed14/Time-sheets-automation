@@ -64,6 +64,60 @@ async def test_second_sheet_unions_not_overwrites():
         assert rec2.public_holiday_dates == ["2026-06-15"]
 
 
+async def test_portal_and_email_sheets_union_into_one_record():
+    """The employee portal's Accept path (a portal-style source_key) and the
+    email/upload Accept path (any other source_key) must UNION into ONE
+    TimesheetRecord for the same employee+month, in EITHER order — the
+    duplicate-detection guarantee both intake directions rely on
+    (ingest_manual_entry._find_existing keys on matched_employee_pk+month+year
+    regardless of how the record got there — see services/pipeline/ingestion.py)."""
+    async with SessionLocal() as db:
+        emp = await _employee(db)
+        for r in (await db.execute(select(TimesheetRecord).where(
+                TimesheetRecord.matched_employee_pk == emp.id,
+                TimesheetRecord.month == 7, TimesheetRecord.year == 2026))).scalars():
+            await db.delete(r)
+        await db.commit()
+
+        # 1) Portal submission files its timesheet first.
+        rec1, _ = await ingest_manual_entry(
+            db, employee_pk=emp.id, month=7, year=2026,
+            buckets={"annual": ["2026-07-06", "2026-07-07"]},
+            source_key="portal:sub-1:timesheet", source_filename="timesheet.pdf")
+        assert sorted(rec1.annual_leave_dates) == ["2026-07-06", "2026-07-07"]
+
+        # 2) An email/upload-sourced sick-leave certificate arrives LATER for
+        #    the SAME employee+month — must union into the SAME record.
+        rec2, _ = await ingest_manual_entry(
+            db, employee_pk=emp.id, month=7, year=2026,
+            buckets={"sick": ["2026-07-20"]},
+            source_key="email::sick-cert.pdf", source_filename="sick.pdf")
+        assert rec2.id == rec1.id, "portal-then-email must land in ONE record"
+        assert sorted(rec2.annual_leave_dates) == ["2026-07-06", "2026-07-07"], \
+            "the portal's annual leaves must survive the later email accept"
+        assert rec2.sick_leave_dates == ["2026-07-20"]
+
+        # 3) Symmetric check, opposite order: email/upload files first, THEN
+        #    a portal submission for the same employee+month.
+        for r in (await db.execute(select(TimesheetRecord).where(
+                TimesheetRecord.matched_employee_pk == emp.id,
+                TimesheetRecord.month == 8, TimesheetRecord.year == 2026))).scalars():
+            await db.delete(r)
+        await db.commit()
+
+        rec3, _ = await ingest_manual_entry(
+            db, employee_pk=emp.id, month=8, year=2026,
+            buckets={"annual": ["2026-08-03"]},
+            source_key="upload::week1.pdf", source_filename="week1.pdf")
+        rec4, _ = await ingest_manual_entry(
+            db, employee_pk=emp.id, month=8, year=2026,
+            buckets={"sick": ["2026-08-10"]},
+            source_key="portal:sub-2:sick_leave", source_filename="sick.pdf")
+        assert rec4.id == rec3.id, "email-then-portal must ALSO land in ONE record"
+        assert rec4.annual_leave_dates == ["2026-08-03"]
+        assert rec4.sick_leave_dates == ["2026-08-10"]
+
+
 async def test_reaccepting_same_sheet_replaces_its_own_dates():
     """Re-accepting the SAME sheet (same key) with edited dates replaces that
     sheet's contribution — it does not double or accumulate."""

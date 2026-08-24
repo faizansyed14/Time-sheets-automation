@@ -72,6 +72,53 @@ def test_clean_full_month_sheet_auto_accepts():
     assert d.confidence == "high"
 
 
+def test_approval_not_detected_blocks_an_otherwise_clean_group():
+    """The exact scenario reported: a fully clean, day-accounted group must
+    NOT show "AI recommends" when manager approval evidence wasn't found —
+    approval is a real, separately-verified signal (a model's read of a
+    signature, or the portal employee's own attestation), not something a
+    reviewer would trust just because everything else checks out."""
+    weekend = _weekend_dates(6, 2026)
+    sheet = full_month_sheet("TIMESHEET.pdf", 6, 2026,
+                              public_holiday=["2026-06-15"], sick=["2026-06-19"])
+    sheet["working_days"] = [d for d in sheet["working_days"] if d not in weekend]
+    sheet["weekend_days"] = sorted(weekend - {"2026-06-15", "2026-06-19"})
+    g = _group_from_sheets([sheet])
+
+    not_detected = auto_accept.evaluate(
+        g, approval={"detected": False, "detail": "No manager approval found in this thread."})
+    assert not_detected.accepted is False
+    assert any("approval" in b.lower() for b in not_detected.blockers)
+
+    detected = auto_accept.evaluate(
+        g, approval={"detected": True, "detail": "Approval found: signed off by manager."})
+    assert detected.accepted is True, detected.blockers
+
+
+def test_named_only_weak_signature_still_blocks():
+    """A typed name next to "Approved by:" with no signature/stamp
+    (weak_evidence) never sets detected=True upstream — it must block here
+    exactly like no evidence at all, not partially count."""
+    sheet = full_month_sheet("TIMESHEET.pdf", 6, 2026)
+    g = _group_from_sheets([sheet])
+    d = auto_accept.evaluate(g, approval={
+        "detected": False, "weak_evidence": True,
+        "detail": "Only a name was found near an approval field - no signature, stamp, or status mark.",
+    })
+    assert d.accepted is False
+
+
+def test_approval_omitted_entirely_leaves_the_old_behaviour_unchanged():
+    """Callers that don't track approval (or haven't been updated to pass
+    it) must see EXACTLY the pre-existing behaviour — approval only ever
+    gates the decision when a caller actually supplies it."""
+    sheet = full_month_sheet("TIMESHEET.pdf", 6, 2026)
+    g = _group_from_sheets([sheet])
+    d = auto_accept.evaluate(g)
+    assert d.accepted is True, d.blockers
+    assert not any("approval" in b.lower() for b in d.blockers)
+
+
 def test_unmatched_employee_blocks_auto_accept():
     sheet = full_month_sheet("TIMESHEET.pdf", 6, 2026)
     g = _group_from_sheets([sheet], employee_pk=None)

@@ -121,7 +121,7 @@ async def stage_groups(
         flags = group_flags(g)
         summary = f"{summarize_group(g)} {approval['detail']}"
 
-        decision = auto_accept.evaluate(g)
+        decision = auto_accept.evaluate(g, approval=approval)
 
         display = raw_name if len(groups) == 1 else \
             f"{g['name'] or 'Unassigned sheets'} — {raw_name}"

@@ -103,10 +103,24 @@ def _parse_dt(s: str | None) -> datetime | None:
 
 def _is_eml(name: str, ctype: str) -> bool:
     """A forwarded email carried as a file — its nested PDF/sheet is the real
-    timesheet, so the whole .eml is a TIMESHEET container (never an approval)."""
+    timesheet, so the whole .eml (or Outlook .msg — the same thing saved in
+    the other export format) is a TIMESHEET container (never an approval)."""
     n = (name or "").lower()
     c = (ctype or "").lower()
-    return n.endswith(".eml") or c in ("message/rfc822", "application/eml")
+    return (n.endswith((".eml", ".msg"))
+            or c in ("message/rfc822", "application/eml", "application/vnd.ms-outlook"))
+
+
+def _as_eml_name(name: str) -> str:
+    """An itemAttachment's bytes are always fetched as real RFC822 (.eml) —
+    regardless of what the item's own display name looked like in Outlook
+    (often ending in .msg, since that's Outlook's own "save as" format for an
+    embedded message). Strip any existing .eml/.msg suffix first so the
+    result is never a confusing double extension like "X.msg.eml"."""
+    n = (name or "forwarded-email").strip() or "forwarded-email"
+    if n.lower().endswith((".eml", ".msg")):
+        n = n.rsplit(".", 1)[0]
+    return f"{n}.eml"
 
 
 def _is_doc(name: str, ctype: str) -> bool:
@@ -193,9 +207,7 @@ def _build(msg: dict) -> ProviderMessage:
     for a in items:
         # Treat the forwarded email as a timesheet candidate; its bytes are
         # fetched as raw MIME (.eml) and processed by the same .eml extractor.
-        name = (a.get("name") or "forwarded-email").strip() or "forwarded-email"
-        if not name.lower().endswith(".eml"):
-            name = f"{name}.eml"
+        name = _as_eml_name(a.get("name"))
         atts.append(ProviderAttachment(
             attachment_id=a["id"],
             filename=name,
@@ -376,10 +388,7 @@ class GraphEmailProvider(EmailProvider):
                 rv = await c.get(f"{url}/$value", headers=await _headers())
                 if rv.status_code != 200 or not rv.content:
                     raise FileNotFoundError(f"No content for {attachment_id}")
-                name = (a.get("name") or "forwarded-email").strip() or "forwarded-email"
-                if not name.lower().endswith(".eml"):
-                    name = f"{name}.eml"
-                return rv.content, name, "message/rfc822"
+                return rv.content, _as_eml_name(a.get("name")), "message/rfc822"
             return (base64.b64decode(content),
                     a.get("name") or "attachment",
                     a.get("contentType") or "application/octet-stream")

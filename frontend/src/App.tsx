@@ -14,7 +14,12 @@ import AdminSettings from "./pages/admin/Settings";
 import AdminUsers from "./pages/admin/Users";
 import AdminCalendars from "./pages/admin/Calendars";
 import AdminExtractionDebug from "./pages/admin/ExtractionDebug";
+import AdminPortalUsers from "./pages/admin/PortalUsers";
+import PortalLogin from "./pages/portal/PortalLogin";
+import PortalEmployeeUpload from "./pages/portal/PortalEmployeeUpload";
+import PortalEmployeeHistory from "./pages/portal/PortalEmployeeHistory";
 import { useAuth } from "./lib/auth";
+import { PortalAuthProvider, usePortalAuth } from "./lib/portalAuth";
 import { Spinner } from "./components/ui";
 
 // The restricted "vault_matcher" role only ever sees these two pages — every
@@ -40,11 +45,50 @@ function Protected({ children, adminOnly }: { children: JSX.Element; adminOnly?:
   return children;
 }
 
+// Entirely separate auth from the internal Protected/useAuth above — its own
+// token namespace, its own login page, never reachable from the internal nav.
+function PortalProtected({ children }: { children: JSX.Element }) {
+  const { user, loading } = usePortalAuth();
+  if (loading)
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <Spinner className="h-7 w-7" />
+      </div>
+    );
+  if (!user) return <Navigate to="/portal/login" replace />;
+  return children;
+}
+
+function PortalRoutes() {
+  const { user } = usePortalAuth();
+  return (
+    <Routes>
+      <Route
+        path="login"
+        element={user ? <Navigate to="/portal/employee" replace /> : <PortalLogin />}
+      />
+      <Route path="employee" element={<PortalProtected><PortalEmployeeUpload /></PortalProtected>} />
+      <Route
+        path="employee/history"
+        element={<PortalProtected><PortalEmployeeHistory /></PortalProtected>}
+      />
+    </Routes>
+  );
+}
+
 export default function App() {
   const { user } = useAuth();
   return (
     <Routes>
       <Route path="/login" element={user ? <Navigate to="/" replace /> : <Login />} />
+      <Route
+        path="/portal/*"
+        element={
+          <PortalAuthProvider>
+            <PortalRoutes />
+          </PortalAuthProvider>
+        }
+      />
       <Route
         path="/*"
         element={
@@ -63,6 +107,7 @@ export default function App() {
                 <Route path="/admin/settings" element={<Protected adminOnly><AdminSettings /></Protected>} />
                 <Route path="/admin/users" element={<Protected adminOnly><AdminUsers /></Protected>} />
                 <Route path="/admin/calendars" element={<Protected><AdminCalendars /></Protected>} />
+                <Route path="/admin/portal-users" element={<Protected><AdminPortalUsers /></Protected>} />
                 <Route path="/admin/debug" element={<Protected adminOnly><AdminExtractionDebug /></Protected>} />
               </Routes>
             </Shell>

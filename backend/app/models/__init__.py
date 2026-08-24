@@ -9,6 +9,15 @@ from app.models.pipeline_file import (
     PipelineStage,
     PipelineStatus,
 )
+from app.models.portal_auth import PortalRole, PortalUser
+from app.models.portal_submission import (
+    ExtractionState,
+    ManagerDecision,
+    PortalSubmission,
+    PortalSubmissionFile,
+    PortalSubmissionStatus,
+    SubmissionFileKind,
+)
 from app.models.timesheet_record import (
     ApprovalStatus,
     TimesheetRecord,
@@ -31,4 +40,12 @@ __all__ = [
     "AuthMode",
     "MonthCalendar",
     "ExtractionDebugRun",
+    "PortalRole",
+    "PortalUser",
+    "PortalSubmission",
+    "PortalSubmissionFile",
+    "PortalSubmissionStatus",
+    "ManagerDecision",
+    "ExtractionState",
+    "SubmissionFileKind",
 ]

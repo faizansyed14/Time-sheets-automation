@@ -25,6 +25,8 @@ from app.api.routes import (
     files,
     inbox,
     pipeline,
+    portal_auth,
+    portal_employee,
     timesheets,
     upload,
 )
@@ -90,8 +92,14 @@ app.add_middleware(
 )
 
 
-# Inline previews (<iframe>/<img>) load these paths on the same origin as the SPA.
-_EMBEDDABLE_PATH_MARKERS = ("/files/content", "/attachments/", "/raw-preview")
+# Inline previews (<iframe>/<img>) load these paths on the same origin as the
+# SPA. "/content" (not the old, narrower "/files/content") also covers the
+# portal preview routes' .../files/{kind}/content shape — a {kind} path
+# segment sits between "files" and "content" there, so the old literal
+# "/files/content" substring never matched and those iframes got DENY'd.
+# Verified every current backend route ending in "/content" is a preview
+# endpoint (grep across api/routes/), so this stays a safe, precise check.
+_EMBEDDABLE_PATH_MARKERS = ("/content", "/attachments/", "/raw-preview")
 
 
 def _embeddable_preview_path(path: str) -> bool:
@@ -121,11 +129,20 @@ async def security_headers(request: Request, call_next):
 
 # public
 app.include_router(auth.router, prefix=settings.api_prefix)
+# portal (employee self-service) — its own auth namespace entirely; gated by
+# its own Depends(require_portal_employee) per route, not by anything below,
+# so these are mounted plainly like auth.router. No manager login — approval
+# is the internal timesheet team's job via Compare & Fix (see pipeline.router).
+app.include_router(portal_auth.router, prefix=settings.api_prefix)
+app.include_router(portal_employee.router, prefix=settings.api_prefix)
 # admin (admin role enforced inside the router)
 app.include_router(admin.router, prefix=settings.api_prefix)
 # month calendars — same read/write split as the business routes below, not
 # admin-only (see admin.py's module docstring).
 app.include_router(admin.calendars_router, prefix=settings.api_prefix)
+# portal-user account management — same read/write split as calendars above,
+# not admin-only (see admin.py's portal_users_router comment).
+app.include_router(admin.portal_users_router, prefix=settings.api_prefix)
 
 # business routes — authenticated; viewers may read but not mutate (require_write
 # allows safe methods for everyone and blocks writes for the read-only role).

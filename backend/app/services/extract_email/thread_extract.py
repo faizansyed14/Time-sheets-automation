@@ -27,6 +27,7 @@ import calendar
 import email as _email
 import email.policy
 import hashlib
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -35,6 +36,8 @@ from app.core.config import settings
 from app.core.pii import scrub_text
 from app.services.extract_email.constants import BUCKETS
 from app.services.extract_email.progress import count_llm, emit
+
+log = logging.getLogger("extract_email.msg")
 
 # A forward of a forward of a forward is real; beyond this it is a mail loop,
 # not a timesheet. Applies to .eml/.msg attached as a FILE (not MIME-nested —
@@ -120,12 +123,26 @@ def _content_digest(payload: bytes) -> str:
 
 def msg_to_eml_bytes(payload: bytes) -> bytes | None:
     """Outlook .msg -> raw .eml bytes, via extract-msg. Returns None if the
-    file can't be parsed (corrupt / not really a .msg)."""
+    file can't be parsed (corrupt / not really a .msg) — every caller treats
+    that as "skip this one," so the real reason must reach the server log
+    (log.exception below) instead of vanishing silently; a caller-facing
+    error message can only ever say "could not parse," not why.
+
+    asEmailMessage() — NOT export()/exportBytes() — is the correct call
+    here: export()/exportBytes() re-save the SAME .msg (OLE) format, which
+    is useless for feeding the RFC822 (.eml) reader below; export() also
+    requires a destination path argument and returns None, so calling it
+    with none (as this function used to) raised TypeError on every single
+    .msg, unconditionally — silently swallowed by the broad except below,
+    so .msg conversion had never actually worked. asEmailMessage() returns a
+    real stdlib EmailMessage, which .as_bytes() serializes to genuine
+    RFC822 bytes the rest of this module already knows how to read."""
     import tempfile
 
     try:
         import extract_msg
     except ImportError:
+        log.warning("extract-msg is not installed — cannot convert .msg to .eml")
         return None
     path = None
     try:
@@ -134,10 +151,11 @@ def msg_to_eml_bytes(payload: bytes) -> bytes | None:
             path = f.name
         msg = extract_msg.Message(path)
         try:
-            return msg.export()
+            return msg.asEmailMessage().as_bytes()
         finally:
             msg.close()
     except Exception:
+        log.exception("Could not convert .msg to .eml (%d bytes)", len(payload or b""))
         return None
     finally:
         if path:

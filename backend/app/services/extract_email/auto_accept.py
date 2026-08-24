@@ -20,6 +20,13 @@ way regardless of layout. Recommends accepting only when EVERY check passes:
      cover a whole month.
   5. No day flagged uncertain by the model.
   6. Any leave_certificate sheet in the group actually produced dates.
+  7. Manager approval evidence was actually found (approval["detected"]) —
+     a named-only signature (weak_evidence) never sets `detected`, so it
+     blocks here the same as no evidence at all. Only checked when a caller
+     actually supplies `approval` (see evaluate()'s docstring) — this is a
+     genuine, model/employee-verified signal, not a guess a reviewer would
+     have to double-check anyway; requiring it means "AI recommends" is
+     never shown for a document nobody has actually approved yet.
 """
 from __future__ import annotations
 
@@ -45,10 +52,27 @@ class AutoAcceptDecision:
         }
 
 
-def evaluate(group: dict, extra_flags: list[str] | None = None) -> AutoAcceptDecision:
-    """Decide whether this employee+month group may be filed without review."""
+def evaluate(
+    group: dict, extra_flags: list[str] | None = None, approval: dict | None = None,
+) -> AutoAcceptDecision:
+    """Decide whether this employee+month group may be filed without review.
+
+    approval is the SAME dict stage_groups()/retry_pipeline_file() already
+    carry (from thread_extract.approval_from_triage or the portal
+    self-attestation) — pass it and a missing/weak/undetected manager
+    approval becomes a blocker; omit it (the default) to leave approval out
+    of the decision entirely, e.g. for a caller that doesn't track it."""
     reasons: list[str] = []
     blockers: list[str] = []
+
+    if approval is not None:
+        if approval.get("detected"):
+            reasons.append("manager approval evidence found")
+        else:
+            blockers.append(
+                "no manager approval evidence found"
+                + (f" — {approval['detail']}" if approval.get("detail") else "")
+            )
 
     if group.get("employee_pk"):
         reasons.append(f"employee matched: {group.get('name') or '?'} "

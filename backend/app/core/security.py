@@ -64,6 +64,20 @@ def create_access_token(user_id: str, username: str, role: str) -> str:
     )
 
 
+def create_portal_access_token(user_id: str, role: str) -> str:
+    """Employee/manager portal session token. Deliberately a SEPARATE `typ`
+    from the internal "access" token above — same signing secret, but
+    api/deps.py's get_current_user rejects anything whose typ != "access" and
+    api/portal_deps.py's get_current_portal_user rejects anything whose
+    typ != "portal_access", so a token from either namespace is inert against
+    the other's routes even though they share a secret."""
+    return _encode(
+        {"sub": user_id, "typ": "portal_access", "role": role,
+         "jti": secrets.token_urlsafe(16)},
+        settings.access_token_ttl_minutes,
+    )
+
+
 def is_token_revoked_key(jti: str) -> str:
     """Cache key under which a revoked (logged-out) token's jti is stored."""
     return f"revoked_jti:{jti}"
