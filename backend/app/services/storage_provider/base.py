@@ -12,6 +12,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass
@@ -20,6 +21,9 @@ class FileItem:
     rel_path: str
     size: int
     content_type: str
+    # When this file was written into the vault — local disk's mtime, S3's
+    # LastModified, etc. None only for a provider that can't report one.
+    stored_at: datetime | None = None
 
 
 @dataclass

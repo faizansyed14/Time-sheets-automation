@@ -56,12 +56,13 @@ _DOC_CONTENT_TYPES = {
     "application/vnd.ms-excel",
     "message/rfc822",
     "application/eml",
+    "application/vnd.ms-outlook",
 }
-_DOC_EXTS = (".pdf", ".docx", ".xlsx", ".doc", ".xls", ".eml")
+_DOC_EXTS = (".pdf", ".docx", ".xlsx", ".doc", ".xls", ".eml", ".msg")
 
 
 def is_doc_attachment(a) -> bool:
-    """A real document (pdf/docx/xlsx/eml) — not an inline image, logo, or screenshot."""
+    """A real document (pdf/docx/xlsx/eml/msg) — not an inline image, logo, or screenshot."""
     if not isinstance(a, dict):
         return False
     ct = (a.get("content_type") or "").lower()
@@ -804,7 +805,8 @@ async def get_attachment(provider_message_id: str, attachment_id: str):
 
 @router.get("/{provider_message_id}/attachments/{attachment_id}/eml-preview")
 async def get_attachment_eml_preview(provider_message_id: str, attachment_id: str):
-    """Parse an EML attachment and return its structured content as JSON."""
+    """Parse an EML (or Outlook .msg) attachment and return its structured
+    content as JSON."""
     provider = get_email_provider()
     try:
         data, filename, _ct = await provider.get_attachment_bytes(
@@ -812,10 +814,13 @@ async def get_attachment_eml_preview(provider_message_id: str, attachment_id: st
         )
     except FileNotFoundError:
         raise HTTPException(404, "Attachment not found")
-    if not filename.lower().endswith(".eml"):
-        raise HTTPException(400, "Not an EML file")
+    if not filename.lower().endswith((".eml", ".msg")):
+        raise HTTPException(400, "Not an EML or .msg file")
     from app.services.extraction.eml_parser import parse_eml
-    return parse_eml(data)
+    try:
+        return parse_eml(data, filename=filename)
+    except Exception:
+        raise HTTPException(422, "Could not parse this email file")
 
 
 @router.post("/{provider_message_id}/decision")

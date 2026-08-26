@@ -51,6 +51,10 @@ services:
       AUTO_CREATE_TABLES: "false"         # Alembic owns the schema (see command)
     volumes:
       - backend_storage:/app/storage
+      # See docker-compose.local.yml's comment — portal uploads must be
+      # shared between backend and worker when STORAGE_PROVIDER=local (S3
+      # needs no volume, it's already shared).
+      - portal_uploads:/app/data/portal_uploads
     expose: ["8000"]
     restart: unless-stopped
     depends_on:
@@ -74,6 +78,7 @@ services:
       DB_NULLPOOL: "true"
     volumes:
       - backend_storage:/app/storage
+      - portal_uploads:/app/data/portal_uploads
     restart: unless-stopped
     depends_on:
       redis: { condition: service_healthy }
@@ -110,3 +115,4 @@ volumes:
   pg_data:
   redis_data:
   backend_storage:
+  portal_uploads:

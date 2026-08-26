@@ -215,3 +215,29 @@ def process_upload_task(filename: str, content_type: str, data_b64: str):
                     "groups": res["groups"], "message": res["message"]}
 
     return _run_coro(_run)
+
+
+@celery_app.task(name="portal.extract_submission", bind=True, max_retries=2, default_retry_delay=15)
+def run_portal_extraction_task(self, submission_id: str, only_kind: str | None = None):
+    """Runs immediately after the employee hits Submit — NOT gated on the
+    manager's decision (extraction and manager approval are independent; see
+    services/extract_email/portal_extract.py's module docstring).
+
+    only_kind restricts the run to one changed slot instead of every file on
+    the submission — see portal_extract.run_portal_extract."""
+    from app.core.database import SessionLocal
+    from app.models.portal_submission import PortalSubmission
+    from app.services.extract_email.portal_extract import run_portal_extract
+
+    async def _run():
+        async with SessionLocal() as db:
+            from sqlalchemy import select
+            sub = (await db.execute(select(PortalSubmission).where(
+                PortalSubmission.id == submission_id))).scalar_one_or_none()
+            if sub:
+                await run_portal_extract(db, sub, only_kind=only_kind)
+
+    try:
+        return _run_coro(_run)
+    except Exception as exc:  # pragma: no cover - network/model dependent
+        raise self.retry(exc=exc)

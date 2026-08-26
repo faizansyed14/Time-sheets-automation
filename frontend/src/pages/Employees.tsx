@@ -108,6 +108,17 @@ export default function EmployeesPage() {
 
   const activeCount = useMemo(() => (rows ?? []).filter((r) => r.active).length, [rows]);
 
+  // Distinct existing account managers — offered as a dropdown so adding a
+  // new employee under an already-known manager doesn't rely on retyping
+  // their name exactly (a mismatched spelling would silently split one
+  // manager's roster in two). Still a free-text field underneath (a
+  // datalist, not a strict <select>), since the very first employee under a
+  // brand-new manager has to be able to type a name that doesn't exist yet.
+  const accountManagerNames = useMemo(
+    () => Array.from(new Set((rows ?? []).map((r) => r.account_manager).filter(Boolean) as string[])).sort(),
+    [rows]
+  );
+
   const visible = useMemo(
     () =>
       (rows ?? []).filter(
@@ -389,10 +400,18 @@ export default function EmployeesPage() {
           </Field>
           <Field label="Account manager" name="account_manager">
             <Input
+              list="account-manager-names"
               value={form.account_manager ?? ""}
               onChange={(e) => setForm({ ...form, account_manager: e.target.value || null })}
+              placeholder="Select or type a name…"
+              autoComplete="off"
             />
           </Field>
+          <datalist id="account-manager-names">
+            {accountManagerNames.map((m) => (
+              <option key={m} value={m} />
+            ))}
+          </datalist>
           <Field label="ACO number" name="aco_number">
             <Input
               value={form.aco_number ?? ""}

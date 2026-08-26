@@ -4,6 +4,7 @@ from __future__ import annotations
 import mimetypes
 import re
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app.core.config import settings
@@ -91,11 +92,13 @@ class LocalStorageProvider(StorageProvider):
             for f in sorted(base.iterdir()):
                 if f.is_file():
                     ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+                    st = f.stat()
                     out.append(FileItem(
                         name=f.name,
                         rel_path=f"{_safe(manager)}/{_safe(employee)}/{_safe(month)}/{f.name}",
-                        size=f.stat().st_size,
+                        size=st.st_size,
                         content_type=ctype,
+                        stored_at=datetime.fromtimestamp(st.st_mtime, tz=timezone.utc),
                     ))
         return out
 

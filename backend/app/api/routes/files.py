@@ -7,11 +7,15 @@ STORAGE_PROVIDER=onedrive.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import get_db
 from app.core.http_headers import content_disposition
+from app.models.employee import Employee
 from app.services import storage_provider as sp
 from app.services.storage_provider.archive import iter_zip, scope_size, year_summary
 
@@ -66,6 +70,147 @@ def list_items(manager: str, employee: str, month: str):
     return [i.__dict__ for i in sp.get_storage_provider().list_items(manager, employee, month)]
 
 
+# ---- alternate (project-wise / location-wise / search) navigation onto the
+# SAME vault files ----
+#
+# The vault's physical layout is (and stays) Manager/Employee/Month — that's
+# what save_file/create_month/etc. above actually write to. These are
+# second, read-oriented lenses onto the identical files: grouped by the
+# Employee Matcher's own `project` or `location` field instead of the
+# manager, or found directly by a name/ID/project search. Nothing here
+# creates a parallel storage structure: every route below resolves back down
+# to the exact same (manager, employee_folder, month) triple the Manager
+# view already uses, so every file-level action (preview, delete, upload,
+# zip download) works via the SAME existing endpoints/rel_paths — a row
+# found this way IS the Manager-view file, just reached by a different path.
+# Only the folder-CRUD routes above (create/rename/delete a folder) have no
+# equivalent here — a project/location's employee roster comes from the
+# Employee Matcher, not from folders created by hand.
+
+async def _distinct_grouping(db: AsyncSession, column) -> list[dict]:
+    rows = (await db.execute(
+        select(column, func.count(Employee.id))
+        .where(column.is_not(None), column != "")
+        .group_by(column)
+        .order_by(column)
+    )).all()
+    return [{"name": name, "employee_count": count} for name, count in rows]
+
+
+@router.get("/projects")
+async def list_projects(db: AsyncSession = Depends(get_db)):
+    return await _distinct_grouping(db, Employee.project)
+
+
+@router.get("/locations")
+async def list_locations(db: AsyncSession = Depends(get_db)):
+    return await _distinct_grouping(db, Employee.location)
+
+
+_VAULT_LOOKUP_CONCURRENCY = 20
+
+
+async def _employees_with_vault_info(rows: list[Employee]) -> list[dict]:
+    """One row per employee, each needing its own vault lookup for
+    month_count — a group's employees (by project, location, or a search
+    match) can be scattered across many different manager folders, so
+    there's no single listing that covers them all at once. Run those
+    lookups CONCURRENTLY, bounded to _VAULT_LOOKUP_CONCURRENCY at a time,
+    and off the event loop (asyncio.to_thread) — sequential + on-loop was
+    fine for local disk (a directory stat is microseconds) but would
+    head-of-line block on S3, where each lookup is a real network round
+    trip: a large roster could turn a sub-second request into one taking
+    tens of seconds, and every other request sharing this worker would
+    stall behind it meanwhile."""
+    import asyncio
+
+    sem = asyncio.Semaphore(_VAULT_LOOKUP_CONCURRENCY)
+    provider = sp.get_storage_provider()
+
+    async def _month_count(manager: str, folder: str) -> int:
+        async with sem:
+            try:
+                return await asyncio.to_thread(lambda: len(provider.list_months(manager, folder)))
+            except Exception:
+                return 0
+
+    locations = [sp.employee_vault_location(e.account_manager, e.name, e.aco_number, e.dco_number)
+                 for e in rows]
+    counts = await asyncio.gather(*(_month_count(m, f) for m, f in locations))
+
+    return [
+        {
+            "employee_pk": e.id, "employee_id": e.employee_id, "name": e.name,
+            "project": e.project, "location": e.location,
+            "account_manager": manager, "employee_folder": folder, "month_count": count,
+        }
+        for e, (manager, folder), count in zip(rows, locations, counts)
+    ]
+
+
+@router.get("/projects/{project}/employees")
+async def list_project_employees(project: str, db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(
+        select(Employee).where(Employee.project == project).order_by(Employee.name)
+    )).scalars().all()
+    return await _employees_with_vault_info(rows)
+
+
+@router.get("/locations/{location}/employees")
+async def list_location_employees(location: str, db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(
+        select(Employee).where(Employee.location == location).order_by(Employee.name)
+    )).scalars().all()
+    return await _employees_with_vault_info(rows)
+
+
+# Hard cap on a search's fan-out — _employees_with_vault_info's own
+# concurrency limit keeps any single batch from monopolising the worker, but
+# a very broad query (e.g. one common letter) could still match hundreds of
+# employees; capping the SQL result itself is what actually bounds the work,
+# not just how fast that work runs.
+_SEARCH_RESULT_LIMIT = 25
+
+
+@router.get("/search-employees")
+async def search_vault_employees(q: str = Query(..., min_length=1), db: AsyncSession = Depends(get_db)):
+    """Employee name, employee ID, or project ("client name") — one search
+    across the whole Employee Matcher, used by each view's search bar to
+    jump straight into an employee's vault without manually drilling down
+    through Manager/Project/Location first."""
+    like = f"%{q.strip()}%"
+    rows = (await db.execute(
+        select(Employee)
+        .where(
+            Employee.name.ilike(like)
+            | Employee.employee_id.ilike(like)
+            | Employee.project.ilike(like)
+        )
+        .order_by(Employee.name)
+        .limit(_SEARCH_RESULT_LIMIT)
+    )).scalars().all()
+    return await _employees_with_vault_info(rows)
+
+
+async def _resolve_employee_vault(db: AsyncSession, employee_pk: str) -> tuple[str, str]:
+    e = (await db.execute(select(Employee).where(Employee.id == employee_pk))).scalar_one_or_none()
+    if not e:
+        raise HTTPException(404, "Employee not found")
+    return sp.employee_vault_location(e.account_manager, e.name, e.aco_number, e.dco_number)
+
+
+@router.get("/employee-vault/{employee_pk}/months")
+async def list_employee_vault_months(employee_pk: str, db: AsyncSession = Depends(get_db)):
+    manager, folder = await _resolve_employee_vault(db, employee_pk)
+    return [m.__dict__ for m in sp.get_storage_provider().list_months(manager, folder)]
+
+
+@router.get("/employee-vault/{employee_pk}/months/{month}/items")
+async def list_employee_vault_items(employee_pk: str, month: str, db: AsyncSession = Depends(get_db)):
+    manager, folder = await _resolve_employee_vault(db, employee_pk)
+    return [i.__dict__ for i in sp.get_storage_provider().list_items(manager, folder, month)]
+
+
 # ---- reading ----
 
 @router.get("/content")
@@ -81,32 +226,36 @@ def file_content(rel_path: str = Query(...)):
 
 @router.get("/eml-preview")
 def eml_preview(rel_path: str = Query(...)):
-    """Parse an EML file and return its structured content as JSON."""
+    """Parse an EML (or Outlook .msg) file and return its structured content
+    as JSON."""
     try:
         data, name, _ctype = sp.get_storage_provider().read_file(rel_path)
     except FileNotFoundError:
         raise HTTPException(404, "File not found")
-    if not name.lower().endswith(".eml"):
-        raise HTTPException(400, "Not an EML file")
+    if not name.lower().endswith((".eml", ".msg")):
+        raise HTTPException(400, "Not an EML or .msg file")
     from app.services.extraction.eml_parser import parse_eml
-    return parse_eml(data)
+    try:
+        return parse_eml(data, filename=name)
+    except Exception:
+        raise HTTPException(422, "Could not parse this email file")
 
 
 @router.post("/eml-preview-upload")
 async def eml_preview_upload(file: UploadFile = File(...)):
-    """Parse raw EML bytes → structured content.
+    """Parse raw EML (or Outlook .msg) bytes → structured content.
 
     The GET form needs a stored file. An email attached INSIDE another email
     only exists as bytes in the parent's preview payload, so nesting could not
-    be opened at all. Posting the bytes back makes a forwarded email open like
-    any other — at any depth.
+    be opened at all. Posting the bytes back makes a forwarded email — or a
+    .msg attached inside one — open like any other, at any depth.
     """
     data = await file.read()
     if not data:
         raise HTTPException(400, "Empty file")
     from app.services.extraction.eml_parser import parse_eml
     try:
-        return parse_eml(data)
+        return parse_eml(data, filename=file.filename)
     except Exception:
         raise HTTPException(422, "Could not parse this email file")
 

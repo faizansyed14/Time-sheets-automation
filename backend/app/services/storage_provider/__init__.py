@@ -42,6 +42,19 @@ def employee_folder_label(name: str, aco: str | None = None, dco: str | None = N
     return f"{name} ({', '.join(bits)})" if bits else name
 
 
+def employee_vault_location(
+    account_manager: str | None, name: str, aco: str | None, dco: str | None,
+) -> tuple[str, str]:
+    """The (manager_folder, employee_folder) pair this employee's vault files
+    are actually stored under — the exact same resolution save_file/
+    ensure_employee_folder use at filing time. Lets an alternate navigation
+    lens (e.g. the Files page's project-wise view) look up an existing
+    employee's vault content by their Employee Matcher row, without
+    duplicating — or drifting from — the manager-based folder layout that
+    still owns the physical structure."""
+    return (account_manager or _UNASSIGNED), employee_folder_label(name, aco, dco)
+
+
 def employee_folder_base(folder_name: str) -> str:
     """Inverse of the label: the plain employee name a vault folder belongs to.
 

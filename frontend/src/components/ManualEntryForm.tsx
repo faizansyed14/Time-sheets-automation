@@ -261,7 +261,7 @@ export default function ManualEntryForm({ onResult }: { onResult: (r: UploadResu
               ref={fileRef}
               type="file"
               multiple
-              accept=".pdf,.docx,.xlsx,.png,.jpg,.jpeg,.eml"
+              accept=".pdf,.docx,.xlsx,.png,.jpg,.jpeg,.eml,.msg"
               className="hidden"
               onChange={(e) => { addFiles(e.target.files); e.target.value = ""; }}
             />

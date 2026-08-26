@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     # file can be retried. This lives OUTSIDE storage_root so it never shows up
     # in the File Vault browser. (Local-disk providers only.)
     pipeline_raw_root: str = str(BACKEND_ROOT / "data" / "pipeline_raw")
+
+    # Where the employee portal's submission uploads live BEFORE they're
+    # Accepted into the File Vault — kept for the submission's life (unlike
+    # pipeline_raw_root, which is retry-copy-only and purged on success), so
+    # this is its own root/prefix, never repurposing pipeline_raw. (Local-disk
+    # providers only — S3 uses s3_portal_prefix below.)
+    portal_uploads_root: str = str(BACKEND_ROOT / "data" / "portal_uploads")
     # Retry copies are normally deleted as soon as a file succeeds; this caps how
     # long a STILL-failed file's original is kept before it is purged, so the
     # raw store can never grow without bound. 0 disables the age purge.
@@ -85,6 +92,10 @@ class Settings(BaseSettings):
     # to timesheets/*. The leading "_" keeps it hidden from the File Vault browser
     # (which skips folders starting with "_" or ".").
     s3_raw_prefix: str = "_pipeline-raw"
+    # Same visibility/policy rationale as s3_raw_prefix above, but for portal
+    # submission uploads — a separate folder since its lifecycle (kept for the
+    # submission's life) differs from the retry-only raw copies.
+    s3_portal_prefix: str = "_portal-uploads"
     s3_region: str = "us-east-1"
     aws_access_key_id: str | None = None     # omit on EC2/ECS to use the IAM role
     aws_secret_access_key: str | None = None
@@ -264,6 +275,12 @@ class Settings(BaseSettings):
     @property
     def pipeline_raw_path(self) -> Path:
         p = Path(self.pipeline_raw_root)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def portal_uploads_path(self) -> Path:
+        p = Path(self.portal_uploads_root)
         p.mkdir(parents=True, exist_ok=True)
         return p
 

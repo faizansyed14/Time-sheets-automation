@@ -15,8 +15,9 @@ _DOC_CONTENT_TYPES = frozenset({
     "application/msword",
     "application/vnd.ms-excel",
     "message/rfc822",
+    "application/vnd.ms-outlook",
 })
-_DOC_EXTS = (".pdf", ".docx", ".xlsx", ".doc", ".xls", ".eml")
+_DOC_EXTS = (".pdf", ".docx", ".xlsx", ".doc", ".xls", ".eml", ".msg")
 _GENERIC_INLINE_RE = re.compile(
     r"^(image\d{2,3}\.(png|jpe?g|gif)|outlook-.+\.(png|jpe?g|gif|bmp)"
     r"|c2_signature_.+\.(png|jpe?g|gif))$", re.I)

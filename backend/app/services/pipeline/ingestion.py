@@ -467,7 +467,7 @@ async def retry_pipeline_file(db: AsyncSession, tracker: PipelineFile) -> tuple[
     # employee match above are FRESH from this retry, and leaving the old
     # decision in extraction_meta would show a reviewer a "why held" reason
     # (or an "AI recommends") left over from the run before the retry.
-    decision = auto_accept.evaluate(primary)
+    decision = auto_accept.evaluate(primary, approval=analysis["approval"])
 
     tracker.employee_id = primary["employee_id"]
     tracker.employee_name = primary["name"]

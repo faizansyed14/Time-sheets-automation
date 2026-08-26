@@ -36,7 +36,7 @@ def _decode_text(part) -> str:
     return raw.decode(charset, errors="replace")
 
 
-_DOC_EXTS = (".pdf", ".docx", ".xlsx", ".xls", ".doc", ".eml")
+_DOC_EXTS = (".pdf", ".docx", ".xlsx", ".xls", ".doc", ".eml", ".msg")
 _DOC_CTS = {
     "application/pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -45,6 +45,7 @@ _DOC_CTS = {
     "application/vnd.ms-excel",
     "message/rfc822",
     "application/eml",
+    "application/vnd.ms-outlook",
 }
 
 
@@ -59,6 +60,8 @@ def _guess_content_type(filename: str, declared: str, raw: bytes) -> str:
         return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     if name.endswith(".eml"):
         return "message/rfc822"
+    if name.endswith(".msg"):
+        return "application/vnd.ms-outlook"
     if name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")):
         if declared.startswith("image/"):
             return declared
@@ -130,8 +133,15 @@ def _walk_parts(part, *, root: bool = True):
                 yield from _walk_parts(sub, root=False)
 
 
-def parse_eml(raw: bytes) -> dict[str, Any]:
-    """Parse raw EML bytes → JSON-serialisable dict.
+def parse_eml(raw: bytes, filename: str | None = None) -> dict[str, Any]:
+    """Parse raw EML (or Outlook .msg) bytes → JSON-serialisable dict.
+
+    A real .msg is an OLE compound binary, not RFC822 text, so it can't go
+    straight into ``email.message_from_bytes`` like every other caller's
+    bytes can. Passing its filename here converts it to real .eml bytes
+    first (via extract-msg, the same converter services/extract_email uses
+    for extraction) so every caller downstream — the viewer included — never
+    needs its own .msg-specific branch.
 
     Returns:
         subject, from_, to, date  – decoded header strings
@@ -139,6 +149,12 @@ def parse_eml(raw: bytes) -> dict[str, Any]:
         body_html                 – HTML body with CID images inlined as data URIs
         attachments               – list of {filename, content_type, size} dicts
     """
+    if (filename or "").lower().endswith(".msg"):
+        from app.services.extract_email.thread_extract import msg_to_eml_bytes
+        converted = msg_to_eml_bytes(raw)
+        if not converted:
+            raise ValueError("Could not parse this .msg file.")
+        raw = converted
     msg = email.message_from_bytes(raw, policy=email.policy.compat32)
 
     subject = _decode_header_value(msg.get("Subject"))
