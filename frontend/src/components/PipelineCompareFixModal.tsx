@@ -206,7 +206,7 @@ function EmployeePicker({
                 <span className="min-w-0 flex-1">
                   <span className="block truncate font-medium text-slate-800">{e.name}</span>
                   <span className="block truncate text-xs text-slate-500">
-                    {e.employee_id}{e.location ? ` · ${e.location}` : ""}{e.account_manager ? ` · ${e.account_manager}` : ""}
+                    {e.employee_id}{e.location ? ` · ${e.location}` : ""}{e.project ? ` · ${e.project}` : ""}{e.account_manager ? ` · ${e.account_manager}` : ""}
                   </span>
                 </span>
               </button>
@@ -750,6 +750,7 @@ export default function PipelineCompareFixModal({
                 <p className="mt-1 text-xs text-emerald-700">
                   {selected.name} ({selected.employee_id}
                   {selected.location ? ` · ${selected.location}` : ""})
+                  {selected.project ? ` · ${selected.project}` : ""}
                   {selected.account_manager ? ` — ${selected.account_manager}` : ""}
                 </p>
               )}

@@ -657,6 +657,32 @@ async def test_no_cache_behaves_exactly_like_before(mock_vision_calls):
     assert meta.get("reused_sheets", 0) == 0
 
 
+async def test_multi_employee_roster_is_skipped_before_pass2(mock_vision_calls):
+    """A roster-style attachment covering many employees in one grid must
+    never reach pass 2's per-person reader (it would just pick one row and
+    silently drop everyone else) — it belongs on the Bulk Upload page
+    instead. Only ONE scripted reply is queued here (pass 1); if pass 2 were
+    invoked anyway, mock_vision_calls would raise on the unscripted call."""
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    eml = _mail(plain="See attached.", attachments=[
+        ("august-roster.xlsx", b"fake roster bytes", "application",
+         "vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ])
+    mock_vision_calls([{"thread_summary": "", "items": [{
+        "source": "[A1]", "is_timesheet": True, "kind": "timesheet",
+        "employee_name": None, "employee_id": None,
+        "covers_multiple_employees": True, "employee_row_count": 42,
+        "period_hint": "August 2026", "evidence": "one grid, many named rows",
+        "manager_signature": False, "signature_evidence": "", "notes": "",
+    }]}])
+
+    sheets, approval, conflicts, meta = await extract_thread_sheets([("msg 1", eml)])
+
+    assert sheets == []
+    assert meta["multi_employee_skipped"] == ["august-roster.xlsx (~42 employees)"]
+
+
 # --------------------------------------------------------------------------
 # Pass 2 retry when a confirmed, non-empty batch comes back with nothing
 # --------------------------------------------------------------------------

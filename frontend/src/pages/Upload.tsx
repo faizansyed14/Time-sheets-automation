@@ -11,33 +11,36 @@ import {
   ExternalLink,
   Layers,
 } from "lucide-react";
-import {
-  uploadTimesheetsStream,
-  MONTHS_LONG,
-  type PipelineFile,
-  type UploadResult,
-} from "../api/client";
+import { uploadTimesheetsStream, MONTHS_LONG, type PipelineFile } from "../api/client";
 import { cn, formatBytes } from "../lib/utils";
-import { Button, Card, PageHeader } from "../components/ui";
-import { ExtractionActivityModal, useExtractionStream } from "../components/ExtractionActivity";
+import { Button, Card, ComingSoon, PageHeader } from "../components/ui";
+import { useAuth } from "../lib/auth";
+import { ExtractionActivityModal } from "../components/ExtractionActivity";
 import StoredFilesPreview from "../components/StoredFilesPreview";
 import ManualEntryForm from "../components/ManualEntryForm";
+import BulkRosterUpload from "../components/BulkRosterUpload";
 import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
 import { FailureChip } from "../components/status";
 import { useToast } from "../components/toast";
+import { useUploadSession } from "../lib/uploadSession";
 
 export default function UploadPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const { isAdmin } = useAuth();
   const inputRef = useRef<HTMLInputElement>(null);
-  const [queue, setQueue] = useState<File[]>([]);
+  // Everything below (except the transient drag-hover flag) lives in
+  // UploadSessionProvider, mounted above the router — see lib/uploadSession.tsx.
+  // Navigating to another page and back no longer loses a picked queue, a
+  // roster analysis, or an in-progress extraction run.
+  const {
+    queue, setQueue, busy, setBusy,
+    manualResults, setManualResults,
+    stagedQueue, setStagedQueue,
+    pendingReview, setPendingReview,
+    extractRun, mode, setMode,
+  } = useUploadSession();
   const [dragging, setDragging] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [manualResults, setManualResults] = useState<UploadResult[]>([]);
-  const [stagedQueue, setStagedQueue] = useState<PipelineFile[]>([]);
-  const extractRun = useExtractionStream();
-  const [pendingReview, setPendingReview] = useState<PipelineFile[]>([]);
-  const [mode, setMode] = useState<"files" | "manual">("files");
 
   const afterChange = () => {
     qc.invalidateQueries({ queryKey: ["pipeline"] });
@@ -101,7 +104,11 @@ export default function UploadPage() {
       />
 
       <div className="mb-5 inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
-        {([["files", "Upload files"], ["manual", "Enter manually"]] as const).map(([m, label]) => (
+        {([
+          ["files", "Upload files"],
+          ["bulk", "Bulk upload"],
+          ["manual", "Enter manually"],
+        ] as const).map(([m, label]) => (
           <button
             key={m}
             onClick={() => setMode(m)}
@@ -122,6 +129,8 @@ export default function UploadPage() {
             afterChange();
           }}
         />
+      ) : mode === "bulk" ? (
+        isAdmin ? <BulkRosterUpload onStaged={afterChange} /> : <ComingSoon feature="Bulk upload" />
       ) : (
       <Card className="p-6">
         <div

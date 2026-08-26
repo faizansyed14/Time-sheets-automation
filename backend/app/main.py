@@ -20,6 +20,7 @@ from app.api.routes import (
     admin,
     agentic_chat,
     auth,
+    bulk_upload,
     employee_matcher,
     employees,
     files,
@@ -158,6 +159,9 @@ app.include_router(timesheets.router, prefix=settings.api_prefix, dependencies=_
 app.include_router(employees.router, prefix=settings.api_prefix, dependencies=_protected)
 app.include_router(employee_matcher.router, prefix=settings.api_prefix, dependencies=_vault_and_matcher)
 app.include_router(upload.router, prefix=settings.api_prefix, dependencies=_protected)
+# Bulk roster upload — one sheet, many employees. Same gating as /upload;
+# separate router so the per-employee flow above is never touched.
+app.include_router(bulk_upload.router, prefix=settings.api_prefix, dependencies=_protected)
 app.include_router(files.router, prefix=settings.api_prefix, dependencies=_vault_and_matcher)
 app.include_router(pipeline.router, prefix=settings.api_prefix, dependencies=_protected)
 app.include_router(agentic_chat.router, prefix=settings.api_prefix, dependencies=_protected)

@@ -20,6 +20,7 @@ import PortalEmployeeUpload from "./pages/portal/PortalEmployeeUpload";
 import PortalEmployeeHistory from "./pages/portal/PortalEmployeeHistory";
 import { useAuth } from "./lib/auth";
 import { PortalAuthProvider, usePortalAuth } from "./lib/portalAuth";
+import { UploadSessionProvider } from "./lib/uploadSession";
 import { Spinner } from "./components/ui";
 
 // The restricted "vault_matcher" role only ever sees these two pages — every
@@ -93,6 +94,11 @@ export default function App() {
         path="/*"
         element={
           <Protected>
+            {/* Wrapped ABOVE the inner route switch (not inside UploadPage
+                itself), so it survives navigating away from /upload and
+                back — only the matched route's component unmounts, this
+                stays mounted the whole session. See lib/uploadSession.tsx. */}
+            <UploadSessionProvider>
             <Shell>
               <Routes>
                 <Route path="/" element={<Dashboard />} />
@@ -111,6 +117,7 @@ export default function App() {
                 <Route path="/admin/debug" element={<Protected adminOnly><AdminExtractionDebug /></Protected>} />
               </Routes>
             </Shell>
+            </UploadSessionProvider>
           </Protected>
         }
       />

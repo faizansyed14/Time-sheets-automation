@@ -92,6 +92,12 @@ async def extract_full_email(
         # never actually read."
         if thread_notes:
             message = f"{message} " + " ".join(thread_notes[:3])
+        # ctx.notes (e.g. "looks like a multi-employee roster, use Bulk Upload
+        # instead") is normally only surfaced on the success path below — but
+        # an email whose ONLY attachment was a skipped roster ends up here
+        # instead, and that's exactly when the reviewer most needs the note.
+        if ctx.notes:
+            message = f"{message} " + " ".join(ctx.notes[:3])
         await mark_no_sheets(db, email, message)
         return build_result([], [], ctx.sheets, approval, message)
 
