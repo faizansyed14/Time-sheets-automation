@@ -106,14 +106,14 @@ async def preview_import_from_excel(
     """Dry run — exactly what this file would add/update/leave alone, plus who
     is in the matcher but NOT in the file. Writes nothing; the UI shows this
     for confirmation and only then POSTs the same file to /import."""
-    if not file.filename or not file.filename.lower().endswith(".xlsx"):
-        raise HTTPException(400, "Only .xlsx files are accepted.")
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(400, "Only .xlsx or .xls files are accepted.")
     data = await file.read()
     from app.services.employee.import_service import build_import_plan
     try:
         return await build_import_plan(db, data)
     except Exception as exc:
-        raise HTTPException(500, f"Could not read this file: {exc}") from exc
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.post("/import", response_model=ImportSummary, status_code=200)
@@ -121,19 +121,19 @@ async def import_from_excel(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
-    """Import employees from a .xlsx file containing DXB and AUH sheets.
+    """Import employees from a .xlsx or legacy .xls file containing DXB and AUH sheets.
 
     Additive only: inserts new people and updates changed fields on existing
     ones. Nobody is ever deleted or deactivated by an import, and a blank
     cell never erases a stored value."""
-    if not file.filename or not file.filename.lower().endswith(".xlsx"):
-        raise HTTPException(400, "Only .xlsx files are accepted.")
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(400, "Only .xlsx or .xls files are accepted.")
     data = await file.read()
     from app.services.employee.import_service import import_employees_from_bytes
     try:
         summary = await import_employees_from_bytes(db, data)
     except Exception as exc:
         await db.rollback()
-        raise HTTPException(500, f"Import failed: {exc}") from exc
+        raise HTTPException(400, str(exc)) from exc
     await datacache.bust_employees()
     return summary

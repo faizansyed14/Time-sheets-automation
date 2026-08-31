@@ -1,8 +1,8 @@
 """
 Employee Excel Importer.
 
-Parses a .xlsx file with TWO sheets (DXB and AUH), normalises the different
-header schemas, and upserts every row into all_employee_data.
+Parses a .xlsx OR legacy .xls file with TWO sheets (DXB and AUH), normalises
+the different header schemas, and upserts every row into all_employee_data.
 
 DXB headers: "Emp ID", "DCO", "Employees Name", "Project",
              "Account Managers Name", "Contact No.", "Email"
@@ -48,8 +48,35 @@ def _norm_name(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip()).lower()
 
 
+# The employee-number at the START of an ID cell. The real sheets append free
+# text to it — "E2607411 – On Consultancy Agreement", "E2607433 - Consultancy
+# Agreement (Outside Country)" — and the SAME person's suffix is worded
+# differently from one export to the next, so the number alone is the stable
+# part of the identity.
+_ID_CORE_RE = re.compile(r"^\s*([A-Za-z]?\d{4,})")
+
+
+def _id_core(employee_id: str) -> str:
+    """The stable employee-number in an ID cell, or "" when there isn't one.
+
+    "E2607411 – On Consultancy Agreement" -> "E2607411"
+    "NA" / "N/A" / "NA - Offshore" / "Replacement for Afsal" -> ""
+
+    A cell with no leading employee-number is a PLACEHOLDER, not an ID: those
+    rows were entered before the person had a number issued. Returning "" for
+    them lets _resolve_existing below recognise a later file that finally
+    supplies the real number as the SAME person, instead of inserting a
+    second row beside the provisional one.
+    """
+    raw = (employee_id or "").strip()
+    if not raw:
+        return ""
+    m = _ID_CORE_RE.match(raw)
+    return m.group(1).upper() if m else ""
+
+
 def _identity_key(employee_id: str, name: str) -> tuple[str, str]:
-    return (employee_id.strip(), _norm_name(name))
+    return (_id_core(employee_id), _norm_name(name))
 
 
 _BLANK_REF = {"", "NA", "N/A", "-", "--", "NIL", "NONE"}
@@ -202,18 +229,88 @@ def _parse_sheet_auh(ws) -> list[dict]:
     return records
 
 
-def parse_workbook(data: bytes) -> list[dict]:
-    """xlsx bytes -> raw parsed rows (DXB + AUH sheets, normalised headers)."""
-    try:
-        import openpyxl
-    except ImportError:
-        raise RuntimeError("openpyxl is required for Excel import.")
+_XLSX_MAGIC = b"PK"                                    # zip container (Office Open XML)
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"        # legacy .xls, OR an IRM-wrapped .xlsx
 
-    wb = openpyxl.load_workbook(BytesIO(data), read_only=True, data_only=True)
+
+class _XlsCell:
+    """Adapts one xlrd cell value to openpyxl's Cell.value shape — the ONE
+    attribute _parse_sheet_dxb/_parse_sheet_auh actually read."""
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+
+class _XlsSheet:
+    """Adapts an xlrd Sheet to the .title / .iter_rows(min_row=) shape those
+    same two parsers already expect from an openpyxl worksheet — so neither
+    parser needed to change to also read legacy .xls files."""
+
+    def __init__(self, sheet):
+        self._sheet = sheet
+        self.title = sheet.name
+
+    def iter_rows(self, min_row: int = 1):
+        for r in range(min_row - 1, self._sheet.nrows):
+            yield [_XlsCell(self._sheet.cell_value(r, c)) for c in range(self._sheet.ncols)]
+
+
+def _reject_if_irm_protected(data: bytes) -> None:
+    """An OLE2 file that isn't actually a legacy .xls but Microsoft
+    Information Rights Management (IRM / Azure RMS) protected can't be read
+    by ANY library — decrypting it needs Excel itself, authenticated as a
+    permitted user. Detected by its distinctive DataSpaces/EncryptedPackage
+    streams, so the importer can say exactly what's wrong instead of xlrd
+    failing with an opaque "Can't find workbook in OLE2 compound document"."""
+    try:
+        import olefile
+    except ImportError:
+        return  # best-effort — skip the friendlier message if olefile isn't installed
+    try:
+        with olefile.OleFileIO(BytesIO(data)) as ole:
+            streams = {"/".join(p) for p in ole.listdir()}
+    except Exception:
+        return
+    if any("EncryptedPackage" in s or "DataSpaces" in s for s in streams):
+        raise RuntimeError(
+            "This file is protected by Microsoft Information Rights Management "
+            "(IRM/Azure RMS) — no script can read it, only Excel itself, "
+            "authenticated as a permitted user, can. Open it in Excel, then "
+            "File → Save As a plain copy (or export to CSV), and import "
+            "that copy instead."
+        )
+
+
+def _load_sheets(data: bytes) -> list:
+    """.xlsx OR legacy .xls bytes -> a list of sheet-like objects exposing
+    .title and .iter_rows(min_row=) — the common shape _parse_sheet_dxb/
+    _parse_sheet_auh read, regardless of which format supplied it."""
+    if data[:2] == _XLSX_MAGIC:
+        try:
+            import openpyxl
+        except ImportError:
+            raise RuntimeError("openpyxl is required to read .xlsx files.")
+        wb = openpyxl.load_workbook(BytesIO(data), read_only=True, data_only=True)
+        return [wb[name] for name in wb.sheetnames]
+
+    if data[:8] == _OLE2_MAGIC:
+        _reject_if_irm_protected(data)
+        try:
+            import xlrd
+        except ImportError:
+            raise RuntimeError("xlrd is required to read legacy .xls files.")
+        book = xlrd.open_workbook(file_contents=data)
+        return [_XlsSheet(book.sheet_by_index(i)) for i in range(book.nsheets)]
+
+    raise RuntimeError("Unrecognized file — expected a .xlsx or .xls workbook.")
+
+
+def parse_workbook(data: bytes) -> list[dict]:
+    """.xlsx or legacy .xls bytes -> raw parsed rows (DXB + AUH sheets, normalised headers)."""
     records: list[dict] = []
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        name_lower = sheet_name.strip().lower()
+    for ws in _load_sheets(data):
+        name_lower = ws.title.strip().lower()
         if "dxb" in name_lower:
             records.extend(_parse_sheet_dxb(ws))
         elif "auh" in name_lower:
@@ -294,6 +391,47 @@ def _index_by_identity(rows: list[Employee]) -> dict[tuple[str, str], Employee]:
     return {_identity_key(e.employee_id, e.name or ""): e for e in rows}
 
 
+def _index_placeholder_by_name(rows: list[Employee]) -> dict[str, list[Employee]]:
+    """Stored rows that have NO usable employee-number, keyed by name — the
+    candidates a real ID can be an upgrade of. See _resolve_existing."""
+    out: dict[str, list[Employee]] = {}
+    for e in rows:
+        if not _id_core(e.employee_id):
+            out.setdefault(_norm_name(e.name or ""), []).append(e)
+    return out
+
+
+def _resolve_existing(
+    index: dict[tuple[str, str], Employee],
+    placeholder_by_name: dict[str, list[Employee]],
+    rec: dict,
+) -> tuple[Employee | None, bool]:
+    """Find the stored row this file row is about.
+
+    Returns (row, is_id_upgrade). The second flag marks the case where the
+    stored row had a PLACEHOLDER id ("NA") and this file finally supplies the
+    real employee-number: the match was made on name alone, so the caller
+    must also write the new employee_id — which a normal match never touches
+    (it is part of the identity key and equal by definition).
+
+    The name-only fallback is deliberately narrow: it applies only when the
+    stored row has no usable number at all, and only when exactly ONE such
+    row carries that name. Two people sharing a name would leave the match
+    ambiguous, and guessing there could silently fuse two different people —
+    so those fall through and are reported as additions instead.
+    """
+    existing = index.get(rec["_key"])
+    if existing is not None:
+        return existing, False
+    if not rec["_key"][0]:
+        # This row has no usable ID either — nothing to upgrade from.
+        return None, False
+    candidates = placeholder_by_name.get(rec["_key"][1], [])
+    if len(candidates) == 1:
+        return candidates[0], True
+    return None, False
+
+
 def _existing_out(e: Employee) -> dict:
     return {
         "id": e.id, "employee_id": e.employee_id, "name": e.name,
@@ -317,6 +455,7 @@ async def build_import_plan(db: AsyncSession, data: bytes) -> dict:
     usable, skipped = _split_usable(parse_workbook(data))
     rows = await _load_employees(db)
     index = _index_by_identity(rows)
+    placeholder_by_name = _index_placeholder_by_name(rows)
 
     # Same ID in the same office under a DIFFERENT name is very likely a
     # rename — flagged, never auto-merged: AUH and DXB reuse ID ranges, so
@@ -324,7 +463,7 @@ async def build_import_plan(db: AsyncSession, data: bytes) -> dict:
     by_id_loc: dict[tuple[str, str], list[Employee]] = {}
     for e in rows:
         by_id_loc.setdefault(
-            ((e.employee_id or "").strip(), (e.location or "").strip()), []).append(e)
+            (_id_core(e.employee_id), (e.location or "").strip()), []).append(e)
 
     to_add: list[dict] = []
     to_update: list[dict] = []
@@ -332,10 +471,16 @@ async def build_import_plan(db: AsyncSession, data: bytes) -> dict:
     matched: set[str] = set()
 
     for rec in usable:
-        existing = index.get(rec["_key"])
+        existing, id_upgrade = _resolve_existing(index, placeholder_by_name, rec)
         if existing is not None:
             matched.add(existing.id)
             changes = _changes_for(existing, rec)
+            if id_upgrade:
+                # Matched on name because the stored row had a placeholder id;
+                # the real number this file supplies is itself a change.
+                changes.insert(0, {"field": "employee_id",
+                                   "old": existing.employee_id,
+                                   "new": rec["employee_id"]})
             base = {"id": existing.id, "employee_id": existing.employee_id,
                     "name": existing.name, "location": existing.location}
             if changes:
@@ -345,7 +490,7 @@ async def build_import_plan(db: AsyncSession, data: bytes) -> dict:
             continue
 
         same = by_id_loc.get(
-            (rec["employee_id"], (rec.get("location") or "").strip()), [])
+            (_id_core(rec["employee_id"]), (rec.get("location") or "").strip()), [])
         to_add.append({
             "employee_id": rec["employee_id"], "name": rec["name"],
             "location": _clean(rec.get("location")),
@@ -380,17 +525,29 @@ async def import_employees_from_bytes(db: AsyncSession, data: bytes) -> dict:
     usable, skipped = _split_usable(parse_workbook(data))
     rows = await _load_employees(db)
     index = _index_by_identity(rows)
+    placeholder_by_name = _index_placeholder_by_name(rows)
 
     inserted = updated = touched = 0
     with db.no_autoflush:
         for rec in usable:
-            existing = index.get(rec["_key"])
+            existing, id_upgrade = _resolve_existing(index, placeholder_by_name, rec)
             if existing is not None:
                 changes = _changes_for(existing, rec)
+                if id_upgrade:
+                    # See _resolve_existing: a placeholder-id row finally
+                    # getting its real employee-number.
+                    changes.insert(0, {"field": "employee_id",
+                                       "old": existing.employee_id,
+                                       "new": rec["employee_id"]})
+                    placeholder_by_name.get(rec["_key"][1], []).remove(existing)
                 if not changes:
                     continue
                 for c in changes:
                     setattr(existing, c["field"], c["new"])
+                # The row's identity key just moved (name and/or id changed);
+                # re-index it so a later row in the same file resolves to it
+                # rather than inserting a duplicate.
+                index[_identity_key(existing.employee_id, existing.name or "")] = existing
                 updated += 1
             else:
                 row = Employee(
