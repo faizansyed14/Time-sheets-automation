@@ -10,6 +10,7 @@ import {
   Users,
   FolderOpen,
   FileSpreadsheet,
+  BellRing,
   Zap,
   CircleDot,
   Settings,
@@ -45,6 +46,9 @@ const TOOLS_NAV = [
   { to: "/employees", label: "Employee matcher", icon: Users },
   { to: "/export", label: "Export", icon: FileSpreadsheet },
   { to: "/files", label: "File Vault", icon: FolderOpen },
+  // Same read/write split as calendars/portal-accounts below (require_full_access,
+  // not admin-only) — sending a nudge is routine ops work, not admin config.
+  { to: "/reminders", label: "Reminders", icon: BellRing },
   // Read by every extraction run and relevant to normal timesheet review, not
   // just admin config — every role can view it (backend: require_write, same
   // as the routes above), so it lives here rather than under Admin.
@@ -70,6 +74,7 @@ const TITLES: Record<string, string> = {
   "/employees": "Employee matcher",
   "/export": "Export",
   "/files": "File vault",
+  "/reminders": "Reminders",
 };
 
 /** Short blurb shown beside "Workspace" — replaces long page subtitles. */

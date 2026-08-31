@@ -240,3 +240,71 @@ class S3StorageProvider(StorageProvider):
             objs = [{"Key": o["Key"]} for o in page.get("Contents", [])]
             if objs:
                 self._client.delete_objects(Bucket=self.bucket, Delete={"Objects": objs})
+
+    # ---- relocation ----
+    def _object_exists(self, key: str) -> bool:
+        try:
+            self._client.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except Exception:
+            return False
+
+    def _prefix_has_any_object(self, prefix: str) -> bool:
+        resp = self._client.list_objects_v2(Bucket=self.bucket, Prefix=prefix, MaxKeys=1)
+        return resp.get("KeyCount", 0) > 0
+
+    def _dedupe_key(self, key: str) -> str:
+        """key if free, else '<stem> (2)<ext>', '<stem> (3)<ext>', ... within
+        the same "folder" (S3 has no real directories, so this just varies
+        the last path segment) — never silently overwrite an existing object."""
+        if not self._object_exists(key):
+            return key
+        folder, _, name = key.rpartition("/")
+        stem, dot, ext = name.rpartition(".") if "." in name else (name, "", "")
+        i = 2
+        while True:
+            candidate_name = f"{stem} ({i}){dot}{ext}" if dot else f"{name} ({i})"
+            candidate = f"{folder}/{candidate_name}" if folder else candidate_name
+            if not self._object_exists(candidate):
+                return candidate
+            i += 1
+
+    def move_path(self, src_rel_path: str, dst_rel_path: str, *, copy: bool = False) -> str:
+        src_parts = [p for p in src_rel_path.split("/") if p]
+        dst_parts = [p for p in dst_rel_path.split("/") if p]
+        src_key = self._key(*[_safe(p) for p in src_parts])
+        dst_key = self._key(*[_safe(p) for p in dst_parts])
+        if src_key == dst_key:
+            raise ValueError("Source and destination are the same path")
+
+        if self._object_exists(src_key):
+            # A single file.
+            final_key = self._dedupe_key(dst_key)
+            self._client.copy_object(Bucket=self.bucket,
+                                     CopySource={"Bucket": self.bucket, "Key": src_key}, Key=final_key)
+            if not copy:
+                self._client.delete_object(Bucket=self.bucket, Key=src_key)
+            return final_key[len(self.prefix) + 1:] if self.prefix else final_key
+
+        # A "folder" — a key prefix, since S3 has no real directories.
+        src_prefix = src_key.rstrip("/") + "/"
+        dst_prefix = dst_key.rstrip("/") + "/"
+        if dst_prefix.startswith(src_prefix):
+            raise ValueError("Cannot move a folder into itself")
+        if self._prefix_has_any_object(dst_prefix):
+            raise FileExistsError(f"A folder already exists at {dst_rel_path}")
+
+        found = False
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=src_prefix):
+            for obj in page.get("Contents", []):
+                found = True
+                src = obj["Key"]
+                dst = dst_prefix + src[len(src_prefix):]
+                self._client.copy_object(Bucket=self.bucket,
+                                         CopySource={"Bucket": self.bucket, "Key": src}, Key=dst)
+                if not copy:
+                    self._client.delete_object(Bucket=self.bucket, Key=src)
+        if not found:
+            raise FileNotFoundError(src_rel_path)
+        return "/".join(dst_parts)

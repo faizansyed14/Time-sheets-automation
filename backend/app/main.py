@@ -28,6 +28,7 @@ from app.api.routes import (
     pipeline,
     portal_auth,
     portal_employee,
+    reminders,
     timesheets,
     upload,
 )
@@ -165,6 +166,7 @@ app.include_router(bulk_upload.router, prefix=settings.api_prefix, dependencies=
 app.include_router(files.router, prefix=settings.api_prefix, dependencies=_vault_and_matcher)
 app.include_router(pipeline.router, prefix=settings.api_prefix, dependencies=_protected)
 app.include_router(agentic_chat.router, prefix=settings.api_prefix, dependencies=_protected)
+app.include_router(reminders.router, prefix=settings.api_prefix, dependencies=_protected)
 
 
 @app.get("/health")

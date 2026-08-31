@@ -7,6 +7,7 @@ import UploadPage from "./pages/Upload";
 import PipelinePage from "./pages/Pipeline";
 import EmployeesPage from "./pages/Employees";
 import FilesPage from "./pages/Files";
+import RemindersPage from "./pages/Reminders";
 import ExportPage from "./pages/Export";
 import RecordPage from "./pages/Record";
 import Login from "./pages/Login";
@@ -109,6 +110,7 @@ export default function App() {
                 <Route path="/employees" element={<EmployeesPage />} />
                 <Route path="/export" element={<ExportPage />} />
                 <Route path="/files" element={<FilesPage />} />
+                <Route path="/reminders" element={<RemindersPage />} />
                 <Route path="/records/:id" element={<RecordPage />} />
                 <Route path="/admin/settings" element={<Protected adminOnly><AdminSettings /></Protected>} />
                 <Route path="/admin/users" element={<Protected adminOnly><AdminUsers /></Protected>} />

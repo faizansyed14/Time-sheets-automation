@@ -63,6 +63,72 @@ def test_s3_provider_full_lifecycle(monkeypatch):
     assert sp.list_items("Sarah Khan", "Mohammed Ali", "March-2026") == []
 
 
+@mock_aws
+def test_s3_move_path_file_and_folder(monkeypatch):
+    """move_path on S3 — the Files page's Move/Copy action. S3 has no real
+    directories, so a "folder" move/copy is really a copy+delete loop over
+    every key under that prefix (see S3StorageProvider.move_path)."""
+    import boto3
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "storage_provider", "s3")
+    monkeypatch.setattr(settings, "s3_bucket", "ts-test-bucket-2")
+    monkeypatch.setattr(settings, "s3_prefix", "timesheets")
+    monkeypatch.setattr(settings, "s3_region", "us-east-1")
+    monkeypatch.setattr(settings, "aws_access_key_id", "test")
+    monkeypatch.setattr(settings, "aws_secret_access_key", "test")
+    monkeypatch.setattr(settings, "s3_endpoint_url", None)
+
+    boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="ts-test-bucket-2")
+
+    from app.services.storage_provider.s3_provider import S3StorageProvider
+    sp = S3StorageProvider()
+
+    # ---- move a single file ----
+    sp.save_file("Alice", "Bob", "June-2026", "sheet.pdf", b"original bytes")
+    new_rel = sp.move_path("Alice/Bob/June-2026/sheet.pdf", "Alice/Carol/July-2026/sheet.pdf")
+    assert new_rel == "Alice/Carol/July-2026/sheet.pdf"
+    data, _name, _ctype = sp.read_file("Alice/Carol/July-2026/sheet.pdf")
+    assert data == b"original bytes"
+    assert sp.list_items("Alice", "Bob", "June-2026") == []
+
+    # ---- copy leaves the source in place ----
+    sp.save_file("Alice", "Bob", "June-2026", "sheet2.pdf", b"copy me")
+    copied_rel = sp.move_path("Alice/Bob/June-2026/sheet2.pdf", "Alice/Denise/June-2026/sheet2.pdf", copy=True)
+    assert copied_rel == "Alice/Denise/June-2026/sheet2.pdf"
+    assert {i.name for i in sp.list_items("Alice", "Bob", "June-2026")} == {"sheet2.pdf"}
+    assert {i.name for i in sp.list_items("Alice", "Denise", "June-2026")} == {"sheet2.pdf"}
+
+    # ---- file destination collision is deduped ----
+    sp.save_file("Alice", "Bob", "June-2026", "sheet3.pdf", b"incoming")
+    sp.save_file("Alice", "Denise", "June-2026", "sheet3.pdf", b"already there")
+    deduped_rel = sp.move_path("Alice/Bob/June-2026/sheet3.pdf", "Alice/Denise/June-2026/sheet3.pdf")
+    assert deduped_rel == "Alice/Denise/June-2026/sheet3 (2).pdf"
+    kept, _n, _c = sp.read_file("Alice/Denise/June-2026/sheet3.pdf")
+    moved, _n2, _c2 = sp.read_file("Alice/Denise/June-2026/sheet3 (2).pdf")
+    assert kept == b"already there" and moved == b"incoming"
+
+    # ---- move a whole employee folder to a different manager ----
+    sp.save_file("Erin", "Frank", "May-2026", "a.pdf", b"a")
+    sp.save_file("Erin", "Frank", "June-2026", "b.pdf", b"b")
+    new_folder_rel = sp.move_path("Erin/Frank", "Grace/Frank")
+    assert new_folder_rel == "Grace/Frank"
+    assert sp.list_months("Erin", "Frank") == []
+    months = {m.name for m in sp.list_months("Grace", "Frank")}
+    assert months == {"May-2026", "June-2026"}
+
+    # ---- folder destination that already exists is rejected ----
+    sp.save_file("Henry", "Ivan", "May-2026", "x.pdf", b"x")
+    sp.save_file("Jack", "Ivan", "May-2026", "y.pdf", b"y")
+    with pytest.raises(FileExistsError):
+        sp.move_path("Henry/Ivan", "Jack/Ivan")
+
+    # ---- missing source ----
+    with pytest.raises(FileNotFoundError):
+        sp.move_path("Nobody/Nothing/June-2026/missing.pdf", "Alice/Bob/June-2026/missing.pdf")
+
+
 def test_factory_selects_s3(monkeypatch):
     from app.core.config import settings
     import app.services.storage_provider as sp_pkg

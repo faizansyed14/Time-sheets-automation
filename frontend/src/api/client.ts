@@ -1057,6 +1057,32 @@ export const renameFolder = (rel_path: string, new_name: string) =>
   api.patch("/files/folder", { rel_path, new_name }).then((r) => r.data);
 export const deleteFolder = (relPath: string) =>
   api.delete("/files/folder", { params: { rel_path: relPath } }).then((r) => r.data);
+/** Move (or, with asCopy, copy) a sheet or a whole employee/month folder to
+ *  a different vault location — e.g. re-filing a sheet under the right
+ *  employee, or reassigning an employee's whole folder to another manager.
+ *  dstRelPath is the FULL destination path (including the filename, for a
+ *  file). Returns the actual path written (deduped if a same-named file
+ *  already existed there). */
+export const moveVaultPath = (srcRelPath: string, dstRelPath: string, asCopy = false) =>
+  api
+    .post<{ rel_path: string }>("/files/move-path", {
+      src_rel_path: srcRelPath, dst_rel_path: dstRelPath, as_copy: asCopy,
+    })
+    .then((r) => r.data);
+
+/** The Vault's "View extracted data" action — resolves a month folder to the
+ *  TimesheetRecord Compare & Fix filed for it, so the Vault can link
+ *  straight into /records/{id} (the same page Dashboard/Pipeline/Chat use).
+ *  Pass employee_pk when known (Project/Location view); manager view has
+ *  only folder names, so pass manager + employeeFolder instead. */
+export const fetchVaultRecordFor = (month: string, by: { employeePk: string } | { manager: string; employeeFolder: string }) =>
+  api
+    .get<{ record_id: string }>("/files/record-for", {
+      params: "employeePk" in by
+        ? { month, employee_pk: by.employeePk }
+        : { month, manager: by.manager, employee_folder: by.employeeFolder },
+    })
+    .then((r) => r.data);
 
 // ---------------------------------------------------------------------------
 // Employee matcher (all_employee_data)
@@ -1315,6 +1341,83 @@ export const adminUpsertCalendar = (body: {
 }) => api.put<MonthCalendar>("/admin/calendars", body).then((r) => r.data);
 export const adminDeleteCalendar = (id: string) =>
   api.delete(`/admin/calendars/${id}`).then((r) => r.data);
+
+// ===========================================================================
+// Reminders — automatic 28th/9am UAE nudge + per-employee "Send now" + tests
+// ===========================================================================
+export interface ReminderConfig {
+  auto_send_enabled: boolean;
+  send_day: number;
+  send_hour_uae: number;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+export const fetchReminderConfig = () =>
+  api.get<ReminderConfig>("/reminders/config").then((r) => r.data);
+export const updateReminderConfig = (auto_send_enabled: boolean) =>
+  api.put<ReminderConfig>("/reminders/config", { auto_send_enabled }).then((r) => r.data);
+
+export interface ReminderEmployeeRow {
+  employee_pk: string;
+  employee_id: string;
+  name: string;
+  account_manager: string | null;
+  location: string | null;
+  email: string | null;
+  missing: boolean;
+  last_status: "sent" | "failed" | "skipped" | null;
+  last_sent_at: string | null;
+  last_trigger: string | null;
+  last_error: string | null;
+}
+export const fetchReminderEmployees = (params: {
+  month: number; year: number; q?: string; only_missing?: boolean; limit?: number; offset?: number;
+}) =>
+  api.get<{ total: number; rows: ReminderEmployeeRow[] }>("/reminders/employees", { params }).then((r) => r.data);
+
+export interface ReminderLog {
+  id: string;
+  run_id: string | null;
+  employee_pk: string | null;
+  employee_id: string | null;
+  employee_name: string | null;
+  recipient_email: string | null;
+  month: number;
+  year: number;
+  trigger: "scheduled" | "manual_batch" | "manual" | "test";
+  status: "sent" | "failed" | "skipped";
+  error: string | null;
+  sent_at: string | null;
+  created_at: string | null;
+}
+/** Throws with response.status 409 (existing send's timestamp in
+ *  err.response.data.detail.sent_at) when a reminder was already sent for
+ *  this employee/month and force wasn't passed. */
+export const sendReminderNow = (employee_pk: string, month: number, year: number, force = false) =>
+  api.post<ReminderLog>("/reminders/send-now", { employee_pk, month, year, force }).then((r) => r.data);
+
+export const sendTestReminder = (email: string, month: number, year: number, employee_name = "Test Employee") =>
+  api.post<ReminderLog>("/reminders/test", { email, month, year, employee_name }).then((r) => r.data);
+
+export interface ReminderRun {
+  id: string;
+  trigger: "scheduled" | "manual_batch";
+  month: number;
+  year: number;
+  started_at: string | null;
+  finished_at: string | null;
+  total: number;
+  sent_count: number;
+  failed_count: number;
+  skipped_count: number;
+  triggered_by: string | null;
+}
+export const runReminderBatch = (month?: number, year?: number) =>
+  api.post<{ run_id: string }>("/reminders/run-batch", { month, year }).then((r) => r.data);
+export const fetchReminderRuns = (limit = 20) =>
+  api.get<ReminderRun[]>("/reminders/runs", { params: { limit } }).then((r) => r.data);
+export const fetchReminderRun = (id: string) =>
+  api.get<ReminderRun & { logs: ReminderLog[] }>(`/reminders/runs/${id}`).then((r) => r.data);
 
 // ===========================================================================
 // Admin — extraction debug runs (temporary, purgeable full LLM trace)

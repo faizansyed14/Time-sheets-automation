@@ -1597,12 +1597,21 @@ export default function InboxPage() {
                             const at = detail.extract_email_at;
                             const isNewer = !!at && !!detail.received_at
                               && new Date(detail.received_at) > new Date(at);
-                            if (at && !isNewer) return null;
+                            // A fully caught-up thread (extracted before, nothing
+                            // newer since) used to render NO buttons at all here —
+                            // there was no way to re-extract it short of a new
+                            // reply arriving. The primary button still hides in
+                            // that case (nothing new to read incrementally), but
+                            // "Re-read entire thread" below must always stay
+                            // available once a thread has been extracted at least
+                            // once, so a stale/wrong past read can always be redone.
+                            const showPrimary = !at || isNewer;
                             const busy = isBusy(detail.provider_message_id);
                             const myTask = taskFor(detail.provider_message_id);
                             const queued = myTask?.status === "queued";
                             return (
                               <>
+                                {showPrimary && (
                                 <Button
                                   size="sm"
                                   variant={isNewer ? "secondary" : undefined}
@@ -1625,6 +1634,7 @@ export default function InboxPage() {
                                       ? "Extracting…"
                                       : isNewer ? "Re-extract (new reply)" : "Extract Email"}
                                 </Button>
+                                )}
                                 {at && (
                                   <Button
                                     size="sm"

@@ -10,6 +10,13 @@ from app.models.pipeline_file import (
     PipelineStatus,
 )
 from app.models.portal_auth import PortalRole, PortalUser
+from app.models.reminder import (
+    ReminderConfig,
+    ReminderLog,
+    ReminderRun,
+    ReminderStatus,
+    ReminderTrigger,
+)
 from app.models.portal_submission import (
     ExtractionState,
     ManagerDecision,
@@ -48,4 +55,9 @@ __all__ = [
     "ManagerDecision",
     "ExtractionState",
     "SubmissionFileKind",
+    "ReminderConfig",
+    "ReminderRun",
+    "ReminderLog",
+    "ReminderTrigger",
+    "ReminderStatus",
 ]

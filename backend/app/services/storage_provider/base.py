@@ -125,3 +125,25 @@ class StorageProvider(ABC):
 
     @abstractmethod
     def delete_file(self, rel_path: str) -> None: ...
+
+    # ---- relocation (used by the Files page's Move/Copy action) ----
+    @abstractmethod
+    def move_path(self, src_rel_path: str, dst_rel_path: str, *, copy: bool = False) -> str:
+        """Move (or, when copy=True, copy) a FILE or an entire FOLDER from
+        src_rel_path to dst_rel_path — the one relocation primitive
+        rename_folder doesn't provide (that one can only rename in place,
+        never reparent to a different manager/employee). dst_rel_path is the
+        FULL destination path, including the filename for a file — the
+        caller decides the destination name; this never infers one from src.
+
+        A single FILE destination that already exists is deduped (never
+        silently overwritten, matching the ingestion pipeline's own
+        _dedupe_filename convention in storage_provider/__init__.py) — the
+        actual final path actually written is returned. A FOLDER destination
+        that already exists is rejected outright (no merge semantics in
+        v1) — move a folder to a fresh, not-yet-existing location, or move
+        its files individually to merge into one that already exists.
+
+        Raises FileNotFoundError if src_rel_path doesn't exist, ValueError
+        for a no-op (src == dst) or for moving a folder into its own
+        subtree, and FileExistsError for an occupied folder destination."""
