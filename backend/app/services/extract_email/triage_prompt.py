@@ -119,7 +119,21 @@ team's monthly submission. Read each item's own printed name/ID, every time.
 
 For every timesheet or leave_certificate, report the employee name and ID EXACTLY as
 printed on that item (employee_name, employee_id). If a document is bilingual, use
-whichever name is in Latin script if both are given, otherwise transliterate as printed."""
+whichever name is in Latin script if both are given, otherwise transliterate as printed.
+
+MULTI-EMPLOYEE ROSTERS - some attachments are not one person's timesheet but a single grid
+covering MANY employees at once: one ROW (or column) per employee, each with their own
+name/ID and their own run of daily statuses, all on the same page/sheet - a "roster" or
+"attendance register" rather than an individual's sheet. If an item's day-by-day grid is
+organised this way, set covers_multiple_employees: true and employee_row_count to your
+best count of distinct employees visible, and leave employee_name/employee_id null - do
+not pick one name (e.g. row 1) and silently drop the rest. This is different from several
+employees' OWN separate timesheets arriving as separate items in the same email (see WHOSE
+RECORD IS IT above) - that is the ordinary case and each such item still covers only one
+person, so covers_multiple_employees stays false for it. A multi-employee roster is a
+SINGLE item whose own grid lists many people together; it belongs on the Bulk Upload page,
+not this reader - do not transcribe its day-by-day data here, just flag it and give your
+best row count so it is never mistaken for one person's data."""
 
 PASS1_OUTPUT = """Return EXACTLY this JSON and nothing else (no markdown fence):
 
@@ -136,6 +150,8 @@ PASS1_OUTPUT = """Return EXACTLY this JSON and nothing else (no markdown fence):
       "kind": "timesheet" | "leave_certificate" | "approval" | "other" | "noise",
       "employee_name": "<exactly as printed on THIS item, or null>",
       "employee_id": "<exactly as printed on THIS item, or null>",
+      "covers_multiple_employees": false,
+      "employee_row_count": null,
       "period_hint": "<month/year or date range, however it's expressed on the item>",
       "evidence": "<quote or describe ONE thing that supports your kind - a dated row, a
                     leave-type + date range, an approval line. If you cannot point at one
@@ -150,8 +166,10 @@ PASS1_OUTPUT = """Return EXACTLY this JSON and nothing else (no markdown fence):
 }
 
 "noise" = not a document at all. "other" = a real document, just not relevant here (an
-invoice, an ID card, a plain mention with no grid or leave data). Be honest in `notes`
-when you're unsure - a flagged uncertainty is much more useful to a reviewer than false
+invoice, an ID card, a plain mention with no grid or leave data). Keep "kind": "timesheet"
+for a multi-employee roster (it IS a timesheet-shaped grid) - covers_multiple_employees is
+what routes it away from per-person extraction, not the kind. Be honest in `notes` when
+you're unsure - a flagged uncertainty is much more useful to a reviewer than false
 confidence."""
 
 

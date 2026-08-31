@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Users, Plus, Pencil, UserX, UserCheck, FileSpreadsheet, MapPin, Copy } from "lucide-react";
+import { Users, Plus, Pencil, UserX, UserCheck, FileSpreadsheet, MapPin, Copy, Search, User } from "lucide-react";
 import {
   createEmployee,
   fetchEmployeeMatcher,
@@ -399,19 +399,12 @@ export default function EmployeesPage() {
             </Select>
           </Field>
           <Field label="Account manager" name="account_manager">
-            <Input
-              list="account-manager-names"
+            <ManagerPicker
+              names={accountManagerNames}
               value={form.account_manager ?? ""}
-              onChange={(e) => setForm({ ...form, account_manager: e.target.value || null })}
-              placeholder="Select or type a name…"
-              autoComplete="off"
+              onChange={(v) => setForm({ ...form, account_manager: v || null })}
             />
           </Field>
-          <datalist id="account-manager-names">
-            {accountManagerNames.map((m) => (
-              <option key={m} value={m} />
-            ))}
-          </datalist>
           <Field label="ACO number" name="aco_number">
             <Input
               value={form.aco_number ?? ""}
@@ -521,6 +514,64 @@ export default function EmployeesPage() {
           </>
         )}
       </Modal>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Account manager picker — a searchable dropdown styled like the rest of the
+// app, replacing a native <input list> datalist (bare, unstyled, and
+// inconsistent across browsers). Still free-text underneath: the first
+// employee under a brand-new manager has to be able to type a name that
+// doesn't exist in `names` yet.
+// ---------------------------------------------------------------------------
+function ManagerPicker({
+  names,
+  value,
+  onChange,
+}: {
+  names: string[];
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+
+  const matches = useMemo(
+    () => names.filter((n) => n.toLowerCase().includes(value.trim().toLowerCase())).slice(0, 25),
+    [names, value]
+  );
+
+  return (
+    <div className="relative">
+      <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+      <Input
+        value={value}
+        onChange={(e) => { onChange(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        placeholder="Select or type a name…"
+        className="pl-9"
+        autoComplete="off"
+      />
+      {open && matches.length > 0 && (
+        <div className="absolute z-20 mt-1 max-h-52 w-full overflow-y-auto rounded-lg border border-slate-200 bg-white shadow-pop">
+          {matches.map((n) => (
+            <button
+              key={n}
+              type="button"
+              onMouseDown={(ev) => ev.preventDefault()}
+              onClick={() => { onChange(n); setOpen(false); }}
+              className={cn(
+                "flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-brand-50",
+                value === n && "bg-brand-50"
+              )}
+            >
+              <User className="h-4 w-4 shrink-0 text-slate-400" />
+              <span className="truncate text-slate-800">{n}</span>
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

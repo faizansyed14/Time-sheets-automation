@@ -873,6 +873,84 @@ export const uploadFilesToMonth = (
     .then((r) => r.data);
 };
 
+// ---------------------------------------------------------------------------
+// Bulk roster upload — ONE sheet listing MANY employees.
+// Separate from the per-employee /upload endpoints above: a roster is read,
+// previewed, and then staged as one review item per person on it.
+// ---------------------------------------------------------------------------
+export interface RosterPreviewRow {
+  sr_no: number;
+  name: string;
+  title: string | null;
+  location: string | null;
+  confirmation: string | null;
+  /** What the sheet itself prints in its Leave/Billing Days columns. */
+  stated_leave_days: number | null;
+  stated_billing_days: number | null;
+  /** What the reader actually got out of the day grid. */
+  leave_days_read: number;
+  working_days_read: number;
+  weekend_days_read: number;
+  uncertain_days: number;
+  /** Non-null when this person resolves to someone in the Employee Matcher. */
+  matched_name: string | null;
+  matched_employee_id: string | null;
+  issues: string[];
+}
+export interface RosterPreview {
+  filename: string;
+  /** "xlsx-cells" (read straight from the spreadsheet, no AI) or
+   *  "vision-roster" (census + chunked day-grid reads). */
+  method: string;
+  month: number | null;
+  year: number | null;
+  calendar_days: number | null;
+  agency: string | null;
+  headcount: number;
+  matched: number;
+  unmatched: number;
+  flagged: number;
+  llm_calls: number;
+  issues: string[];
+  rows: RosterPreviewRow[];
+}
+export interface BulkStageResult {
+  filename: string;
+  headcount: number;
+  staged: number;
+  matched: number;
+  unmatched: string[];
+  flagged: number;
+  month: number | null;
+  year: number | null;
+  method: string;
+  issues: string[];
+}
+
+function rosterForm(file: File, month?: number, year?: number): FormData {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  if (month) form.append("month", String(month));
+  if (year) form.append("year", String(year));
+  return form;
+}
+
+/** Read the roster and report what WOULD be staged — writes nothing. */
+export const bulkRosterPreview = (file: File, month?: number, year?: number) =>
+  api
+    .post<RosterPreview>("/bulk-upload/preview", rosterForm(file, month, year), {
+      headers: { "Content-Type": "multipart/form-data" },
+    })
+    .then((r) => r.data);
+
+/** Stage one review item per employee on the roster. */
+export const bulkRosterUpload = (file: File, month?: number, year?: number) =>
+  api
+    .post<BulkStageResult>("/bulk-upload", rosterForm(file, month, year), {
+      headers: { "Content-Type": "multipart/form-data" },
+    })
+    .then((r) => r.data);
+
 export type EmlParsed = {
   subject: string;
   from_: string;
@@ -1543,3 +1621,4 @@ export interface PortalRosterMemberAdmin {
 }
 export const fetchPortalRosterAdmin = (month: number, year: number) =>
   api.get<PortalRosterMemberAdmin[]>("/pipeline/portal-roster", { params: { month, year } }).then((r) => r.data);
+

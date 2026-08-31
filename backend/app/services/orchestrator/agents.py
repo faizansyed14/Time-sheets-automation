@@ -187,6 +187,11 @@ class ThreadAgent(Agent):
             names = [s.get("name") for s in skipped if isinstance(s, dict) and s.get("name")]
             if names:
                 ctx.notes.append("Not sent (size/noise filter): " + ", ".join(names[:4]))
+        multi_employee = meta.get("multi_employee_skipped") or []
+        if multi_employee:
+            ctx.notes.append(
+                "Not extracted — looks like a multi-employee roster (upload it on the "
+                "Bulk Upload page instead): " + ", ".join(multi_employee[:4]))
         if not sheets:
             ctx.abort("no readable sheets")
             return meta.get("errors", ["nothing readable in this thread"])[0]

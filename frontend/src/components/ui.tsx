@@ -10,7 +10,7 @@ import {
   useEffect,
 } from "react";
 import { createPortal } from "react-dom";
-import { X, Inbox } from "lucide-react";
+import { X, Inbox, Sparkles } from "lucide-react";
 import { cn } from "../lib/utils";
 import { BADGE_TONES, type BadgeTone } from "../lib/theme";
 
@@ -229,6 +229,29 @@ export function EmptyState({
       {detail && <p className="max-w-sm text-sm leading-relaxed text-slate-500">{detail}</p>}
       {action && <div className="mt-1">{action}</div>}
     </div>
+  );
+}
+
+/** Placeholder shown to a role a feature isn't rolled out to yet — a
+ *  product/UX choice (the backend route may not even be role-restricted),
+ *  not a permissions error. Used standalone (e.g. the Bulk upload tab); for
+ *  gating live content underneath instead of replacing it entirely,
+ *  blur/disable that content and overlay this (see AgenticChat's own inline
+ *  version — a different composition, not reused here). */
+export function ComingSoon({ feature }: { feature: string }) {
+  return (
+    <Card className="flex flex-col items-center justify-center gap-4 p-16 text-center">
+      <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-card">
+        <Sparkles className="h-8 w-8" />
+      </div>
+      <div>
+        <p className="text-xs font-bold uppercase tracking-[0.24em] text-brand-600">Coming soon</p>
+        <h3 className="mt-2 text-2xl font-bold text-slate-900">Working on something exciting</h3>
+        <p className="mx-auto mt-2 max-w-sm text-sm leading-6 text-slate-600">
+          {feature} is being polished for non-admin users. More to come soon.
+        </p>
+      </div>
+    </Card>
   );
 }
 

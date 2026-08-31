@@ -678,6 +678,9 @@ def _normalise_pass1_items(raw_items: list) -> list[dict]:
             if it.get("employee_name") else None,
             "employee_id": (str(it.get("employee_id")).strip() or None)
             if it.get("employee_id") else None,
+            "covers_multiple_employees": bool(it.get("covers_multiple_employees")),
+            "employee_row_count": (int(it["employee_row_count"])
+                                   if isinstance(it.get("employee_row_count"), (int, float)) else None),
             "period_hint": str(it.get("period_hint") or "").strip(),
             "evidence": str(it.get("evidence") or "").strip(),
             "manager_signature": bool(it.get("manager_signature")),
@@ -785,6 +788,8 @@ def _ui_pass_item(t: dict, items: list[Item]) -> dict:
         "source": t["source"], "name": it.name if it is not None else t["source"],
         "kind": t["kind"],
         "employee": t.get("employee_name"), "employee_id": t.get("employee_id"),
+        "covers_multiple_employees": bool(t.get("covers_multiple_employees")),
+        "employee_row_count": t.get("employee_row_count"),
         "period": t.get("period_hint"),
         "signature": bool(t.get("manager_signature")),
         "notes": t.get("notes") or "",
@@ -1049,14 +1054,30 @@ async def extract_thread_sheets(
     combined_triage = triage + reused_triage
     approval = _derive_approval(combined_triage)
     summary_obj = _build_summary(combined_triage, approval, thread_summary, len(batches))
-    data_items = [t for t in triage if t["kind"] in ("timesheet", "leave_certificate")]
+    confirmed_kind = [t for t in triage if t["kind"] in ("timesheet", "leave_certificate")]
+    # A multi-employee roster (one grid, many people) is a fundamentally
+    # different shape than the per-person sheets pass 2 is built to read —
+    # extracting it here would pick one row and silently drop everyone else.
+    # Pass 1 already flagged it (triage_prompt.py); route it away from pass 2
+    # entirely rather than let it through as an ordinary timesheet. This is
+    # the ONLY thing that changes pass 2's input — pass 2 itself is untouched.
+    multi_employee_items = [t for t in confirmed_kind if t.get("covers_multiple_employees")]
+    data_items = [t for t in confirmed_kind if not t.get("covers_multiple_employees")]
+    multi_employee_labels: list[str] = []
+    for t in multi_employee_items:
+        it = resolve_source(t.get("source"), th.items)
+        label = it.name if it is not None else t.get("source")
+        count = t.get("employee_row_count")
+        multi_employee_labels.append(f"{label} (~{count} employees)" if count else str(label))
     full_summary = _enrich_thread_summary(
         summary_obj, triage=combined_triage, approval=approval,
         message_count=len(messages), model=model)
 
     emit("pass1", "ok",
          f"Pass 1 done — {len(data_items)} timesheet/certificate(s) identified"
-         + (f", {len(noise)} noise item(s) ignored" if noise else "") + ".",
+         + (f", {len(noise)} noise item(s) ignored" if noise else "")
+         + (f", {len(multi_employee_labels)} multi-employee roster(s) skipped (use Bulk Upload)"
+            if multi_employee_labels else "") + ".",
          pass_no=1,
          items=[_ui_pass_item(t, th.items) for t in triage],
          confirmed=[_ui_pass_item(t, th.items) for t in data_items],
@@ -1072,6 +1093,7 @@ async def extract_thread_sheets(
         "summary_obj": full_summary, "triage": triage,
         "thread_summary": full_summary,
         "_opened_containers": list(th.opened_containers),
+        "multi_employee_skipped": multi_employee_labels,
     }
 
     if not data_items:
