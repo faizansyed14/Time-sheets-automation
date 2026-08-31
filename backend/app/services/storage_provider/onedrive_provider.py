@@ -30,3 +30,4 @@ class OneDriveStorageProvider(StorageProvider):
     def rename_folder(self, rel_path, new_name): raise NotImplementedError
     def delete_folder(self, rel_path): raise NotImplementedError
     def delete_file(self, rel_path): raise NotImplementedError
+    def move_path(self, src_rel_path, dst_rel_path, *, copy=False): raise NotImplementedError

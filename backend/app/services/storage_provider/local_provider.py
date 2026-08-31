@@ -200,3 +200,43 @@ class LocalStorageProvider(StorageProvider):
         p = self._abs(rel_path)
         if p.is_file():
             p.unlink()
+
+    # ---- relocation ----
+    @staticmethod
+    def _dedupe_file(dst: Path) -> Path:
+        """dst if free, else '<stem> (2)<suffix>', '<stem> (3)<suffix>', ... —
+        never silently overwrite an existing file at the destination."""
+        if not dst.exists():
+            return dst
+        i = 2
+        while True:
+            candidate = dst.with_name(f"{dst.stem} ({i}){dst.suffix}")
+            if not candidate.exists():
+                return candidate
+            i += 1
+
+    def move_path(self, src_rel_path: str, dst_rel_path: str, *, copy: bool = False) -> str:
+        src = self._abs(src_rel_path)
+        if not src.exists():
+            raise FileNotFoundError(src_rel_path)
+        dst = self._abs(dst_rel_path)
+        if dst == src:
+            raise ValueError("Source and destination are the same path")
+        if src.is_dir() and (dst == src or dst.is_relative_to(src)):
+            raise ValueError("Cannot move a folder into itself")
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_file():
+            dst = self._dedupe_file(dst)
+            if copy:
+                shutil.copy2(src, dst)
+            else:
+                shutil.move(str(src), str(dst))
+        else:
+            if dst.exists():
+                raise FileExistsError(f"A folder already exists at {dst_rel_path}")
+            if copy:
+                shutil.copytree(src, dst)
+            else:
+                shutil.move(str(src), str(dst))
+        return str(dst.relative_to(self.root))

@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     # the on-demand sync, so this never duplicates a request-triggered pull.
     inbox_auto_sync_enabled: bool = True
     inbox_auto_sync_interval_seconds: int = 60
+    # Celery beat gate for the monthly reminder check. Off in local dev when
+    # prod employee data is loaded — the DB toggle alone is not enough because
+    # beat still fires hourly (it just no-ops). Set false to skip the task entirely.
+    reminder_scheduled_check_enabled: bool = True
     # Image attachments smaller than this are signature logos/icons in
     # practice: hidden from attachment lists/counts and never sent to the
     # vision model. Applies ONLY to images — documents of any size still flow.

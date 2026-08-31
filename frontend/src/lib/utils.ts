@@ -38,6 +38,26 @@ export function formatDateTime(iso: string | null | undefined): string {
   });
 }
 
+/** Always UAE local time (Asia/Dubai, UTC+4), regardless of the viewer's own
+ *  timezone — used anywhere a reminder's sent/scheduled time is shown, since
+ *  the automatic run's own schedule (28th, 9am) is defined in UAE time and a
+ *  "sent at" timestamp reads as ambiguous/wrong if it silently switched to
+ *  whoever happens to be looking at the page. */
+export function formatUaeDateTime(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const formatted = d.toLocaleString("en-GB", {
+    timeZone: "Asia/Dubai",
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `${formatted} UAE`;
+}
+
 /** Outlook reading-pane style: "Fri 6/12/2026 10:15 AM". */
 export function formatOutlookDateTime(iso: string | null | undefined): string {
   if (!iso) return "—";

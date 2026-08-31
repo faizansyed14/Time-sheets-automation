@@ -7,6 +7,8 @@ STORAGE_PROVIDER=onedrive.
 """
 from __future__ import annotations
 
+import calendar
+
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -16,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.http_headers import content_disposition
 from app.models.employee import Employee
+from app.models.timesheet_record import TimesheetRecord
 from app.services import storage_provider as sp
 from app.services.storage_provider.archive import iter_zip, scope_size, year_summary
 
@@ -46,6 +49,12 @@ class CreateMonth(BaseModel):
 class RenameFolder(BaseModel):
     rel_path: str
     new_name: str
+
+
+class MovePath(BaseModel):
+    src_rel_path: str
+    dst_rel_path: str
+    as_copy: bool = False   # not "copy" — that shadows pydantic BaseModel.copy()
 
 
 # ---- 3-level listing ----
@@ -209,6 +218,63 @@ async def list_employee_vault_months(employee_pk: str, db: AsyncSession = Depend
 async def list_employee_vault_items(employee_pk: str, month: str, db: AsyncSession = Depends(get_db)):
     manager, folder = await _resolve_employee_vault(db, employee_pk)
     return [i.__dict__ for i in sp.get_storage_provider().list_items(manager, folder, month)]
+
+
+def _parse_month_label(label: str) -> tuple[int, int]:
+    """'August-2026' -> (8, 2026) — the inverse of storage_provider.month_label."""
+    name, _, year_str = label.rpartition("-")
+    try:
+        month = list(calendar.month_name).index(name)
+        if month == 0:
+            raise ValueError
+        year = int(year_str)
+    except ValueError:
+        raise HTTPException(400, f"Unrecognized month folder name: {label!r}")
+    return month, year
+
+
+@router.get("/record-for")
+async def record_for(
+    month: str = Query(..., description='Vault month folder label, e.g. "August-2026"'),
+    employee_pk: str | None = Query(None),
+    manager: str | None = Query(None),
+    employee_folder: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """The Vault's "View extracted data" action: given the (month, employee)
+    a vault month-folder belongs to, find the TimesheetRecord Compare & Fix
+    filed for it, if any, so the Vault can link straight into
+    /records/{id} — the same page Dashboard/Pipeline/Chat already link to.
+
+    Project/Location views already know employee_pk directly. Manager view
+    only ever has folder names (see files.py's own module notes on why —
+    there's no persisted employee_pk<->folder link), so it resolves the
+    employee the same way every other vault lookup does: by recomputing
+    each candidate's OWN vault location and matching it against
+    (manager, employee_folder) — never by guessing from the name alone."""
+    m, y = _parse_month_label(month)
+
+    if not employee_pk:
+        if not manager or not employee_folder:
+            raise HTTPException(400, "Provide employee_pk, or both manager and employee_folder")
+        candidates = (await db.execute(select(Employee))).scalars().all()
+        match = next(
+            (e for e in candidates
+             if sp.employee_vault_location(e.account_manager, e.name, e.aco_number, e.dco_number)
+             == (manager, employee_folder)),
+            None,
+        )
+        if not match:
+            raise HTTPException(404, "No employee in the matcher resolves to this vault folder")
+        employee_pk = match.id
+
+    record = (await db.execute(select(TimesheetRecord).where(
+        TimesheetRecord.matched_employee_pk == employee_pk,
+        TimesheetRecord.month == m, TimesheetRecord.year == y,
+    ))).scalar_one_or_none()
+    if not record:
+        raise HTTPException(404, "No extracted record has been filed for this employee/month yet")
+    return {"record_id": record.id}
 
 
 # ---- reading ----
@@ -429,6 +495,31 @@ def delete_folder(rel_path: str = Query(...)):
 def delete_file(rel_path: str = Query(...)):
     sp.get_storage_provider().delete_file(rel_path)
     return {"deleted": rel_path}
+
+
+@router.post("/move-path")
+def move_path(body: MovePath):
+    """Move (or, when body.as_copy, copy) a sheet — or a whole employee/month
+    folder — from one vault location to another. dst_rel_path is the FULL
+    destination path (including the filename, for a file); the frontend
+    builds it the same way it builds any other rel_path here (manager/
+    employee/month[/file]). A file destination that collides with an
+    existing name is deduped, never overwritten; a folder destination that
+    already exists is rejected (move/copy into a fresh location, or move
+    files individually to merge into one that already exists) — see
+    StorageProvider.move_path for the exact rules."""
+    if not body.src_rel_path.strip() or not body.dst_rel_path.strip():
+        raise HTTPException(400, "src_rel_path and dst_rel_path are required")
+    try:
+        new_rel = sp.get_storage_provider().move_path(
+            body.src_rel_path, body.dst_rel_path, copy=body.as_copy)
+    except FileNotFoundError:
+        raise HTTPException(404, "Source not found")
+    except FileExistsError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"rel_path": new_rel}
 
 
 # ---- upload into an existing month folder (manual vault management) ----

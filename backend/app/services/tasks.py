@@ -1,8 +1,10 @@
 """
 Celery tasks — background work.
 
-  send_otp_email_task : deliver an OTP without blocking the login request.
-  process_upload_task : (optional) run the extraction pipeline off-request.
+  send_otp_email_task        : deliver an OTP without blocking the login request.
+  process_upload_task        : (optional) run the extraction pipeline off-request.
+  run_reminder_execute_task  : send a reminder batch's emails (run-batch route).
+  run_reminder_scheduled_check_task : hourly gate for the automatic 28th/9am UAE run.
 
 With celery_task_always_eager=true (dev/tests) these run inline, so the same
 code path is exercised whether or not a worker is running.
@@ -213,6 +215,51 @@ def process_upload_task(filename: str, content_type: str, data_b64: str):
             staged = res["staged"]
             return {"staged": [t.id for t in staged],
                     "groups": res["groups"], "message": res["message"]}
+
+    return _run_coro(_run)
+
+
+@celery_app.task(name="reminders.execute_run", bind=True, max_retries=2, default_retry_delay=15)
+def run_reminder_execute_task(self, run_id: str):
+    """Does the actual sending for a ReminderRun row that already exists
+    (created synchronously by POST /reminders/run-batch so its id could be
+    returned immediately — see that route). One employee's Graph API
+    failure never stops the rest; see reminders/service.py's
+    _send_and_log/execute_run for how that's guaranteed."""
+    from sqlalchemy import select
+
+    from app.core.database import SessionLocal
+    from app.models.reminder import ReminderRun
+    from app.services.reminders import service
+
+    async def _run():
+        async with SessionLocal() as db:
+            run = (await db.execute(select(ReminderRun).where(ReminderRun.id == run_id))).scalar_one_or_none()
+            if run:
+                await service.execute_run(db, run)
+
+    try:
+        return _run_coro(_run)
+    except Exception as exc:  # pragma: no cover - network dependent
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(name="reminders.scheduled_check")
+def run_reminder_scheduled_check_task():
+    """Fires hourly via Celery beat (see core/celery_app.py). Only actually
+    sends anything when the ON/OFF switch is on AND it's the 28th at 9am UAE
+    AND today's scheduled run hasn't already happened — see
+    reminders/service.py's run_scheduled_check for the full gate. The beat
+    entry itself is unconditional (it can't read the DB toggle at
+    process-startup time the way inbox_auto_sync_enabled gates its own
+    entry from a static env var), so this task is the one place the
+    runtime ON/OFF switch is actually enforced."""
+    from app.core.database import SessionLocal
+    from app.services.reminders import service
+
+    async def _run():
+        async with SessionLocal() as db:
+            return await service.run_scheduled_check(db)
 
     return _run_coro(_run)
 

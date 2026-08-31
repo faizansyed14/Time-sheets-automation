@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   FolderOpen,
   Folder,
   FolderKanban,
+  FolderInput,
   MapPin,
   FileText,
   Download,
@@ -15,6 +17,7 @@ import {
   User,
   Upload,
   Search,
+  Eye,
 } from "lucide-react";
 import {
   createFileEmployee,
@@ -23,6 +26,7 @@ import {
   deleteFolder,
   deleteVaultFile,
   downloadScopedZipUrl,
+  fetchVaultRecordFor,
   fileContentUrl,
   fileRenderUrl,
   listEmployeeVaultItems,
@@ -35,6 +39,7 @@ import {
   listFileProjects,
   listLocationEmployees,
   listProjectEmployees,
+  moveVaultPath,
   renameFolder,
   searchVaultEmployees,
   uploadFilesToMonth,
@@ -43,7 +48,7 @@ import {
 import { cn, formatBytes, formatDateTime } from "../lib/utils";
 import { FilePreviewModal, PreviewableFileRow } from "../components/FilePreview";
 import { VaultDownload } from "../components/VaultDownload";
-import { Button, Card, EmptyState, Input, Modal, PageHeader, Skeleton } from "../components/ui";
+import { Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton } from "../components/ui";
 import { useToast } from "../components/toast";
 import type { PreviewFile } from "../lib/filePreview";
 
@@ -123,6 +128,7 @@ function EmployeeSearchBox({ onSelect }: { onSelect: (r: ProjectEmployee) => voi
 export default function FilesPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const navigate = useNavigate();
 
   // ---- Manager-wise view (the vault's real physical layout) ----
   const [manager, setManager] = useState<string | null>(null);
@@ -354,6 +360,45 @@ export default function FilesPage() {
       invalidate();
     },
     onError: (e: any) => toast("error", "Delete failed", e?.response?.data?.detail ?? String(e)),
+  });
+
+  // Move/copy a sheet to a different employee/month, or an employee's whole
+  // folder to a different account manager — see MoveDestinationModal below.
+  const [movingFile, setMovingFile] = useState<{ relPath: string; name: string } | null>(null);
+  const [movingFolder, setMovingFolder] = useState<{ relPath: string; name: string } | null>(null);
+  const moveMut = useMutation({
+    mutationFn: ({ src, dst, asCopy }: { src: string; dst: string; asCopy: boolean }) =>
+      moveVaultPath(src, dst, asCopy),
+    onSuccess: (res, vars) => {
+      const finalName = res.rel_path.split("/").pop();
+      const renamed = finalName && finalName !== vars.dst.split("/").pop();
+      toast(
+        "success",
+        vars.asCopy ? "Copied" : "Moved",
+        renamed ? `A file named "${vars.dst.split("/").pop()}" already existed there — saved as "${finalName}".` : undefined
+      );
+      setMovingFile(null);
+      setMovingFolder(null);
+      invalidate();
+    },
+    onError: (e: any) => toast("error", "Move/copy failed", e?.response?.data?.detail ?? String(e)),
+  });
+
+  // "View extracted data" — jump from a vault month folder straight into the
+  // TimesheetRecord it was accepted into (the same /records/{id} page
+  // Dashboard/Pipeline/Chat already link to). 404 just means Compare & Fix
+  // hasn't accepted anything for this employee/month yet.
+  const viewRecordMut = useMutation({
+    mutationFn: (args: { month: string; by: { employeePk: string } | { manager: string; employeeFolder: string } }) =>
+      fetchVaultRecordFor(args.month, args.by),
+    onSuccess: (res) => navigate(`/records/${res.record_id}`),
+    onError: (e: any) => {
+      if (e?.response?.status === 404) {
+        toast("info", "Not extracted yet", "No record has been accepted for this employee/month in Compare & Fix yet.");
+      } else {
+        toast("error", "Could not open the record", e?.response?.data?.detail ?? String(e));
+      }
+    },
   });
 
   const crumb = (label: string, onClick?: () => void, active?: boolean) => (
@@ -641,6 +686,7 @@ export default function FilesPage() {
                     onDelete={() => {
                       if (confirm(`Delete folder "${e.name}"?`)) deleteMut.mutate(e.rel_path);
                     }}
+                    onMove={() => setMovingFolder({ relPath: e.rel_path, name: e.name })}
                   />
                 ))
               )
@@ -762,6 +808,14 @@ export default function FilesPage() {
                         </div>
                         <button
                           type="button"
+                          title="Move or copy this file to a different employee/month"
+                          onClick={() => setMovingFile({ relPath: f.rel_path, name: f.name })}
+                          className="shrink-0 rounded-lg p-2 text-slate-400 transition-colors hover:bg-brand-50 hover:text-brand-600"
+                        >
+                          <FolderInput className="h-4 w-4" />
+                        </button>
+                        <button
+                          type="button"
                           title="Delete this file"
                           disabled={deleteFileMut.isPending}
                           onClick={() => {
@@ -795,6 +849,7 @@ export default function FilesPage() {
                     onDelete={() => {
                       if (confirm(`Delete folder "${mo.name}"?`)) deleteMut.mutate(mo.rel_path);
                     }}
+                    onView={() => viewRecordMut.mutate({ month: mo.name, by: { manager: manager!, employeeFolder: employee! } })}
                   />
                 ) : viewMode === "project" ? (
                   <FolderRow
@@ -804,6 +859,7 @@ export default function FilesPage() {
                     label={mo.name}
                     meta={`${mo.file_count} file${mo.file_count !== 1 ? "s" : ""}`}
                     onClick={() => setProjMonth(mo.name)}
+                    onView={() => viewRecordMut.mutate({ month: mo.name, by: { employeePk: projEmployee!.employee_pk } })}
                   />
                 ) : (
                   <FolderRow
@@ -813,6 +869,7 @@ export default function FilesPage() {
                     label={mo.name}
                     meta={`${mo.file_count} file${mo.file_count !== 1 ? "s" : ""}`}
                     onClick={() => setLocMonth(mo.name)}
+                    onView={() => viewRecordMut.mutate({ month: mo.name, by: { employeePk: locEmployee!.employee_pk } })}
                   />
                 )
               )
@@ -847,6 +904,40 @@ export default function FilesPage() {
         </div>
       </Modal>
 
+      {/* Move/copy a sheet — destination is a manager/employee/month, same
+          triple every other file-level action here already uses. */}
+      <MoveDestinationModal
+        open={!!movingFile}
+        onClose={() => setMovingFile(null)}
+        title={movingFile ? `Move or copy "${movingFile.name}"` : ""}
+        needsEmployee
+        needsMonth
+        allowCopy
+        isPending={moveMut.isPending}
+        onConfirm={(dstManager, dstEmployee, dstMonth, asCopy) => {
+          const dst = `${dstManager}/${dstEmployee}/${dstMonth}/${movingFile!.name}`;
+          moveMut.mutate({ src: movingFile!.relPath, dst, asCopy });
+        }}
+      />
+
+      {/* Move/copy an employee's WHOLE folder — destination is just a
+          different account manager; the employee's own folder name travels
+          with it unchanged. */}
+      <MoveDestinationModal
+        open={!!movingFolder}
+        onClose={() => setMovingFolder(null)}
+        title={movingFolder ? `Move or copy "${movingFolder.name}"'s folder` : ""}
+        subtitle="Files this employee to a different account manager — every month/file underneath moves with it."
+        needsEmployee={false}
+        needsMonth={false}
+        allowCopy
+        isPending={moveMut.isPending}
+        onConfirm={(dstManager, _e, _m, asCopy) => {
+          const dst = `${dstManager}/${movingFolder!.name}`;
+          moveMut.mutate({ src: movingFolder!.relPath, dst, asCopy });
+        }}
+      />
+
       <FilePreviewModal file={preview} onClose={() => setPreview(null)} />
     </div>
   );
@@ -860,6 +951,8 @@ function FolderRow({
   onClick,
   onRename,
   onDelete,
+  onMove,
+  onView,
 }: {
   active: boolean;
   icon: React.ReactNode;
@@ -868,6 +961,8 @@ function FolderRow({
   onClick: () => void;
   onRename?: () => void;
   onDelete?: () => void;
+  onMove?: () => void;
+  onView?: () => void;
 }) {
   return (
     <div
@@ -883,8 +978,18 @@ function FolderRow({
           <span className="block text-[11px] text-slate-400">{meta}</span>
         </span>
       </button>
-      {(onRename || onDelete) && (
+      {(onRename || onDelete || onMove || onView) && (
         <span className="hidden shrink-0 gap-0.5 group-hover:flex">
+          {onView && (
+            <button onClick={onView} title="View this month's extracted data" className="rounded p-1 text-slate-400 hover:text-brand-600">
+              <Eye className="h-3.5 w-3.5" />
+            </button>
+          )}
+          {onMove && (
+            <button onClick={onMove} title="Move or copy to a different manager" className="rounded p-1 text-slate-400 hover:text-brand-600">
+              <FolderInput className="h-3.5 w-3.5" />
+            </button>
+          )}
           {onRename && (
             <button onClick={onRename} className="rounded p-1 text-slate-400 hover:text-brand-600">
               <Pencil className="h-3.5 w-3.5" />
@@ -898,5 +1003,125 @@ function FolderRow({
         </span>
       )}
     </div>
+  );
+}
+
+/** Destination picker for the Move/Copy action — a manager, and (for a
+ *  single file, not a whole employee folder) an employee and month within
+ *  it, with a text field to name a month that doesn't exist yet. Reused for
+ *  both "move this sheet" (needsEmployee+needsMonth) and "move this
+ *  employee's whole folder to another manager" (neither — only the manager
+ *  changes, the employee's own folder name travels with it). */
+function MoveDestinationModal({
+  open,
+  onClose,
+  title,
+  subtitle,
+  needsEmployee,
+  needsMonth,
+  allowCopy,
+  isPending,
+  onConfirm,
+}: {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  subtitle?: string;
+  needsEmployee: boolean;
+  needsMonth: boolean;
+  allowCopy: boolean;
+  isPending: boolean;
+  onConfirm: (dstManager: string, dstEmployee: string, dstMonth: string, asCopy: boolean) => void;
+}) {
+  const [dstManager, setDstManager] = useState("");
+  const [dstEmployee, setDstEmployee] = useState("");
+  const [dstMonth, setDstMonth] = useState("");
+  const [newMonth, setNewMonth] = useState("");
+  const [asCopy, setAsCopy] = useState(false);
+
+  const { data: dstManagers } = useQuery({
+    queryKey: ["files", "managers"], queryFn: listFileManagers, enabled: open,
+  });
+  const { data: dstEmployees } = useQuery({
+    queryKey: ["files", "employees", dstManager],
+    queryFn: () => listFileEmployees(dstManager),
+    enabled: open && needsEmployee && !!dstManager,
+  });
+  const { data: dstMonths } = useQuery({
+    queryKey: ["files", "months", dstManager, dstEmployee],
+    queryFn: () => listFileMonths(dstManager, dstEmployee),
+    enabled: open && needsMonth && !!dstManager && !!dstEmployee,
+  });
+
+  // Fresh picker every time this opens for a new source — Modal fully
+  // unmounts when closed (see components/ui.tsx), so this only needs to
+  // guard against the *same* modal instance being reused for a second pick.
+  useEffect(() => {
+    if (open) { setDstManager(""); setDstEmployee(""); setDstMonth(""); setNewMonth(""); setAsCopy(false); }
+  }, [open]);
+
+  const finalMonth = newMonth.trim() || dstMonth;
+  const canConfirm =
+    !!dstManager && (!needsEmployee || !!dstEmployee) && (!needsMonth || !!finalMonth);
+
+  return (
+    <Modal open={open} onClose={onClose} title={title} subtitle={subtitle}>
+      <div className="space-y-3">
+        <Field label="Destination manager">
+          <Select value={dstManager} onChange={(e) => { setDstManager(e.target.value); setDstEmployee(""); setDstMonth(""); }}>
+            <option value="">Select…</option>
+            {dstManagers?.map((m) => <option key={m.rel_path} value={m.name}>{m.name}</option>)}
+          </Select>
+        </Field>
+        {needsEmployee && (
+          <Field label="Destination employee">
+            <Select
+              value={dstEmployee}
+              onChange={(e) => { setDstEmployee(e.target.value); setDstMonth(""); }}
+              disabled={!dstManager}
+            >
+              <option value="">Select…</option>
+              {dstEmployees?.map((e) => <option key={e.rel_path} value={e.name}>{e.name}</option>)}
+            </Select>
+          </Field>
+        )}
+        {needsMonth && (
+          <Field label="Destination month">
+            <div>
+              <Select
+                value={dstMonth}
+                onChange={(e) => { setDstMonth(e.target.value); setNewMonth(""); }}
+                disabled={!dstEmployee}
+              >
+                <option value="">Select existing…</option>
+                {dstMonths?.map((m) => <option key={m.rel_path} value={m.name}>{m.name}</option>)}
+              </Select>
+              <Input
+                className="mt-2"
+                placeholder="Or type a new month, e.g. August-2026"
+                value={newMonth}
+                onChange={(e) => { setNewMonth(e.target.value); setDstMonth(""); }}
+                disabled={!dstEmployee}
+              />
+            </div>
+          </Field>
+        )}
+        {allowCopy && (
+          <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-600">
+            <input type="checkbox" checked={asCopy} onChange={(e) => setAsCopy(e.target.checked)} />
+            Copy instead of move (keep the original in place too)
+          </label>
+        )}
+      </div>
+      <div className="mt-4 flex justify-end gap-2">
+        <Button variant="secondary" onClick={onClose}>Cancel</Button>
+        <Button
+          disabled={!canConfirm || isPending}
+          onClick={() => onConfirm(dstManager, dstEmployee, finalMonth, asCopy)}
+        >
+          {asCopy ? "Copy" : "Move"}
+        </Button>
+      </div>
+    </Modal>
   );
 }
