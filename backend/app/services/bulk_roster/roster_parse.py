@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import calendar as _calendar
 import csv
+import datetime as _datetime
 import io
 import re
 
+from app.services.bulk_roster.roster_codes import iso, translate_attendance_type
 from app.services.bulk_roster.roster_types import RosterDoc, RosterRow
 
 _MONTHS = {m.lower(): i for i, m in enumerate(_calendar.month_name) if m}
@@ -46,6 +48,23 @@ _COL_PATTERNS: dict[str, tuple[str, ...]] = {
     "leave_days": ("leavedays", "leave", "totalleave", "leavedaystotal"),
     "billing_days": ("billingdays", "billable", "billabledays", "billing", "payabledays"),
 }
+
+# Column-header synonyms for the LONG format — one row per employee PER DAY
+# (e.g. a "PGC"-style attendance export), a completely different shape from
+# the wide day-grid above (one row per employee, day-number columns across
+# the row). Detected separately in _detect_long_format(); every one of
+# _LONG_REQUIRED must be found for a sheet to count as long-format — a
+# deliberately narrow fingerprint so this can never misfire on the wide
+# format's own header (which has no per-row date/attendance-type column at
+# all — it has 31 separate numbered day columns instead).
+_LONG_COL_PATTERNS: dict[str, tuple[str, ...]] = {
+    "employee_id": ("employeeid", "empid", "empcode", "employeecode", "id"),
+    "name": ("employeename", "name", "resourcename"),
+    "title": ("jobtitle", "designation", "title", "role", "position"),
+    "date": ("attendancedate", "date"),
+    "attendance_type": ("attendancetype", "type", "status", "daytype"),
+}
+_LONG_REQUIRED = ("employee_id", "name", "date", "attendance_type")
 
 
 def _squash(v) -> str:
@@ -85,6 +104,30 @@ def _as_day_number(v) -> int | None:
     return None
 
 
+_LONG_DATE_FORMATS = ("%d-%b-%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d.%m.%Y")
+
+
+def _parse_long_date_cell(v) -> tuple[int, int, int] | None:
+    """A long-format AttendanceDate cell -> (day, month, year). openpyxl
+    (data_only=True) hands back either a real date/datetime object or a
+    string like "01-Jul-2026", depending on how the source cell was typed —
+    handle both."""
+    if v is None:
+        return None
+    if hasattr(v, "day") and hasattr(v, "month") and hasattr(v, "year"):
+        return int(v.day), int(v.month), int(v.year)
+    s = str(v).strip()
+    if not s:
+        return None
+    for fmt in _LONG_DATE_FORMATS:
+        try:
+            d = _datetime.datetime.strptime(s, fmt)
+            return d.day, d.month, d.year
+        except ValueError:
+            continue
+    return None
+
+
 def _grid_from_xlsx(data: bytes) -> list[list]:
     from openpyxl import load_workbook
 
@@ -104,6 +147,80 @@ def _grid_from_xlsx(data: bytes) -> list[list]:
                 if c < len(grid[r]) and grid[r][c] in (None, ""):
                     grid[r][c] = top
     return grid
+
+
+_XLSX_MAGIC = b"PK"                                     # zip container (Office Open XML)
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"          # legacy .xls, OR an IRM-wrapped .xlsx
+
+
+def _grid_from_xls(data: bytes) -> list[list]:
+    """Legacy .xls (BIFF) bytes -> the same list[list] grid shape
+    _grid_from_xlsx produces — openpyxl cannot read this format at all, so
+    this goes through xlrd instead (same library already used for the
+    Employee Matcher's own .xls support, see services/employee/import_service.py)."""
+    try:
+        import xlrd
+    except ImportError:
+        raise RuntimeError("xlrd is required to read legacy .xls files.")
+    book = xlrd.open_workbook(file_contents=data)
+    sheet = book.sheet_by_index(0)
+    grid = [[sheet.cell_value(r, c) for c in range(sheet.ncols)] for r in range(sheet.nrows)]
+    # Merged cells: xlrd reports the value only in the top-left member, same
+    # as openpyxl — fill the rest so header discovery below sees real text.
+    for (rlo, rhi, clo, chi) in getattr(sheet, "merged_cells", []):
+        if rlo >= len(grid) or clo >= len(grid[rlo]):
+            continue
+        top = grid[rlo][clo]
+        for r in range(rlo, min(rhi, len(grid))):
+            for c in range(clo, min(chi, len(grid[r]))):
+                if grid[r][c] in (None, ""):
+                    grid[r][c] = top
+    return grid
+
+
+def _reject_if_irm_protected(data: bytes) -> None:
+    """An OLE2 file that isn't actually a legacy .xls but Microsoft
+    Information Rights Management (IRM/Azure RMS) protected can't be read by
+    ANY library — decrypting it needs Excel itself, authenticated as a
+    permitted user. Detected by its distinctive DataSpaces/EncryptedPackage
+    streams, so this can say exactly what's wrong instead of xlrd failing
+    with an opaque "Can't find workbook in OLE2 compound document". Same
+    check as services/employee/import_service.py's own — kept as a small
+    local copy rather than a cross-module import of a private helper, since
+    it's a fixed byte/stream-name signature, not prose that could drift."""
+    try:
+        import olefile
+    except ImportError:
+        return  # best-effort — skip the friendlier message if olefile isn't installed
+    try:
+        with olefile.OleFileIO(io.BytesIO(data)) as ole:
+            streams = {"/".join(p) for p in ole.listdir()}
+    except Exception:
+        return
+    if any("EncryptedPackage" in s or "DataSpaces" in s for s in streams):
+        raise RuntimeError(
+            "This file is protected by Microsoft Information Rights Management "
+            "(IRM/Azure RMS) — no script can read it, only Excel itself, "
+            "authenticated as a permitted user, can. Open it in Excel, then "
+            "File → Save As a plain copy (or export to CSV), and import that "
+            "copy instead."
+        )
+
+
+def _load_grid(filename: str, data: bytes) -> list[list]:
+    """Any supported roster file (.xlsx/.xlsm/.xls/.csv) -> the same
+    list[list] grid shape, regardless of which format supplied it. Format is
+    decided by the bytes' own magic number, not the filename extension —
+    a mislabeled or renamed file still reads correctly, and a genuine
+    IRM-protected file gets a clear, specific error instead of an opaque
+    crash deep inside xlrd/openpyxl."""
+    name = (filename or "").lower()
+    if name.endswith(".csv"):
+        return _grid_from_csv(data)
+    if data[:8] == _OLE2_MAGIC:
+        _reject_if_irm_protected(data)
+        return _grid_from_xls(data)
+    return _grid_from_xlsx(data)
 
 
 def _grid_from_csv(data: bytes) -> list[list]:
@@ -211,17 +328,162 @@ def parse_period(text: str) -> tuple[int | None, int | None]:
     return None, None
 
 
-def parse_roster_cells(filename: str, data: bytes) -> RosterDoc:
-    """Read an XLSX/CSV roster straight from its cells.
+def _detect_long_format(grid: list[list]) -> tuple[int, dict[str, int]] | None:
+    """Find the long-format header row (all of _LONG_REQUIRED present) within
+    the first few rows. Returns (row_index, {logical: column_index}) or None
+    — this sheet just isn't laid out that way."""
+    for r, row in enumerate(grid[:5]):
+        cols: dict[str, int] = {}
+        for c, cell in enumerate(row):
+            key = _squash(cell)
+            if not key:
+                continue
+            for logical, pats in _LONG_COL_PATTERNS.items():
+                if logical in cols:
+                    continue
+                if key in pats:
+                    cols[logical] = c
+        if all(k in cols for k in _LONG_REQUIRED):
+            return r, cols
+    return None
 
-    Raises ValueError when the file plainly isn't a roster grid (no day
-    columns found) so the caller can fall back to the vision path rather than
-    stage something nonsensical.
+
+def _parse_long_format(grid: list[list], header_row: int, cols: dict[str, int]) -> RosterDoc:
+    """Pivot a long/flat (one row per employee PER DAY) sheet — e.g. a "PGC"-
+    style attendance export — into the same RosterDoc/RosterRow shape the
+    wide-format reader produces below, so every downstream step (bucket
+    distribution, employee matching, staging) works completely unchanged.
+
+    Unlike the wide format, this shape carries no document-level title,
+    calendar-days, or leave/billing-days totals to read — month/year are
+    derived from the AttendanceDate values themselves, and every RosterRow's
+    stated_leave_days/stated_billing_days stay None (verify_row_totals()
+    already no-ops when those are None, so this degrades gracefully rather
+    than needing new code there).
+    """
+    # Pass 1: read every row into a flat, uninterpreted record. This lets the
+    # document's own month/year be determined (the majority (month, year)
+    # across every AttendanceDate) BEFORE any day gets assigned to a grid
+    # position, so a stray row from a different month/year can be recognised
+    # and flagged rather than silently landing on the wrong date.
+    records: list[dict] = []
+    month_year_counts: dict[tuple[int, int], int] = {}
+    for row in grid[header_row + 1:]:
+        def cell(logical: str):
+            c = cols.get(logical)
+            return row[c] if c is not None and c < len(row) else None
+
+        person = _text(cell("name"))
+        if not person:
+            continue
+        date_parts = _parse_long_date_cell(cell("date"))
+        records.append({
+            "name": person,
+            "employee_id": _text(cell("employee_id")) or None,
+            "title": _text(cell("title")) or None,
+            "date_parts": date_parts,
+            "attendance_type": _text(cell("attendance_type")),
+        })
+        if date_parts:
+            my = (date_parts[1], date_parts[2])
+            month_year_counts[my] = month_year_counts.get(my, 0) + 1
+
+    if not records:
+        raise ValueError("The long-format sheet was found but no employee rows could be read from it.")
+
+    month, year = (max(month_year_counts, key=month_year_counts.get)
+                   if month_year_counts else (None, None))
+
+    # Pass 2: group by EmployeeId (falling back to normalised name when
+    # blank), pivot AttendanceDate -> day_codes. Every distinct employee
+    # becomes a RosterRow unconditionally — never silently dropped, even
+    # when a row within their block has a bad date or an already-claimed day.
+    groups: dict[str, RosterRow] = {}
+    order: list[str] = []
+
+    for rec in records:
+        emp_id = rec["employee_id"]
+        key = emp_id or f"name:{rec['name'].strip().lower()}"
+        if key not in groups:
+            order.append(key)
+            groups[key] = RosterRow(sr_no=0, name=rec["name"], title=rec["title"], employee_id=emp_id)
+        rr = groups[key]
+        if not rr.title and rec["title"]:
+            rr.title = rec["title"]
+
+        dp = rec["date_parts"]
+        if dp is None:
+            rr.issues.append(f"a row for {rec['name']} had no readable AttendanceDate — skipped")
+            continue
+        day, mth, yr = dp
+        if month and (mth, yr) != (month, year):
+            rr.issues.append(
+                f"a row dated {yr:04d}-{mth:02d}-{day:02d} doesn't belong to "
+                f"{_calendar.month_name[month]} {year} — skipped")
+            continue
+        if day in rr.day_codes:
+            rr.issues.append(f"day {day} appears more than once for {rec['name']} — kept the first")
+            continue
+
+        code, flag = translate_attendance_type(rec["attendance_type"])
+        rr.day_codes[day] = code
+        if flag:
+            rr.issues.append(f"{iso(year, month, day)}: {flag}")
+
+    doc = RosterDoc(month=month, year=year, method="xlsx-cells-long")
+    for i, key in enumerate(order, 1):
+        rr = groups[key]
+        rr.sr_no = int(rr.employee_id) if rr.employee_id and rr.employee_id.isdigit() else i
+        doc.rows.append(rr)
+    return doc
+
+
+def looks_like_roster_grid(filename: str, data: bytes) -> bool:
+    """True when this file's cells are laid out like a multi-employee roster
+    (either shape parse_roster_cells() understands — wide day-grid or long
+    per-day-row). Used as a cheap, deterministic guard on the SINGLE-employee
+    /upload path (see api/routes/upload.py) so a roster dropped there by
+    mistake is caught before it ever reaches the vision pipeline — no
+    LibreOffice conversion, no images, no LLM call spent finding out.
+
+    False on anything that fails to read as a spreadsheet at all, or isn't
+    one of the extensions this reader handles — that's a different problem,
+    not this guard's job to catch; the normal pipeline deals with it as it
+    always has.
     """
     name = (filename or "").lower()
-    grid = _grid_from_csv(data) if name.endswith(".csv") else _grid_from_xlsx(data)
+    if not name.endswith((".xlsx", ".xlsm", ".xls", ".csv")):
+        return False
+    try:
+        grid = _load_grid(filename, data)
+    except Exception:
+        return False
+    if not grid:
+        return False
+    if _detect_long_format(grid) is not None:
+        return True
+    return _find_day_header(grid) is not None
+
+
+def parse_roster_cells(filename: str, data: bytes) -> RosterDoc:
+    """Read an XLSX/XLS/CSV roster straight from its cells.
+
+    Raises ValueError when the file plainly isn't a roster grid (no day
+    columns found, in either the wide or long layout) so the caller can fall
+    back to the vision path rather than stage something nonsensical.
+    """
+    grid = _load_grid(filename, data)
     if not grid:
         raise ValueError("The spreadsheet is empty.")
+
+    # Long format (one row per employee PER DAY) is checked FIRST — a
+    # deliberately narrow, four-column fingerprint (see _LONG_REQUIRED) that
+    # can never match the wide format's own header, so this never steals a
+    # sheet the wide-grid logic below should handle.
+    long_hit = _detect_long_format(grid)
+    if long_hit is not None:
+        header_row, cols = long_hit
+        return _parse_long_format(grid, header_row, cols)
 
     hit = _find_day_header(grid)
     if not hit:

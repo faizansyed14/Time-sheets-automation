@@ -89,6 +89,8 @@ async def list_pipeline_files(
                      "employee+month groups it produced"),
     auto_accepted: bool | None = Query(
         default=None, description="true = AI recommends accept (not yet filed)"),
+    month: int | None = Query(default=None, ge=1, le=12, description="Filter by PipelineFile.month"),
+    year: int | None = Query(default=None, ge=2000, le=2100, description="Filter by PipelineFile.year"),
     q: str | None = Query(default=None, description="search filename / employee (whole table)"),
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -111,6 +113,10 @@ async def list_pipeline_files(
         base = base.where(PipelineFile.source_id == source_id)
     if thread_key:
         base = base.where(PipelineFile.thread_key == thread_key)
+    if month:
+        base = base.where(PipelineFile.month == month)
+    if year:
+        base = base.where(PipelineFile.year == year)
     if auto_accepted is not None:
         # Filter in SQL, not on the page: successes are mostly human accepts,
         # so client-side filtering would drop auto-accepts past the first page.
@@ -375,6 +381,26 @@ async def portal_submission_file_render(submission_id: str, kind: str,
     if not data:
         raise HTTPException(404, "File is no longer available")
     return portal_store.render_response(f.filename, data, page)
+
+
+@router.post("/rematch-unmatched")
+async def rematch_unmatched_pipeline(db: AsyncSession = Depends(get_db)):
+    """Re-check employee identity for every still-under-review pipeline item
+    whose employee wasn't found at staging time — catches a roster/email
+    that was staged BEFORE that employee existed in the Employee Matcher
+    (matching only ever runs once, at staging time; nothing re-checks an
+    already-staged item later on its own). Reuses the name/ID already
+    captured — no re-extraction, no LLM call — so unlike /retry (a full
+    vision re-extraction, one file at a time, and not built for bulk-roster
+    items anyway) this is safe and cheap to run over the whole backlog at
+    once. Never overwrites an already-matched or already-decided item, and
+    never guesses — anything still genuinely unmatched or ambiguous is left
+    exactly as it was."""
+    from app.services.pipeline.rematch import rematch_unmatched
+
+    result = await rematch_unmatched(db)
+    await datacache.bust_pipeline()
+    return result
 
 
 @router.post("/{pipeline_id}/retry", response_model=PipelineFileOut)

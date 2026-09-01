@@ -18,7 +18,22 @@ from app.core import datacache
 from app.core.database import get_db
 from app.schemas import PipelineFileOut, UploadResult
 from app.services.agents.full_email_extract import extract_upload
+from app.services.bulk_roster.roster_parse import looks_like_roster_grid
 from app.services.pipeline.ingestion import ingest_manual_entry
+
+# A multi-employee roster dropped here by mistake must never reach the vision
+# pipeline — checked with the SAME deterministic, zero-LLM cell reader Bulk
+# Roster Upload itself uses, so this costs essentially nothing and runs
+# before any file in the batch is sent for extraction.
+_ROSTER_REJECT_MSG = (
+    '"{name}" looks like a multi-employee roster (many people on one sheet) '
+    "— upload it on the Bulk Roster Upload page instead, not here."
+)
+
+
+def _reject_if_roster(filename: str, data: bytes) -> None:
+    if looks_like_roster_grid(filename, data):
+        raise HTTPException(422, _ROSTER_REJECT_MSG.format(name=filename))
 
 # Leave buckets a manual entry may carry (matches the extraction buckets),
 # plus the day-accounting fields (not leave, same editable UI).
@@ -49,6 +64,8 @@ async def upload_timesheets_streamed(files: list[UploadFile] = File(...)):
                           f.content_type or "application/octet-stream", data))
     if not batch:
         raise HTTPException(400, "No files uploaded")
+    for filename, _ct, data in batch:
+        _reject_if_roster(filename, data)
 
     async def run() -> dict:
         async with SessionLocal() as db:
@@ -82,6 +99,9 @@ async def upload_timesheets(
             ))
     if not batch:
         raise HTTPException(400, "All uploaded files were empty.")
+    for filename, _ct, data in batch:
+        _reject_if_roster(filename, data)
+
     from app.api.routes.pipeline import _out as _pipeline_out
 
     staged = []

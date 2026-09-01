@@ -94,6 +94,9 @@ async def preview_bulk_roster(
     db: AsyncSession = Depends(get_db),
 ):
     """Read the roster and report what WOULD be staged. Writes nothing."""
+    from sqlalchemy import select
+
+    from app.models.employee import Employee
     from app.services.pipeline import matching
 
     filename, _ct, data = await _read_upload(file)
@@ -104,13 +107,18 @@ async def preview_bulk_roster(
     except RuntimeError as e:      # vision not configured
         raise HTTPException(503, str(e))
 
+    # Fetched ONCE and reused for every row below — see roster_stage.py's
+    # build_groups() for why (match_employee() otherwise re-fetches the whole
+    # employee table per roster row).
+    all_employees = (await db.execute(select(Employee))).scalars().all()
+
     rows: list[RosterPreviewRow] = []
     matched_count = 0
     for r in doc.rows:
         fields, uncertain, day_issues = distribute_days(r.day_codes, doc.month, doc.year)
         issues = list(r.issues) + day_issues + verify_row_totals(
             r.day_codes, r.stated_leave_days, r.stated_billing_days, doc.calendar_days)
-        m = await matching.match_employee(db, r.employee_id, r.name)
+        m = await matching.match_employee(db, r.employee_id, r.name, all_employees=all_employees)
         if m.employee:
             matched_count += 1
         leave = sum(len(v) for k, v in fields.items()

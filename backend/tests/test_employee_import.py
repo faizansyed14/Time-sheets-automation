@@ -252,6 +252,53 @@ async def test_duplicate_rows_inside_the_file_are_skipped(clean_matcher):
 
 
 # --------------------------------------------------------------------------
+# DXB current schema (same shape as AUH's current schema, work/personal split
+# already done, ACO/DCO combined in one column) — the "Merged Employee List"
+# workbook ships both sheets under this schema now.
+# --------------------------------------------------------------------------
+
+DXB_NEW_HEADERS = ["Employee ID", "ACO/DCO", "Employee Name", "Project",
+                    "Account Manager", "Contact number", "Work Email", "Personal Email"]
+
+
+async def test_dxb_new_schema_keeps_work_and_personal_email_separate(clean_matcher):
+    data = _xlsx(
+        [["E1", "DCO2604314", "Abdelaziz Attia Hassan Mohamed", "Accor Group",
+          "Vishal Vidyadharan", "0565539215", "abdelaziz.mohamed@accorplus.com",
+          "a.aziz.attia@gmail.com"]],
+        headers=DXB_NEW_HEADERS, title="DXB",
+    )
+    async with SessionLocal() as db:
+        await import_employees_from_bytes(db, data)
+        e = (await _load(db))["E1"]
+
+    assert e.work_email == "abdelaziz.mohamed@accorplus.com"
+    assert e.personal_email == "a.aziz.attia@gmail.com"
+    assert e.employee_email_id == "abdelaziz.mohamed@accorplus.com"
+    assert e.location == "DXB"
+    assert e.account_manager == "Vishal Vidyadharan"
+    assert e.contact_no == "0565539215"
+    assert e.dco_number == "2604314"
+    assert e.aco_number is None
+
+
+async def test_dxb_new_schema_with_only_personal_email_filled_in(clean_matcher):
+    data = _xlsx(
+        [["E2", "", "Arshi Mahmood Mohammad Zahid Husain", "Accor Group",
+          "Vishal Vidyadharan", "0564159129", "", "mahmood_arshi@yahoo.com"]],
+        headers=DXB_NEW_HEADERS, title="DXB",
+    )
+    async with SessionLocal() as db:
+        await import_employees_from_bytes(db, data)
+        e = (await _load(db))["E2"]
+
+    assert e.work_email is None
+    assert e.personal_email == "mahmood_arshi@yahoo.com"
+    assert e.employee_email_id == "mahmood_arshi@yahoo.com"
+    assert e.aco_number is None and e.dco_number is None
+
+
+# --------------------------------------------------------------------------
 # AUH work/personal email split
 # --------------------------------------------------------------------------
 

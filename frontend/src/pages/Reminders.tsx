@@ -191,7 +191,6 @@ export default function RemindersPage() {
   const [month, setMonth] = useState(now.getMonth() + 1);
   const [year, setYear] = useState(now.getFullYear());
   const [q, setQ] = useState("");
-  const [onlyMissing, setOnlyMissing] = useState(true);
   const [sendRow, setSendRow] = useState<ReminderEmployeeRow | null>(null);
   const [viewRunId, setViewRunId] = useState<string | null>(null);
   const [pollingRunId, setPollingRunId] = useState<string | null>(null);
@@ -226,8 +225,10 @@ export default function RemindersPage() {
   });
 
   const { data: employees, isLoading: employeesLoading } = useQuery({
-    queryKey: ["reminder-employees", month, year, q, onlyMissing],
-    queryFn: () => fetchReminderEmployees({ month, year, q: q || undefined, only_missing: onlyMissing, limit: 500 }),
+    queryKey: ["reminder-employees", month, year, q],
+    // Reminders only ever needs the missing set — that's the whole point of
+    // the page (who to send to) — so this is never toggled off.
+    queryFn: () => fetchReminderEmployees({ month, year, q: q || undefined, only_missing: true, limit: 500 }),
     enabled: isAdmin,
   });
 
@@ -275,7 +276,6 @@ export default function RemindersPage() {
   const { data: runs } = useQuery({ queryKey: ["reminder-runs"], queryFn: () => fetchReminderRuns(10), enabled: isAdmin });
 
   const rows = employees?.rows ?? [];
-  const missingCount = rows.filter((r) => r.missing).length;
 
   if (!isAdmin) {
     return (
@@ -349,11 +349,6 @@ export default function RemindersPage() {
                 <Input className="w-56 pl-8" placeholder="Name, ID or manager…" value={q} onChange={(e) => setQ(e.target.value)} />
               </div>
             </Field>
-            <label className="mb-1.5 flex h-[38px] items-center gap-2 text-sm text-slate-600">
-              <input type="checkbox" checked={onlyMissing} onChange={(e) => setOnlyMissing(e.target.checked)}
-                className="h-4 w-4 rounded border-slate-300 text-brand-600 focus:ring-brand-500" />
-              Only missing
-            </label>
           </div>
           <div className="flex items-center gap-2">
             <Button
@@ -386,8 +381,7 @@ export default function RemindersPage() {
         {!employeesLoading && rows.length > 0 && (
           <div className="flex items-center justify-between border-b border-slate-100 px-5 py-2.5">
             <p className="text-xs text-slate-500">
-              {rows.length} employee{rows.length === 1 ? "" : "s"} shown
-              {onlyMissing ? "" : ` · ${missingCount} missing ${MONTHS_LONG[month]} ${year}`}
+              {rows.length} missing employee{rows.length === 1 ? "" : "s"} · {MONTHS_LONG[month]} {year}
             </p>
           </div>
         )}
@@ -395,7 +389,7 @@ export default function RemindersPage() {
           <div className="space-y-2 p-6"><Skeleton className="h-12" /><Skeleton className="h-12" /><Skeleton className="h-12" /></div>
         ) : rows.length === 0 ? (
           <EmptyState icon={<BellRing className="h-6 w-6" />} title="Nobody matches this view"
-            detail={onlyMissing ? "No active employee is missing this month's timesheet." : "Try a different search or month."} />
+            detail="No active employee is missing this month's timesheet." />
         ) : (
           <table className="w-full text-left text-sm">
             <thead>

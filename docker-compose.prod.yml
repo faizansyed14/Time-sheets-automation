@@ -5,9 +5,27 @@
 # (Celery broker + cache + rate-limit windows) — a small appendonly volume so
 # queued background jobs survive a restart.
 #
-# Resource limits match docker-compose.dev.yml exactly (tuned for a 2-vCPU
-# box, e.g. t3.large): a smaller/bigger instance just needs UVICORN_WORKERS /
-# CELERY_CONCURRENCY tuned in .env, not this file.
+# Resource limits below are sized for a 4-vCPU / 16GB box (e.g. m6i.xlarge) —
+# NOT dev.yml's 2-vCPU numbers anymore. Reasoning per service, since it's not
+# an even split:
+#   worker  — highest headroom on purpose. Each Celery task can shell out to
+#             LibreOffice (headless `soffice`) to render DOCX/XLSX to page
+#             images for extraction/preview, and LibreOffice alone commonly
+#             uses several hundred MB per conversion. With
+#             CELERY_CONCURRENCY=4, up to 4 of those can run at once —
+#             underestimating this is exactly what OOM-kills a worker mid
+#             month-end burst.
+#   backend — async I/O-bound (FastAPI + SQLAlchemy), not memory-hungry per
+#             worker process, but UVICORN_WORKERS=4 means 4 separate
+#             processes, so still needs real headroom, just less than worker.
+#   redis   — broker + cache + rate-limit windows for a few hundred
+#             employees, not millions of keys — genuinely light.
+#   frontend/nginx — static-file serving / reverse proxy only, no per-request
+#             processing — trivial either way.
+# If you resize the box again, UVICORN_WORKERS/CELERY_CONCURRENCY in .env are
+# still the primary lever (roughly: workers = vCPUs) — just make sure these
+# limits scale with them, or more workers just means more OOM risk instead
+# of more throughput.
 #
 #   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
 # or: bash scripts/prod/start.sh        (see commands/prod.txt for all commands)
@@ -32,7 +50,7 @@ services:
     restart: unless-stopped
     deploy:
       resources:
-        limits: { cpus: "0.50", memory: 256M }
+        limits: { cpus: "0.50", memory: 512M }
 
   backend:
     build: { context: ./backend }
@@ -54,14 +72,14 @@ services:
       redis: { condition: service_healthy }
     deploy:
       resources:
-        limits: { cpus: "2.00", memory: 2048M }
+        limits: { cpus: "2.50", memory: 4096M }
 
   worker:
     build: { context: ./backend }
     # -B = embedded beat scheduler (pipeline-raw purge on
     # PIPELINE_RAW_PURGE_INTERVAL_HOURS from .env). Keep this a SINGLE replica
     # — beat must not run twice.
-    command: celery -A app.core.celery_app.celery_app worker -B --loglevel=info --concurrency=${CELERY_CONCURRENCY:-3}
+    command: celery -A app.core.celery_app.celery_app worker -B --loglevel=info --concurrency=${CELERY_CONCURRENCY:-4}
     env_file: [.env]
     environment:
       REDIS_URL: redis://redis:6379/0
@@ -74,7 +92,7 @@ services:
       backend: { condition: service_healthy }   # wait for migrations to finish
     deploy:
       resources:
-        limits: { cpus: "1.00", memory: 1024M }
+        limits: { cpus: "1.50", memory: 4096M }
 
   frontend:
     build: { context: ./frontend, target: prod }
@@ -84,21 +102,23 @@ services:
     restart: unless-stopped
     deploy:
       resources:
-        limits: { cpus: "0.50", memory: 256M }
+        limits: { cpus: "0.25", memory: 256M }
 
-  # Public gateway: SPA → frontend, API → backend. Bound to 127.0.0.1 so a
-  # host-level nginx + certbot owns 80/443 and terminates HTTPS, proxying to
-  # this container (see docs/DEPLOYMENT.md §7) — same pattern as dev.
+  # Public gateway: SPA → frontend, API → backend. Bound directly on :80 so
+  # http://<ec2-public-ip>/ works with no extra setup — this box has no
+  # host-level nginx/certbot/domain in front. If you later add a domain +
+  # TLS (docs/DEPLOYMENT.md §7, nginx/host-tls.conf.example), switch this to
+  # "127.0.0.1:8080:80" instead so the host nginx can own 80/443.
   nginx:
     image: nginx:1.27-alpine
-    ports: ["127.0.0.1:8080:80"]
+    ports: ["80:80"]
     volumes:
       - ./nginx/gateway.conf:/etc/nginx/conf.d/default.conf:ro
     restart: unless-stopped
     depends_on: [frontend, backend]
     deploy:
       resources:
-        limits: { cpus: "0.50", memory: 256M }
+        limits: { cpus: "0.25", memory: 256M }
 
 volumes:
   redis_data:

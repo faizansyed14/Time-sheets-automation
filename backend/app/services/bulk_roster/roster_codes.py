@@ -99,6 +99,63 @@ def leave_weight(raw: str | None) -> float:
     return 1.0 if code in _LEAVE_CODES else 0.0
 
 
+# --------------------------------------------------------------------------- #
+# Long-format (one row per employee PER DAY, e.g. "PGC"-style attendance
+# exports) AttendanceType phrases -> the SAME short codes CODE_TO_FIELD
+# already understands above. Kept as its OWN table (not merged into
+# CODE_TO_FIELD) because the vocabulary is completely different in shape —
+# full English phrases, not single letters/short codes — and mixing the two
+# risks an accidental key collision.
+#
+# Only genuinely unambiguous day types are listed. A phrase not listed here is
+# deliberately left UNTRANSLATED by translate_attendance_type() below, so it
+# flows into day_codes unchanged, fails the CODE_TO_FIELD lookup exactly like
+# any other unrecognised code, and becomes an uncertain_days entry — reaching
+# a human reviewer instead of being guessed. Extending coverage later is a
+# one-line addition here, never a structural change.
+# --------------------------------------------------------------------------- #
+LONG_FORMAT_BASE_TYPE_TO_CODE: dict[str, str] = {
+    "daily present": "P",
+    "weekend": "WK",
+    "sick leave": "SL",
+    "annual leave": "AL",
+}
+
+
+def _split_status_suffix(raw: str) -> tuple[str, str]:
+    """"Sick Leave - Waiting for Approval -   Line Manager" ->
+    ("sick leave", "waiting for approval -   line manager"). A base type is
+    everything before the FIRST " - "; the rest is a workflow-status suffix
+    the source system appends, not part of the type itself."""
+    base, _, suffix = raw.strip().partition(" - ")
+    return base.strip().lower(), suffix.strip().lower()
+
+
+def translate_attendance_type(raw: str | None) -> tuple[str, str | None]:
+    """One long-format cell's AttendanceType text -> (code, flag_message).
+
+    `code` is one of CODE_TO_FIELD's own short codes when the base type is
+    known; otherwise it's the ORIGINAL raw text, unchanged, so the normal
+    normalise_code()+CODE_TO_FIELD lookup in distribute_days() naturally
+    treats it as an unrecognised code (uncertain_days, blocks auto-accept)
+    with zero new code needed there.
+
+    `flag_message`, when not None, is a business-status note (e.g. "not yet
+    approved") to append to the row's issues — distinct from a parse
+    failure: the type WAS understood, but its approval workflow isn't done.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return "", None
+    base, suffix = _split_status_suffix(text)
+    code = LONG_FORMAT_BASE_TYPE_TO_CODE.get(base)
+    if code is None:
+        return text, None
+    if suffix and ("waiting" in suffix or "pending" in suffix):
+        return code, f"marked \"{text}\" — not yet approved, confirm before filing"
+    return code, None
+
+
 def iso(year: int, month: int, day: int) -> str:
     return f"{year:04d}-{month:02d}-{day:02d}"
 

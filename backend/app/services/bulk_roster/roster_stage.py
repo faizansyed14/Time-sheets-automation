@@ -67,6 +67,7 @@ async def build_groups(db: AsyncSession, doc: RosterDoc) -> tuple[list[dict], li
     is NOT skipped and NOT guessed — they are staged with employee_pk=None so
     the reviewer picks them in Compare & Fix.
     """
+    from app.models.employee import Employee
     from app.models.month_calendar import MonthCalendar
     from app.services.extract_email.grouping import normalise_sheet, tag_for
     from app.services.pipeline import matching
@@ -78,6 +79,13 @@ async def build_groups(db: AsyncSession, doc: RosterDoc) -> tuple[list[dict], li
     cal_row = ({"weekend_weekdays": cal_obj.weekend_weekdays or [],
                 "public_holidays": cal_obj.public_holidays or []} if cal_obj else None)
 
+    # Fetched ONCE and reused for every row below — match_employee() would
+    # otherwise re-fetch the whole employee table per roster row, which is
+    # what made staging a large roster slow. Read-only for the life of this
+    # call, so reusing it produces identical matches to fetching it fresh
+    # each time — see matching.py's _match_by_name docstring.
+    all_employees = (await db.execute(select(Employee))).scalars().all()
+
     doc_key = doc.title or ""
     groups: list[dict] = []
     unmatched: list[str] = []
@@ -87,7 +95,7 @@ async def build_groups(db: AsyncSession, doc: RosterDoc) -> tuple[list[dict], li
         total_issues = list(row.issues) + day_issues + verify_row_totals(
             row.day_codes, row.stated_leave_days, row.stated_billing_days, doc.calendar_days)
 
-        m = await matching.match_employee(db, row.employee_id, row.name)
+        m = await matching.match_employee(db, row.employee_id, row.name, all_employees=all_employees)
         if m.employee:
             employee_pk = m.employee.id
             matched_name = m.employee.name

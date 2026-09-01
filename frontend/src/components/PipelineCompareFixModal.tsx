@@ -20,6 +20,8 @@ import {
   Columns2,
   Download,
   FileText,
+  Maximize2,
+  Minimize2,
   Paperclip,
   PencilLine,
   Plus,
@@ -296,6 +298,11 @@ export default function PipelineCompareFixModal({
   const [pending, setPending] = useState(false);
   const [sendBackOpen, setSendBackOpen] = useState(false);
   const [sendBackNote, setSendBackNote] = useState("");
+  // The right-side preview only ever gets half the modal's width — plenty
+  // for a PDF/EML, too cramped to read a dense spreadsheet or scanned photo
+  // even at 100%+ zoom. This lets the reviewer collapse the left form away
+  // and give the preview the WHOLE modal instead.
+  const [previewExpanded, setPreviewExpanded] = useState(false);
 
   const { data: employees, isLoading } = useQuery({
     queryKey: ["employee-matcher"],
@@ -386,6 +393,7 @@ export default function PipelineCompareFixModal({
   useEffect(() => {
     if (!file || file.id === prevFileId.current) return;
     prevFileId.current = file.id;
+    setPreviewExpanded(false);
 
     const staged = (file.extraction_meta?.staged ?? null) as {
       employee_pk?: string | null; matched_name?: string | null;
@@ -649,10 +657,14 @@ export default function PipelineCompareFixModal({
           </button>
         </div>
 
-        {/* Two-pane body */}
-        <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-2">
+        {/* Two-pane body — the right pane can take over the whole modal (see
+            the maximize/minimize button in its header) when a dense sheet or
+            scanned photo needs more room than half the modal ever gives it. */}
+        <div className={cn("grid min-h-0 flex-1", previewExpanded ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}>
 
-          {/* LEFT — summary first, form second, AI/review callout last */}
+          {/* LEFT — summary first, form second, AI/review callout last.
+              Hidden entirely while the preview is maximized. */}
+          {!previewExpanded && (
           <div className="flex min-h-0 flex-col overflow-y-auto border-b border-slate-100 p-5 lg:border-b-0 lg:border-r">
             {/* Extract Email breakdown — Pass 1's plain-English read of the
                 whole conversation, followed by the structured per-sheet facts
@@ -1002,6 +1014,7 @@ export default function PipelineCompareFixModal({
               </Button>
             </div>
           </div>
+          )}
 
           {/* RIGHT — source preview, switchable between the staged file (the
               full thread, viewable there via its own attachments list) and
@@ -1022,6 +1035,14 @@ export default function PipelineCompareFixModal({
               >
                 <Download className="h-3.5 w-3.5" />
               </a>
+              <button
+                type="button"
+                onClick={() => setPreviewExpanded((v) => !v)}
+                className="rounded p-1 text-slate-400 hover:text-brand-600"
+                title={previewExpanded ? "Restore split view" : "Expand preview to full screen"}
+              >
+                {previewExpanded ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+              </button>
             </div>
             {docTabs.length > 0 && (
               <div className="flex max-h-24 shrink-0 flex-wrap items-center gap-1.5 overflow-y-auto border-b border-slate-200 bg-white/70 px-3 py-2">

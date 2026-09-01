@@ -339,6 +339,16 @@ export default function Dashboard() {
                 {c.label}
               </button>
               ))}
+              {quickFilter === "awaiting_review" && (
+                <Link
+                  to={`/pipeline?status=needs_review&month=${month}&year=${year}`}
+                  className="inline-flex items-center gap-1 rounded-lg bg-amber-100 px-3 py-1.5 text-xs font-semibold text-amber-800 transition-colors hover:bg-amber-200"
+                  title={`Everything awaiting review for ${MONTHS_LONG[month]} ${year}, in the Pipeline`}
+                >
+                  <Eye className="h-3 w-3" />
+                  View in Pipeline
+                </Link>
+              )}
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <div className="flex rounded-lg border border-slate-200 p-0.5">

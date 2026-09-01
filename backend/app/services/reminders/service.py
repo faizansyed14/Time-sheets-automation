@@ -17,11 +17,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.employee import Employee
-from app.models.pipeline_file import PipelineFile
 from app.models.reminder import (
     EmailPreference, ReminderConfig, ReminderLog, ReminderRun, ReminderStatus, ReminderTrigger,
 )
 from app.models.timesheet_record import TimesheetRecord
+from app.services.pipeline.coverage import received_employee_pks
 from app.services.reminders.mailer import send_reminder_email
 from app.services.reminders.template import reminder_subject, render_reminder_html
 
@@ -123,22 +123,14 @@ async def set_config(
 
 
 # --------------------------- who's missing? ---------------------------
-
-async def _received_pks(db: AsyncSession, month: int, year: int) -> set[str]:
-    """Any employee the pipeline has ANY staged file for this month/year,
-    from ANY source (email, upload, portal, manual) — deliberately broader
-    than employees.py's own `received_subq` (email-only, used for that
-    page's specific KPI): a reminder must never tell someone who already
-    uploaded via the Portal or the internal Upload page that "we haven't
-    received" their timesheet just because it hasn't been Accepted yet."""
-    pk = PipelineFile.extraction_meta["staged"]["employee_pk"].as_string()
-    rows = (await db.execute(
-        select(pk).where(
-            PipelineFile.month == month, PipelineFile.year == year, pk.is_not(None),
-        ).distinct()
-    )).scalars().all()
-    return set(rows)
-
+#
+# "Received" here reuses services/pipeline/coverage.py's received_employee_pks
+# — the SAME function the Dashboard and the Export page's Status column read
+# — so all three surfaces agree on one definition, from any intake channel
+# (email, Upload, Bulk Roster, Portal), never just email. A reminder must
+# never tell someone who already submitted via any of those channels that
+# "we haven't received" their timesheet just because it hasn't been Accepted
+# yet.
 
 async def _submitted_pks(db: AsyncSession, month: int, year: int) -> set[str]:
     rows = (await db.execute(
@@ -157,7 +149,7 @@ async def missing_employee_pks(
     reminder-worthy set. `active_employee_pks` is passed in (not queried
     here) so callers that already loaded the Employee rows don't pay for a
     second query just to get the same id set."""
-    covered = (await _received_pks(db, month, year)) | (await _submitted_pks(db, month, year))
+    covered = (await received_employee_pks(db, month, year)) | (await _submitted_pks(db, month, year))
     return {pk for pk in active_employee_pks if pk not in covered}
 
 

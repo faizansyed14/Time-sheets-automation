@@ -1,19 +1,30 @@
 /**
- * In-browser XLSX preview — a real spreadsheet grid (not a page image).
+ * In-browser XLSX/XLS preview — a real spreadsheet grid (not a page image).
  *
- * Renders with ExcelJS (reads cell fill/font/border, not just values — the
- * SheetJS community build drops all of that, and fill colour is exactly
- * what these timesheets use to encode leave-type legends). One continuous
- * scrollable table per sheet, with a tab bar when a workbook has more than
- * one sheet — no click-through pagination.
+ * Modern .xlsx renders with ExcelJS (reads cell fill/font/border, not just
+ * values — the SheetJS community build drops all of that, and fill colour is
+ * exactly what these timesheets use to encode leave-type legends). Legacy
+ * binary .xls (which ExcelJS cannot read at all — it only understands the
+ * OOXML/ZIP format) falls back to SheetJS, which DOES understand the old
+ * BIFF format — text/values only, no fill/font/border, but that's enough for
+ * a plain tabular sheet. One continuous scrollable table per sheet, with a
+ * tab bar when a workbook has more than one sheet, and a search box that
+ * filters rows by any cell's text (e.g. finding one employee's row in a long
+ * roster) — no click-through pagination.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { Search as SearchIcon } from "lucide-react";
 import { cn } from "../lib/utils";
 import { Spinner } from "./ui";
 import { ServerRenderPane } from "./FilePreview";
 
-const MAX_ROWS = 500;
-const MAX_COLS = 60;
+// Generous ceilings, not a real page size — a long PGC-style roster (one row
+// per employee PER DAY) can genuinely run past 1,000 rows for one month, and
+// the whole point of the search box is finding one employee in the FULL
+// sheet, not just whatever fit in the first slice. Only a truly pathological
+// file (a million-row CSV saved as .xls by mistake) would ever hit these.
+const MAX_ROWS = 20000;
+const MAX_COLS = 200;
 
 interface CellModel {
   text: string;
@@ -174,6 +185,62 @@ function buildSheetModel(ws: any): SheetModel {
   };
 }
 
+// SheetJS's own column-width unit (characters) matches ExcelJS's — same
+// conversion applies.
+function buildSheetModelFromSheetJS(XLSXmod: any, ws: any, name: string): SheetModel {
+  const ref = ws["!ref"];
+  if (!ref) return { name, colWidths: [], rows: [], truncatedRows: false, truncatedCols: false };
+  const range = XLSXmod.utils.decode_range(ref);
+  const totalRows = range.e.r - range.s.r + 1;
+  const totalCols = range.e.c - range.s.c + 1;
+  const lastRow = Math.min(totalRows, MAX_ROWS);
+  const lastCol = Math.min(totalCols, MAX_COLS);
+
+  const colInfo: any[] = ws["!cols"] || [];
+  const colWidths: number[] = [];
+  for (let c = 0; c < lastCol; c++) colWidths.push(colWidthPx(colInfo[c]?.wch));
+
+  const rows: SheetModel["rows"] = [];
+  for (let r = 0; r < lastRow; r++) {
+    const cells: (CellModel | null)[] = [];
+    for (let c = 0; c < lastCol; c++) {
+      const addr = XLSXmod.utils.encode_cell({ r: range.s.r + r, c: range.s.c + c });
+      const cell = ws[addr];
+      // `.w` is the formatted display text (dates/numbers rendered per the
+      // cell's own number format) when SheetJS computed one; `.v` is the
+      // raw value otherwise. No fill/font/border — SheetJS's community
+      // build doesn't carry those for legacy BIFF the way ExcelJS does for
+      // OOXML, but plain tabular text is exactly what this fallback is for.
+      const text = cell == null ? "" : String(cell.w ?? cell.v ?? "");
+      cells.push({ text, colSpan: 1, rowSpan: 1, style: {} });
+    }
+    rows.push({ heightPx: rowHeightPx(undefined), cells });
+  }
+
+  return {
+    name,
+    colWidths,
+    rows,
+    truncatedRows: totalRows > MAX_ROWS,
+    truncatedCols: totalCols > MAX_COLS,
+  };
+}
+
+async function loadLegacyXlsWorkbook(url: string): Promise<SheetModel[]> {
+  // Lazy-loaded, same as the ExcelJS path — only paid for when actually
+  // needed (a genuine legacy .xls hits this fallback).
+  const XLSX: any = await import("xlsx");
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const buf = await res.arrayBuffer();
+  const wb = XLSX.read(buf, { type: "array" });
+  const models = (wb.SheetNames as string[]).map((name) =>
+    buildSheetModelFromSheetJS(XLSX, wb.Sheets[name], name));
+  return models.length ? models : [{
+    name: "Sheet1", colWidths: [], rows: [], truncatedRows: false, truncatedCols: false,
+  }];
+}
+
 // Rollup wraps this CJS bundle in its own commonjs-interop namespace, and
 // that wrapper's shape (which key holds the real module — `.default`,
 // `.e.__moduleExports`, etc.) is an internal Rollup implementation detail
@@ -238,6 +305,19 @@ export function XlsxPreviewPane({ url }: { url: string }) {
   const [error, setError] = useState<string | null>(null);
   const [errorCode, setErrorCode] = useState<string | null>(null);
   const [pageFallback, setPageFallback] = useState(false);
+  const [usedLegacyParser, setUsedLegacyParser] = useState(false);
+  const [search, setSearch] = useState("");
+
+  const sheet = sheets ? sheets[active] : null;
+  const term = search.trim().toLowerCase();
+  // Computed unconditionally (before the loading/error early-returns below)
+  // — hooks can never be called only on SOME renders.
+  const filteredRows = useMemo(
+    () => (sheet
+      ? (term ? sheet.rows.filter((row) => row.cells.some((c) => c && c.text.toLowerCase().includes(term))) : sheet.rows)
+      : []),
+    [sheet, term]
+  );
 
   useEffect(() => {
     let alive = true;
@@ -245,6 +325,8 @@ export function XlsxPreviewPane({ url }: { url: string }) {
     setError(null);
     setErrorCode(null);
     setPageFallback(false);
+    setUsedLegacyParser(false);
+    setSearch("");
     setActive(0);
     loadWorkbook(url)
       .then((wb) => {
@@ -256,16 +338,36 @@ export function XlsxPreviewPane({ url }: { url: string }) {
           name: "Sheet1", colWidths: [], rows: [], truncatedRows: false, truncatedCols: false,
         }]);
       })
-      .catch((e) => {
+      .catch(async (e) => {
+        const code = e instanceof Error ? e.message : "";
+        // ExcelJS can only read modern OOXML — a genuine legacy .xls (not
+        // rights-protected, just old) is real, readable data that SheetJS
+        // CAN parse directly from the same bytes. Try that automatically
+        // instead of just showing an error — this is what makes .xls
+        // actually previewable, not merely download-only.
+        if (code === "LEGACY_XLS_FORMAT") {
+          try {
+            const models = await loadLegacyXlsWorkbook(url);
+            if (!alive) return;
+            setUsedLegacyParser(true);
+            setSheets(models);
+            return;
+          } catch (e2) {
+            if (!alive) return;
+            console.error("Legacy .xls preview also failed:", e2);
+            setErrorCode(code);
+            setError(
+              "This older Excel format (.xls) couldn't be read directly either — "
+              + "please download this file and compare it against what's shown on the other side.");
+            return;
+          }
+        }
         if (!alive) return;
         console.error("XLSX preview failed:", e);
-        const code = e instanceof Error ? e.message : "";
         setErrorCode(code);
         setError(
           code === "RIGHTS_PROTECTED"
             ? "This spreadsheet is rights-protected (encrypted) — it can't be previewed here. Download it and open in Excel with the right permissions."
-            : code === "LEGACY_XLS_FORMAT"
-            ? "This is an older Excel format (.xls), not a modern .xlsx file, so it can't be shown as a spreadsheet grid here."
             : "Could not read this spreadsheet."
         );
       });
@@ -289,22 +391,29 @@ export function XlsxPreviewPane({ url }: { url: string }) {
       <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center text-sm text-rose-500">
         <p>{error}</p>
         {errorCode === "LEGACY_XLS_FORMAT" && (
-          <button
-            type="button"
-            onClick={() => setPageFallback(true)}
-            className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
-          >
-            Try a page-image preview instead
-          </button>
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            <a
+              href={url}
+              download
+              className="rounded-lg border border-brand-200 bg-brand-50 px-3 py-1.5 text-xs font-semibold text-brand-700 hover:bg-brand-100"
+            >
+              Download original file
+            </a>
+            <button
+              type="button"
+              onClick={() => setPageFallback(true)}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+            >
+              Try a page-image preview instead
+            </button>
+          </div>
         )}
       </div>
     );
   }
-  if (!sheets) {
+  if (!sheets || !sheet) {
     return <div className="flex h-full items-center justify-center"><Spinner className="h-6 w-6" /></div>;
   }
-
-  const sheet = sheets[active];
 
   return (
     <div className="flex h-full flex-col">
@@ -327,6 +436,29 @@ export function XlsxPreviewPane({ url }: { url: string }) {
           ))}
         </div>
       )}
+      <div className="flex shrink-0 items-center gap-2 border-b border-slate-200 bg-white px-3 py-1.5">
+        <SearchIcon className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search this sheet — e.g. a name or ID…"
+          className="min-w-0 flex-1 bg-transparent text-xs text-slate-700 placeholder:text-slate-400 focus:outline-none"
+        />
+        {term && (
+          <span className="shrink-0 text-[11px] font-medium text-slate-400">
+            {filteredRows.length} / {sheet.rows.length} row{sheet.rows.length === 1 ? "" : "s"}
+          </span>
+        )}
+      </div>
+      {usedLegacyParser && (
+        <div className="shrink-0 border-b border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-700">
+          Legacy .xls format — showing cell text only (colours/fonts aren't available in this view).{" "}
+          <a href={url} download className="font-semibold underline hover:no-underline">
+            Download the original
+          </a>{" "}
+          to see it exactly as saved.
+        </div>
+      )}
       {(sheet.truncatedRows || sheet.truncatedCols) && (
         <div className="shrink-0 border-b border-amber-200 bg-amber-50 px-3 py-1 text-[11px] text-amber-700">
           Showing the first {MAX_ROWS} rows / {MAX_COLS} columns of a larger sheet.
@@ -337,13 +469,17 @@ export function XlsxPreviewPane({ url }: { url: string }) {
           <div className="flex h-full items-center justify-center p-8 text-sm text-slate-400">
             (empty spreadsheet)
           </div>
+        ) : filteredRows.length === 0 ? (
+          <div className="flex h-full items-center justify-center p-8 text-sm text-slate-400">
+            No rows match "{search.trim()}".
+          </div>
         ) : (
           <table className="border-collapse text-[12px] leading-tight text-slate-800" style={{ tableLayout: "fixed" }}>
             <colgroup>
               {sheet.colWidths.map((w, i) => <col key={i} style={{ width: w }} />)}
             </colgroup>
             <tbody>
-              {sheet.rows.map((row, ri) => (
+              {filteredRows.map((row, ri) => (
                 <tr key={ri} style={{ height: row.heightPx }}>
                   {row.cells.map((cell, ci) =>
                     cell === null ? null : (

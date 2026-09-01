@@ -218,12 +218,12 @@ async def coverage(
 
     # Same page's "received this month" set (see received_subq above) — lets
     # each row distinguish "awaiting review" (sent, not yet filed) from a true
-    # "missing" without a second round trip per row.
+    # "missing" without a second round trip per row. Any intake channel, same
+    # as the aggregate above — not just email.
     page_received_pks: set[str] = set()
     if page_pks:
         page_received_pks = set((await db.execute(
             select(staged_pk).where(
-                PipelineFile.source_kind == "email",
                 PipelineFile.month == focus_month,
                 PipelineFile.year == focus_year,
                 staged_pk.in_(page_pks),

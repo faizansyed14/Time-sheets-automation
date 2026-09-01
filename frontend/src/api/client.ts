@@ -717,6 +717,10 @@ export const fetchPipeline = (params?: {
   thread_key?: string;
   /** true = AI recommends accept (staged, not filed yet). */
   auto_accepted?: boolean;
+  /** Filter by PipelineFile.month/.year — e.g. the Dashboard's "View in
+   *  Pipeline" deep link for a specific awaiting-review period. */
+  month?: number;
+  year?: number;
   q?: string;
   offset?: number;
   limit?: number;
@@ -731,6 +735,8 @@ export const fetchPipeline = (params?: {
         source_id: params?.source_id || undefined,
         thread_key: params?.thread_key || undefined,
         auto_accepted: params?.auto_accepted ?? undefined,
+        month: params?.month || undefined,
+        year: params?.year || undefined,
         q: params?.q || undefined,
         offset: params?.offset ?? 0,
         limit: params?.limit ?? PAGE_SIZE,
@@ -746,6 +752,28 @@ export const retryPipelineFile = (id: string) =>
 
 export const deletePipelineFile = (id: string) =>
   api.delete(`/pipeline/${id}`).then((r) => r.data);
+
+export interface RematchResultRow {
+  id: string;
+  filename: string;
+  name: string | null;
+  employee_id?: string;
+  month: number | null;
+  year: number | null;
+}
+export interface RematchResult {
+  checked: number;
+  rematched_count: number;
+  rematched: RematchResultRow[];
+  still_unmatched_count: number;
+  still_unmatched: RematchResultRow[];
+}
+/** Re-check employee identity for every still-under-review pipeline item
+ *  whose employee wasn't found at staging time — catches a roster/email
+ *  staged BEFORE that employee existed in the Employee Matcher. No
+ *  re-extraction, no LLM call — safe to run over the whole backlog. */
+export const rematchUnmatchedPipelineFiles = () =>
+  api.post<RematchResult>("/pipeline/rematch-unmatched").then((r) => r.data);
 
 // ---------------------------------------------------------------------------
 // Files / folders (3-level: Manager → Employee → Month)
