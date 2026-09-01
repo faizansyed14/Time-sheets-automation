@@ -13,6 +13,11 @@ python-docx==1.2.0
 Pillow==11.3.0
 PyMuPDF==1.26.4
 openpyxl==3.1.5
+# legacy .xls (BIFF/OLE2) support for the Employee Matcher importer
+xlrd==2.0.2
+# detects Microsoft IRM/Azure-RMS-protected files so the importer can say so
+# clearly instead of a raw parse failure — see import_service._reject_if_irm_protected
+olefile==0.47
 
 # Optional local OCR reader (free) for scanned/photo timesheets — enable with
 # OCR_PROVIDER=tesseract. The Python binding needs the Tesseract ENGINE binary

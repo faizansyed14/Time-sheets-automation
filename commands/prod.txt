@@ -1,19 +1,23 @@
 ==========================================================================
  PRODUCTION — Docker commands
- Stack: Postgres + Redis + backend (4 workers) + Celery worker
-        (concurrency 4) + frontend + nginx gateway.
+ Stack: Redis + backend (uvicorn, UVICORN_WORKERS from .env) + Celery
+        worker (CELERY_CONCURRENCY from .env) + frontend + nginx gateway.
+        Postgres = external AWS RDS, files = external S3 — no local db
+        service (see docs/AWS_SETUP.md / docs/DEPLOYMENT.md).
  File:  docker-compose.prod.yml     Env: .env  (from .env.example + PROD profile)
- IMPORTANT: edit .env and replace every CHANGE_ME secret first.
+ IMPORTANT: edit .env and replace every CHANGE_ME secret, plus DATABASE_URL
+ (RDS endpoint) and S3_BUCKET/S3_REGION first.
 ==========================================================================
 
 # ---- setup (once) ----
 ./scripts/create-env.sh PROD     # or interactive: ./scripts/create-env.sh
-# then replace all CHANGE_ME values in .env
+# then replace all CHANGE_ME values in .env, and fill in DATABASE_URL (RDS)
+# + STORAGE_PROVIDER=s3 + S3_BUCKET/S3_REGION
 
 # ---- start / stop (or use scripts/prod/start.sh | stop.sh) ----
 docker compose -f docker-compose.prod.yml --env-file .env up --build -d
-docker compose -f docker-compose.prod.yml down                               # stop (keeps data)
-docker compose -f docker-compose.prod.yml down --volumes                     # stop + DROP DB (irreversible)
+docker compose -f docker-compose.prod.yml down                # stop (Redis broker volume kept)
+docker compose -f docker-compose.prod.yml down --volumes       # stop + drop the Redis volume too (queued jobs lost, not app data — RDS/S3 are untouched either way)
 
 # ---- logs ----
 docker compose -f docker-compose.prod.yml logs -f
@@ -32,16 +36,22 @@ docker compose -f docker-compose.prod.yml --env-file .env build frontend
 docker compose -f docker-compose.prod.yml --env-file .env up -d frontend
 docker compose -f docker-compose.prod.yml restart nginx
 
-# ---- shells / DB ----
+# ---- shells / migrations ----
 docker compose -f docker-compose.prod.yml exec backend bash
-docker compose -f docker-compose.prod.yml exec db psql -U timesheet -d timesheet
+docker compose -f docker-compose.prod.yml exec backend alembic upgrade head   # targets DATABASE_URL in .env
 
-# ---- database backup / restore ----
-docker compose -f docker-compose.prod.yml exec db \
-  pg_dump -U timesheet timesheet > backup_$(date +%F).sql
-cat backup.sql | docker compose -f docker-compose.prod.yml exec -T db \
-  psql -U timesheet -d timesheet
+# ---- connect to RDS directly (reads DATABASE_URL out of .env) ----
+psql "$(grep -E '^DATABASE_URL' .env | cut -d= -f2- | sed 's#+asyncpg##;s#?ssl=require#?sslmode=require#')"
+
+# ---- database backup / restore (against RDS, not a local container) ----
+# Prefer an RDS snapshot for anything you'd need to restore from (Console →
+# RDS → your instance → Actions → Take snapshot, or automated backups are
+# already on) — a plain pg_dump is fine for a quick ad-hoc export:
+pg_dump "$(grep -E '^DATABASE_URL' .env | cut -d= -f2- | sed 's#+asyncpg##;s#?ssl=require#?sslmode=require#')" \
+  > backup_$(date +%F).sql
+psql "$(grep -E '^DATABASE_URL' .env | cut -d= -f2- | sed 's#+asyncpg##;s#?ssl=require#?sslmode=require#')" \
+  < backup_$(date +%F).sql
 
 # ---- health ----
-curl -fsS http://localhost/health        # via nginx -> backend
-# App: http://localhost      (nginx gateway → frontend SPA + backend API)
+curl -fsS http://localhost:8080/health   # nginx container -> backend (host nginx+certbot proxies 443 -> this)
+# App (via host nginx/certbot): https://yourdomain.com

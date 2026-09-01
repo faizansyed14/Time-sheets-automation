@@ -143,6 +143,43 @@ def test_csv_and_txt_attachments_are_native_text():
     assert txt_item.send_mode == "native"
 
 
+def _zip_bytes(*, with_xl_folder: bool = False) -> bytes:
+    """A real, valid zip — detect_file_type actually opens it with
+    zipfile.ZipFile, so a fake byte string with just a "PK" prefix wouldn't
+    exercise the real internal-path check."""
+    import io as _io
+    import zipfile as _zipfile
+
+    buf = _io.BytesIO()
+    with _zipfile.ZipFile(buf, "w") as zf:
+        if with_xl_folder:
+            zf.writestr("xl/worksheets/sheet1.xml", "<x/>")
+        else:
+            zf.writestr("readme.txt", "just some files")
+    return buf.getvalue()
+
+
+def test_zip_attachment_is_never_extracted():
+    eml = _mail(attachments=[("archive.zip", _zip_bytes(), "application", "zip")])
+    th = collect_thread([("msg 1", eml)])
+    assert not any(it.name == "archive.zip" for it in th.items)
+    dropped = next(d for d in th.dropped if d["name"] == "archive.zip")
+    assert dropped["filter"] == "zip"
+
+
+def test_zip_with_xlsx_style_internal_paths_is_still_never_opened_as_a_spreadsheet():
+    """A zip whose contents happen to start with xl/ — the same internal
+    layout a real .xlsx has — must still be skipped as a zip, never handed
+    to openpyxl. The .zip extension/content-type check runs BEFORE
+    detect_file_type's own xl//word/ internal-path heuristic, specifically
+    so this can't be misdetected as a real Office document."""
+    eml = _mail(attachments=[("weird.zip", _zip_bytes(with_xl_folder=True), "application", "zip")])
+    th = collect_thread([("msg 1", eml)])
+    assert not any(it.name == "weird.zip" for it in th.items)
+    dropped = next(d for d in th.dropped if d["name"] == "weird.zip")
+    assert dropped["filter"] == "zip"
+
+
 # --------------------------------------------------------------------------
 # Emails/messages inside emails (forwarded)
 # --------------------------------------------------------------------------

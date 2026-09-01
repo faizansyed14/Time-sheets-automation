@@ -48,6 +48,11 @@ os.environ.update(
     GRAPH_CLIENT_SECRET="",
     GRAPH_MAILBOX="",
     GRAPH_OTP_SENDER="",
+    # Kept off in tests too, matching the real .env's deliberate kill-switch —
+    # see core/celery_app.py. The reminder feature is not to be exercised
+    # right now (real employee data), so this stays false everywhere rather
+    # than being flipped on just to make one test's assertion pass.
+    REMINDER_SCHEDULED_CHECK_ENABLED="false",
     # "missing" is a non-empty key so require_vision_configured() doesn't
     # block the thread pipeline in tests — the vision call itself is
     # monkeypatched per-test (see mock_vision_calls below), so nothing ever

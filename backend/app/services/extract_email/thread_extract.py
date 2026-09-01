@@ -481,6 +481,23 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
         ext = os.path.splitext(name)[1].lower()
         is_image = ext in IMAGE_EXTS or (ctype or "").startswith("image/")
 
+        # ZIP archives are never extracted — checked BEFORE detect_file_type,
+        # not after: an xlsx/docx file IS a zip container internally, and
+        # detect_file_type's own zip-sniffing only tells them apart by
+        # checking whether an internal path starts with "xl/"/"word/". A
+        # genuine .zip whose contents coincidentally include a top-level
+        # "xl" or "word" folder would otherwise be misdetected as a real
+        # Office document and handed to openpyxl/LibreOffice. A real xlsx/
+        # docx attachment never carries ".zip"/a zip content-type, so this
+        # can never false-positive on an actual timesheet.
+        if ext == ".zip" or (ctype or "").lower() in ("application/zip", "application/x-zip-compressed"):
+            _record_dropped(th, {
+                "name": name, "mime": ctype, "size": len(payload), "msg_index": msg_index,
+                "filter": "zip",
+                "reason": "ZIP archives are never extracted.",
+            }, None)
+            return
+
         # Size filter FIRST — logos, signature icons and social buttons never
         # reach any further processing (no OCR call spent on them either).
         if is_image and settings.min_image_bytes and len(payload) < settings.min_image_bytes:
