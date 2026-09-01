@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.deps import require_full_access, require_write
+from app.api.deps import require_admin, require_full_access, require_write
 from app.api.routes import (
     admin,
     agentic_chat,
@@ -25,6 +25,7 @@ from app.api.routes import (
     employees,
     files,
     inbox,
+    notice,
     pipeline,
     portal_auth,
     portal_employee,
@@ -131,6 +132,12 @@ async def security_headers(request: Request, call_next):
 
 # public
 app.include_router(auth.router, prefix=settings.api_prefix)
+# System notice — its own router with require_user at the router level (GET
+# reachable by every authenticated role, including viewer/vault_matcher, since
+# the popup must show for everyone; PUT is gated to admin inside the route
+# itself). Mounted outside _protected/_vault_and_matcher on purpose — either
+# of those would 403 some role's GET.
+app.include_router(notice.router, prefix=settings.api_prefix)
 # portal (employee self-service) — its own auth namespace entirely; gated by
 # its own Depends(require_portal_employee) per route, not by anything below,
 # so these are mounted plainly like auth.router. No manager login — approval
@@ -166,7 +173,10 @@ app.include_router(bulk_upload.router, prefix=settings.api_prefix, dependencies=
 app.include_router(files.router, prefix=settings.api_prefix, dependencies=_vault_and_matcher)
 app.include_router(pipeline.router, prefix=settings.api_prefix, dependencies=_protected)
 app.include_router(agentic_chat.router, prefix=settings.api_prefix, dependencies=_protected)
-app.include_router(reminders.router, prefix=settings.api_prefix, dependencies=_protected)
+# Admin-only (not require_full_access) — sends real email to real employees,
+# so only admin can see or act on it, unlike the "any full-access role" tier
+# calendars/portal-users/reminders-adjacent business routes use.
+app.include_router(reminders.router, prefix=settings.api_prefix, dependencies=[Depends(require_admin)])
 
 
 @app.get("/health")

@@ -49,6 +49,8 @@ class UserOut(BaseModel):
     auth_mode: str
     is_active: bool
     last_login_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    online: bool = False
 
 
 class LoginResult(BaseModel):

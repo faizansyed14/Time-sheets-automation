@@ -18,7 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.employee import Employee
 from app.models.pipeline_file import PipelineFile
-from app.models.reminder import ReminderConfig, ReminderLog, ReminderRun, ReminderStatus, ReminderTrigger
+from app.models.reminder import (
+    EmailPreference, ReminderConfig, ReminderLog, ReminderRun, ReminderStatus, ReminderTrigger,
+)
 from app.models.timesheet_record import TimesheetRecord
 from app.services.reminders.mailer import send_reminder_email
 from app.services.reminders.template import reminder_subject, render_reminder_html
@@ -47,11 +49,32 @@ def month_label(month: int, year: int) -> str:
     return f"{calendar.month_name[month]} {year}"
 
 
-def resolve_email(e: Employee) -> str | None:
-    """Same resolution order as chat_tools.py's own employee-email lookup:
-    the dedicated field first, else the first address in the semicolon-
-    separated `all_emails` import column."""
-    return (e.employee_email_id or (e.all_emails or "").split(";")[0] or "").strip() or None
+def resolve_email_with_source(e: Employee, *, prefer: str = EmailPreference.WORK) -> tuple[str | None, str]:
+    """(address, source) for the reminders send path specifically — unlike
+    chat_tools/exports (which just want ANY usable address), reminders lets
+    the sender choose which of the two SEPARATE addresses to actually use.
+
+    source is "work" or "personal" — whichever was actually used, which is
+    `prefer` itself unless that slot is blank for this person, in which case
+    the other slot is used instead — or "legacy" for a row created before
+    the work/personal split existed (falls back to the older resolved
+    employee_email_id) — or "none" when nothing is on file at all. The
+    Reminders page shows this so a fallback is visible, not silent."""
+    primary = e.personal_email if prefer == EmailPreference.PERSONAL else e.work_email
+    fallback = e.work_email if prefer == EmailPreference.PERSONAL else e.personal_email
+    if primary and primary.strip():
+        return primary.strip(), prefer
+    if fallback and fallback.strip():
+        other = EmailPreference.WORK if prefer == EmailPreference.PERSONAL else EmailPreference.PERSONAL
+        return fallback.strip(), other
+    if e.employee_email_id and e.employee_email_id.strip():
+        return e.employee_email_id.strip(), "legacy"
+    return None, "none"
+
+
+def resolve_email(e: Employee, *, prefer: str = EmailPreference.WORK) -> str | None:
+    address, _source = resolve_email_with_source(e, prefer=prefer)
+    return address
 
 
 class AlreadySentError(Exception):
@@ -78,9 +101,21 @@ async def get_config(db: AsyncSession) -> ReminderConfig:
     return row
 
 
-async def set_config(db: AsyncSession, *, enabled: bool, updated_by: str | None) -> ReminderConfig:
+async def set_config(
+    db: AsyncSession, *, enabled: bool | None = None, email_preference: str | None = None,
+    updated_by: str | None,
+) -> ReminderConfig:
+    """Either field may be omitted to leave it unchanged — the route always
+    knows both (it reads current config first), but this signature keeps
+    "just flip the switch" and "just change the email preference" equally
+    easy to call from anywhere else that might need it."""
     row = await get_config(db)
-    row.auto_send_enabled = enabled
+    if enabled is not None:
+        row.auto_send_enabled = enabled
+    if email_preference is not None:
+        if email_preference not in EmailPreference.ALL:
+            raise ValueError(f"email_preference must be one of {EmailPreference.ALL}")
+        row.email_preference = email_preference
     row.updated_by = updated_by
     await db.commit()
     await db.refresh(row)
@@ -191,9 +226,11 @@ async def send_now(db: AsyncSession, *, employee: Employee, month: int, year: in
         )).scalar_one_or_none()
         if existing:
             raise AlreadySentError(existing)
+    cfg = await get_config(db)
     return await _send_and_log(
         db, employee_pk=employee.id, employee_id=employee.employee_id, employee_name=employee.name,
-        email=resolve_email(employee), month=month, year=year, trigger=ReminderTrigger.MANUAL_SINGLE, run_id=None,
+        email=resolve_email(employee, prefer=cfg.email_preference),
+        month=month, year=year, trigger=ReminderTrigger.MANUAL_SINGLE, run_id=None,
     )
 
 
@@ -241,6 +278,7 @@ async def execute_run(db: AsyncSession, run: ReminderRun) -> ReminderRun:
     but zeros until the entire batch (one Graph API call per employee)
     finished, real progress or not."""
     month, year, trigger = run.month, run.year, run.trigger
+    cfg = await get_config(db)
     employees = (await db.execute(select(Employee).where(Employee.active.is_(True)))).scalars().all()
     active_pks = {e.id for e in employees}
     missing = await missing_employee_pks(db, month, year, active_employee_pks=active_pks)
@@ -256,7 +294,7 @@ async def execute_run(db: AsyncSession, run: ReminderRun) -> ReminderRun:
         if prior:
             db.add(ReminderLog(
                 run_id=run.id, employee_pk=e.id, employee_id=e.employee_id, employee_name=e.name,
-                recipient_email=resolve_email(e), month=month, year=year, trigger=trigger,
+                recipient_email=resolve_email(e, prefer=cfg.email_preference), month=month, year=year, trigger=trigger,
                 status=ReminderStatus.SKIPPED,
                 error=f"Already sent on {prior.sent_at.isoformat() if prior.sent_at else '?'}",
             ))
@@ -264,7 +302,8 @@ async def execute_run(db: AsyncSession, run: ReminderRun) -> ReminderRun:
         else:
             row = await _send_and_log(
                 db, employee_pk=e.id, employee_id=e.employee_id, employee_name=e.name,
-                email=resolve_email(e), month=month, year=year, trigger=trigger, run_id=run.id,
+                email=resolve_email(e, prefer=cfg.email_preference),
+                month=month, year=year, trigger=trigger, run_id=run.id,
             )
             sent += row.status == ReminderStatus.SENT
             failed += row.status == ReminderStatus.FAILED

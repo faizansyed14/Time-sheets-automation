@@ -31,7 +31,8 @@ def _out(e: Employee) -> EmployeeOut:
         project=e.project,
         contact_no=e.contact_no,
         location=e.location,
-        all_emails=e.all_emails,
+        work_email=e.work_email,
+        personal_email=e.personal_email,
         active=e.active,
     )
 
@@ -52,6 +53,25 @@ def _same_identity(a_name: str, b_name: str) -> bool:
     return a_name.strip().lower() == b_name.strip().lower()
 
 
+def _apply_derived_emails(e: Employee) -> None:
+    """Recompute employee_email_id (the resolved "primary" address) from
+    work_email/personal_email — the same derivation the bulk importer
+    already does from its own WORK EMAIL/PERSONAL EMAIL columns (see
+    import_service.py), applied here too so a manually created/edited row
+    is never left with an email an editor typed into "Work email" but that
+    exports/chat can't see (employee_email_id is what those still read;
+    Reminders reads work_email/personal_email directly instead, so it can
+    let the sender choose which one to use).
+
+    Only overwrites when at least one of the two is actually filled in —
+    an edit that doesn't touch either field (e.g. just fixing a phone
+    number on a DXB-sourced row) must never wipe out an email that came
+    from the original import.
+    """
+    if e.work_email or e.personal_email:
+        e.employee_email_id = e.work_email or e.personal_email
+
+
 @router.post("", response_model=EmployeeOut, status_code=201)
 async def create_employee(body: EmployeeIn, db: AsyncSession = Depends(get_db)):
     # The same employee_id may exist for DIFFERENT people (AUH vs DXB teams),
@@ -60,6 +80,7 @@ async def create_employee(body: EmployeeIn, db: AsyncSession = Depends(get_db)):
     if any(_same_identity(r.name, body.name) for r in rows):
         raise HTTPException(409, f"Employee {body.employee_id} / {body.name} already exists.")
     e = Employee(**body.model_dump())
+    _apply_derived_emails(e)
     db.add(e)
     await db.commit()
     await db.refresh(e)
@@ -77,6 +98,7 @@ async def update_employee(pk: str, body: EmployeeIn, db: AsyncSession = Depends(
         raise HTTPException(409, f"Employee {body.employee_id} / {body.name} already used by another row.")
     for k, v in body.model_dump().items():
         setattr(e, k, v)
+    _apply_derived_emails(e)
     await db.commit()
     await db.refresh(e)
     await datacache.bust_employees()

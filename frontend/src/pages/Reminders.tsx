@@ -1,19 +1,20 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  BellRing, Send, FlaskConical, PlayCircle, Search,
+  BellRing, Send, FlaskConical, FileDown, PlayCircle, Search,
   CheckCircle2, XCircle, MinusCircle, History,
 } from "lucide-react";
 import {
   fetchReminderConfig, updateReminderConfig,
-  fetchReminderEmployees, sendReminderNow, sendTestReminder,
+  fetchReminderEmployees, reminderExportUrl, sendReminderNow, sendTestReminder,
   runReminderBatch, fetchReminderRuns, fetchReminderRun,
-  MONTHS_LONG, type ReminderEmployeeRow, type ReminderRun,
+  MONTHS_LONG, type EmailPreference, type ReminderEmployeeRow, type ReminderRun,
 } from "../api/client";
-import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton, Spinner } from "../components/ui";
+import { Badge, Button, Card, ComingSoon, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton, Spinner } from "../components/ui";
 import { useToast } from "../components/toast";
 import { useAuth } from "../lib/auth";
-import { formatUaeDateTime } from "../lib/utils";
+import { downloadFile } from "../lib/filePreview";
+import { cn, formatUaeDateTime } from "../lib/utils";
 
 const now = new Date();
 
@@ -185,7 +186,7 @@ function RunDetailModal({ runId, onClose }: { runId: string; onClose: () => void
 export default function RemindersPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
-  const { canWrite } = useAuth();
+  const { canWrite, isAdmin } = useAuth();
 
   const [month, setMonth] = useState(now.getMonth() + 1);
   const [year, setYear] = useState(now.getFullYear());
@@ -198,10 +199,10 @@ export default function RemindersPage() {
   const [testEmail, setTestEmail] = useState("");
   const [testName, setTestName] = useState("");
 
-  const { data: config } = useQuery({ queryKey: ["reminder-config"], queryFn: fetchReminderConfig });
+  const { data: config } = useQuery({ queryKey: ["reminder-config"], queryFn: fetchReminderConfig, enabled: isAdmin });
 
   const toggleMut = useMutation({
-    mutationFn: (enabled: boolean) => updateReminderConfig(enabled),
+    mutationFn: (enabled: boolean) => updateReminderConfig({ auto_send_enabled: enabled }),
     onSuccess: (cfg) => {
       toast(cfg.auto_send_enabled ? "success" : "info",
         cfg.auto_send_enabled ? "Automatic reminders turned on" : "Automatic reminders turned off",
@@ -213,9 +214,21 @@ export default function RemindersPage() {
     onError: (e: any) => toast("error", "Could not update", e?.response?.data?.detail ?? String(e)),
   });
 
+  const emailPrefMut = useMutation({
+    mutationFn: (email_preference: EmailPreference) => updateReminderConfig({ email_preference }),
+    onSuccess: (cfg) => {
+      toast("success", `Now sending to ${cfg.email_preference} email`,
+        "Falls back to the other address for anyone missing their preferred one.");
+      qc.invalidateQueries({ queryKey: ["reminder-config"] });
+      qc.invalidateQueries({ queryKey: ["reminder-employees"] });
+    },
+    onError: (e: any) => toast("error", "Could not update", e?.response?.data?.detail ?? String(e)),
+  });
+
   const { data: employees, isLoading: employeesLoading } = useQuery({
     queryKey: ["reminder-employees", month, year, q, onlyMissing],
     queryFn: () => fetchReminderEmployees({ month, year, q: q || undefined, only_missing: onlyMissing, limit: 500 }),
+    enabled: isAdmin,
   });
 
   const invalidateAfterSend = () => {
@@ -245,7 +258,7 @@ export default function RemindersPage() {
   const { data: polling } = useQuery({
     queryKey: ["reminder-run", pollingRunId],
     queryFn: () => fetchReminderRun(pollingRunId!),
-    enabled: !!pollingRunId,
+    enabled: isAdmin && !!pollingRunId,
     refetchInterval: (q) => (q.state.data?.finished_at ? false : 1200),
   });
 
@@ -259,10 +272,22 @@ export default function RemindersPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [polling?.finished_at]);
 
-  const { data: runs } = useQuery({ queryKey: ["reminder-runs"], queryFn: () => fetchReminderRuns(10) });
+  const { data: runs } = useQuery({ queryKey: ["reminder-runs"], queryFn: () => fetchReminderRuns(10), enabled: isAdmin });
 
   const rows = employees?.rows ?? [];
   const missingCount = rows.filter((r) => r.missing).length;
+
+  if (!isAdmin) {
+    return (
+      <div className="animate-fade-up">
+        <PageHeader
+          title="Reminders"
+          subtitle="Sends real emails to real employees, so this stays admin-only."
+        />
+        <ComingSoon feature="Reminders" />
+      </div>
+    );
+  }
 
   return (
     <div className="animate-fade-up">
@@ -270,13 +295,39 @@ export default function RemindersPage() {
         title="Reminders"
         subtitle="An automatic nudge on the 28th of every month at 9:00 AM (UAE) to anyone missing that month's timesheet, plus on-demand sends."
         actions={
-          <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white px-3.5 py-2 shadow-xs">
-            <div className="text-right">
-              <p className="text-xs font-semibold text-slate-700">Automatic reminders</p>
-              <p className="text-[11px] text-slate-400">28th · 9:00 AM UAE</p>
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 py-2 shadow-xs">
+              <div className="text-right">
+                <p className="text-xs font-semibold text-slate-700">Send to</p>
+                <p className="text-[11px] text-slate-400">falls back if blank</p>
+              </div>
+              <div className="flex rounded-lg bg-slate-100 p-0.5">
+                {(["work", "personal"] as EmailPreference[]).map((opt) => (
+                  <button
+                    key={opt}
+                    type="button"
+                    disabled={!canWrite || emailPrefMut.isPending}
+                    onClick={() => emailPrefMut.mutate(opt)}
+                    className={cn(
+                      "rounded-md px-2.5 py-1 text-xs font-semibold capitalize transition-colors disabled:cursor-not-allowed",
+                      config?.email_preference === opt
+                        ? "bg-white text-brand-700 shadow-xs"
+                        : "text-slate-500 hover:text-slate-700"
+                    )}
+                  >
+                    {opt}
+                  </button>
+                ))}
+              </div>
             </div>
-            <Switch on={!!config?.auto_send_enabled} disabled={!canWrite || toggleMut.isPending}
-              onChange={() => toggleMut.mutate(!config?.auto_send_enabled)} />
+            <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white px-3.5 py-2 shadow-xs">
+              <div className="text-right">
+                <p className="text-xs font-semibold text-slate-700">Automatic reminders</p>
+                <p className="text-[11px] text-slate-400">28th · 9:00 AM UAE</p>
+              </div>
+              <Switch on={!!config?.auto_send_enabled} disabled={!canWrite || toggleMut.isPending}
+                onChange={() => toggleMut.mutate(!config?.auto_send_enabled)} />
+            </div>
           </div>
         }
       />
@@ -304,19 +355,30 @@ export default function RemindersPage() {
               Only missing
             </label>
           </div>
-          {canWrite && (
+          <div className="flex items-center gap-2">
             <Button
               variant="secondary"
-              disabled={runBatchMut.isPending || !!pollingRunId}
-              onClick={() => {
-                if (!confirm(`Send the ${MONTHS_LONG[month]} ${year} reminder email to every active employee who hasn't submitted yet (and hasn't already been reminded)?`)) return;
-                runBatchMut.mutate();
-              }}
+              onClick={() => downloadFile(
+                reminderExportUrl(month, year),
+                `missing_timesheets_${year}-${String(month).padStart(2, "0")}.xlsx`,
+              )}
             >
-              {pollingRunId ? <Spinner className="h-4 w-4 border-t-brand-600" /> : <PlayCircle className="h-4 w-4" />}
-              {pollingRunId ? `Sending… ${polling ? polling.sent_count + polling.failed_count + polling.skipped_count : 0}/${polling?.total ?? "?"}` : "Run for all now"}
+              <FileDown className="h-4 w-4" />
+              Export missing
             </Button>
-          )}
+            {canWrite && (
+              <Button
+                disabled={runBatchMut.isPending || !!pollingRunId}
+                onClick={() => {
+                  if (!confirm(`Send the ${MONTHS_LONG[month]} ${year} reminder email to every active employee who hasn't submitted yet (and hasn't already been reminded)?`)) return;
+                  runBatchMut.mutate();
+                }}
+              >
+                {pollingRunId ? <Spinner className="h-4 w-4 border-t-brand-600" /> : <PlayCircle className="h-4 w-4" />}
+                {pollingRunId ? `Sending… ${polling ? polling.sent_count + polling.failed_count + polling.skipped_count : 0}/${polling?.total ?? "?"}` : "Run for all now"}
+              </Button>
+            )}
+          </div>
         </div>
       </Card>
 
@@ -340,7 +402,9 @@ export default function RemindersPage() {
               <tr className="border-b border-slate-100 text-[11px] uppercase tracking-wide text-slate-400">
                 <th className="px-5 py-2.5 font-semibold">Employee</th>
                 <th className="px-3 py-2.5 font-semibold">Manager</th>
-                <th className="px-3 py-2.5 font-semibold">Email</th>
+                <th className="px-3 py-2.5 font-semibold">
+                  Email <span className="normal-case text-slate-300">({config?.email_preference ?? "work"} preferred)</span>
+                </th>
                 <th className="px-3 py-2.5 font-semibold">{MONTHS_LONG[month]} {year}</th>
                 <th className="px-3 py-2.5 font-semibold">Last reminder</th>
                 <th className="px-3 py-2.5" />
@@ -354,7 +418,27 @@ export default function RemindersPage() {
                     <p className="text-xs text-slate-400">{row.employee_id}</p>
                   </td>
                   <td className="px-3 py-2.5 text-slate-600">{row.account_manager ?? "—"}</td>
-                  <td className="px-3 py-2.5 text-slate-600">{row.email ?? <span className="text-rose-500">No email on file</span>}</td>
+                  <td className="px-3 py-2.5 text-slate-600">
+                    {row.email ? (
+                      <>
+                        {row.email}
+                        {row.email_source !== config?.email_preference && (
+                          <span
+                            className="ml-1.5 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-amber-700 ring-1 ring-inset ring-amber-200"
+                            title={
+                              row.email_source === "legacy"
+                                ? "No work/personal split on file yet — showing the older resolved address."
+                                : `No ${config?.email_preference} email on file — showing ${row.email_source} instead.`
+                            }
+                          >
+                            {row.email_source}
+                          </span>
+                        )}
+                      </>
+                    ) : (
+                      <span className="text-rose-500">No email on file</span>
+                    )}
+                  </td>
                   <td className="px-3 py-2.5">
                     <Badge tone={row.missing ? "warning" : "success"}>{row.missing ? "Missing" : "Received"}</Badge>
                   </td>

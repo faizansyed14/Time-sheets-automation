@@ -637,7 +637,7 @@ async def draft_reminder_email(
     recipients: list[dict[str, Any]] = []
 
     def _email(e: Employee) -> str | None:
-        return (e.employee_email_id or (e.all_emails or "").split(";")[0] or "").strip() or None
+        return (e.employee_email_id or e.work_email or e.personal_email or "").strip() or None
 
     if str(kind).lower().startswith("appr"):
         recs = (await pending_approvals(db, month, year))["records"]

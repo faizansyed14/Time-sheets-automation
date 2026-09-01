@@ -1098,7 +1098,8 @@ export interface Employee {
   project: string | null;
   contact_no: string | null;
   location: string | null;
-  all_emails: string | null;
+  work_email: string | null;
+  personal_email: string | null;
   active: boolean;
 }
 export type EmployeeInput = Omit<Employee, "id">;
@@ -1138,6 +1139,8 @@ export interface ImportPlanAdd {
   project: string | null;
   account_manager: string | null;
   employee_email_id: string | null;
+  work_email: string | null;
+  personal_email: string | null;
   contact_no: string | null;
   aco_number: string | null;
   dco_number: string | null;
@@ -1159,6 +1162,8 @@ export interface ImportPlanExisting {
   location: string | null;
   account_manager: string | null;
   employee_email_id: string | null;
+  work_email: string | null;
+  personal_email: string | null;
   active: boolean;
 }
 export interface ImportPlan {
@@ -1241,6 +1246,11 @@ export interface AuthUser {
   auth_mode: AuthModeT;
   is_active: boolean;
   last_login_at: string | null;
+  // Bumped (throttled) on every authenticated request; `online` is computed
+  // server-side from it (see api/deps.ONLINE_THRESHOLD) — never stored as its
+  // own column, so it can't go stale.
+  last_seen_at: string | null;
+  online: boolean;
 }
 
 export interface LoginResult {
@@ -1345,8 +1355,10 @@ export const adminDeleteCalendar = (id: string) =>
 // ===========================================================================
 // Reminders — automatic 28th/9am UAE nudge + per-employee "Send now" + tests
 // ===========================================================================
+export type EmailPreference = "work" | "personal";
 export interface ReminderConfig {
   auto_send_enabled: boolean;
+  email_preference: EmailPreference;
   send_day: number;
   send_hour_uae: number;
   updated_at: string | null;
@@ -1354,8 +1366,8 @@ export interface ReminderConfig {
 }
 export const fetchReminderConfig = () =>
   api.get<ReminderConfig>("/reminders/config").then((r) => r.data);
-export const updateReminderConfig = (auto_send_enabled: boolean) =>
-  api.put<ReminderConfig>("/reminders/config", { auto_send_enabled }).then((r) => r.data);
+export const updateReminderConfig = (patch: { auto_send_enabled?: boolean; email_preference?: EmailPreference }) =>
+  api.put<ReminderConfig>("/reminders/config", patch).then((r) => r.data);
 
 export interface ReminderEmployeeRow {
   employee_pk: string;
@@ -1364,6 +1376,11 @@ export interface ReminderEmployeeRow {
   account_manager: string | null;
   location: string | null;
   email: string | null;
+  /** Which address `email` actually is: the preferred type, the OTHER type
+   *  (fallback — the preferred one was blank for this person), "legacy" (an
+   *  older row with no work/personal split yet, falling back to the
+   *  resolved employee_email_id), or "none" (nothing on file at all). */
+  email_source: "work" | "personal" | "legacy" | "none";
   missing: boolean;
   last_status: "sent" | "failed" | "skipped" | null;
   last_sent_at: string | null;
@@ -1373,7 +1390,16 @@ export interface ReminderEmployeeRow {
 export const fetchReminderEmployees = (params: {
   month: number; year: number; q?: string; only_missing?: boolean; limit?: number; offset?: number;
 }) =>
-  api.get<{ total: number; rows: ReminderEmployeeRow[] }>("/reminders/employees", { params }).then((r) => r.data);
+  api
+    .get<{ total: number; rows: ReminderEmployeeRow[]; email_preference: EmailPreference }>(
+      "/reminders/employees", { params })
+    .then((r) => r.data);
+
+/** XLSX of everyone missing this month's timesheet (Employee ID, Name,
+ *  Manager Name, Client, Personal Email, Work Email) — a plain browser
+ *  download, same pattern as timesheetExportUrl. */
+export const reminderExportUrl = (month: number, year: number) =>
+  withAuthParam(`/api/v1/reminders/export?month=${month}&year=${year}`);
 
 export interface ReminderLog {
   id: string;
@@ -1418,6 +1444,21 @@ export const fetchReminderRuns = (limit = 20) =>
   api.get<ReminderRun[]>("/reminders/runs", { params: { limit } }).then((r) => r.data);
 export const fetchReminderRun = (id: string) =>
   api.get<ReminderRun & { logs: ReminderLog[] }>(`/reminders/runs/${id}`).then((r) => r.data);
+
+// ===========================================================================
+// System notice — one admin-authored sentence shown as a popup to every
+// logged-in role (including viewer/vault_matcher) when enabled.
+// ===========================================================================
+export interface SystemNotice {
+  message: string;
+  enabled: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+export const fetchSystemNotice = () =>
+  api.get<SystemNotice>("/notice").then((r) => r.data);
+export const updateSystemNotice = (patch: { message?: string; enabled?: boolean }) =>
+  api.put<SystemNotice>("/notice", patch).then((r) => r.data);
 
 // ===========================================================================
 // Admin — extraction debug runs (temporary, purgeable full LLM trace)

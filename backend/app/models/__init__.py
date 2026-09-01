@@ -3,6 +3,7 @@ from app.models.email_message import EmailMessage, EmailStatus
 from app.models.employee import Employee
 from app.models.extraction_debug_run import ExtractionDebugRun
 from app.models.month_calendar import MonthCalendar
+from app.models.notice import SystemNotice
 from app.models.pipeline_file import (
     FailureCode,
     PipelineFile,
@@ -46,6 +47,7 @@ __all__ = [
     "Role",
     "AuthMode",
     "MonthCalendar",
+    "SystemNotice",
     "ExtractionDebugRun",
     "PortalRole",
     "PortalUser",

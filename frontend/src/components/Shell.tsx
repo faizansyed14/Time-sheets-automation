@@ -11,7 +11,6 @@ import {
   FolderOpen,
   FileSpreadsheet,
   BellRing,
-  Zap,
   CircleDot,
   Settings,
   ShieldCheck,
@@ -29,6 +28,7 @@ import { useAuth } from "../lib/auth";
 import AutoExtractWidget from "./AutoExtractWidget";
 import ExtractQueueWidget from "./ExtractQueueWidget";
 import ExtractQueueBridge from "./ExtractQueueBridge";
+import SystemNoticeBanner from "./SystemNoticeBanner";
 import { useExtractQueue } from "../lib/extractQueue";
 
 const NAV = [
@@ -46,9 +46,6 @@ const TOOLS_NAV = [
   { to: "/employees", label: "Employee matcher", icon: Users },
   { to: "/export", label: "Export", icon: FileSpreadsheet },
   { to: "/files", label: "File Vault", icon: FolderOpen },
-  // Same read/write split as calendars/portal-accounts below (require_full_access,
-  // not admin-only) — sending a nudge is routine ops work, not admin config.
-  { to: "/reminders", label: "Reminders", icon: BellRing },
   // Read by every extraction run and relevant to normal timesheet review, not
   // just admin config — every role can view it (backend: require_write, same
   // as the routes above), so it lives here rather than under Admin.
@@ -61,6 +58,10 @@ const TOOLS_NAV = [
 
 const ADMIN_NAV = [
   { to: "/admin/users", label: "Users & access", icon: ShieldCheck },
+  // Sends real email to real employees — admin only (see api/deps.require_admin
+  // and main.py's router wiring), unlike the "any full-access role" tier
+  // calendars/portal-accounts above use.
+  { to: "/reminders", label: "Reminders", icon: BellRing },
   { to: "/admin/settings", label: "AI Settings", icon: Settings },
   { to: "/admin/debug", label: "Extraction debug", icon: Bug },
 ];
@@ -149,6 +150,7 @@ export default function Shell({ children }: { children: ReactNode }) {
   return (
     <div className="flex h-screen overflow-hidden app-canvas">
       <ExtractQueueBridge />
+      <SystemNoticeBanner />
       <aside
         className={cn(
           "relative flex shrink-0 flex-col border-r border-slate-200/80 bg-white/70 text-slate-700 backdrop-blur-md transition-[width] duration-200",
@@ -156,8 +158,8 @@ export default function Shell({ children }: { children: ReactNode }) {
         )}
       >
         <div className={cn("flex items-center border-b border-slate-200/70 py-3", collapsed ? "justify-center px-1.5" : "gap-2 px-2.5")}>
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-brand-600 shadow-sm">
-            <Zap className="h-4 w-4 text-white" />
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg shadow-sm ring-1 ring-slate-900/10">
+            <img src="/timesheets_logo.jpg" alt="Alpha Data" className="h-full w-full object-cover" />
           </div>
           {!collapsed && (
             <div className="min-w-0">

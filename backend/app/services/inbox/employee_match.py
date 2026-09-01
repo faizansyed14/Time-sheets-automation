@@ -44,7 +44,8 @@ async def match_sender(
     rows = (await db.execute(select(Employee))).scalars().all()
     index: dict[str, Employee] = {}
     for emp in rows:
-        for e in (_split_emails(emp.employee_email_id) + _split_emails(emp.all_emails)):
+        for e in (_split_emails(emp.employee_email_id)
+                  + _split_emails(emp.work_email) + _split_emails(emp.personal_email)):
             index.setdefault(e, emp)
 
     for addr in candidates:

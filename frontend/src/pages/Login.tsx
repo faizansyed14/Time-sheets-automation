@@ -1,15 +1,11 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
-  Zap,
   Loader2,
   RefreshCw,
   ShieldCheck,
   KeyRound,
   Smartphone,
-  Mail,
-  Sparkles,
-  FolderLock,
   ArrowLeft,
 } from "lucide-react";
 import {
@@ -28,120 +24,6 @@ import { cn } from "../lib/utils";
 
 // Sign-in = username + password, then exactly ONE challenge — never stacked.
 type Stage = "credentials" | "captcha" | "otp" | "totp";
-
-const PIPELINE_LINE =
-  "Extract from inbox, review with AI, file to vault — one portal for the full pipeline.";
-
-// Reveal each feature card as its phrase is typed in PIPELINE_LINE.
-const FEATURES = [
-  {
-    icon: Mail,
-    label: "Inbox extraction",
-    desc: "Pull timesheets straight from email threads",
-    at: "Extract from inbox".length,
-  },
-  {
-    icon: Sparkles,
-    label: "AI-powered review",
-    desc: "Compare, fix, and accept in one flow",
-    at: "Extract from inbox, review with AI".length,
-  },
-  {
-    icon: FolderLock,
-    label: "Secure vault filing",
-    desc: "Organized by employee, month, and ACO/DCO",
-    at: "Extract from inbox, review with AI, file to vault".length,
-  },
-] as const;
-
-function usePrefersReducedMotion() {
-  const [reduced, setReduced] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches
-  );
-  useEffect(() => {
-    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-    setReduced(mq.matches);
-    const onChange = () => setReduced(mq.matches);
-    mq.addEventListener("change", onChange);
-    return () => mq.removeEventListener("change", onChange);
-  }, []);
-  return reduced;
-}
-
-function useTypewriter(text: string, speed = 26, startDelay = 500) {
-  const reduced = usePrefersReducedMotion();
-  const [n, setN] = useState(reduced ? text.length : 0);
-
-  useEffect(() => {
-    if (reduced) {
-      setN(text.length);
-      return;
-    }
-    let i = 0;
-    let timeout: number | undefined;
-    let interval: number | undefined;
-
-    const clear = () => {
-      if (timeout) window.clearTimeout(timeout);
-      if (interval) window.clearInterval(interval);
-    };
-
-    const type = () => {
-      interval = window.setInterval(() => {
-        i += 1;
-        setN(i);
-        if (i >= text.length) {
-          window.clearInterval(interval);
-          timeout = window.setTimeout(erase, 4500);
-        }
-      }, speed);
-    };
-
-    const erase = () => {
-      interval = window.setInterval(() => {
-        i = Math.max(0, i - 2);
-        setN(i);
-        if (i <= 0) {
-          window.clearInterval(interval);
-          timeout = window.setTimeout(type, 420);
-        }
-      }, 14);
-    };
-
-    timeout = window.setTimeout(type, startDelay);
-    return clear;
-  }, [text, speed, startDelay, reduced]);
-
-  return n;
-}
-
-const PIPELINE_PARTS = [
-  { text: "Extract from inbox", hot: true },
-  { text: ", ", hot: false },
-  { text: "review with AI", hot: true },
-  { text: ", ", hot: false },
-  { text: "file to vault", hot: true },
-  { text: " — one portal for the full pipeline.", hot: false },
-] as const;
-
-function TypedPipeline({ n }: { n: number }) {
-  let seen = 0;
-  return (
-    <>
-      {PIPELINE_PARTS.map((part, i) => {
-        const start = seen;
-        seen += part.text.length;
-        if (n <= start) return null;
-        const slice = part.text.slice(0, n - start);
-        return (
-          <span key={i} className={part.hot ? "font-medium text-white" : "text-brand-100/70"}>
-            {slice}
-          </span>
-        );
-      })}
-    </>
-  );
-}
 
 const STAGE_LABEL: Record<Stage, string> = {
   credentials: "Sign in",
@@ -174,13 +56,6 @@ export default function Login() {
   const [captchaImg, setCaptchaImg] = useState("");
   const [captchaAns, setCaptchaAns] = useState("");
   const [captchaTick, setCaptchaTick] = useState(0);
-
-  const typed = useTypewriter(PIPELINE_LINE);
-  const [revealed, setRevealed] = useState(0);
-  useEffect(() => {
-    setRevealed((prev) => Math.max(prev, typed));
-  }, [typed]);
-  const lineDone = typed >= PIPELINE_LINE.length;
 
   const captchaLockedSec = (() => {
     void captchaTick;
@@ -338,110 +213,41 @@ export default function Login() {
   };
 
   return (
-    <div className="flex min-h-screen">
-      {/* ── Hero panel (desktop) ── */}
-      <aside className="login-hero relative hidden w-[46%] flex-col justify-between overflow-hidden p-10 text-white lg:flex xl:p-14">
-        <div className="login-orb -left-20 -top-20 h-72 w-72 bg-brand-400/30" />
-        <div className="login-orb bottom-10 right-0 h-56 w-56 bg-teal-300/20" />
-        <div className="login-orb left-1/3 top-1/2 h-40 w-40 bg-emerald-400/15" />
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-canvas px-5 py-10 sm:px-8">
+      {/* Single, uniform background across the whole page — soft accents only, never a hard two-tone split. */}
+      <div className="login-orb -left-24 -top-24 h-[420px] w-[420px] bg-brand-400/15" aria-hidden />
+      <div className="login-orb -right-24 bottom-[-80px] h-[360px] w-[360px] bg-emerald-300/15" aria-hidden />
+      <div
+        className="pointer-events-none absolute inset-0"
+        style={{
+          background:
+            "conic-gradient(from 180deg at 50% 35%, rgba(13,148,136,0.12), rgba(20,184,166,0.06), rgba(67,78,96,0.10), rgba(13,148,136,0.12))",
+          maskImage: "radial-gradient(60% 60% at 50% 40%, rgba(0,0,0,1) 0%, rgba(0,0,0,0) 75%)",
+        }}
+        aria-hidden
+      />
+      <div className="pointer-events-none absolute inset-0 bg-grid opacity-30" aria-hidden />
 
-        <div className="relative z-10 animate-fade-up">
-          <div className="flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/15 shadow-lg ring-1 ring-white/20 backdrop-blur-sm">
-              <Zap className="h-6 w-6 text-brand-100" />
-            </div>
-            <div>
-              <p className="font-serif text-xl font-semibold tracking-tight">TimeSheets</p>
-              <p className="text-xs font-medium text-brand-100/80">Intelligence Portal</p>
-            </div>
-          </div>
+      <div className="relative z-10 flex w-full max-w-6xl items-center justify-center gap-14 xl:gap-20">
+        {/* Left tagline — desktop only, flanks the centered card */}
+        <div className="hidden w-64 shrink-0 animate-fade-up xl:block">
+          <div className="h-0.5 w-10 bg-brand-500" />
+          <p className="mt-5 font-serif text-[1.7rem] italic leading-tight text-slate-800">
+            "AI-powered <span className="text-brand-600">extraction</span>"
+          </p>
+          <p className="mt-4 text-[15px] italic leading-relaxed text-slate-500">
+            Pull timesheets straight from inbox threads, automatically.
+          </p>
         </div>
 
-        <div className="relative z-10 space-y-8">
-          <div>
-            <h1 className="font-serif text-4xl font-semibold leading-tight tracking-tight text-white xl:text-[2.75rem]">
-              Timesheet ops,<br />
-              <span className="text-brand-200">automated.</span>
-            </h1>
-            <p
-              className="mt-5 min-h-[4.75rem] max-w-md text-[15px] leading-relaxed text-brand-100/80"
-              aria-label={PIPELINE_LINE}
-            >
-              <TypedPipeline n={typed} />
-              <span
-                className={cn(
-                  "ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] bg-brand-200 align-middle",
-                  lineDone && "animate-caret-blink"
-                )}
-                aria-hidden
-              />
-            </p>
-          </div>
-
-          <ul className="space-y-2.5">
-            {FEATURES.map(({ icon: Icon, label, desc, at }, i) =>
-              revealed >= at ? (
-                <li
-                  key={label}
-                  className="animate-feature-in flex items-start gap-3.5 rounded-xl border border-white/12 bg-white/[0.08] p-3.5 shadow-lg shadow-black/10 ring-1 ring-inset ring-white/10 backdrop-blur-sm"
-                  style={{ animationDelay: `${i * 40}ms` }}
-                >
-                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-white/20 to-white/5 ring-1 ring-white/20">
-                    <Icon className="h-4 w-4 text-brand-100" />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-baseline justify-between gap-2">
-                      <p className="text-sm font-semibold text-white">{label}</p>
-                      <span className="font-mono text-[10px] tabular-nums text-brand-200/50">
-                        0{i + 1}
-                      </span>
-                    </div>
-                    <p className="mt-0.5 text-xs leading-relaxed text-brand-100/70">{desc}</p>
-                  </div>
-                </li>
-              ) : null
-            )}
-          </ul>
-        </div>
-
-
-      </aside>
-
-      {/* ── Form panel ── */}
-      <main className="relative flex flex-1 flex-col items-center justify-center bg-canvas px-5 py-10 sm:px-8 overflow-hidden">
-        {/* Unique background mesh for the form side */}
-        <div
-          className="pointer-events-none absolute -left-24 top-[-120px] h-[420px] w-[420px] rounded-full bg-brand-400/20 blur-3xl"
-          aria-hidden
-        />
-        <div
-          className="pointer-events-none absolute -right-32 top-[-60px] h-[360px] w-[360px] rounded-full bg-emerald-400/15 blur-3xl"
-          aria-hidden
-        />
-        <div
-          className="pointer-events-none absolute inset-0"
-          style={{
-            background:
-              "conic-gradient(from 180deg at 50% 35%, rgba(13,148,136,0.22), rgba(20,184,166,0.10), rgba(67,78,96,0.18), rgba(13,148,136,0.22))",
-            maskImage: "radial-gradient(60% 60% at 50% 40%, rgba(0,0,0,1) 0%, rgba(0,0,0,0) 75%)",
-          }}
-          aria-hidden
-        />
-        <div className="pointer-events-none absolute inset-0 bg-grid opacity-30" aria-hidden />
-
-        <div className="relative w-full max-w-[420px] animate-fade-up">
-          {/* Mobile logo */}
-          <div className="mb-8 flex flex-col items-center gap-3 text-center lg:hidden">
-            <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-brand-700 shadow-card ring-4 ring-brand-100/50">
-              <Zap className="h-7 w-7 text-white" />
-            </div>
-            <div>
-              <h1 className="font-serif text-2xl font-semibold tracking-tight text-slate-900">TimeSheets</h1>
-              <p className="text-sm text-slate-500">Timesheet Intelligence Portal</p>
-            </div>
-          </div>
-
+        {/* Card column */}
+        <div className="w-full max-w-[420px] animate-fade-up">
           <div className="login-card p-7 sm:p-8">
+            <div className="mb-6 flex justify-center">
+              <div className="flex h-32 w-32 items-center justify-center overflow-hidden rounded-2xl shadow-card ring-4 ring-brand-100/60">
+                <img src="/timesheets_logo.jpg" alt="Alpha Data" className="h-full w-full object-cover" />
+              </div>
+            </div>
             {/* Stage header */}
             <div className="mb-6">
               <div className="mb-4 flex items-center gap-2">
@@ -639,10 +445,19 @@ export default function Login() {
               )}
             </div>
           </div>
-
-      
         </div>
-      </main>
+
+        {/* Right tagline — desktop only, mirrors the left */}
+        <div className="hidden w-64 shrink-0 animate-fade-up text-right xl:block">
+          <div className="ml-auto h-0.5 w-10 bg-brand-500" />
+          <p className="mt-5 font-serif text-[1.7rem] italic leading-tight text-slate-800">
+            "Secure <span className="text-brand-600">vault filing</span>"
+          </p>
+          <p className="mt-4 text-[15px] italic leading-relaxed text-slate-500">
+            Every timesheet organized by employee, month, and project.
+          </p>
+        </div>
+      </div>
     </div>
   );
 }

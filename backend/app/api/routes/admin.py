@@ -33,11 +33,13 @@ Extraction debug runs (RBAC: admin only; temporary, purgeable — see debug_capt
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_admin, require_full_access
+from app.api.deps import ONLINE_THRESHOLD, require_admin, require_full_access
 from app.api.routes.portal_auth import portal_user_out
 from app.core.database import get_db
 from app.core.security import hash_password
@@ -75,8 +77,10 @@ def _check_password(pw: str) -> None:
 
 
 def _user_out(u: User) -> UserOut:
+    online = bool(u.last_seen_at and (datetime.now(timezone.utc) - u.last_seen_at) <= ONLINE_THRESHOLD)
     return UserOut(id=u.id, username=u.username, email=u.email, role=u.role,
-                   auth_mode=u.auth_mode, is_active=u.is_active, last_login_at=u.last_login_at)
+                   auth_mode=u.auth_mode, is_active=u.is_active, last_login_at=u.last_login_at,
+                   last_seen_at=u.last_seen_at, online=online)
 
 
 def _provision_totp(u: User, *, reset: bool = False) -> TotpSetupOut:

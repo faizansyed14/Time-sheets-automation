@@ -249,3 +249,98 @@ async def test_duplicate_rows_inside_the_file_are_skipped(clean_matcher):
     assert len(plan["to_add"]) == 1
     reasons = sorted(r["reason"] for r in plan["skipped"])
     assert reasons == ["Duplicate ID + Name in file", "Missing ID or Name"]
+
+
+# --------------------------------------------------------------------------
+# AUH work/personal email split
+# --------------------------------------------------------------------------
+
+AUH_SPLIT_HEADERS = ["Employee ID", "EMPLOYEE NAME", "PROJECT", "ACCOUNT MANAGER",
+                     "Contact number", "WORK EMAIL", "PERSONAL EMAIL"]
+AUH_LEGACY_HEADERS = ["Employee ID", "Full Name", "Project", "Salesman",
+                      "Mobile Number", "Email ID"]
+
+
+async def test_auh_new_schema_keeps_work_and_personal_email_separate(clean_matcher):
+    data = _xlsx(
+        [["E1", "Nitin Mehta", "ADFD", "Mohammed Moinuddin Hassan",
+          "0500000000", "nmehta@adfd.ae", "mehtan67@gmail.com"]],
+        headers=AUH_SPLIT_HEADERS, title="AUH",
+    )
+    async with SessionLocal() as db:
+        await import_employees_from_bytes(db, data)
+        e = (await _load(db))["E1"]
+
+    assert e.work_email == "nmehta@adfd.ae"
+    assert e.personal_email == "mehtan67@gmail.com"
+    # Existing callers that just need ONE usable value (chat, exports) still
+    # get one — work email wins as the "primary" address.
+    assert e.employee_email_id == "nmehta@adfd.ae"
+    assert e.location == "AUH"
+    assert e.account_manager == "Mohammed Moinuddin Hassan"
+
+
+async def test_auh_new_schema_with_only_personal_email_filled_in(clean_matcher):
+    """Real rows in the wild often have only ONE of the two columns filled —
+    e.g. a client-facing work address was never issued."""
+    data = _xlsx(
+        [["E2", "Mohammed Riyasudeen Thajudeen", "Abu Dhabi Media Office", "Mustafa Ahmed Ali",
+          "525241326", "", "RIYASPG@GMAIL.COM"]],
+        headers=AUH_SPLIT_HEADERS, title="AUH",
+    )
+    async with SessionLocal() as db:
+        await import_employees_from_bytes(db, data)
+        e = (await _load(db))["E2"]
+
+    assert e.work_email is None
+    assert e.personal_email == "RIYASPG@GMAIL.COM"
+    assert e.employee_email_id == "RIYASPG@GMAIL.COM"
+
+
+async def test_auh_legacy_single_email_column_is_split_by_domain(clean_matcher):
+    """The OLD AUH schema (one blended "Email ID" column, sometimes
+    "company@x / personal@gmail.com") has no explicit split of its own —
+    classified by domain instead: a public webmail address is personal,
+    anything else is presumed work. The only signal available for a sheet
+    that never separated them itself."""
+    data = _xlsx(
+        [["E3", "Some Person", "Some Project", "Some Manager",
+          "0500000000", "some.person@company.ae / someperson@yahoo.com"]],
+        headers=AUH_LEGACY_HEADERS, title="AUH",
+    )
+    async with SessionLocal() as db:
+        await import_employees_from_bytes(db, data)
+        e = (await _load(db))["E3"]
+
+    assert e.work_email == "some.person@company.ae"
+    assert e.personal_email == "someperson@yahoo.com"
+    assert e.employee_email_id == "some.person@company.ae"
+
+
+async def test_reimporting_new_schema_updates_an_existing_legacy_row(clean_matcher):
+    """A person first imported under the old blended schema, then re-imported
+    from a file that finally splits their address — work_email/personal_email
+    should populate, and the plan must report it as a real change."""
+    legacy = _xlsx(
+        [["E4", "Some Person", "Some Project", "Some Manager", "0500000000", "old@x.ae"]],
+        headers=AUH_LEGACY_HEADERS, title="AUH",
+    )
+    async with SessionLocal() as db:
+        await import_employees_from_bytes(db, legacy)
+
+    split = _xlsx(
+        [["E4", "SOME PERSON", "Some Project", "Some Manager",
+          "0500000000", "work@x.ae", "personal@x.ae"]],
+        headers=AUH_SPLIT_HEADERS, title="AUH",
+    )
+    async with SessionLocal() as db:
+        plan = await build_import_plan(db, split)
+        changed = {c["field"] for c in plan["to_update"][0]["changes"]}
+        assert "work_email" in changed
+        assert "personal_email" in changed
+
+        await import_employees_from_bytes(db, split)
+        e = (await _load(db))["E4"]
+
+    assert e.work_email == "work@x.ae"
+    assert e.personal_email == "personal@x.ae"
