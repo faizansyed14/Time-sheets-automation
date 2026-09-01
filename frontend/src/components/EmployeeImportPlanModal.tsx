@@ -38,10 +38,11 @@ const FIELD_LABELS: Record<string, string> = {
   dco_number: "DCO number",
   account_manager: "Account manager",
   employee_email_id: "Email",
+  work_email: "Work email",
+  personal_email: "Personal email",
   project: "Project",
   contact_no: "Contact no.",
   location: "Location",
-  all_emails: "All emails",
 };
 
 const dash = (v: string | null | undefined) => (v && v.trim() ? v : "—");

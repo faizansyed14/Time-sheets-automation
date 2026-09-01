@@ -58,3 +58,7 @@ class User(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Bumped (throttled) on every authenticated request in api/deps.py's
+    # get_current_user — the "online" dot on the Users & Access page is just
+    # `now - last_seen_at < ONLINE_THRESHOLD`, computed on read, never stored.
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

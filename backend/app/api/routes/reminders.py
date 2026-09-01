@@ -3,29 +3,33 @@
   GET  /reminders/config          the auto-send ON/OFF switch + fixed schedule
   PUT  /reminders/config          flip the switch
   GET  /reminders/employees       roster for a month/year, with missing/sent status
+  GET  /reminders/export          XLSX of everyone missing that month's timesheet
   POST /reminders/send-now        one employee, right now (409 if already sent, unless force)
   POST /reminders/test            send the reminder design to an arbitrary address
   POST /reminders/run-batch       everyone missing this month, in the background
   GET  /reminders/runs            run history
   GET  /reminders/runs/{run_id}   one run's per-employee outcome
 
-RBAC: require_full_access at router level (main.py) — any full-access role
-(admin/user) may view AND act; viewers read-only (GETs pass, writes 403);
-the restricted vault_matcher role has no access at all, same as every other
-business router.
+RBAC: require_admin at router level (main.py) — admin ONLY, every route,
+including every GET. Unlike the "any full-access role" tier (calendars,
+portal-users, employee matcher, ...), this router sends real email to real
+employees, so it's deliberately narrower than require_full_access — not
+even the standard "user" role, let alone viewer, can see or act on it.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_full_access
+from app.api.deps import require_admin
 from app.core.database import get_db
+from app.core.http_headers import content_disposition
 from app.models.auth import User
 from app.models.employee import Employee
-from app.models.reminder import ReminderLog, ReminderRun, ReminderTrigger
+from app.models.reminder import EmailPreference, ReminderLog, ReminderRun, ReminderTrigger
+from app.services.export.reminder_export import build_missing_reminders_xlsx
 from app.services.reminders import service
 
 router = APIRouter(prefix="/reminders", tags=["reminders"])
@@ -55,31 +59,35 @@ def _run_out(run: ReminderRun) -> dict:
 # --------------------------------- config ---------------------------------
 
 class ConfigIn(BaseModel):
-    auto_send_enabled: bool
+    auto_send_enabled: bool | None = None
+    email_preference: str | None = None
+
+
+def _config_out(cfg) -> dict:
+    return {
+        "auto_send_enabled": cfg.auto_send_enabled,
+        "email_preference": cfg.email_preference,
+        "send_day": service.SEND_DAY,
+        "send_hour_uae": service.SEND_HOUR_UAE,
+        "updated_at": cfg.updated_at.isoformat() if cfg.updated_at else None,
+        "updated_by": cfg.updated_by,
+    }
 
 
 @router.get("/config")
 async def get_config(db: AsyncSession = Depends(get_db)):
-    cfg = await service.get_config(db)
-    return {
-        "auto_send_enabled": cfg.auto_send_enabled,
-        "send_day": service.SEND_DAY,
-        "send_hour_uae": service.SEND_HOUR_UAE,
-        "updated_at": cfg.updated_at.isoformat() if cfg.updated_at else None,
-        "updated_by": cfg.updated_by,
-    }
+    return _config_out(await service.get_config(db))
 
 
 @router.put("/config")
-async def update_config(body: ConfigIn, user: User = Depends(require_full_access), db: AsyncSession = Depends(get_db)):
-    cfg = await service.set_config(db, enabled=body.auto_send_enabled, updated_by=user.username)
-    return {
-        "auto_send_enabled": cfg.auto_send_enabled,
-        "send_day": service.SEND_DAY,
-        "send_hour_uae": service.SEND_HOUR_UAE,
-        "updated_at": cfg.updated_at.isoformat() if cfg.updated_at else None,
-        "updated_by": cfg.updated_by,
-    }
+async def update_config(body: ConfigIn, user: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    if body.email_preference is not None and body.email_preference not in EmailPreference.ALL:
+        raise HTTPException(400, f"email_preference must be one of {EmailPreference.ALL}")
+    cfg = await service.set_config(
+        db, enabled=body.auto_send_enabled, email_preference=body.email_preference,
+        updated_by=user.username,
+    )
+    return _config_out(cfg)
 
 
 # ------------------------------- employees --------------------------------
@@ -97,8 +105,10 @@ async def list_employees(
     """The Reminders page's own roster view — deliberately independent of
     employees.py's /coverage (different "received" definition, see
     service.missing_employee_pks) and returns each employee's resolved email
-    + most recent reminder outcome for this month, which that endpoint has no
+    (per the CURRENT work/personal preference — see email_source below) +
+    most recent reminder outcome for this month, which that endpoint has no
     reason to carry."""
+    cfg = await service.get_config(db)
     employees = (await db.execute(
         select(Employee).where(Employee.active.is_(True)).order_by(Employee.name)
     )).scalars().all()
@@ -119,16 +129,54 @@ async def list_employees(
     rows = []
     for e in page:
         l = last.get(e.id)
+        email, source = service.resolve_email_with_source(e, prefer=cfg.email_preference)
         rows.append({
             "employee_pk": e.id, "employee_id": e.employee_id, "name": e.name,
             "account_manager": e.account_manager, "location": e.location,
-            "email": service.resolve_email(e), "missing": e.id in missing,
+            "email": email, "email_source": source, "missing": e.id in missing,
             "last_status": l.status if l else None,
             "last_sent_at": l.sent_at.isoformat() if l and l.sent_at else None,
             "last_trigger": l.trigger if l else None,
             "last_error": l.error if l else None,
         })
-    return {"total": len(filtered), "rows": rows}
+    return {"total": len(filtered), "rows": rows, "email_preference": cfg.email_preference}
+
+
+@router.get("/export")
+async def export_missing(
+    month: int = Query(..., ge=1, le=12),
+    year: int = Query(..., ge=2000, le=2100),
+    db: AsyncSession = Depends(get_db),
+):
+    """XLSX handout of everyone missing this month's timesheet — Employee ID,
+    Name, Manager Name, Client, Personal Email, Work Email — so this list can
+    be shared with people who don't have Reminders access, to chase down who
+    hasn't sent theirs. Same missing-definition as the roster above
+    (service.missing_employee_pks), not filtered by search/pagination."""
+    employees = (await db.execute(
+        select(Employee).where(Employee.active.is_(True)).order_by(Employee.name)
+    )).scalars().all()
+    active_pks = {e.id for e in employees}
+    missing = await service.missing_employee_pks(db, month, year, active_employee_pks=active_pks)
+
+    rows = [
+        {
+            "employee_id": e.employee_id,
+            "name": e.name,
+            "account_manager": e.account_manager,
+            "project": e.project,
+            "personal_email": e.personal_email,
+            "work_email": e.work_email,
+        }
+        for e in employees if e.id in missing
+    ]
+    data = build_missing_reminders_xlsx(rows, month, year)
+    fname = f"missing_timesheets_{year}-{month:02d}.xlsx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": content_disposition("attachment", fname)},
+    )
 
 
 # ---------------------------------- send -----------------------------------
@@ -178,7 +226,7 @@ class RunBatchIn(BaseModel):
 
 
 @router.post("/run-batch")
-async def run_batch(body: RunBatchIn, user: User = Depends(require_full_access), db: AsyncSession = Depends(get_db)):
+async def run_batch(body: RunBatchIn, user: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
     """Admin's "Run for all now". The run row is created synchronously (fast
     — no sending yet) so its id can be returned right away; the actual
     sending (one Graph call per missing employee) runs in a Celery task —

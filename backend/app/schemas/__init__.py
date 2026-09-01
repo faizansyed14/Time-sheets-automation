@@ -299,7 +299,8 @@ class EmployeeIn(BaseModel):
     project: str | None = None
     contact_no: str | None = None
     location: str | None = None
-    all_emails: str | None = None
+    work_email: str | None = None
+    personal_email: str | None = None
     active: bool = True
 
 
@@ -411,6 +412,8 @@ class ImportPlanAdd(BaseModel):
     project: str | None = None
     account_manager: str | None = None
     employee_email_id: str | None = None
+    work_email: str | None = None
+    personal_email: str | None = None
     contact_no: str | None = None
     aco_number: str | None = None
     dco_number: str | None = None
@@ -436,6 +439,8 @@ class ImportPlanExisting(BaseModel):
     location: str | None = None
     account_manager: str | None = None
     employee_email_id: str | None = None
+    work_email: str | None = None
+    personal_email: str | None = None
     active: bool = True
 
 

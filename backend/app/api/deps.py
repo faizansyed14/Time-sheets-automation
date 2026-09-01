@@ -13,6 +13,8 @@ the rest of the API keeps working without logging in.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +27,14 @@ from app.models.auth import Role, User
 
 # HTTP methods that never mutate state — viewers are allowed these.
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+# Online/offline tracking: last_seen_at is bumped here, throttled to at most
+# once per this interval per user, so an active session doesn't write to the
+# DB on every single request. ONLINE_THRESHOLD (used by admin.py to decide
+# the green/red dot) must stay comfortably larger than this so a user isn't
+# shown offline just because they landed inside the throttle gap.
+LAST_SEEN_THROTTLE = timedelta(seconds=60)
+ONLINE_THRESHOLD = timedelta(minutes=3)
 
 _DEV_ADMIN = User(id="dev-admin", username="dev", email=None,
                   password_hash="", role=Role.ADMIN, auth_mode="otp", is_active=True)
@@ -58,6 +68,11 @@ async def get_current_user(
     user = (await db.execute(select(User).where(User.id == payload.get("sub")))).scalar_one_or_none()
     if not user or not user.is_active:
         raise HTTPException(401, "User not found or inactive")
+    now = datetime.now(timezone.utc)
+    if not user.last_seen_at or (now - user.last_seen_at) > LAST_SEEN_THROTTLE:
+        user.last_seen_at = now
+        await db.commit()
+        await db.refresh(user)
     return user
 
 

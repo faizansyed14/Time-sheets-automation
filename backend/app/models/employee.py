@@ -40,13 +40,24 @@ class Employee(Base):
     aco_number: Mapped[str | None] = mapped_column(String, nullable=True)
     dco_number: Mapped[str | None] = mapped_column(String, nullable=True)
     account_manager: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The resolved "primary" address (work if set, else personal) — kept for
+    # every existing caller that just needs ONE usable address (chat_tools,
+    # exports, inbox matching). Reminders is the one caller that does NOT use
+    # this — it lets the sender explicitly choose work vs personal instead
+    # (see reminders/service.py's resolve_email).
     employee_email_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Extended fields from the real Excel import
     project: Mapped[str | None] = mapped_column(String, nullable=True)
     contact_no: Mapped[str | None] = mapped_column(String, nullable=True)
     location: Mapped[str | None] = mapped_column(String, nullable=True)   # "DXB" | "AUH"
-    all_emails: Mapped[str | None] = mapped_column(String, nullable=True)  # semicolon-separated
+    # Kept SEPARATE from each other — a source sheet that lists both a
+    # company address and a personal one must never have them silently
+    # merged into one blob (that WAS what the old all_emails column did;
+    # removed once work/personal replaced every reason to keep it — see
+    # import_service.py's AUH/DXB parsers for how each is populated).
+    work_email: Mapped[str | None] = mapped_column(String, nullable=True)
+    personal_email: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Soft-delete: inactivating keeps the row (and every timesheet record /
     # vault file that references it) intact — just excluded from active

@@ -76,6 +76,28 @@ export function formatOutlookDateTime(iso: string | null | undefined): string {
   return `${weekday} ${date} ${time}`;
 }
 
+/** "Online now" / "5m ago" / "3h ago" / "12d ago" — for the last-seen dot on
+ *  the Users & Access page. Falls back to a full date once it's old enough
+ *  that a relative label stops being useful. Also the label for a user who
+ *  has never logged in AND for one who just logged out (logout explicitly
+ *  clears last_seen_at server-side — see auth.py's /logout — so the dot
+ *  flips red immediately instead of still reading "online" for up to
+ *  ONLINE_THRESHOLD after they signed out). */
+export function formatRelativeTime(iso: string | null | undefined): string {
+  if (!iso) return "Offline";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const seconds = Math.max(0, (Date.now() - d.getTime()) / 1000);
+  if (seconds < 60) return "Online now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return formatDateTime(iso);
+}
+
 export function initials(name: string | null | undefined): string {
   if (!name) return "?";
   return name

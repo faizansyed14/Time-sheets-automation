@@ -30,7 +30,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user
+from app.api.deps import ONLINE_THRESHOLD, get_current_user
 from app.core.cache import cache
 from app.core.config import settings
 from app.core.security import (
@@ -64,8 +64,10 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _user_out(u: User) -> UserOut:
+    online = bool(u.last_seen_at and (datetime.now(timezone.utc) - u.last_seen_at) <= ONLINE_THRESHOLD)
     return UserOut(id=u.id, username=u.username, email=u.email, role=u.role,
-                   auth_mode=u.auth_mode, is_active=u.is_active, last_login_at=u.last_login_at)
+                   auth_mode=u.auth_mode, is_active=u.is_active, last_login_at=u.last_login_at,
+                   last_seen_at=u.last_seen_at, online=online)
 
 
 def _client_ip(request: Request) -> str:
@@ -301,7 +303,7 @@ async def me(user: User = Depends(get_current_user)):
 
 
 @router.post("/logout")
-async def logout(authorization: str | None = Header(default=None)):
+async def logout(authorization: str | None = Header(default=None), db: AsyncSession = Depends(get_db)):
     token = None
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1].strip()
@@ -310,6 +312,14 @@ async def logout(authorization: str | None = Header(default=None)):
         if payload and payload.get("jti"):
             await cache.set(is_token_revoked_key(payload["jti"]), "1",
                             ttl=token_remaining_seconds(payload) or 1)
+            # Revoking the token doesn't touch last_seen_at, so the Users &
+            # Access page would otherwise keep showing this person "online"
+            # (green dot, "Xm ago") for up to ONLINE_THRESHOLD after they
+            # actually signed out. Clear it so the dot flips red right away.
+            user = (await db.execute(select(User).where(User.id == payload.get("sub")))).scalar_one_or_none()
+            if user:
+                user.last_seen_at = None
+                await db.commit()
     return {"status": "logged_out"}
 
 

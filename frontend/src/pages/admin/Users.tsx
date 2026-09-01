@@ -1,21 +1,83 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { UserPlus, Shield, Eye, User as UserIcon, Mail, KeyRound, Trash2, Power, Pencil, Smartphone, FolderLock } from "lucide-react";
+import { UserPlus, Shield, Eye, User as UserIcon, Mail, KeyRound, Trash2, Power, Pencil, Smartphone, FolderLock, Megaphone } from "lucide-react";
 import {
   adminCreateUser,
   adminDeleteUser,
   adminListUsers,
   adminTotpSetup,
   adminUpdateUser,
+  fetchSystemNotice,
+  updateSystemNotice,
   type AuthModeT,
   type AuthRole,
   type AuthUser,
   type TotpSetupResult,
 } from "../../api/client";
-import { avatarColor, cn, initials } from "../../lib/utils";
+import { avatarColor, cn, formatRelativeTime, initials } from "../../lib/utils";
 import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton } from "../../components/ui";
 import { useToast } from "../../components/toast";
 import { useAuth } from "../../lib/auth";
+
+function SystemNoticeCard() {
+  const { toast } = useToast();
+  const qc = useQueryClient();
+  const { data: notice, isLoading } = useQuery({ queryKey: ["system-notice"], queryFn: fetchSystemNotice });
+  const [message, setMessage] = useState("");
+  const [enabled, setEnabled] = useState(false);
+  const [dirty, setDirty] = useState(false);
+
+  useEffect(() => {
+    if (notice && !dirty) {
+      setMessage(notice.message);
+      setEnabled(notice.enabled);
+    }
+  }, [notice, dirty]);
+
+  const saveMut = useMutation({
+    mutationFn: () => updateSystemNotice({ message: message.trim(), enabled }),
+    onSuccess: () => {
+      toast("success", "Notice updated");
+      setDirty(false);
+      qc.invalidateQueries({ queryKey: ["system-notice"] });
+    },
+    onError: (e: any) => toast("error", "Could not update notice", e?.response?.data?.detail ?? String(e)),
+  });
+
+  return (
+    <Card className="mb-5 p-5">
+      <div className="mb-1 flex items-center gap-2">
+        <Megaphone className="h-4 w-4 text-brand-600" />
+        <h3 className="text-sm font-bold text-slate-800">System notice</h3>
+      </div>
+      <p className="mb-3 text-xs text-slate-500">
+        One sentence shown as a popup to every signed-in user, including viewers — e.g. "System under maintenance tonight 10pm–11pm."
+      </p>
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="min-w-64 flex-1">
+          <Field label="Message">
+            <Input
+              value={message}
+              disabled={isLoading}
+              placeholder="e.g. System under maintenance tonight 10pm–11pm"
+              onChange={(e) => { setMessage(e.target.value); setDirty(true); }}
+            />
+          </Field>
+        </div>
+        <label className="mb-1.5 flex h-[38px] items-center gap-2 text-sm text-slate-600">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => { setEnabled(e.target.checked); setDirty(true); }}
+            className="h-4 w-4 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+          />
+          Show to everyone
+        </label>
+        <Button disabled={saveMut.isPending} onClick={() => saveMut.mutate()}>Save</Button>
+      </div>
+    </Card>
+  );
+}
 
 type Form = { username: string; password: string; email: string; role: AuthRole; auth_mode: AuthModeT };
 const EMPTY: Form = { username: "", password: "", email: "", role: "user", auth_mode: "otp" };
@@ -37,7 +99,14 @@ export default function AdminUsers() {
   const qc = useQueryClient();
   const { toast } = useToast();
   const { user: me } = useAuth();
-  const { data: users, isLoading } = useQuery({ queryKey: ["admin-users"], queryFn: adminListUsers });
+  const { data: users, isLoading } = useQuery({
+    queryKey: ["admin-users"], queryFn: adminListUsers,
+    // Short poll so the online/offline dot stays accurate without a manual
+    // reload — last_seen_at itself is only bumped server-side at most once a
+    // minute per user (see api/deps.LAST_SEEN_THROTTLE), so this cadence is
+    // plenty to reflect that.
+    refetchInterval: 20_000,
+  });
   const [modal, setModal] = useState<{ mode: "create" } | { mode: "edit"; user: AuthUser } | null>(null);
   const [form, setForm] = useState<Form>(EMPTY);
   const [totpSetup, setTotpSetup] = useState<{ user: AuthUser; data: TotpSetupResult } | null>(null);
@@ -109,6 +178,8 @@ export default function AdminUsers() {
         actions={<Button onClick={openCreate}><UserPlus className="h-4 w-4" /> Add user</Button>}
       />
 
+      <SystemNoticeCard />
+
       <Card>
         {isLoading ? (
           <div className="space-y-2 p-6"><Skeleton className="h-12" /><Skeleton className="h-12" /></div>
@@ -122,6 +193,7 @@ export default function AdminUsers() {
                 <th className="px-3 py-2.5 font-semibold">Role</th>
                 <th className="px-3 py-2.5 font-semibold">Email (OTP)</th>
                 <th className="px-3 py-2.5 font-semibold">2-factor</th>
+                <th className="px-3 py-2.5 font-semibold">Last active</th>
                 <th className="px-3 py-2.5 font-semibold">Status</th>
                 <th className="px-3 py-2.5" />
               </tr>
@@ -143,6 +215,12 @@ export default function AdminUsers() {
                   </td>
                   <td className="px-3 py-2.5">
                     <span className="text-xs font-medium text-slate-600">{authModeLabel(u.auth_mode)}</span>
+                  </td>
+                  <td className="px-3 py-2.5">
+                    <span className="flex items-center gap-1.5 text-xs text-slate-600" title={u.online ? "Online now" : u.last_seen_at ? `Last seen: ${formatRelativeTime(u.last_seen_at)}` : "Offline"}>
+                      <span className={cn("h-2 w-2 shrink-0 rounded-full", u.online ? "bg-emerald-500" : "bg-rose-400")} />
+                      {formatRelativeTime(u.last_seen_at)}
+                    </span>
                   </td>
                   <td className="px-3 py-2.5">
                     {u.is_active ? <Badge tone="success">active</Badge> : <Badge tone="danger">disabled</Badge>}

@@ -27,7 +27,8 @@ _BATCH_FLUSH = 200
 # admin decision, so a bulk upload never touches either.
 _DIFF_FIELDS = (
     "name", "account_manager", "employee_email_id",
-    "project", "contact_no", "location", "all_emails",
+    "project", "contact_no", "location",
+    "work_email", "personal_email",
 )
 # ACO and DCO arrive in ONE spreadsheet column, so they're diffed as a pair —
 # see _changes_for. A row that fills that cell is authoritative for both.
@@ -110,14 +111,33 @@ def _split_ref(raw: str) -> tuple[str | None, str | None]:
     return (None, digits or None)
 
 
-def _first_email(raw: str) -> str | None:
-    if not raw:
-        return None
-    for addr in re.split(r"[;,]", raw):
-        addr = addr.strip()
-        if addr:
-            return addr
-    return None
+# Public webmail providers — an address on one of these is classified
+# "personal"; anything else (a company domain) is classified "work". Used
+# ONLY when a sheet has ONE blended email column with no real split of its
+# own (DXB's "Email" column; AUH's older single "Email ID" schema before the
+# "WORK EMAIL"/"PERSONAL EMAIL" split existed) — a best-effort classification
+# from the only signal available, never a guess by column position (a "/"-
+# separated cell's ordering isn't consistent row to row).
+_PERSONAL_EMAIL_DOMAINS = {
+    "gmail.com", "yahoo.com", "yahoo.co.in", "hotmail.com", "outlook.com",
+    "live.com", "live.co.uk", "icloud.com", "aol.com", "ymail.com",
+    "msn.com", "rediffmail.com", "protonmail.com",
+}
+
+
+def _split_blended_emails(raw: str) -> tuple[str | None, str | None]:
+    """One cell, possibly holding one or two "/"-, ";"- or ","-separated
+    addresses -> (work_email, personal_email), classified by domain. Never
+    invents an address that isn't there; when nothing matches the personal
+    list, the first address found is treated as work (the common case: one
+    company address and nothing else)."""
+    addrs = [p.strip() for p in re.split(r"[;/,]", raw or "") if p.strip()]
+    if not addrs:
+        return None, None
+    personal = next(
+        (a for a in addrs if a.rsplit("@", 1)[-1].lower() in _PERSONAL_EMAIL_DOMAINS), None)
+    work = next((a for a in addrs if a != personal), None)
+    return work, personal
 
 
 def _parse_sheet_dxb(ws) -> list[dict]:
@@ -156,7 +176,7 @@ def _parse_sheet_dxb(ws) -> list[dict]:
             continue
         aco, dco = _split_ref(gl(["dco", "aco/dco", "aco / dco", "dco number",
                                   "dco no.", "dco no", "aco", "reference"]))
-        all_emails_raw = gl(["email"])
+        work_email, personal_email = _split_blended_emails(gl(["email"]))
         records.append({
             "employee_id": emp_id,
             "name": emp_name,
@@ -168,8 +188,9 @@ def _parse_sheet_dxb(ws) -> list[dict]:
             "project": gl(["project"]),
             "account_manager": gl(["account managers name"]),
             "contact_no": gl(["contact no."]),
-            "all_emails": all_emails_raw,
-            "employee_email_id": _first_email(all_emails_raw),
+            "work_email": work_email,
+            "personal_email": personal_email,
+            "employee_email_id": work_email or personal_email,
             "location": "DXB",
             "_row": row_num,
             "_sheet": ws.title,
@@ -178,12 +199,22 @@ def _parse_sheet_dxb(ws) -> list[dict]:
 
 
 def _parse_sheet_auh(ws) -> list[dict]:
+    """AUH has shipped under two header schemas so far — this reads either:
+      original : "Employee ID", "Full Name", "Salesman", "Mobile Number", "Email ID"
+      current  : "Employee ID", "EMPLOYEE NAME", "ACCOUNT MANAGER", "Contact number",
+                 "WORK EMAIL", "PERSONAL EMAIL"
+    The current schema's whole point is that work and personal addresses are
+    NOT the same thing and must never be blended into one value. A sheet
+    still using the old single "Email"/"Email ID" column has no such split
+    of its own to read — those rows fall back to _split_blended_emails'
+    domain classifier, same as the DXB parser.
+    """
     header_idx: dict[str, int] = {}
     header_row_num = None
     for i, row in enumerate(ws.iter_rows()):
         cells = [_norm(c.value) for c in row]
         low = [c.lower() for c in cells]
-        if "employee id" in low or "full name" in low:
+        if "employee id" in low or "full name" in low or "employee name" in low:
             header_row_num = i + 1
             for j, h in enumerate(low):
                 header_idx[h.strip()] = j
@@ -206,10 +237,17 @@ def _parse_sheet_auh(ws) -> list[dict]:
             return ""
 
         emp_id = gl(["employee id"])
-        emp_name = gl(["full name"])
+        emp_name = gl(["full name", "employee name"])
         if not emp_id and not emp_name:
             continue      # spacer/layout row — see the DXB parser above
-        all_emails_raw = gl(["email id", "email"])
+
+        work_email = gl(["work email"]) or None
+        personal_email = gl(["personal email"]) or None
+        if not work_email and not personal_email:
+            # Old single-column schema — sometimes "a@x.com / b@y.com" in one
+            # cell — classify by domain, same as the DXB parser.
+            work_email, personal_email = _split_blended_emails(gl(["email id", "email"]))
+
         aco, dco = _split_ref(gl(["dco", "aco/dco", "aco / dco", "aco", "reference"]))
         records.append({
             "employee_id": emp_id,
@@ -218,10 +256,13 @@ def _parse_sheet_auh(ws) -> list[dict]:
             "dco_number": dco,
             "_ref_present": bool(aco or dco),
             "project": gl(["project"]),
-            "account_manager": gl(["salesman"]),
-            "contact_no": gl(["mobile number", "contact no."]),
-            "all_emails": all_emails_raw,
-            "employee_email_id": _first_email(all_emails_raw),
+            "account_manager": gl(["salesman", "account manager"]),
+            "contact_no": gl(["mobile number", "contact no.", "contact number"]),
+            "work_email": work_email,
+            "personal_email": personal_email,
+            "employee_email_id": work_email or personal_email,
+            "work_email": work_email,
+            "personal_email": personal_email,
             "location": "AUH",
             "_row": row_num,
             "_sheet": ws.title,
@@ -436,7 +477,9 @@ def _existing_out(e: Employee) -> dict:
     return {
         "id": e.id, "employee_id": e.employee_id, "name": e.name,
         "location": e.location, "account_manager": e.account_manager,
-        "employee_email_id": e.employee_email_id, "active": e.active,
+        "employee_email_id": e.employee_email_id,
+        "work_email": e.work_email, "personal_email": e.personal_email,
+        "active": e.active,
     }
 
 
@@ -497,6 +540,8 @@ async def build_import_plan(db: AsyncSession, data: bytes) -> dict:
             "project": _clean(rec.get("project")),
             "account_manager": _clean(rec.get("account_manager")),
             "employee_email_id": _clean(rec.get("employee_email_id")),
+            "work_email": _clean(rec.get("work_email")),
+            "personal_email": _clean(rec.get("personal_email")),
             "contact_no": _clean(rec.get("contact_no")),
             "aco_number": _clean(rec.get("aco_number")),
             "dco_number": _clean(rec.get("dco_number")),
@@ -560,7 +605,8 @@ async def import_employees_from_bytes(db: AsyncSession, data: bytes) -> dict:
                     project=_clean(rec.get("project")),
                     contact_no=_clean(rec.get("contact_no")),
                     location=_clean(rec.get("location")),
-                    all_emails=_clean(rec.get("all_emails")),
+                    work_email=_clean(rec.get("work_email")),
+                    personal_email=_clean(rec.get("personal_email")),
                 )
                 db.add(row)
                 index[rec["_key"]] = row

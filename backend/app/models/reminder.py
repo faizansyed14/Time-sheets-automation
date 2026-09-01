@@ -55,11 +55,24 @@ class ReminderStatus:
     ALL = (SENT, FAILED, SKIPPED)
 
 
+class EmailPreference:
+    """Which of an employee's two separate addresses (Employee.work_email /
+    Employee.personal_email) reminders send to. A single global choice
+    (not per-employee) — see services/reminders/service.py's resolve_email
+    for the fallback order when the preferred one is blank for a given
+    person."""
+    WORK = "work"
+    PERSONAL = "personal"
+    ALL = (WORK, PERSONAL)
+
+
 class ReminderConfig(Base):
     __tablename__ = "reminder_config"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: "singleton")
     auto_send_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    email_preference: Mapped[str] = mapped_column(
+        String, nullable=False, default=EmailPreference.WORK, server_default=EmailPreference.WORK)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

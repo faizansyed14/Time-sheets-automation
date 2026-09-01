@@ -29,7 +29,8 @@ const EMPTY: EmployeeInput = {
   project: null,
   contact_no: null,
   location: null,
-  all_emails: null,
+  work_email: null,
+  personal_email: null,
   active: true,
 };
 
@@ -154,7 +155,7 @@ export default function EmployeesPage() {
               id="employee-import"
               name="employee-import"
               type="file"
-              accept=".xlsx"
+              accept=".xlsx,.xls"
               className="hidden"
               onChange={(e) => {
                 const f = e.target.files?.[0];
@@ -226,13 +227,14 @@ export default function EmployeesPage() {
           <div className="overflow-x-auto">
             <table className="w-full table-fixed text-left text-xs">
               <colgroup>
-                <col className="w-[20%]" />
-                <col className="w-[12%]" />
-                <col className="w-[8%]" />
-                <col className="hidden lg:table-column lg:w-[14%]" />
-                <col className="hidden xl:table-column xl:w-[10%]" />
-                <col className="hidden xl:table-column xl:w-[16%]" />
+                <col className="w-[18%]" />
                 <col className="w-[10%]" />
+                <col className="w-[7%]" />
+                <col className="hidden lg:table-column lg:w-[12%]" />
+                <col className="hidden xl:table-column xl:w-[8%]" />
+                <col className="hidden xl:table-column xl:w-[13%]" />
+                <col className="hidden xl:table-column xl:w-[13%]" />
+                <col className="w-[9%]" />
                 <col className="w-[10%]" />
               </colgroup>
               <thead>
@@ -242,7 +244,8 @@ export default function EmployeesPage() {
                   <th className="px-2 py-2">Loc</th>
                   <th className="hidden px-2 py-2 lg:table-cell">Manager</th>
                   <th className="hidden px-2 py-2 xl:table-cell">Project</th>
-                  <th className="hidden px-2 py-2 xl:table-cell">Email</th>
+                  <th className="hidden px-2 py-2 xl:table-cell">Work email</th>
+                  <th className="hidden px-2 py-2 xl:table-cell">Personal email</th>
                   <th className="px-2 py-2">Status</th>
                   <th className="px-2 py-2 text-right">Actions</th>
                 </tr>
@@ -317,9 +320,15 @@ export default function EmployeesPage() {
                     </td>
                     <td
                       className="hidden truncate px-2 py-1.5 text-[10px] text-slate-500 xl:table-cell"
-                      title={r.employee_email_id ?? undefined}
+                      title={r.work_email ?? undefined}
                     >
-                      {r.employee_email_id ?? "—"}
+                      {r.work_email ?? "—"}
+                    </td>
+                    <td
+                      className="hidden truncate px-2 py-1.5 text-[10px] text-slate-500 xl:table-cell"
+                      title={r.personal_email ?? undefined}
+                    >
+                      {r.personal_email ?? "—"}
                     </td>
                     <td className="px-2 py-1.5">
                       <Badge tone={r.active ? "success" : "slate"} className="px-1.5 py-0 text-[10px]">
@@ -423,10 +432,18 @@ export default function EmployeesPage() {
               onChange={(e) => setForm({ ...form, project: e.target.value || null })}
             />
           </Field>
-          <Field label="Email" name="employee_email_id">
+          <Field label="Work email" name="work_email">
             <Input
-              value={form.employee_email_id ?? ""}
-              onChange={(e) => setForm({ ...form, employee_email_id: e.target.value || null })}
+              type="email"
+              value={form.work_email ?? ""}
+              onChange={(e) => setForm({ ...form, work_email: e.target.value || null })}
+            />
+          </Field>
+          <Field label="Personal email" name="personal_email">
+            <Input
+              type="email"
+              value={form.personal_email ?? ""}
+              onChange={(e) => setForm({ ...form, personal_email: e.target.value || null })}
             />
           </Field>
           <Field label="Contact no." name="contact_no">
