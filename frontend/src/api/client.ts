@@ -216,10 +216,16 @@ export interface TimesheetExportRow extends Omit<TimesheetRecord, "validation_st
   approval_status: TimesheetRecord["approval_status"] | "";
   location: string | null;
   project: string | null;
-  employee_email: string | null;
+  personal_email: string | null;
+  work_email: string | null;
   contact_no: string | null;
   has_record: boolean;
   status: ExportStatus;
+  // Pre-formatted ("YYYY-MM-DD HH:MM") — when the pipeline first received
+  // something for this employee this period, and when it was actually
+  // filed. A "Received & Not Stored" row has the first without the second.
+  received_at: string | null;
+  stored_at: string | null;
 }
 
 export interface DashboardRow {
@@ -517,35 +523,16 @@ export const uploadTimesheetsStream = (
 };
 
 // ---------------------------------------------------------------------------
-// Agentic chat (timesheet assistant)
+// AI chat — generic assistant, no database access. Can read an attached file
+// (PDF/DOCX/XLSX/TXT as text, an image as an image) the same way ChatGPT/
+// Claude's own chat does.
 // ---------------------------------------------------------------------------
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
 }
 
-export interface ChatChange {
-  record_id: string;
-  employee_name: string | null;
-  month: number;
-  year: number;
-  month_name: string | null;
-  leave_type: string;
-  action: "add" | "set" | "clear";
-  before: string[];
-  after: string[];
-  added: string[];
-  removed: string[];
-}
-
-export interface ChatPromptGroup {
-  group: string;
-  prompts: string[];
-}
-
 export interface ChatSuggestions {
-  suggestions: string[];
-  prompt_book: ChatPromptGroup[];
   enabled: boolean;
   model: string | null;
 }
@@ -553,39 +540,47 @@ export interface ChatSuggestions {
 export const fetchChatSuggestions = () =>
   api.get<ChatSuggestions>("/agentic-chat/suggestions").then((r) => r.data);
 
-// ---- streaming chat (Server-Sent Events) ----------------------------------
-// A structured result card the assistant streams back (rendered visually).
-export interface ChatCard {
-  type:
-    | "leave_change" | "approval_change" | "draft_email" | "dashboard"
-    | "missing" | "submitted" | "pending" | "team" | "compare" | "anomalies";
-  // union payload — fields depend on `type`; read defensively in the UI.
-  [k: string]: unknown;
+// Whether "others" (non-admin) can see/use Ask AI — admin always can
+// regardless of this flag. Read by every role that can reach the chat page
+// (to decide whether to lock it); written by admin only, from AI Settings.
+export interface ChatAccess {
+  enabled_for_others: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
 }
+
+export const fetchChatAccess = () =>
+  api.get<ChatAccess>("/agentic-chat/access").then((r) => r.data);
+
+export const updateChatAccess = (enabled_for_others: boolean) =>
+  api.put<ChatAccess>("/agentic-chat/access", { enabled_for_others }).then((r) => r.data);
 
 export type ChatStreamEvent =
   | { type: "token"; text: string }
-  | { type: "tool"; phase: "start" | "end"; name: string; label?: string; write?: boolean; ok?: boolean }
-  | { type: "card"; card: ChatCard }
-  | { type: "suggestions"; items: string[] }
-  | { type: "done"; tools_used?: string[]; changes?: ChatChange[]; error?: string | null };
+  | { type: "done"; error?: string | null };
 
-/** POST the conversation and stream SSE events back through `onEvent`.
- *  Resolves when the stream ends. Uses fetch (axios can't stream in-browser). */
+/** POST the conversation (+ optional attached file) and stream SSE events
+ *  back through `onEvent`. Resolves when the stream ends. Uses fetch (axios
+ *  can't stream in-browser); multipart so a File can ride alongside the
+ *  JSON-encoded message history in one request. */
 export async function sendChatStream(
   messages: ChatMessage[],
   onEvent: (ev: ChatStreamEvent) => void,
   signal?: AbortSignal,
+  file?: File | null,
 ): Promise<void> {
   const token = getToken();
+  const form = new FormData();
+  form.set("messages", JSON.stringify(messages));
+  if (file) form.set("file", file);
   const res = await fetch("/api/v1/agentic-chat/stream", {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
+      // No Content-Type here — the browser sets the multipart boundary itself.
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       "X-Fingerprint": deviceFingerprint(),
     },
-    body: JSON.stringify({ messages }),
+    body: form,
     signal,
   });
   if (!res.ok || !res.body) {
@@ -1391,6 +1386,13 @@ export interface ReminderConfig {
   send_hour_uae: number;
   updated_at: string | null;
   updated_by: string | null;
+  // Read-only, set from .env — this page can't change these, only explain
+  // them. scheduled_check_enabled false means the automatic 28th/9am job
+  // doesn't exist at all, regardless of auto_send_enabled above.
+  // sending_enabled false means NOTHING on this page can actually email —
+  // scheduled, Send now, Run for all now, or Test — all blocked alike.
+  scheduled_check_enabled: boolean;
+  sending_enabled: boolean;
 }
 export const fetchReminderConfig = () =>
   api.get<ReminderConfig>("/reminders/config").then((r) => r.data);

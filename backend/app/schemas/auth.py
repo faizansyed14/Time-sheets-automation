@@ -62,7 +62,7 @@ class LoginResult(BaseModel):
     captcha_id: str | None = None
     user: UserOut | None = None
     message: str | None = None
-    debug_otp: str | None = None  # populated only when not running in prod
+    debug_otp: str | None = None  # populated only when settings.debug_otp_enabled
     totp_uri: str | None = None
     totp_qr_png: str | None = None  # base64 PNG for authenticator enrollment
 

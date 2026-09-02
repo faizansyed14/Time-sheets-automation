@@ -104,14 +104,14 @@ services:
       resources:
         limits: { cpus: "0.25", memory: 256M }
 
-  # Public gateway: SPA → frontend, API → backend. Bound directly on :80 so
-  # http://<ec2-public-ip>/ works with no extra setup — this box has no
-  # host-level nginx/certbot/domain in front. If you later add a domain +
-  # TLS (docs/DEPLOYMENT.md §7, nginx/host-tls.conf.example), switch this to
-  # "127.0.0.1:8080:80" instead so the host nginx can own 80/443.
+  # Public gateway: SPA → frontend, API → backend. Bound to 127.0.0.1 so a
+  # host-level nginx + certbot owns 80/443, terminates HTTPS, and proxies to
+  # this container (see docs/DEPLOYMENT.md §7, nginx/host-tls.conf.example)
+  # — same pattern as dev.yml. If you ever run this box with no domain/TLS
+  # in front, switch this back to "80:80" for direct http://<ec2-public-ip>/.
   nginx:
     image: nginx:1.27-alpine
-    ports: ["80:80"]
+    ports: ["127.0.0.1:8080:80"]
     volumes:
       - ./nginx/gateway.conf:/etc/nginx/conf.d/default.conf:ro
     restart: unless-stopped

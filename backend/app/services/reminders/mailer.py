@@ -45,7 +45,18 @@ def _token() -> str:
 
 def send_reminder_email(to_email: str, subject: str, html_body: str) -> None:
     """Synchronous send. Raises on failure — callers (service.py) catch this
-    per-recipient so one bad address never stops the rest of a batch."""
+    per-recipient so one bad address never stops the rest of a batch.
+
+    settings.reminder_sending_enabled is a hard kill-switch checked first,
+    before anything else: set false in .env and NOTHING sent through this
+    module can ever actually reach a real inbox, regardless of the scheduled
+    check being registered, the Reminders page's auto-send toggle, or which
+    button (Send now / Run for all now / Test email) triggered the call."""
+    if not settings.reminder_sending_enabled:
+        raise ValueError(
+            "Reminder sending is disabled (REMINDER_SENDING_ENABLED=false in "
+            ".env) — no email was actually sent."
+        )
     if not to_email or "@" not in to_email:
         raise ValueError(f"Not a usable email address: {to_email!r}")
     if not _graph_configured():

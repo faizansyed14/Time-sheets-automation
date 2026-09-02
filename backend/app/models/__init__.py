@@ -1,4 +1,5 @@
 from app.models.auth import AuthMode, Role, User
+from app.models.chat_access import ChatAccessConfig
 from app.models.email_message import EmailMessage, EmailStatus
 from app.models.employee import Employee
 from app.models.extraction_debug_run import ExtractionDebugRun
@@ -62,4 +63,5 @@ __all__ = [
     "ReminderLog",
     "ReminderTrigger",
     "ReminderStatus",
+    "ChatAccessConfig",
 ]

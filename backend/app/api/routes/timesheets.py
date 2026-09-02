@@ -1,6 +1,9 @@
 """Timesheet record routes — detail view + manager Approve/Not-approve sign-off."""
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from sqlalchemy import select
@@ -12,8 +15,8 @@ from app.core.http_headers import content_disposition
 from app.models.employee import Employee
 from app.models.timesheet_record import ApprovalStatus, TimesheetRecord
 from app.schemas import ApprovalIn, TimesheetExportOut, TimesheetOut, TimesheetUpdate
-from app.services.export.timesheet_export import build_timesheet_xlsx, employees_grid_rows, status_for
-from app.services.pipeline.coverage import received_employee_pks
+from app.services.export.timesheet_export import _fmt_dt, build_timesheet_xlsx, employees_grid_rows, status_for
+from app.services.pipeline.coverage import received_employee_dates, received_employee_pks
 
 router = APIRouter(prefix="/timesheets", tags=["timesheets"])
 
@@ -63,21 +66,27 @@ def to_out(r: TimesheetRecord) -> TimesheetOut:
     )
 
 
-def to_export_out(r: TimesheetRecord, emp: Employee | None) -> TimesheetExportOut:
+def to_export_out(
+    r: TimesheetRecord, emp: Employee | None, received_at: datetime | None = None,
+) -> TimesheetExportOut:
     base = to_out(r)
     return TimesheetExportOut(
         **base.model_dump(),
         location=(emp.location if emp else None),
         project=(emp.project if emp else None),
-        employee_email=(emp.employee_email_id if emp else None),
+        personal_email=(emp.personal_email if emp else None),
+        work_email=(emp.work_email if emp else None),
         contact_no=(emp.contact_no if emp else None),
         has_record=True,
         status=status_for(True, emp.id if emp else None, set()),
+        received_at=_fmt_dt(received_at) or None,
+        stored_at=_fmt_dt(r.created_at) or None,
     )
 
 
 def empty_export_out(
     emp: Employee, month: int, year: int, received_pks: set[str] | None = None,
+    received_at: datetime | None = None,
 ) -> TimesheetExportOut:
     return TimesheetExportOut(
         id=emp.id,
@@ -121,19 +130,23 @@ def empty_export_out(
         source_file_count=0,
         location=emp.location,
         project=emp.project,
-        employee_email=emp.employee_email_id,
+        personal_email=emp.personal_email,
+        work_email=emp.work_email,
         contact_no=emp.contact_no,
         has_record=False,
         status=status_for(False, emp.id, received_pks or set()),
+        received_at=_fmt_dt(received_at) or None,
+        stored_at=None,
     )
 
 
 async def _export_grid(
     db: AsyncSession, month: int, year: int,
-) -> tuple[list[Employee], dict[str, TimesheetRecord], set[str]]:
+) -> tuple[list[Employee], dict[str, TimesheetRecord], set[str], dict[str, Any]]:
     """All matcher employees + any filed record for that month keyed by employee
-    PK, plus the set of employee PKs the pipeline received a sheet for (whether
-    or not it's been filed yet) — same source as the dashboard's coverage."""
+    PK, the set of employee PKs the pipeline received a sheet for (whether
+    or not it's been filed yet) — same source as the dashboard's coverage —
+    and, per employee PK, the earliest moment the pipeline received one."""
     employees = (
         await db.execute(select(Employee).order_by(Employee.name))
     ).scalars().all()
@@ -148,7 +161,8 @@ async def _export_grid(
     ).scalars().all()
     records_by_pk = {r.matched_employee_pk: r for r in period_records if r.matched_employee_pk}
     received_pks = await received_employee_pks(db, month, year)
-    return list(employees), records_by_pk, received_pks
+    received_dates = await received_employee_dates(db, month, year)
+    return list(employees), records_by_pk, received_pks, received_dates
 
 
 @router.get("/export")
@@ -158,8 +172,8 @@ async def export_period(
     db: AsyncSession = Depends(get_db),
 ):
     """Download all matcher employees for one month as XLSX (empty cells if not filed)."""
-    employees, records_by_pk, received_pks = await _export_grid(db, month, year)
-    rows = employees_grid_rows(employees, records_by_pk, month, year, received_pks)
+    employees, records_by_pk, received_pks, received_dates = await _export_grid(db, month, year)
+    rows = employees_grid_rows(employees, records_by_pk, month, year, received_pks, received_dates)
     data = build_timesheet_xlsx(rows, month, year)
     fname = f"timesheets_{year}-{month:02d}.xlsx"
     return Response(
@@ -176,14 +190,15 @@ async def list_by_period(
     db: AsyncSession = Depends(get_db),
 ):
     """All matcher employees for one month — filed rows filled, others empty."""
-    employees, records_by_pk, received_pks = await _export_grid(db, month, year)
+    employees, records_by_pk, received_pks, received_dates = await _export_grid(db, month, year)
     out: list[TimesheetExportOut] = []
     for emp in employees:
         rec = records_by_pk.get(emp.id)
+        received_at = received_dates.get(emp.id)
         if rec:
-            out.append(to_export_out(rec, emp))
+            out.append(to_export_out(rec, emp, received_at))
         else:
-            out.append(empty_export_out(emp, month, year, received_pks))
+            out.append(empty_export_out(emp, month, year, received_pks, received_at))
     return out
 
 

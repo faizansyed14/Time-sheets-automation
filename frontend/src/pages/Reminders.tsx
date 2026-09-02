@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  BellRing, Send, FlaskConical, FileDown, PlayCircle, Search,
+  AlertTriangle, BellRing, Send, FlaskConical, FileDown, PlayCircle, Search,
   CheckCircle2, XCircle, MinusCircle, History,
 } from "lucide-react";
 import {
@@ -331,6 +331,29 @@ export default function RemindersPage() {
           </div>
         }
       />
+
+      {config && !config.sending_enabled && (
+        <div className="mb-4 flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            <span className="font-semibold">Sending is disabled by the backend</span> (REMINDER_SENDING_ENABLED=false
+            in .env). Nothing on this page can actually email right now — not the scheduled run, not "Send now",
+            not "Run for all now", not "Test email" — regardless of the toggle above. An admin edits .env and
+            restarts the backend to change this.
+          </span>
+        </div>
+      )}
+      {config && config.sending_enabled && !config.scheduled_check_enabled && (
+        <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            <span className="font-semibold">The automatic scheduler is disabled by the backend</span>
+            (REMINDER_SCHEDULED_CHECK_ENABLED=false in .env) — the 28th/9am UAE run will never fire on this box,
+            no matter what the "Automatic reminders" toggle above says. Manual sends ("Send now", "Run for all now",
+            "Test email") are unaffected and will still send.
+          </span>
+        </div>
+      )}
 
       <Card className="mb-5 p-4">
         <div className="flex flex-wrap items-end justify-between gap-3">

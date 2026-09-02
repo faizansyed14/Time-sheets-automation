@@ -53,7 +53,5 @@ psql "$(grep -E '^DATABASE_URL' .env | cut -d= -f2- | sed 's#+asyncpg##;s#?ssl=r
   < backup_$(date +%F).sql
 
 # ---- health ----
-curl -fsS http://localhost/health   # nginx gateway container, bound directly on :80
-# App: http://<ec2-public-ip>/   (no domain/TLS configured yet — see
-#   nginx/host-tls.conf.example to add one later; that switches the gateway's
-#   own port binding in docker-compose.prod.yml to 127.0.0.1:8080:80 instead)
+curl -fsS http://localhost:8080/health   # nginx container -> backend (host nginx+certbot proxies 443 -> this)
+# App (via host nginx/certbot): https://yourdomain.com

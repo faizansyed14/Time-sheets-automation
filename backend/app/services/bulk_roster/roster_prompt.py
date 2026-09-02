@@ -152,3 +152,120 @@ def grid_user_block(
         f"TRANSCRIBE EXACTLY THESE {len(wanted)} ROW(S), and only these:\n{listing}\n\n"
         f"{GRID_OUTPUT}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Single-call reader — a SEPARATE prompt pair from CENSUS/GRID above, not a
+# variant of them. Deliberately kept apart so nothing here ever touches what
+# CENSUS/GRID ask for or how they're read.
+#
+# Why this exists, and why it's opposite the census+grid split above: that
+# split protects a LARGE roster from the "long structured reply starts
+# silently skipping rows" failure (see the module intro). A SMALL, single-
+# page roster doesn't carry that risk the same way, so it can be read in one
+# call — census, full day grid, and approval sign-off together — instead of
+# paying for a census call plus several grid-batch calls plus retries.
+#
+# NOTE: this reader currently sends the SAME image detail level as
+# CENSUS/GRID above (not upgraded to high detail) — so it does NOT, on its
+# own, fix small-code legibility (e.g. telling "VC" apart from a tick mark)
+# any better than the census+grid reader already does. Its value here is
+# purely fewer calls for a small roster; see git history / prior discussion
+# if that legibility problem needs revisiting later.
+#
+# roster_extract.py tries this FIRST for a single-page vision-read roster;
+# it never raises, and any imperfect/incomplete read falls straight back to
+# the proven CENSUS/GRID reader above with zero effect on that path.
+# --------------------------------------------------------------------------- #
+SINGLE_CALL_SYSTEM = """You are reading, in ONE pass, a COMPLETE multi-employee monthly
+attendance roster: one printed table where each ROW is a different person and the day
+columns to the right are that person's calendar days — typically a tick/check mark for a
+normal working day and a short code (letters, e.g. "H", "SL", "VC") for anything else,
+though you must read whatever this specific sheet actually prints, verbatim.
+
+List EVERY employee row, in printed order, with none skipped and none invented, and give
+each one's COMPLETE day-by-day grid, from day 1 to the last day of the month. Missing a
+person or a day is a serious error; inventing one that is not really there is equally
+serious. If a specific cell is genuinely too unclear to call, say so rather than guess —
+do not silently pick whichever code seems more likely."""
+
+SINGLE_CALL_USER_RULES = """WHAT TO READ
+
+Document header (once, from the title/top area):
+  - month and year of the period, however it is printed
+  - "Calendar Days: N" if printed
+  - the agency/vendor name if printed
+
+Approval sign-off (once, if this page shows it):
+  - Look for an "Approved by" / sign-off line, usually near the bottom of the page.
+  - Does it show an actual handwritten signature or stamp mark — as opposed to a
+    blank line, dots/underscores with nothing on them, or only a printed name/title?
+  - If this page has no such line at all, say so — do not guess "no signature" for a
+    page that simply doesn't contain the sign-off area.
+
+Per employee row, copy EXACTLY what is printed:
+  - sr_no          the Sr No / S.No / serial number of the row, as an integer
+  - name           the Resource Name / Employee Name, verbatim
+  - title          the Title / Position / Designation column, verbatim, if present
+  - location       the Loc. / Location column, if present
+  - employee_id    ONLY if the roster actually has an employee-ID column; else null
+  - confirmation   the "Emp. Timesheet Confirmation" / status column, if present
+  - leave_days     the number printed in a "Leave Days" column (number, not text), else null
+  - billing_days   the number printed in a "Billing Days" column, else null
+  - days           one code per calendar day, 1 through the last day of the month —
+                    see HOW TO READ A ROW'S DAY CELLS below
+
+HOW TO READ A ROW'S DAY CELLS
+- Work left to right across every day column, using the numbered header as the ruler.
+- Emit one entry per calendar day from 1 to the stated number of days, with no gaps.
+- Copy the code verbatim — a literal tick/check mark, a letter code, whatever this
+  sheet actually prints. Do not translate a tick mark into a word, and do not decide
+  what a code MEANS — that interpretation happens in a later step, not here.
+- A genuinely EMPTY cell is "" (empty string). Do NOT substitute a tick mark or any
+  other code for a blank — a blank is information and is checked later. Likewise never
+  substitute a blank for a cell that DOES have a mark, even a faint one.
+- Shaded/coloured cells (weekends are often tinted) still have their own printed mark —
+  read the mark, not the colour.
+- If the sheet prints a Key/Legend for its codes, that legend is authoritative for what
+  a code MEANS on this specific document — but your job here is still to copy the code
+  exactly as printed, not to translate it using the legend.
+
+RULES
+- Copy names character-for-character. Do not correct spelling, expand initials, reorder
+  first/last, or tidy capitalisation.
+- A name that wraps onto two printed lines is still ONE employee.
+- If a column does not exist on this roster, use null. Never invent a value.
+- Do not merge two people who share a name — they are separate rows with separate
+  sr_no values."""
+
+SINGLE_CALL_OUTPUT = """Return EXACTLY this JSON and nothing else (no markdown fence):
+{
+  "month": <1-12 or null>,
+  "year": <4-digit year or null>,
+  "calendar_days": <integer or null>,
+  "agency": "<string or null>",
+  "approval_signature": {
+    "present": <true if this page shows an actual signature/stamp on an "Approved by"
+                line, false if that line is blank/unsigned, null if this page has no
+                such line at all>,
+    "detail": "<one short phrase describing what you see, or null>"
+  },
+  "employees": [
+    {
+      "sr_no": <integer>,
+      "name": "<verbatim>",
+      "title": "<string or null>",
+      "location": "<string or null>",
+      "employee_id": "<string or null>",
+      "confirmation": "<string or null>",
+      "leave_days": <number or null>,
+      "billing_days": <number or null>,
+      "days": {"1": "<code>", "2": "<code>", ..., "<N>": "<code>"}
+    }
+  ],
+  "rows_visible": <integer: how many employee rows you could see in total>
+}"""
+
+
+def single_call_user_block() -> str:
+    return f"{SINGLE_CALL_USER_RULES}\n\n{SINGLE_CALL_OUTPUT}"

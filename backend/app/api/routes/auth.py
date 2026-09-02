@@ -178,7 +178,7 @@ async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_
     return LoginResult(
         status="otp_required", login_token=login_token, user=_user_out(user),
         message=f"A code was sent to {_mask_email(user.email)}.",
-        debug_otp=(res.code if not settings.is_prod else None),
+        debug_otp=(res.code if settings.debug_otp_enabled else None),
     )
 
 
@@ -257,7 +257,7 @@ async def resend_otp(body: ResendOtpIn, request: Request, db: AsyncSession = Dep
     send_otp_email_task.delay(user.email if user else "", res.code or "")
     return LoginResult(status="otp_required", login_token=body.login_token,
                        message="A new code was sent.",
-                       debug_otp=(res.code if not settings.is_prod else None))
+                       debug_otp=(res.code if settings.debug_otp_enabled else None))
 
 
 @router.get("/captcha")

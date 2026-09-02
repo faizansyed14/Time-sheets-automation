@@ -37,6 +37,13 @@ os.environ.update(
     EMAIL_PROVIDER="mock",
     FINGERPRINT_REQUIRED="true",
     OTP_RESEND_COOLDOWN_SECONDS="0",
+    # This used to ride along with ENVIRONMENT != "prod" (which tests also
+    # set), but that's now a real deployment's own choice, decoupled from
+    # environment name — see core/config.py's debug_otp_enabled docstring.
+    # Tests need this explicitly on so login_2fa() below (used by nearly
+    # every test needing an authenticated client) can read the code straight
+    # off the response instead of sending real email on every run.
+    DEBUG_OTP_ENABLED="true",
     LOGIN_RATE_MAX="1000",
     OTP_VERIFY_RATE_MAX="1000",
     TOTP_VERIFY_RATE_MAX="1000",
@@ -48,10 +55,21 @@ os.environ.update(
     GRAPH_CLIENT_SECRET="",
     GRAPH_MAILBOX="",
     GRAPH_OTP_SENDER="",
+    # Explicitly true regardless of whatever the real box's .env says — the
+    # actual container this runs in may have REMINDER_SENDING_ENABLED=false
+    # for its own real reasons, and that must never leak into the test run
+    # (confirmed the hard way: without this override, test_reminders.py's
+    # send-path tests fail on a real box with real employee data loaded,
+    # since GRAPH_* being blank above is what actually keeps every "send" in
+    # this suite from reaching a real mailbox — see test_reminders.py's own
+    # docstring). Same reasoning for OTP_SENDING_ENABLED.
+    REMINDER_SENDING_ENABLED="true",
+    OTP_SENDING_ENABLED="true",
     # Kept off in tests too, matching the real .env's deliberate kill-switch —
-    # see core/celery_app.py. The reminder feature is not to be exercised
-    # right now (real employee data), so this stays false everywhere rather
-    # than being flipped on just to make one test's assertion pass.
+    # see core/celery_app.py. Independent of REMINDER_SENDING_ENABLED above:
+    # this one only controls whether the scheduled-check TEST exercises the
+    # "beat task doesn't exist" path; actual sends in other tests are gated
+    # by REMINDER_SENDING_ENABLED, not this.
     REMINDER_SCHEDULED_CHECK_ENABLED="false",
     # "missing" is a non-empty key so require_vision_configured() doesn't
     # block the thread pipeline in tests — the vision call itself is

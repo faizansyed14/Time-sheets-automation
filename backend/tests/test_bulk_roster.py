@@ -27,9 +27,17 @@ from app.services.bulk_roster.roster_parse import (
 def _roster_group(day_codes: dict[int, str], month: int = 7, year: int = 2026) -> dict:
     """The same {issues -> auto_accept} shape roster_stage.build_groups()
     actually produces for one row, without needing a DB session — enough to
-    prove the row-level flags reach auto_accept.evaluate() and block it."""
+    prove the row-level flags reach auto_accept.evaluate() and block it.
+
+    Passes the row's OWN correct totals into verify_row_totals(), the way a
+    real wide-format roster prints them (see test_no_stated_totals_... for
+    the separate, deliberately-always-flagged case where a format prints no
+    totals at all) — so these tests isolate the ambiguous-code/half-day
+    blocking behavior specifically, without the "nothing was verified" flag
+    also firing on every row here."""
     fields, uncertain, day_issues = distribute_days(day_codes, month, year)
-    issues = day_issues + verify_row_totals(day_codes, None, None, 31)
+    stated_leave = sum(leave_weight(c) for c in day_codes.values())
+    issues = day_issues + verify_row_totals(day_codes, stated_leave, 31 - stated_leave, 31)
     return {
         "employee_pk": "pk-1", "name": "Test Employee", "employee_id": "E1",
         "month": month, "year": year,
@@ -138,11 +146,17 @@ def test_half_days_reconcile_and_are_still_flagged():
     assert any("half-day" in i for i in issues)
 
 
-def test_no_stated_totals_means_no_mismatch_claimed():
+def test_no_stated_totals_means_no_false_mismatch_but_still_flags_for_review():
     """A roster without the summary columns simply can't be cross-checked —
-    that must not manufacture a false failure."""
+    that must not manufacture a false MISMATCH claim, but it also must not
+    look "clean" when nothing was actually verified: a format with no
+    printed totals (e.g. PGC's "Certificate of Attendance") gets an explicit
+    "review this directly" flag instead of silently qualifying for
+    auto-accept on the strength of a check that never happened."""
     codes = {d: "P" for d in range(1, 32)}
-    assert verify_row_totals(codes, None, None, 31) == []
+    issues = verify_row_totals(codes, None, None, 31)
+    assert not any("mismatch" in i or "don't add up" in i for i in issues)
+    assert any("prints no Leave/Billing" in i for i in issues)
 
 
 # ------------------------------------------- ambiguous L / HD forces review
@@ -181,8 +195,9 @@ def test_l_or_hd_blocks_even_when_the_rows_own_totals_still_reconcile():
     codes = {d: "P" for d in range(1, 32)}
     codes[10] = codes[11] = "L"
     decision = auto_accept.evaluate(_roster_group(codes))
-    # The checksum has nothing to disagree with (no stated totals passed in
-    # here), yet the row must still be blocked purely for the L ambiguity.
+    # The checksum has nothing to disagree with (the row's own totals
+    # reconcile perfectly), yet the row must still be blocked purely for the
+    # L ambiguity.
     assert decision.accepted is False
     assert any("marked only as" in b for b in decision.blockers)
 

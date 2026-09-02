@@ -100,7 +100,7 @@ class ThreadDetail(BaseModel):
     summary: dict | None = None
 
 
-# ---- agentic chat ----
+# ---- generic AI chat ----
 class ChatMessageIn(BaseModel):
     role: str            # "user" | "assistant"
     content: str
@@ -110,35 +110,12 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessageIn]
 
 
-class ChatChange(BaseModel):
-    record_id: str
-    employee_name: str | None = None
-    month: int
-    year: int
-    month_name: str | None = None
-    leave_type: str
-    action: str          # add | set | clear
-    before: list[str] = []
-    after: list[str] = []
-    added: list[str] = []
-    removed: list[str] = []
-
-
 class ChatResponse(BaseModel):
     answer: str
-    changes: list[ChatChange] = []
-    tools_used: list[str] = []
     error: str | None = None
 
 
-class ChatPromptGroup(BaseModel):
-    group: str
-    prompts: list[str]
-
-
 class ChatSuggestions(BaseModel):
-    suggestions: list[str]
-    prompt_book: list[ChatPromptGroup]
     enabled: bool          # whether an AI provider is configured
     model: str | None = None
 
@@ -205,13 +182,21 @@ class TimesheetExportOut(TimesheetOut):
     """Timesheet row plus matcher fields for the Export page / XLSX."""
     location: str | None = None
     project: str | None = None
-    employee_email: str | None = None
+    personal_email: str | None = None
+    work_email: str | None = None
     contact_no: str | None = None
     has_record: bool = True
     # "Received & Stored" | "Received & Not Stored" | "Not Received" — same
     # three-way split as the dashboard's submitted/awaiting-review/missing
     # (see app/services/export/timesheet_export.py's ExportStatus).
     status: str = ""
+    # When the pipeline first received something for this employee this
+    # period (from PipelineFile), and when it was actually filed
+    # (TimesheetRecord.created_at) — "Received & Not Stored" rows have the
+    # first without the second. Pre-formatted strings ("YYYY-MM-DD HH:MM"),
+    # not raw datetimes — this is a display-only export field.
+    received_at: str | None = None
+    stored_at: str | None = None
 
 
 class DashboardRow(BaseModel):

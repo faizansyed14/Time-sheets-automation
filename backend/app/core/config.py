@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     # Retry copies are normally deleted as soon as a file succeeds; this caps how
     # long a STILL-failed file's original is kept before it is purged, so the
     # raw store can never grow without bound. 0 disables the age purge.
-    pipeline_raw_retention_days: int = 60
+    pipeline_raw_retention_days: int = 120
 
     # Which email provider to use: "mock" now, "graph" later.
     email_provider: str = "mock"
@@ -78,6 +78,23 @@ class Settings(BaseSettings):
     # prod employee data is loaded — the DB toggle alone is not enough because
     # beat still fires hourly (it just no-ops). Set false to skip the task entirely.
     reminder_scheduled_check_enabled: bool = True
+    # Hard, unconditional kill-switch for actually EMAILING a reminder —
+    # independent of reminder_scheduled_check_enabled above (which only
+    # controls whether the hourly scheduled check runs at all) and independent
+    # of ReminderConfig.auto_send_enabled (the DB toggle on the Reminders page).
+    # This is checked in the one place that actually calls the mailer
+    # (reminders/mailer.py's send_reminder_email), so it covers every path —
+    # the scheduled run, "Run for all now", "Send now", and the test-email
+    # panel — not just the scheduled one. Set false in an environment that
+    # holds real employee data (e.g. local dev) so NOTHING can ever actually
+    # send, no matter what the scheduler or the in-app toggle say.
+    # Defaults FALSE — secure by default: a fresh clone/deploy that never
+    # explicitly sets this must never be able to email real employees just
+    # because someone forgot a line in .env. A real production box has to
+    # opt IN explicitly. (Tests set this true for themselves — see
+    # tests/conftest.py — so this default doesn't affect what the test suite
+    # exercises.)
+    reminder_sending_enabled: bool = False
     # Image attachments smaller than this are signature logos/icons in
     # practice: hidden from attachment lists/counts and never sent to the
     # vision model. Applies ONLY to images — documents of any size still flow.
@@ -227,6 +244,27 @@ class Settings(BaseSettings):
     default_admin_username: str = "admin"
     default_admin_password: str = "admin"
     default_admin_email: str = "admin@example.com"
+
+    # Hard, unconditional kill-switch for actually EMAILING an OTP code —
+    # completely independent of reminder_sending_enabled above (two separate
+    # flows, two separate switches; flipping one never touches the other).
+    # Checked in the one place that actually calls Graph (auth/email_otp.py's
+    # send_otp_email). When false, the code is never emailed but login still
+    # works if debug_otp_enabled (below) is also on for this box; otherwise
+    # it behaves exactly like a real deployment where the mailbox is down.
+    otp_sending_enabled: bool = True
+    # Whether /auth/login and /auth/resend-otp hand the OTP code straight back
+    # in the response (api/routes/auth.py's debug_otp field) instead of
+    # requiring the real emailed one. Used to be implicitly tied to
+    # `environment != "prod"`, so LOCAL and DEV both got the shortcut and only
+    # PROD didn't — deliberately decoupled from environment now: every real
+    # deployment (local/dev/prod alike) defaults to false, so logging in
+    # always exercises the real send-and-check-your-inbox path, the same one
+    # prod uses. The ONE place this stays true is the test suite, which sets
+    # DEBUG_OTP_ENABLED=true itself (see tests/conftest.py) so its login
+    # helper isn't sending real email on every test run — that's a test-only
+    # override, not a reason to flip this default for a real box.
+    debug_otp_enabled: bool = False
 
     # OTP lifecycle
     otp_length: int = 6

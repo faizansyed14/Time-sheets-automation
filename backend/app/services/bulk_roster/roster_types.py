@@ -62,6 +62,14 @@ class RosterDoc:
     agency: str | None = None
     rows: list[RosterRow] = field(default_factory=list)
 
+    # A signature/stamp mark next to an "Approved by" line, if the census
+    # pass found one on the page. A coarse VISUAL signal only, not a
+    # verified signoff — roster_stage._row_approval() folds this into each
+    # row's approval evidence alongside the title/confirmation-column
+    # checks it already did.
+    approval_signature_detected: bool = False
+    approval_signature_detail: str | None = None
+
     # How the document was read: "xlsx-cells" (deterministic, no LLM) or
     # "vision-roster" (census + chunked grid). Surfaced to the reviewer,
     # because the two carry genuinely different confidence.

@@ -53,6 +53,14 @@ def _row_approval(doc: RosterDoc, row: RosterRow) -> tuple[bool, str]:
                       f"confirmation column reads \"{confirm}\".")
     if title_says:
         return True, "Roster is titled as an approved monthly timesheet."
+    if doc.approval_signature_detected:
+        # A document-level signal (one sign-off line covers the whole roster,
+        # not one per employee) — a coarse visual read, not a verified
+        # signoff, so it's worded as such rather than as a confirmed fact.
+        return True, (
+            "A signature/stamp was found on this roster's own \"Approved by\" line"
+            + (f" ({doc.approval_signature_detail})." if doc.approval_signature_detail else ".")
+            + " Applies to every row on this roster; confirm in Review if in doubt.")
     if confirm:
         return False, (f"This row's confirmation column reads \"{confirm}\", which does not "
                        f"itself state manager approval — confirm in Review.")
@@ -83,8 +91,11 @@ async def build_groups(db: AsyncSession, doc: RosterDoc) -> tuple[list[dict], li
     # otherwise re-fetch the whole employee table per roster row, which is
     # what made staging a large roster slow. Read-only for the life of this
     # call, so reusing it produces identical matches to fetching it fresh
-    # each time — see matching.py's _match_by_name docstring.
-    all_employees = (await db.execute(select(Employee))).scalars().all()
+    # each time — see matching.py's _match_by_name docstring. Active only —
+    # a deactivated row must never compete with the real, current employee.
+    all_employees = (await db.execute(
+        select(Employee).where(Employee.active.is_(True))
+    )).scalars().all()
 
     doc_key = doc.title or ""
     groups: list[dict] = []

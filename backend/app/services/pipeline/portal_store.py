@@ -23,6 +23,23 @@ def _safe(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]+', "_", name or "file") or "file"
 
 
+def _contained(root, candidate):
+    """Real path containment, not a string-prefix check — same technique as
+    storage_provider/local_provider.py's LocalStorageProvider._abs. Every
+    caller here passes rel_path from a DB row (PortalSubmissionFile.
+    stored_path), never straight from a request param, so this is defense in
+    depth rather than closing a directly-reachable hole — cheap enough to
+    apply anyway."""
+    root = root.resolve()
+    try:
+        p = candidate.resolve()
+    except Exception:
+        return None
+    if p != root and not p.is_relative_to(root):
+        return None
+    return p
+
+
 def _use_s3() -> bool:
     return (settings.storage_provider or "local").lower() == "s3" and bool(settings.s3_bucket)
 
@@ -72,12 +89,8 @@ def read_portal_file(rel_path: str | None) -> bytes | None:
             return obj["Body"].read()
         except Exception:
             return None
-    p = settings.portal_uploads_path / rel_path
-    try:
-        p = p.resolve()
-        return p.read_bytes() if p.is_file() else None
-    except Exception:
-        return None
+    p = _contained(settings.portal_uploads_path, settings.portal_uploads_path / rel_path)
+    return p.read_bytes() if p is not None and p.is_file() else None
 
 
 def delete_portal_file(rel_path: str | None) -> None:

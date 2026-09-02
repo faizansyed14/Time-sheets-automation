@@ -41,8 +41,8 @@ class Employee(Base):
     dco_number: Mapped[str | None] = mapped_column(String, nullable=True)
     account_manager: Mapped[str | None] = mapped_column(String, nullable=True)
     # The resolved "primary" address (work if set, else personal) — kept for
-    # every existing caller that just needs ONE usable address (chat_tools,
-    # exports, inbox matching). Reminders is the one caller that does NOT use
+    # every existing caller that just needs ONE usable address (exports,
+    # inbox matching). Reminders is the one caller that does NOT use
     # this — it lets the sender explicitly choose work vs personal instead
     # (see reminders/service.py's resolve_email).
     employee_email_id: Mapped[str | None] = mapped_column(String, nullable=True)

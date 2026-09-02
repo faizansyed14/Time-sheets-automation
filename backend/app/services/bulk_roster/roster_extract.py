@@ -1,13 +1,20 @@
 """Roster extraction orchestration: census -> chunked day grid -> reconcile.
 
-Route through here for ANY bulk roster file. The two read strategies are
-chosen automatically:
+Route through here for ANY bulk roster file. The read strategy is chosen
+automatically, in order:
 
-  XLSX / CSV  ->  roster_parse.parse_roster_cells (deterministic, zero LLM
-                  calls, exact by construction). Always preferred.
-  PDF / image / DOCX  ->  the vision path below.
+  1. XLSX / CSV  ->  roster_parse.parse_roster_cells (deterministic, zero LLM
+                     calls, exact by construction). Always preferred.
+  2. PDF / image / DOCX, single page  ->  _single_call_roster (see below):
+                     one call reading everything at once. Tried first for a
+                     single-page vision-read roster; NEVER raises, and
+                     anything short of a clean, complete read falls straight
+                     through to step 3 with zero effect on it — it is a
+                     strict addition, not a replacement.
+  3. Anything else (multi-page, or step 2 didn't produce a clean read)  ->
+                     the census + chunked grid path below.
 
-The vision path's contract, and the reason it can be trusted at 100+ people:
+Step 3's contract, and the reason it can be trusted at 100+ people:
 
   1. CENSUS every page. This alone decides the headcount. Pages are read
      independently and merged by Sr No, so a roster that runs across four
@@ -21,10 +28,18 @@ The vision path's contract, and the reason it can be trusted at 100+ people:
   4. VERIFY each row against the roster's own printed Leave/Billing totals
      (roster_codes.verify_row_totals). Mismatches ride into the staged row's
      flags, which blocks auto-accept and puts it in front of a human.
+
+Step 2 (_single_call_roster) is a deliberately SEPARATE reader: same image
+detail level as step 3 (not upgraded), so its benefit is fewer calls for a
+small roster, not better legibility of small codes — see roster_prompt.py's
+own SINGLE CALL section for the full reasoning. It does not touch step 3 in
+any way; nothing about step 3's prompts, batching, or behavior changed to
+add it.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from app.services.bulk_roster import roster_prompt
 from app.services.bulk_roster.roster_codes import days_in_month, normalise_code
@@ -36,6 +51,22 @@ from app.services.bulk_roster.roster_types import RosterDoc, RosterRow
 # quietly truncated — truncation is the one failure mode this flow exists to
 # eliminate.
 MAX_EMPLOYEES = 300
+
+log = logging.getLogger("bulk_roster.extract")
+if not log.handlers:
+    # This app's own custom loggers only use warning()/exception() elsewhere
+    # (e.g. thread_extract.py), which pass through the default logging setup
+    # fine — but this module needs info()-level visibility specifically (see
+    # _single_call_roster below), and a bare custom logger's info() calls are
+    # silently dropped under Python's default WARNING root level with no
+    # confirmed handler in this deployment. Give this logger its own explicit
+    # handler + level so its output reaches `docker logs` regardless of
+    # whatever the ambient uvicorn/root config happens to be.
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s"))
+    log.addHandler(_handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
 
 # Employees per day-grid call. Small on purpose: short replies are where
 # transcription stays reliable. 10 rows x 31 days is ~310 cells, comfortably
@@ -246,13 +277,145 @@ def _apply_grid(row: RosterRow, payload: dict, dim: int) -> None:
         row.issues.append(f"reader note: {note}")
 
 
+async def _single_call_roster(images: list[bytes], model: str, api_key: str) -> RosterDoc | None:
+    """One call: census + full day grid + approval sign-off, together — same
+    image detail level as the census+grid reader (not upgraded), so the win
+    here is fewer calls for a small roster, not better small-code legibility
+    — see roster_prompt.py's SINGLE CALL section for why this exists and how
+    it differs from the census+grid split below.
+
+    NEVER raises. Returns None on anything short of a clean, complete read —
+    a parse failure, no month/year, no rows, an incomplete row, or the
+    model's own rows_visible count disagreeing with what it actually
+    listed — so the caller falls back to the proven census+grid reader with
+    zero cost to that path. Only ever ADDS a chance of a better read; never
+    a chance of a worse one, since an imperfect result here changes nothing
+    about what runs next."""
+    from app.services.extraction.vision_client import chat_call, image_block, text_block
+
+    if len(images) != 1:
+        log.info("single-call roster: skipped (%d pages, only single-page rosters try this)", len(images))
+        return None  # multi-page rosters keep using the page-independent census+grid reader
+
+    try:
+        data = await chat_call(
+            roster_prompt.SINGLE_CALL_SYSTEM,
+            [image_block(images[0]), text_block(roster_prompt.single_call_user_block())],
+            model, api_key, label="roster-single-call",
+            # Same reasoning as the GRID pass (roster_extract._read_grid_batch):
+            # this call is pure literal transcription of ~700 day-cells, not a
+            # judgment call — the model's default reasoning trace competes with
+            # the actual JSON answer for the same token budget, and for a reply
+            # this large that likely means MOST of it, leaving little room to
+            # actually write out the employees array. Disable it, matching the
+            # grid pass's own established, trusted precedent for this exact
+            # class of task.
+            enable_thinking=False,
+        )
+    except Exception as e:
+        log.info("single-call roster: falling back — the call itself failed: %s", e)
+        return None
+    if not isinstance(data, dict):
+        log.info("single-call roster: falling back — reply was not valid JSON (got %s)", type(data).__name__)
+        return None
+
+    doc = RosterDoc(method="vision-roster-single-call", model=model, llm_calls=1)
+    doc.month = _as_int(data.get("month"))
+    doc.year = _as_int(data.get("year"))
+    doc.calendar_days = _as_int(data.get("calendar_days"))
+    doc.agency = _clean_str(data.get("agency"))
+    sig = data.get("approval_signature")
+    if isinstance(sig, dict) and sig.get("present"):
+        doc.approval_signature_detected = True
+        doc.approval_signature_detail = _clean_str(sig.get("detail"))
+
+    if not (doc.month and doc.year):
+        log.info("single-call roster: falling back — no month/year read (month=%r, year=%r)",
+                 doc.month, doc.year)
+        return None
+    dim = doc.calendar_days or days_in_month(doc.month, doc.year)
+
+    by_key: dict[int, RosterRow] = {}
+    for e in data.get("employees") or []:
+        if not isinstance(e, dict):
+            continue
+        name = _clean_str(e.get("name"))
+        if not name:
+            continue
+        sr = _as_int(e.get("sr_no")) or (max(by_key) + 1 if by_key else 1)
+        if sr in by_key:
+            continue
+        row = RosterRow(
+            sr_no=sr, name=name,
+            title=_clean_str(e.get("title")),
+            location=_clean_str(e.get("location")),
+            employee_id=_clean_str(e.get("employee_id")),
+            confirmation=_clean_str(e.get("confirmation")),
+            stated_leave_days=_as_float(e.get("leave_days")),
+            stated_billing_days=_as_float(e.get("billing_days")),
+        )
+        days = e.get("days")
+        if isinstance(days, dict):
+            codes: dict[int, str] = {}
+            for k, v in days.items():
+                d = _as_int(k)
+                if d is not None and 1 <= d <= dim:
+                    codes[d] = str(v or "").strip()
+            row.day_codes = codes
+        by_key[sr] = row
+
+    doc.rows = [by_key[k] for k in sorted(by_key)]
+    if not doc.rows:
+        raw_employees = data.get("employees")
+        log.info("single-call roster: falling back — no employee rows in the reply "
+                 "(raw \"employees\" value was: %s)",
+                 repr(raw_employees)[:800])
+        return None
+    # The same tripwire the census pass uses: the model's own count of rows
+    # it could SEE vs rows it actually listed. A mismatch means this read
+    # already dropped someone — don't trust it, fall back instead.
+    claimed = _as_int(data.get("rows_visible"))
+    if claimed is not None and claimed > len(doc.rows):
+        log.info("single-call roster: falling back — model reported seeing %d rows but only listed %d",
+                 claimed, len(doc.rows))
+        return None
+    # Every row needs a COMPLETE grid — a single-call reply that ran out of
+    # room mid-row gets no benefit of the doubt here; this strategy has no
+    # reconciliation/retry step of its own to recover a partial row.
+    incomplete = [(r.sr_no, r.name, len(r.day_codes)) for r in doc.rows if len(r.day_codes) < dim]
+    if incomplete:
+        log.info("single-call roster: falling back — %d row(s) had an incomplete day grid "
+                 "(expected %d days): %s", len(incomplete), dim, incomplete[:5])
+        return None
+
+    doc.calendar_days = dim
+    log.info("single-call roster: succeeded — %d employee(s), %d days, 1 call", len(doc.rows), dim)
+    return doc
+
+
 async def _vision_roster(filename: str, data: bytes) -> RosterDoc:
     from app.services.extract_email.thread_extract import require_vision_configured
 
     api_key, model = require_vision_configured()
     images = _page_images(filename, data)
 
+    single = await _single_call_roster(images, model, api_key)
+    if single is not None:
+        return single
+
+    log.info("falling back to census+grid reader (see the single-call log line above for why)")
     doc, calls = await _census(images, model, api_key)
+    if not doc.rows:
+        # A census that found NOBODY on every page is rare — usually a
+        # transient issue on one call (a dropped connection, a malformed
+        # JSON reply), not that the document is genuinely unreadable. For a
+        # short document (few pages) that has an outsized effect: one bad
+        # call IS the whole result, with no other page to fall back on. One
+        # full retry, the same reasoning as the grid pass's own per-row
+        # retry, recovers the ordinary case; only a document that ALSO
+        # fails on retry is reported as unreadable below.
+        doc, more_calls = await _census(images, model, api_key)
+        calls += more_calls
     if not doc.rows:
         raise ValueError(
             "No employee rows could be read from this document — if it is a single "
@@ -318,8 +481,61 @@ async def _vision_roster(filename: str, data: bytes) -> RosterDoc:
             + ", ".join(f"{r.name} (Sr {r.sr_no})" for r in still_missing[:5])
             + (" …" if len(still_missing) > 5 else ""))
 
+    # A roster style with no printed Leave/Billing totals at all (e.g. PGC's
+    # "Certificate of Attendance") gives verify_row_totals() nothing to
+    # cross-check the grid against — a misread cell has no arithmetic to
+    # catch it. Compensate with a genuinely SECOND, independent read of every
+    # row and compare cell-by-cell, so a disagreement between the two reads
+    # becomes a specific, dated flag instead of the read being trusted on its
+    # own. Gated to totals-less rosters only — a roster that DOES print
+    # totals already gets that check for free and doesn't pay for a second
+    # full grid pass.
+    if doc.rows and all(r.stated_leave_days is None and r.stated_billing_days is None
+                        for r in doc.rows):
+        log.info("no printed Leave/Billing totals on this roster — running a corroborating "
+                 "second read (%d more call(s))", len(batches))
+        second_results = await asyncio.gather(*(
+            _read_grid_batch(images, b, dim, month_label, model, api_key, sem,
+                             f"roster-grid-verify-b{i + 1}")
+            for i, b in enumerate(batches)
+        ), return_exceptions=True)
+        calls += len(batches)
+        second_merged: dict[int, dict] = {}
+        for res in second_results:
+            if not isinstance(res, BaseException):
+                second_merged.update(res)
+
+        for row in doc.rows:
+            if not row.day_codes:
+                continue  # already flagged above — nothing to compare a first read against
+            second = second_merged.get(row.sr_no)
+            if not isinstance(second, dict) or not isinstance(second.get("days"), dict):
+                row.issues.append(
+                    "a corroborating second read could not be completed for this row — "
+                    "this format prints no totals to verify against either way, so review "
+                    "the day-by-day cells directly")
+                continue
+            second_codes: dict[int, str] = {}
+            for k, v in second["days"].items():
+                d = _as_int(k)
+                if d is not None and 1 <= d <= dim:
+                    second_codes[d] = str(v or "").strip()
+            disagreements = [
+                d for d in range(1, dim + 1)
+                if normalise_code(row.day_codes.get(d, "")) != normalise_code(second_codes.get(d, ""))
+            ]
+            if disagreements:
+                shown = ", ".join(str(d) for d in disagreements[:8])
+                row.issues.append(
+                    f"a second independent read disagreed with the first on day(s) {shown}"
+                    + (" …" if len(disagreements) > 8 else "")
+                    + " — this format has no printed total to check against, so both reads "
+                      "were compared directly; check these dates against the original file")
+
     doc.calendar_days = dim
     doc.llm_calls = calls
+    log.info("census+grid reader finished — %d employee(s), %d total AI call(s)",
+             len(doc.rows), calls)
     return doc
 
 

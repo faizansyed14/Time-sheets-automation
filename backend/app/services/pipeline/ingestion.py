@@ -221,11 +221,15 @@ async def _find_existing(
     for r in rows:
         if r.matched_employee_pk and matched_pk and r.matched_employee_pk != matched_pk:
             continue
-        # id alone is NOT enough (shared across teams) — require the name too.
-        if employee_id and r.employee_id == employee_id:
-            if name_norm and (r.employee_name or "").strip().lower() == name_norm:
-                return r
-            if not name_norm:
+        # id alone is NOT enough (AUH/DXB share employee_id ranges) — the name
+        # must also agree. A blank name (nothing usable extracted/typed) can
+        # NEVER merge on id alone, even for a legacy row with no
+        # matched_employee_pk yet — that would risk silently merging this
+        # entry's leave into a DIFFERENT person's month record just because
+        # they happen to share a raw id. Safer to fall through to "no
+        # existing match" (the caller then files a new record) than guess.
+        if employee_id and r.employee_id == employee_id and name_norm:
+            if (r.employee_name or "").strip().lower() == name_norm:
                 return r
         elif name_norm and (r.employee_name or "").strip().lower() == name_norm:
             return r
@@ -435,7 +439,29 @@ async def _tracker_bytes(tracker: PipelineFile) -> tuple[bytes, str]:
 
 async def retry_pipeline_file(db: AsyncSession, tracker: PipelineFile) -> tuple[TimesheetRecord | None, PipelineFile]:
     """Re-run the ANALYSIS for a tracked file and re-stage it for review —
-    retry never files a record directly (everything goes through Compare & Fix)."""
+    retry never files a record directly (everything goes through Compare & Fix).
+
+    NOT valid for a bulk-roster-sourced tracker (source_kind == "bulk") — see
+    the guard immediately below for why."""
+    if tracker.source_kind == "bulk":
+        # A roster-derived tracker's "file" is really one row on a shared,
+        # multi-employee document. analyse_upload() below runs the SAME
+        # single-submission reader as Extract Email/Upload — pointed at a
+        # 22-person roster image, it has no notion of "read just this one
+        # row" and would misread the whole grid as if it belonged to one
+        # person, silently overwriting this employee's correct roster-read
+        # day_codes with garbage. Block it here rather than let that happen
+        # invisibly; re-staging the whole roster (Bulk Upload) is the
+        # correct, already-supported way to refresh this row — it updates
+        # every employee on the same roster (matched by thread_key) with a
+        # fresh roster-aware read, this one included.
+        raise ValueError(
+            "This file is one employee's row on a shared roster upload — Retry can't "
+            "safely re-read just their row (it would run the single-submission reader "
+            "against the whole multi-employee roster image, which reads it wrong). "
+            "Re-upload the SAME roster file via Bulk Upload instead — re-staging "
+            "refreshes every employee's row on it, including this one."
+        )
     from app.services.agents import full_email_extract as fx
     from app.services.extract_email import auto_accept
     from app.services.extract_email.staging import group_flags, sheet_summaries, summarize_group

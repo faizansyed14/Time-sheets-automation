@@ -10,7 +10,9 @@ are all real channels, that scoping was silently making the Dashboard and
 Export show "Missing" for people who had, in fact, already submitted."""
 from __future__ import annotations
 
-from sqlalchemy import ColumnElement, select
+from datetime import datetime
+
+from sqlalchemy import ColumnElement, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.pipeline_file import PipelineFile
@@ -51,3 +53,26 @@ async def received_employee_pks(db: AsyncSession, month: int, year: int) -> set[
     employee in Python rather than compose it into a further SQL query."""
     rows = (await db.execute(received_subq(month, year))).scalars().all()
     return set(rows)
+
+
+async def received_employee_dates(db: AsyncSession, month: int, year: int) -> dict[str, datetime]:
+    """Employee PK -> the EARLIEST PipelineFile.created_at the pipeline has
+    for them this month/year — "when the timesheet was received", for the
+    export (a person can show up on more than one file in the same period,
+    e.g. weekly sheets; the earliest one is what "received" should mean, not
+    whichever happened to file last). Same identity source as received_subq
+    (staged employee_pk), just keeping the timestamp instead of only
+    membership."""
+    pk = staged_employee_pk()
+    rows = (
+        await db.execute(
+            select(pk, func.min(PipelineFile.created_at))
+            .where(
+                PipelineFile.month == month,
+                PipelineFile.year == year,
+                pk.is_not(None),
+            )
+            .group_by(pk)
+        )
+    ).all()
+    return {row[0]: row[1] for row in rows}

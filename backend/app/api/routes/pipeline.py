@@ -414,6 +414,8 @@ async def retry_pipeline(pipeline_id: str, db: AsyncSession = Depends(get_db)):
         _rec, t = await retry_pipeline_file(db, t)
     except FileNotFoundError as e:
         raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
     await datacache.bust_pipeline()
     return _out(t)
 

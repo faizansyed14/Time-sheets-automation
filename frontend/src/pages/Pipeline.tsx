@@ -159,6 +159,7 @@ type FeeSheet = {
   employee_name?: string | null;
   employee_id?: string | null;
   manager_signature?: boolean;
+  approval_evidence?: string;
   leave_days?: number;
   incomplete_sheet?: boolean;
   missing_days?: number[];
@@ -268,7 +269,7 @@ function ExtractionSummary({ staged, fee }: { staged: StagedMeta | null; fee: Fe
                 </span>
               )}
               {s.manager_signature && (
-                <span className="inline-flex items-center gap-0.5 text-emerald-600" title="Manager signature detected on this sheet">
+                <span className="inline-flex items-center gap-0.5 text-emerald-600" title={s.approval_evidence || "Manager signature detected on this sheet"}>
                   <BadgeCheck className="h-3 w-3" /> signed
                 </span>
               )}

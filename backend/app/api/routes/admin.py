@@ -392,8 +392,13 @@ async def get_debug_run(run_id: str, db: AsyncSession = Depends(get_db)):
 async def get_debug_image(rel_path: str = Query(...)):
     """Serve a dropped-item's full-resolution image, saved under the same
     storage the pipeline's raw retry copies use (see raw_store.py) —
-    rel_path always starts with 'debug/', never any other pipeline id."""
-    if not rel_path.startswith("debug/"):
+    rel_path always starts with 'debug/', never any other pipeline id.
+
+    startswith("debug/") alone is a STRING prefix check, not a path guard —
+    "debug/../../../etc/passwd" satisfies it too. Reject any traversal/
+    absolute segment here explicitly (raw_store.read_raw also now enforces
+    real path containment independently — defense in depth, not either/or)."""
+    if not rel_path.startswith("debug/") or ".." in rel_path.split("/") or rel_path.startswith("/"):
         raise HTTPException(400, "Not a debug image path")
     from app.services.pipeline import raw_store
     data = raw_store.read_raw(rel_path)

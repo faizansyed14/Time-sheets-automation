@@ -19,5 +19,5 @@ if grep -q "CHANGE_ME" .env; then
 fi
 echo "▶ Starting prod stack (Docker)…"
 docker compose -f docker-compose.prod.yml --env-file .env up --build -d
-echo "✓ App: http://localhost/  (or http://<ec2-public-ip>/ from outside this box)"
+echo "✓ Gateway: http://localhost:8080  (host nginx + certbot -> https://yourdomain.com)"
 echo "  Logs: docker compose -f docker-compose.prod.yml logs -f"

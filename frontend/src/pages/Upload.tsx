@@ -27,7 +27,14 @@ import { useUploadSession } from "../lib/uploadSession";
 export default function UploadPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
-  const { isAdmin } = useAuth();
+  // canWrite (not isAdmin) — the backend's own gate on /bulk-upload is
+  // require_full_access, which already permits "user" the same as "admin"
+  // (it only blocks the read-only "viewer" role's writes and the
+  // restricted "vault_matcher" role entirely, and vault_matcher can't even
+  // navigate to this page — see Shell.tsx's visibleNav). Matching that
+  // exactly here, rather than a stricter admin-only frontend check that
+  // didn't reflect what the API actually allowed.
+  const { canWrite } = useAuth();
   const inputRef = useRef<HTMLInputElement>(null);
   // Everything below (except the transient drag-hover flag) lives in
   // UploadSessionProvider, mounted above the router — see lib/uploadSession.tsx.
@@ -130,7 +137,7 @@ export default function UploadPage() {
           }}
         />
       ) : mode === "bulk" ? (
-        isAdmin ? <BulkRosterUpload onStaged={afterChange} /> : <ComingSoon feature="Bulk upload" />
+        canWrite ? <BulkRosterUpload onStaged={afterChange} /> : <ComingSoon feature="Bulk upload" />
       ) : (
       <Card className="p-6">
         <div

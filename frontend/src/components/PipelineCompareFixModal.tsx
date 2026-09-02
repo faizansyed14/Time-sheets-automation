@@ -365,6 +365,7 @@ export default function PipelineCompareFixModal({
     sheets?: {
       filename: string; kind: string; leave_days?: number;
       manager_signature?: boolean;
+      approval_evidence?: string;
       employee_name?: string | null;
       employee_id?: string | null;
     }[];
@@ -709,6 +710,11 @@ export default function PipelineCompareFixModal({
                             {s.kind === "leave_certificate" ? "leave certificate" : s.kind}
                             {s.leave_days ? `, ${s.leave_days} leave day(s)` : ""}
                             {s.manager_signature ? " · manager signature ✓" : ""}
+                            {s.manager_signature && s.approval_evidence && (
+                              <span className="block text-[11px] italic text-slate-500">
+                                {s.approval_evidence}
+                              </span>
+                            )}
                           </span>
                         </li>
                       ))}

@@ -20,9 +20,13 @@ import calendar as _calendar
 # (services/extract_email/constants.py: BUCKETS + DAY_FIELDS).
 #
 # Codes are matched case-insensitively after stripping punctuation/space.
-# The legend on the sample sheet reads:
+# Different clients print different legends — this table is the UNION of
+# every one seen so far, not just one sample sheet:
 #     P - Present | AB - Absent | HD - Half Day | WK - Weekend
 #     L - Leave   | PH - Public Holiday
+#     (PGC "Certificate of Attendance" style) VC - Annual Leave (their own
+#     term for it) | H - Public Holiday | SL - Sick Leave | NS - National
+#     Service | a literal tick mark (see _CHECKMARK_CHARS below) - Present
 CODE_TO_FIELD: dict[str, str] = {
     "P": "working_days",
     "PRESENT": "working_days",
@@ -47,7 +51,13 @@ CODE_TO_FIELD: dict[str, str] = {
     "L": "annual",
     "LV": "annual",
     "LEAVE": "annual",
+    # AL/AUL in the PGC-style legend are "Approved Leave"/"Unapproved Leave" —
+    # an approval STATUS, not a leave type. Per this client, both file as
+    # annual (like VC, their actual "Annual Leave" code) and are always
+    # flagged for confirmation — see AMBIGUOUS_LEAVE_CODES below.
     "AL": "annual",
+    "AUL": "annual",
+    "VC": "annual",     # "Vacation"/"Annual Leave" in the PGC-style legend
     "SL": "sick",
     "SICK": "sick",
     "UL": "unpaid",
@@ -64,24 +74,48 @@ CODE_TO_FIELD: dict[str, str] = {
     "HD": "other",
     "HALF": "other",
     "HALFDAY": "other",
+    # National Service has no dedicated bucket either — same "other" +
+    # always-flag treatment as a half day, see the NS check in
+    # verify_row_totals(). Never silently folded into "absent"/"unpaid" —
+    # it's neither of those in reality.
+    "NS": "other",
 }
 
 # Codes that count toward the roster's own "Leave Days" total. Everything
 # else (present, weekend, public holiday) is billable/non-leave, which is
 # what makes `Leave Days + Billing Days = Calendar Days` hold on the sample.
-_LEAVE_CODES = {"L", "LV", "LEAVE", "AL", "SL", "SICK", "UL", "LWP", "UNPAID",
-                "ML", "MATERNITY", "AB", "A", "ABS", "ABSENT"}
+_LEAVE_CODES = {"L", "LV", "LEAVE", "AL", "AUL", "VC", "SL", "SICK", "UL", "LWP", "UNPAID",
+                "ML", "MATERNITY", "AB", "A", "ABS", "ABSENT", "NS"}
 # Counted as HALF a leave day by the roster's arithmetic.
 _HALF_DAY_CODES = {"HD", "HALF", "HALFDAY"}
 
 # A leave bucket a reviewer should confirm, because the roster's own notation
-# was ambiguous about which kind of leave it meant.
-AMBIGUOUS_LEAVE_CODES = {"L", "LV", "LEAVE"}
+# was ambiguous about which kind of leave it meant: L/LV/LEAVE say "leave"
+# without a type at all, and AL/AUL/VC (the PGC-style legend) say only an
+# approval status or a client-specific term — none of them are as
+# self-evident as SL/ML/UL, so all get a mandatory "confirm in Review" flag
+# even though a default bucket (annual) is filled in.
+AMBIGUOUS_LEAVE_CODES = {"L", "LV", "LEAVE", "AL", "AUL", "VC"}
+
+# Any of these glyphs, however a vision model chooses to transcribe a ticked
+# checkbox, means "present" — normalised straight to "P" below. Without this,
+# a checkmark strips to "" under the alnum-only cleanup (it has no letters or
+# digits) and gets silently mistaken for a genuinely BLANK cell — on a
+# tick-mark roster (e.g. PGC's "Certificate of Attendance") that misreads
+# every present day as an "uncertain_days" blank, which is exactly the
+# failure this table exists to prevent.
+_CHECKMARK_CHARS = {"✓", "✔", "√", "☑"}
 
 
 def normalise_code(raw: str | None) -> str:
-    """A cell's text -> a lookup key. Blank/dash/NA all collapse to ""."""
-    s = "".join(ch for ch in str(raw or "").strip().upper() if ch.isalnum())
+    """A cell's text -> a lookup key. Blank/dash/NA all collapse to "".
+    A checkmark glyph collapses to "P" (present) instead — see
+    _CHECKMARK_CHARS above for why that has to happen BEFORE the alnum
+    strip, not after."""
+    s = str(raw or "").strip()
+    if s in _CHECKMARK_CHARS:
+        return "P"
+    s = "".join(ch for ch in s.upper() if ch.isalnum())
     if s in ("", "-", "NA", "N/A", "NIL", "NONE"):
         return ""
     return s
@@ -237,6 +271,19 @@ def verify_row_totals(
     An empty list means the document's own arithmetic confirms the read.
     """
     issues: list[str] = []
+
+    # Some roster styles (e.g. PGC's "Certificate of Attendance") print no
+    # Leave Days / Billing Days total at all — every check below this point
+    # is then a no-op, and a row with no unknown codes would otherwise sail
+    # through with an EMPTY issues list, as if it had been cross-checked and
+    # confirmed, when nothing was actually verified. Say so explicitly rather
+    # than let a format with no arithmetic to check against look "clean".
+    if stated_leave is None and stated_billing is None:
+        issues.append(
+            "this roster prints no Leave/Billing-day totals to check the day grid "
+            "against — nothing here has been independently verified; review the "
+            "day-by-day cells directly before accepting")
+
     counted = sum(leave_weight(c) for c in day_codes.values())
 
     if stated_leave is not None and abs(counted - float(stated_leave)) > 1e-6:
@@ -256,15 +303,26 @@ def verify_row_totals(
 
     ambiguous = sum(1 for c in day_codes.values() if normalise_code(c) in AMBIGUOUS_LEAVE_CODES)
     if ambiguous:
+        codes_seen = sorted({str(c).strip() for c in day_codes.values()
+                             if normalise_code(c) in AMBIGUOUS_LEAVE_CODES})
+        quoted = "/".join(f'"{c}"' for c in codes_seen)
         issues.append(
-            f"{ambiguous} day(s) marked only as \"L\" — the roster doesn't say which kind of "
-            f"leave, so they were recorded as annual; confirm or re-bucket in Review")
+            f"{ambiguous} day(s) marked only as {quoted} — the roster doesn't say which "
+            f"specific kind of leave this is (or, for an approval-status code like AL/AUL, "
+            f"only whether it was approved), so they were recorded as annual; confirm or "
+            f"re-bucket in Review")
 
     half = sum(1 for c in day_codes.values() if normalise_code(c) in _HALF_DAY_CODES)
     if half:
         issues.append(
             f"{half} half-day (HD) cell(s) — a record stores whole days only, so these were "
             f"recorded as 'other' leave; confirm the intended split in Review")
+
+    ns_days = sum(1 for c in day_codes.values() if normalise_code(c) == "NS")
+    if ns_days:
+        issues.append(
+            f"{ns_days} National Service (NS) day(s) — there is no dedicated bucket for this, "
+            f"so they were recorded as 'other' leave; confirm in Review")
 
     return issues
 

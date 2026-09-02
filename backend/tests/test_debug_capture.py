@@ -187,3 +187,64 @@ async def test_capture_is_scoped_to_its_own_run():
 
     assert [c["label"] for c in cap1.pass1_calls] == ["from-cap1"]
     assert [c["label"] for c in cap2.pass1_calls] == ["from-cap2"]
+
+
+# --------------------------------------------------------------------------- #
+# raw_store.read_raw — path-traversal containment
+#
+# admin.py's GET /admin/debug/image takes rel_path straight off a query
+# param, gated only by `rel_path.startswith("debug/")` — a STRING prefix
+# check, not a path guard. "debug/../../../<secret>" satisfies it. The real
+# guard has to live in read_raw itself (or nothing stops it reaching disk).
+# --------------------------------------------------------------------------- #
+async def test_read_raw_rejects_path_traversal_outside_the_raw_root():
+    from app.core.config import settings
+    from app.services.pipeline import raw_store
+
+    outside_dir = settings.pipeline_raw_path.parent
+    secret = outside_dir / "secret-outside-raw-root.txt"
+    secret.write_bytes(b"must never be readable through raw_store")
+    try:
+        traversal = "debug/" + "../" * 6 + "secret-outside-raw-root.txt"
+        assert raw_store.read_raw(traversal) is None
+    finally:
+        secret.unlink(missing_ok=True)
+
+
+async def test_read_raw_still_reads_a_legitimately_saved_file():
+    """The containment fix must not break the normal, non-malicious path."""
+    from app.services.pipeline import raw_store
+
+    rel = raw_store.save_raw("debug-containment-test-id", "note.txt", b"hello")
+    assert rel
+    try:
+        assert raw_store.read_raw(rel) == b"hello"
+    finally:
+        raw_store.delete_raw(rel)
+
+
+async def test_debug_image_route_rejects_traversal_even_though_it_starts_with_debug(client, admin_token):
+    from tests.conftest import auth_headers
+
+    h = auth_headers(admin_token)
+    r = await client.get("/api/v1/admin/debug/image", headers=h, params={
+        "rel_path": "debug/" + "../" * 6 + "secret-outside-raw-root.txt",
+    })
+    assert r.status_code == 400, r.text
+
+
+async def test_read_portal_file_rejects_path_traversal_outside_its_own_root():
+    """Same containment gap, same fix, in the employee-portal upload store
+    (every real caller passes rel_path from a DB row, never a request param
+    directly — but the fix costs nothing, so it applies here too)."""
+    from app.core.config import settings
+    from app.services.pipeline import portal_store
+
+    outside_dir = settings.portal_uploads_path.parent
+    secret = outside_dir / "secret-outside-portal-root.txt"
+    secret.write_bytes(b"must never be readable through portal_store")
+    try:
+        traversal = "sub/" + "../" * 6 + "secret-outside-portal-root.txt"
+        assert portal_store.read_portal_file(traversal) is None
+    finally:
+        secret.unlink(missing_ok=True)
