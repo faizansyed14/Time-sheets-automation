@@ -1,9 +1,13 @@
 """Shared "did the pipeline receive anything for this employee+period" query.
 
-Used by both the dashboard (employees.py's /coverage) and the timesheet
-export (timesheets.py) so the two can never drift apart — same definition of
-received/missing everywhere it's shown.
-"""
+Used by the dashboard (employees.py's /coverage), the timesheet export
+(timesheets.py), AND the reminder service (services/reminders/service.py) so
+none of the three can ever drift apart — one definition of received/missing
+everywhere it's shown, from whichever channel it arrived through (email,
+Upload, Bulk Roster, Portal). This used to be scoped to source_kind="email"
+only, back when email was the sole intake path — now that Upload/Bulk/Portal
+are all real channels, that scoping was silently making the Dashboard and
+Export show "Missing" for people who had, in fact, already submitted."""
 from __future__ import annotations
 
 from sqlalchemy import ColumnElement, select
@@ -22,13 +26,17 @@ def staged_employee_pk() -> ColumnElement[str]:
 
 
 def received_subq(month: int, year: int):
-    """Distinct employee PKs the pipeline positively identified from an
-    EMAILED sheet for this month/year, regardless of final status."""
+    """Distinct employee PKs the pipeline positively identified a sheet for,
+    this month/year, from ANY intake channel (email, Upload, Bulk Roster,
+    Portal) and regardless of final status — still awaiting Accept, already
+    filed, or later flagged. Not source_kind-scoped: an employee who
+    submitted via Upload or Bulk Roster must show as received/awaiting
+    review, never as flat-out "missing", just because the channel wasn't
+    email."""
     pk = staged_employee_pk()
     return (
         select(pk)
         .where(
-            PipelineFile.source_kind == "email",
             PipelineFile.month == month,
             PipelineFile.year == year,
             pk.is_not(None),
@@ -38,8 +46,8 @@ def received_subq(month: int, year: int):
 
 
 async def received_employee_pks(db: AsyncSession, month: int, year: int) -> set[str]:
-    """Materialised version of received_subq — for callers (like the export)
-    that need to check membership for every employee in Python rather than
-    compose it into a further SQL query."""
+    """Materialised version of received_subq — for callers (like the export
+    and the reminder service) that need to check membership for every
+    employee in Python rather than compose it into a further SQL query."""
     rows = (await db.execute(received_subq(month, year))).scalars().all()
     return set(rows)

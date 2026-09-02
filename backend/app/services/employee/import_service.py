@@ -4,10 +4,15 @@ Employee Excel Importer.
 Parses a .xlsx OR legacy .xls file with TWO sheets (DXB and AUH), normalises
 the different header schemas, and upserts every row into all_employee_data.
 
-DXB headers: "Emp ID", "DCO", "Employees Name", "Project",
+DXB headers (old): "Emp ID", "DCO", "Employees Name", "Project",
              "Account Managers Name", "Contact No.", "Email"
-AUH headers: "Employee ID", "Full Name", "Project", "Salesman",
+DXB headers (current): "Employee ID", "ACO/DCO", "Employee Name", "Project",
+             "Account Manager", "Contact number", "Work Email", "Personal Email"
+AUH headers (old): "Employee ID", "Full Name", "Project", "Salesman",
              "Mobile Number", "Email ID"
+AUH headers (current): same shape as DXB current — "Employee ID", "ACO/DCO",
+             "Employee Name", "Project", "Account Manager", "Contact number",
+             "Work Email", "Personal Email"
 """
 from __future__ import annotations
 
@@ -141,14 +146,25 @@ def _split_blended_emails(raw: str) -> tuple[str | None, str | None]:
 
 
 def _parse_sheet_dxb(ws) -> list[dict]:
+    """DXB has shipped under two header schemas so far — this reads either:
+      original : "Emp ID", "DCO", "Employees Name", "Account Managers Name",
+                 "Contact No.", "Email" (one blended email column)
+      current  : "Employee ID", "ACO/DCO", "Employee Name", "Account Manager",
+                 "Contact number", "Work Email", "Personal Email" — the same
+                 schema AUH's current sheet uses, work/personal already split.
+    A sheet still using the old single "Email" column has no such split of
+    its own to read — those rows fall back to _split_blended_emails' domain
+    classifier, same as the AUH parser.
+    """
     header_row_num = None
     header_idx = {}
     for i, row in enumerate(ws.iter_rows()):
         cells = [_norm(c.value) for c in row]
-        if "Emp ID" in cells or "emp id" in [c.lower() for c in cells]:
+        low = [c.lower() for c in cells]
+        if "Emp ID" in cells or "emp id" in low or "employee id" in low:
             header_row_num = i + 1
-            for j, h in enumerate(cells):
-                header_idx[h.lower().strip()] = j
+            for j, h in enumerate(low):
+                header_idx[h.strip()] = j
             break
     if header_row_num is None:
         return []
@@ -167,8 +183,8 @@ def _parse_sheet_dxb(ws) -> list[dict]:
                     return v
             return ""
 
-        emp_id = gl(["emp id"])
-        emp_name = gl(["employees name"])
+        emp_id = gl(["emp id", "employee id"])
+        emp_name = gl(["employees name", "employee name"])
         # Nothing identifiable at all = a spacer/layout row; ignore it quietly.
         # A row with only ONE of the two IS a data-entry problem, so it's kept
         # and reported as skipped rather than vanishing without trace.
@@ -176,7 +192,10 @@ def _parse_sheet_dxb(ws) -> list[dict]:
             continue
         aco, dco = _split_ref(gl(["dco", "aco/dco", "aco / dco", "dco number",
                                   "dco no.", "dco no", "aco", "reference"]))
-        work_email, personal_email = _split_blended_emails(gl(["email"]))
+        work_email = gl(["work email"]) or None
+        personal_email = gl(["personal email"]) or None
+        if not work_email and not personal_email:
+            work_email, personal_email = _split_blended_emails(gl(["email"]))
         records.append({
             "employee_id": emp_id,
             "name": emp_name,
@@ -186,8 +205,8 @@ def _parse_sheet_dxb(ws) -> list[dict]:
             # an ACO value must also clear a stale DCO (see _changes_for).
             "_ref_present": bool(aco or dco),
             "project": gl(["project"]),
-            "account_manager": gl(["account managers name"]),
-            "contact_no": gl(["contact no."]),
+            "account_manager": gl(["account managers name", "account manager"]),
+            "contact_no": gl(["contact no.", "contact number"]),
             "work_email": work_email,
             "personal_email": personal_email,
             "employee_email_id": work_email or personal_email,

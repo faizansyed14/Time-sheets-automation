@@ -338,6 +338,15 @@ async def extract_roster(
     if name.endswith((".xlsx", ".xlsm", ".xls", ".csv")):
         try:
             doc = parse_roster_cells(filename, data)
+        except RuntimeError:
+            # A RuntimeError from parse_roster_cells() means something the
+            # vision fallback couldn't fix either way — an IRM/Azure-RMS
+            # protected file (its content is encrypted, not just a shape the
+            # cell reader doesn't recognise — vision can't see through that
+            # any better than xlrd can) or a missing xlrd install. Surface it
+            # directly rather than wasting a real LLM call on a file that
+            # will fail either path.
+            raise
         except Exception as e:
             # A spreadsheet that isn't laid out as a grid we can read
             # deterministically still renders fine as an image — fall back

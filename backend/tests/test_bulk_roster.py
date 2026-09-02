@@ -17,7 +17,11 @@ from app.services.bulk_roster.roster_codes import (
     normalise_code,
     verify_row_totals,
 )
-from app.services.bulk_roster.roster_parse import parse_period, parse_roster_cells
+from app.services.bulk_roster.roster_parse import (
+    looks_like_roster_grid,
+    parse_period,
+    parse_roster_cells,
+)
 
 
 def _roster_group(day_codes: dict[int, str], month: int = 7, year: int = 2026) -> dict:
@@ -323,3 +327,212 @@ def test_period_is_parsed_from_several_title_shapes():
     assert parse_period("Timesheet July-2026") == (7, 2026)
     assert parse_period("Monthly sheet 07/2026") == (7, 2026)
     assert parse_period("no period here") == (None, None)
+
+
+# ---------------------------------------------- long format ("PGC"-style)
+def _long_format_workbook(rows: list[tuple]) -> bytes:
+    """rows: (employee_id, name, title, date, attendance_type) tuples — a
+    miniature of a real long/flat export (one row per employee PER DAY)."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["EmployeeId", "EmployeeName", "JobTitle", "AttendanceDate",
+               "DayName", "AttendanceType"])
+    for emp_id, name, title, date, atype in rows:
+        ws.append([emp_id, name, title, date, "", atype])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_long_format_is_detected_and_read_without_any_llm():
+    import datetime as dt
+
+    data = _long_format_workbook([
+        ("E1", "Ada Lovelace", "Engineer", dt.date(2026, 7, 1), "Daily Present"),
+        ("E1", "Ada Lovelace", "Engineer", dt.date(2026, 7, 2), "Weekend"),
+        ("E2", "Grace Hopper", "Engineer", "03-Jul-2026", "Sick Leave"),
+    ])
+    doc = parse_roster_cells("pgc.xlsx", data)
+    assert doc.method == "xlsx-cells-long"
+    assert doc.llm_calls == 0
+    assert (doc.month, doc.year) == (7, 2026)
+    assert doc.headcount == 2
+
+
+def test_long_format_does_not_misfire_on_the_wide_format_sample():
+    """The two shapes must never be confused for each other — detection is
+    checked against BOTH false directions, not just "does PGC parse"."""
+    doc = parse_roster_cells("roster.xlsx", _sample_workbook())
+    assert doc.method == "xlsx-cells"
+
+
+def test_wide_format_with_a_status_column_is_still_not_misdetected():
+    """A wide sheet whose confirmation column happens to be literally named
+    "Status" (a synonym shared with the long format's attendance-type
+    pattern) plus an "Employee ID" column must still resolve as wide — there
+    is no "date" column on it, so the four-way AND can never be satisfied."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Timesheet Jul 2026"])
+    header = ["Sr No", "Employee Name", "Employee ID", "Status", "Leave Days", "Billing Days"]
+    header += [f"{d:02d}" for d in range(1, 32)]
+    ws.append(header)
+    ws.append([1, "Jane Doe", "E100", "Submitted", 0, 31] + ["P"] * 31)
+    buf = io.BytesIO()
+    wb.save(buf)
+    doc = parse_roster_cells("wide_status.xlsx", buf.getvalue())
+    assert doc.method == "xlsx-cells"
+
+
+def test_long_format_maps_the_four_known_attendance_types():
+    import datetime as dt
+
+    data = _long_format_workbook([
+        ("E1", "Ada Lovelace", "Engineer", dt.date(2026, 7, 1), "Daily Present"),
+        ("E1", "Ada Lovelace", "Engineer", dt.date(2026, 7, 2), "Weekend"),
+        ("E1", "Ada Lovelace", "Engineer", dt.date(2026, 7, 3), "Sick Leave"),
+        ("E1", "Ada Lovelace", "Engineer", dt.date(2026, 7, 4), "Annual Leave"),
+    ])
+    doc = parse_roster_cells("pgc.xlsx", data)
+    row = doc.rows[0]
+    fields, _uncertain, _issues = distribute_days(row.day_codes, doc.month, doc.year)
+    assert fields["working_days"] == ["2026-07-01"]
+    assert fields["weekend_days"] == ["2026-07-02"]
+    assert fields["sick"] == ["2026-07-03"]
+    assert fields["annual"] == ["2026-07-04"]
+
+
+def test_long_format_unfamiliar_type_becomes_uncertain_never_guessed():
+    """"Internal Mission (Inside UAE)" etc. are NOT in the known table on
+    purpose — they must reach a human, never get silently bucketed."""
+    import datetime as dt
+
+    data = _long_format_workbook([
+        ("E1", "Ada Lovelace", "Engineer", dt.date(2026, 7, 1), "Internal Mission (Inside UAE)"),
+    ])
+    doc = parse_roster_cells("pgc.xlsx", data)
+    row = doc.rows[0]
+    assert row.day_codes[1] == "Internal Mission (Inside UAE)"   # kept raw, not guessed
+    _fields, uncertain, issues = distribute_days(row.day_codes, doc.month, doc.year)
+    assert "2026-07-01" in {u["date"] for u in uncertain}
+    assert any("Internal Mission" in i for i in issues)
+
+
+def test_long_format_pending_approval_suffix_is_bucketed_and_flagged():
+    import datetime as dt
+
+    data = _long_format_workbook([
+        ("E1", "Ada Lovelace", "Engineer", dt.date(2026, 7, 1),
+         "Sick Leave - Waiting for Approval -   Line Manager"),
+    ])
+    doc = parse_roster_cells("pgc.xlsx", data)
+    row = doc.rows[0]
+    assert row.day_codes[1] == "SL"                              # still classified as sick
+    assert any("not yet approved" in i for i in row.issues)      # but flagged for confirmation
+
+
+def test_long_format_real_dates_and_string_dates_both_parse():
+    import datetime as dt
+
+    data = _long_format_workbook([
+        ("E1", "Ada Lovelace", "Engineer", dt.date(2026, 7, 15), "Daily Present"),
+        ("E2", "Grace Hopper", "Engineer", "15-Jul-2026", "Daily Present"),
+    ])
+    doc = parse_roster_cells("pgc.xlsx", data)
+    for row in doc.rows:
+        assert row.day_codes.get(15) == "P"
+
+
+def test_long_format_groups_by_employee_not_raw_row_count():
+    """Hundreds of raw rows for a handful of employees must collapse to one
+    RosterRow per employee — this is the scale case the format exists for."""
+    import datetime as dt
+
+    rows = []
+    for emp_n in range(1, 6):          # 5 employees
+        for day in range(1, 29):       # 28 days each = 140 raw rows
+            rows.append((f"E{emp_n}", f"Employee {emp_n}", "Engineer",
+                         dt.date(2026, 7, day), "Daily Present"))
+    data = _long_format_workbook(rows)
+    doc = parse_roster_cells("pgc.xlsx", data)
+    assert len(rows) == 140
+    assert doc.headcount == 5
+    for row in doc.rows:
+        assert len(row.day_codes) == 28
+
+
+def test_long_format_bad_or_duplicate_dates_are_flagged_not_dropped():
+    """A row with no readable date, a duplicated day, and a day from a
+    different month must each surface as an issue on that employee — the
+    employee themselves is still staged, never silently skipped."""
+    import datetime as dt
+
+    data = _long_format_workbook([
+        ("E1", "Test Person", "Officer", dt.date(2026, 7, 1), "Daily Present"),
+        ("E1", "Test Person", "Officer", None, "Weekend"),                     # unreadable date
+        ("E1", "Test Person", "Officer", dt.date(2026, 7, 1), "Weekend"),      # duplicate day 1
+        ("E1", "Test Person", "Officer", dt.date(2026, 8, 15), "Weekend"),     # wrong month
+    ])
+    doc = parse_roster_cells("pgc.xlsx", data)
+    assert doc.headcount == 1
+    row = doc.rows[0]
+    assert row.day_codes == {1: "P"}
+    assert any("no readable AttendanceDate" in i for i in row.issues)
+    assert any("more than once" in i for i in row.issues)
+    assert any("doesn't belong to" in i for i in row.issues)
+
+
+def test_long_format_translate_attendance_type_directly():
+    from app.services.bulk_roster.roster_codes import translate_attendance_type
+
+    assert translate_attendance_type("Daily Present") == ("P", None)
+    assert translate_attendance_type("Weekend") == ("WK", None)
+    assert translate_attendance_type("Sick Leave") == ("SL", None)
+    assert translate_attendance_type("Annual Leave - Completed") == ("AL", None)
+
+    code, flag = translate_attendance_type("Sick Leave - Waiting for Approval -   Line Manager")
+    assert code == "SL"
+    assert flag and "not yet approved" in flag
+
+    code, flag = translate_attendance_type("Internal Mission (Inside UAE)")
+    assert code == "Internal Mission (Inside UAE)"
+    assert flag is None
+
+    assert translate_attendance_type(None) == ("", None)
+    assert translate_attendance_type("") == ("", None)
+
+
+# ------------------------------------- the /upload page's roster guard
+def test_roster_guard_catches_both_shapes_but_not_a_real_single_employee_sheet():
+    """The deterministic, zero-LLM guard used to keep a mistakenly-uploaded
+    roster off the single-employee /upload page (see api/routes/upload.py) —
+    must catch either sheet shape, and must NOT flag a genuine one-person
+    timesheet, which is the whole point of the pipeline it protects."""
+    import datetime as dt
+
+    long_data = _long_format_workbook([
+        ("E1", "Ada Lovelace", "Engineer", dt.date(2026, 7, 1), "Daily Present"),
+    ])
+    assert looks_like_roster_grid("pgc.xlsx", long_data) is True
+    assert looks_like_roster_grid("roster.xlsx", _sample_workbook()) is True
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Employee Name", "Jane Doe"])
+    ws.append(["Month", "July 2026"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    assert looks_like_roster_grid("single.xlsx", buf.getvalue()) is False
+
+
+def test_roster_guard_never_crashes_on_a_non_spreadsheet_file():
+    """A file that isn't a spreadsheet at all is a different problem — the
+    guard must defer to the normal pipeline, not raise."""
+    assert looks_like_roster_grid("notes.pdf", b"not a spreadsheet at all") is False
+    assert looks_like_roster_grid("photo.jpg", b"\xff\xd8\xff\xe0") is False

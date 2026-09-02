@@ -53,6 +53,25 @@ async def test_strict_matching_variants(eid, name, code, matched):
 
 async def test_requires_both_id_and_name():
     assert (await _match("MT1", None)).employee is None        # id only
+
+
+async def test_prefetched_all_employees_matches_the_default_db_fetch():
+    """The perf optimization (bulk roster staging passes a pre-fetched
+    employee list through instead of re-querying per row — see
+    roster_stage.build_groups) must never change WHICH employee is matched;
+    it only removes redundant re-fetches of the same, unchanging table."""
+    from sqlalchemy import select
+    from app.core.database import SessionLocal
+    from app.models.employee import Employee
+
+    async with SessionLocal() as db:
+        all_employees = (await db.execute(select(Employee))).scalars().all()
+        default = await M.match_employee(db, "MT1", "Abdul Ghani")
+        prefetched = await M.match_employee(db, "MT1", "Abdul Ghani", all_employees=all_employees)
+        assert prefetched.code == default.code
+        default_id = default.employee.id if default.employee else None
+        prefetched_id = prefetched.employee.id if prefetched.employee else None
+        assert prefetched_id == default_id
     r = await _match(None, "Mohammed Ali")
     assert r.employee is not None and r.employee.name == "Mohammed Ali"
 

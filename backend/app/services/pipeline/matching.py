@@ -148,11 +148,19 @@ def _loc(e: Employee) -> str:
     return f" [{e.location}]" if e.location else ""
 
 
-async def _match_by_name(db: AsyncSession, name_norm: str) -> Employee | None:
+async def _match_by_name(
+    db: AsyncSession, name_norm: str, *, all_employees: list[Employee] | None = None,
+) -> Employee | None:
     """Global fuzzy name search — primary matcher when the sheet carries a
     real name. Returns a single Employee only when exactly one agrees (or one
-    clearly outscores the rest); a tie or no agreement returns None."""
-    all_employees = (await db.execute(select(Employee))).scalars().all()
+    clearly outscores the rest); a tie or no agreement returns None.
+
+    `all_employees`, when given, is used directly instead of querying the DB
+    — lets a caller matching MANY rows in one request (e.g. a bulk roster)
+    fetch the table once and reuse it, rather than re-fetching it per row.
+    Omit it (the default) for the normal one-off call — unchanged behavior."""
+    if all_employees is None:
+        all_employees = (await db.execute(select(Employee))).scalars().all()
     agreeing = [e for e in all_employees if _name_agrees(name_norm, e.name)]
     if len(agreeing) == 1:
         return agreeing[0]
@@ -276,7 +284,13 @@ async def match_employee(
     extracted_name: str | None,
     *,
     email_hint: Employee | None = None,
+    all_employees: list[Employee] | None = None,
 ) -> MatchResult:
+    """`all_employees`, when given, is passed straight through to
+    `_match_by_name` so a caller matching many rows in one request (a bulk
+    roster) can fetch the employee table ONCE and reuse it — see that
+    function's docstring. Omit it (the default) for the normal one-off call;
+    behavior is identical either way, this only removes redundant re-fetches."""
     name_norm = (extracted_name or "").strip().lower()
     name_is_placeholder = bool(name_norm) and _is_placeholder_name(name_norm)
     if name_is_placeholder:
@@ -292,7 +306,7 @@ async def match_employee(
         if email_hint and _name_agrees(name_norm, email_hint.name):
             return _name_match_result(
                 email_hint, extracted_name, id_norm, email_hint=email_hint)
-        by_name = await _match_by_name(db, name_norm)
+        by_name = await _match_by_name(db, name_norm, all_employees=all_employees)
         if by_name is not None:
             return _name_match_result(by_name, extracted_name, id_norm)
 

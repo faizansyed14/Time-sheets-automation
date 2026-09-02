@@ -13,6 +13,7 @@ import {
   ExternalLink,
   FileText,
   Mail,
+  RefreshCw,
   RotateCcw,
   ScanLine,
   ShieldQuestion,
@@ -26,9 +27,11 @@ import {
   deletePipelineFile,
   fetchPipeline,
   fetchPipelineStats,
+  rematchUnmatchedPipelineFiles,
   retryPipelineFile,
   MONTHS,
   type PipelineFile,
+  type RematchResult,
   type ThreadSummary,
 } from "../api/client";
 import PortalSubmissionsTable from "../components/PortalSubmissionsTable";
@@ -419,6 +422,21 @@ export default function PipelinePage() {
     setSp(next, { replace: true });
   };
 
+  // Deep link from the Dashboard's "View in Pipeline" (Awaiting review for a
+  // specific month/year) — narrows the list to that one period.
+  const [periodFilter, setPeriodFilter] = useState<{ month: number; year: number } | null>(() => {
+    const m = Number(sp.get("month"));
+    const y = Number(sp.get("year"));
+    return m >= 1 && m <= 12 && y >= 2000 ? { month: m, year: y } : null;
+  });
+  const clearPeriodFilter = () => {
+    setPeriodFilter(null);
+    const next = new URLSearchParams(sp);
+    next.delete("month");
+    next.delete("year");
+    setSp(next, { replace: true });
+  };
+
   const [statusFilter, setStatusFilter] = useState<Filter>(
     () => (sp.get("status") as Filter) || ""
   );
@@ -449,7 +467,7 @@ export default function PipelinePage() {
 
   const dq = useDebounced(q, 350);
   const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
-    queryKey: ["pipeline", statusFilter, sourceFilter, dq, threadKeyFilter],
+    queryKey: ["pipeline", statusFilter, sourceFilter, dq, threadKeyFilter, periodFilter],
     queryFn: ({ pageParam }) =>
       fetchPipeline({
         status: statusFilter || undefined,
@@ -460,6 +478,8 @@ export default function PipelinePage() {
         exclude_status: statusFilter ? undefined : "success,resolved",
         source_kind: sourceFilter || undefined,
         thread_key: threadKeyFilter || undefined,
+        month: periodFilter?.month,
+        year: periodFilter?.year,
         q: dq || undefined,
         offset: pageParam as number,
       }),
@@ -536,29 +556,64 @@ export default function PipelinePage() {
     onError: (e: any) => toast("error", "Delete failed", e?.response?.data?.detail ?? String(e)),
   });
 
+  // Re-checks employee identity for every still-unreviewed item whose
+  // employee wasn't found at staging time — catches a roster/email staged
+  // BEFORE that employee existed in the Employee Matcher. No LLM call, no
+  // re-extraction, so safe to run over the whole backlog at once.
+  const rematchMut = useMutation({
+    mutationFn: rematchUnmatchedPipelineFiles,
+    onSuccess: (r: RematchResult) => {
+      if (r.rematched_count > 0) {
+        toast("success", `${r.rematched_count} employee(s) now matched`,
+          r.still_unmatched_count > 0
+            ? `${r.still_unmatched_count} still have nobody to match — add them to the Employee Matcher, or assign manually in Compare & Fix.`
+            : "Everything that was waiting on this is now resolved.");
+      } else if (r.still_unmatched_count > 0) {
+        toast("info", "Nothing new to match",
+          `${r.still_unmatched_count} item(s) still have nobody in the Employee Matcher to match against.`);
+      } else {
+        toast("info", "Nothing to check", "No pipeline items are currently waiting on an employee match.");
+      }
+      invalidate();
+    },
+    onError: (e: any) => toast("error", "Could not re-check matches", e?.response?.data?.detail ?? String(e)),
+  });
+
   return (
     <div className="animate-fade-up">
-      <div className="mb-4 flex gap-1 rounded-lg border border-slate-200 bg-white p-1 text-sm w-fit">
-        <button
-          type="button"
-          onClick={() => setTab("pipeline")}
-          className={cn(
-            "rounded-md px-3 py-1.5 font-medium transition-colors",
-            tab === "pipeline" ? "bg-brand-50 text-brand-700" : "text-slate-500 hover:bg-slate-50"
-          )}
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex gap-1 rounded-lg border border-slate-200 bg-white p-1 text-sm w-fit">
+          <button
+            type="button"
+            onClick={() => setTab("pipeline")}
+            className={cn(
+              "rounded-md px-3 py-1.5 font-medium transition-colors",
+              tab === "pipeline" ? "bg-brand-50 text-brand-700" : "text-slate-500 hover:bg-slate-50"
+            )}
+          >
+            Pipeline
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab("portal")}
+            className={cn(
+              "rounded-md px-3 py-1.5 font-medium transition-colors",
+              tab === "portal" ? "bg-brand-50 text-brand-700" : "text-slate-500 hover:bg-slate-50"
+            )}
+          >
+            Portal Submissions
+          </button>
+        </div>
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={rematchMut.isPending}
+          onClick={() => rematchMut.mutate()}
+          title="Re-check employee identity for items whose match wasn't found at staging time (e.g. the employee was added to the matcher afterward) — no LLM call, safe to run anytime."
         >
-          Pipeline
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab("portal")}
-          className={cn(
-            "rounded-md px-3 py-1.5 font-medium transition-colors",
-            tab === "portal" ? "bg-brand-50 text-brand-700" : "text-slate-500 hover:bg-slate-50"
-          )}
-        >
-          Portal Submissions
-        </button>
+          <RefreshCw className={cn("h-3.5 w-3.5", rematchMut.isPending && "animate-spin")} />
+          Re-check unmatched employees
+        </Button>
       </div>
 
       {tab === "portal" ? (
@@ -577,6 +632,22 @@ export default function PipelinePage() {
             className="font-semibold text-brand-700 hover:text-brand-900"
           >
             Show all records
+          </button>
+        </div>
+      )}
+
+      {periodFilter && (
+        <div className="mb-4 flex items-center gap-2 rounded-xl border border-brand-200 bg-brand-50 px-4 py-2.5 text-sm text-brand-800">
+          <Columns2 className="h-4 w-4 shrink-0" />
+          <span className="flex-1">
+            Showing only {MONTHS[periodFilter.month]} {periodFilter.year} — from the Dashboard's Awaiting review.
+          </span>
+          <button
+            type="button"
+            onClick={clearPeriodFilter}
+            className="font-semibold text-brand-700 hover:text-brand-900"
+          >
+            Show all periods
           </button>
         </div>
       )}

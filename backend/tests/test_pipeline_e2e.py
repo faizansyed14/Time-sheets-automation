@@ -94,12 +94,52 @@ async def test_coverage_pagination_and_search(client, admin_token):
     assert any(r["employee_name"] == "Tester" for r in s.json()["rows"])
 
 
+async def test_pipeline_list_filters_by_month_and_year(client, admin_token):
+    """The Dashboard's "View in Pipeline" deep link (Awaiting review for one
+    period) relies on /pipeline accepting month/year filters directly —
+    confirm they narrow the list instead of being silently ignored."""
+    from app.core.database import SessionLocal
+    from app.models.pipeline_file import PipelineFile, PipelineStatus
+
+    h = auth_headers(admin_token)
+    YEAR, MONTH = 2033, 5  # a period no other test touches
+
+    async with SessionLocal() as db:
+        db.add(PipelineFile(
+            filename="period-match.pdf", source_kind="upload", source_id="PF-period-1",
+            status=PipelineStatus.NEEDS_REVIEW, employee_name="Period Match Person",
+            month=MONTH, year=YEAR,
+        ))
+        db.add(PipelineFile(
+            filename="period-other.pdf", source_kind="upload", source_id="PF-period-2",
+            status=PipelineStatus.NEEDS_REVIEW, employee_name="Period Other Person",
+            month=MONTH + 1, year=YEAR,
+        ))
+        await db.commit()
+
+    try:
+        r = await client.get("/api/v1/pipeline", headers=h,
+                             params={"month": MONTH, "year": YEAR, "limit": 500})
+        assert r.status_code == 200, r.text
+        names = {f["employee_name"] for f in r.json()["items"]}
+        assert "Period Match Person" in names
+        assert "Period Other Person" not in names
+    finally:
+        from sqlalchemy import delete
+        async with SessionLocal() as db:
+            await db.execute(delete(PipelineFile).where(
+                PipelineFile.source_id.in_(["PF-period-1", "PF-period-2"])))
+            await db.commit()
+
+
 async def test_coverage_missing_vs_awaiting_review_vs_submitted(client, admin_token):
     """Missing / Submitted / Awaiting-review must exactly partition the active
-    roster for a focus month. An employee who emailed a sheet the pipeline
-    could read (a PipelineFile with extraction_meta.staged.employee_pk) but
+    roster for a focus month. An employee with a readable sheet in the
+    pipeline (a PipelineFile with extraction_meta.staged.employee_pk) but
     that hasn't been accepted into a TimesheetRecord yet must show as
-    "awaiting review", never "missing" — missing means no email at all."""
+    "awaiting review", never "missing" — missing means NOTHING was received,
+    from any channel (see test_coverage_awaiting_review_works_for_every_intake_channel
+    below for the non-email channels this same rule must also hold for)."""
     from sqlalchemy import delete
     from app.core import datacache
     from app.core.database import SessionLocal
@@ -152,6 +192,76 @@ async def test_coverage_missing_vs_awaiting_review_vs_submitted(client, admin_to
     finally:
         async with SessionLocal() as db:
             await db.execute(delete(PipelineFile).where(PipelineFile.thread_key == "COV-msg-1"))
+            await db.commit()
+        await datacache.bust_coverage()
+
+
+async def test_coverage_awaiting_review_works_for_every_intake_channel(client, admin_token):
+    """Regression test: services/pipeline/coverage.py's received_subq() used
+    to be hard-coded to source_kind="email", so anyone who submitted via
+    Upload, Bulk Roster, or the Portal was invisible to the Dashboard/Export
+    and silently counted as "missing" even though their file was already
+    sitting in the pipeline. Every real intake channel must count."""
+    from sqlalchemy import delete
+    from app.core import datacache
+    from app.core.database import SessionLocal
+    from app.models.pipeline_file import PipelineFile, PipelineStatus
+
+    h = auth_headers(admin_token)
+    YEAR, MONTH = 2032, 9  # a period no other test touches
+
+    async def _cov(**params):
+        r = await client.get("/api/v1/employees/coverage", headers=h,
+                             params={"year": YEAR, "month": MONTH, "limit": 500, **params})
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    channels = ("bulk", "upload", "portal")
+    pks: dict[str, str] = {}
+    for i, kind in enumerate(channels):
+        emp = await client.post("/api/v1/employee-matcher", headers=h,
+                                json={"employee_id": f"COV-CH-{i}", "name": f"Channel {kind.title()} Person",
+                                      "location": "DXB"})
+        assert emp.status_code == 201, emp.text
+        pks[kind] = emp.json()["id"]
+
+    before = await _cov()
+    for kind, pk in pks.items():
+        row = next(r for r in before["rows"] if r["employee_pk"] == pk)
+        assert row["awaiting_review_this_month"] is False
+
+    async with SessionLocal() as db:
+        for kind, pk in pks.items():
+            db.add(PipelineFile(
+                filename=f"{kind}.xlsx", source_kind=kind, source_id=f"COV-CH-{kind}",
+                thread_key=f"COV-CH-{kind}", attachment_id=f"pass1:covch{kind}",
+                status=PipelineStatus.NEEDS_REVIEW, employee_id=f"COV-CH-{kind}",
+                employee_name=f"Channel {kind.title()} Person", month=MONTH, year=YEAR,
+                extraction_meta={"staged": {"employee_pk": pk}},
+            ))
+        await db.commit()
+    await datacache.bust_coverage()
+
+    try:
+        mid = await _cov()
+        assert mid["awaiting_review_this_month"] == before["awaiting_review_this_month"] + len(channels)
+        assert mid["missing_this_month"] == before["missing_this_month"] - len(channels)
+        for kind, pk in pks.items():
+            row = next(r for r in mid["rows"] if r["employee_pk"] == pk)
+            assert row["awaiting_review_this_month"] is True, f"{kind}-sourced submission not recognised"
+
+        awaiting = await _cov(status="awaiting_review")
+        awaiting_pks = {r["employee_pk"] for r in awaiting["rows"]}
+        for pk in pks.values():
+            assert pk in awaiting_pks
+        missing = await _cov(status="missing")
+        missing_pks = {r["employee_pk"] for r in missing["rows"]}
+        for pk in pks.values():
+            assert pk not in missing_pks
+    finally:
+        async with SessionLocal() as db:
+            for kind in channels:
+                await db.execute(delete(PipelineFile).where(PipelineFile.thread_key == f"COV-CH-{kind}"))
             await db.commit()
         await datacache.bust_coverage()
 
