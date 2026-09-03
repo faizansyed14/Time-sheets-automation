@@ -10,6 +10,7 @@ for local hacking.
 """
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
@@ -36,9 +37,15 @@ from app.api.routes import (
 from app.core.config import settings
 from app.core.database import SessionLocal, init_db
 
+log = logging.getLogger("app.startup")
+
 
 def _assert_prod_secrets() -> None:
-    """Fail closed in production if the JWT secret is weak/default (OWASP A02)."""
+    """Fail closed in production if the JWT secret is weak/default (OWASP A02),
+    or if the admin account would be seeded with its hardcoded default
+    password. Both are config-level checks (this runs before init_db/seeding
+    even touch the DB) — they stop a prod box from ever coming up
+    reachable with a credential anyone can read straight out of this file."""
     if not settings.is_prod:
         return
     weak = (not settings.jwt_secret
@@ -48,6 +55,13 @@ def _assert_prod_secrets() -> None:
         raise RuntimeError(
             "Refusing to start in prod with a weak JWT_SECRET. Set a long random "
             "value, e.g. `python -c \"import secrets; print(secrets.token_urlsafe(48))\"`."
+        )
+    if settings.default_admin_password == "admin":
+        raise RuntimeError(
+            "Refusing to start in prod with DEFAULT_ADMIN_PASSWORD still set to "
+            "the hardcoded default \"admin\". Set a strong, unique password in "
+            "your prod .env before first boot — this is what the admin account "
+            "gets seeded with."
         )
 
 
@@ -79,7 +93,11 @@ async def lifespan(app: FastAPI):
             from app.seed.seed_admin import seed_admin
             await seed_admin(db)
         except Exception:
-            pass
+            # A failed seed here can mean "no admin account exists and no one
+            # can log in" — that must never fail silently (see S2: this used
+            # to be a bare `pass`, so a broken seed on a fresh prod box left
+            # no way in and no log line explaining why).
+            log.warning("Admin account seeding failed at startup", exc_info=True)
     yield
 
 

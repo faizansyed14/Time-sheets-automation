@@ -20,12 +20,32 @@ import re
 import shutil
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from pathlib import Path
 
 from app.core.config import settings
 
 
 def _safe(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]+', "_", name or "file") or "file"
+
+
+def _contained(root: Path, candidate: Path) -> Path | None:
+    """Resolve `candidate` and confirm it's genuinely inside `root` — real
+    path containment, not a string-prefix check. rel_path here ultimately
+    comes from a caller-supplied query param (admin.py's /debug/image), and
+    that route's own guard is only `rel_path.startswith("debug/")` — a plain
+    prefix check that "debug/../../../etc/passwd" still satisfies. Without
+    resolving and checking containment HERE, that string sails straight
+    through to read_bytes(). Same technique as
+    storage_provider/local_provider.py's LocalStorageProvider._abs."""
+    root = root.resolve()
+    try:
+        p = candidate.resolve()
+    except Exception:
+        return None
+    if p != root and not p.is_relative_to(root):
+        return None
+    return p
 
 
 def _use_s3() -> bool:
@@ -85,20 +105,21 @@ def read_raw(rel_path: str | None) -> bytes | None:
         except Exception:
             return None
     # local — try the current path, plus the older "_pipeline/" layouts.
-    candidates = []
+    # Each candidate is checked for real path containment against its OWN
+    # root before ever being opened — see _contained's docstring for why a
+    # plain resolve()+is_file() (the previous behavior) is not enough.
+    candidates: list[tuple[Path, Path]] = []
     if rel_path.startswith("_pipeline/"):
-        candidates.append(settings.storage_path / rel_path)
-        candidates.append(settings.pipeline_raw_path / rel_path[len("_pipeline/"):])
+        candidates.append((settings.storage_path, settings.storage_path / rel_path))
+        candidates.append((settings.pipeline_raw_path,
+                            settings.pipeline_raw_path / rel_path[len("_pipeline/"):]))
     else:
-        candidates.append(settings.pipeline_raw_path / rel_path)
-        candidates.append(settings.storage_path / "_pipeline" / rel_path)
-    for p in candidates:
-        try:
-            p = p.resolve()
-            if p.is_file():
-                return p.read_bytes()
-        except Exception:
-            continue
+        candidates.append((settings.pipeline_raw_path, settings.pipeline_raw_path / rel_path))
+        candidates.append((settings.storage_path, settings.storage_path / "_pipeline" / rel_path))
+    for root, candidate in candidates:
+        p = _contained(root, candidate)
+        if p is not None and p.is_file():
+            return p.read_bytes()
     return None
 
 

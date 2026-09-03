@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import calendar
+from datetime import datetime
 from io import BytesIO
 from typing import Any
 
@@ -63,7 +64,8 @@ _EMPLOYEE_HEADERS: list[tuple[str, str]] = [
     ("account_manager", "Account Manager"),
     ("location", "Location"),
     ("project", "Project"),
-    ("employee_email", "Email"),
+    ("personal_email", "Personal Email"),
+    ("work_email", "Work Email"),
     ("contact_no", "Contact"),
 ]
 
@@ -71,13 +73,21 @@ _META_HEADERS: list[tuple[str, str]] = [
     ("status", "Status"),
     ("month_label", "Month"),
     ("year", "Year"),
+    ("received_at", "Timesheet Received"),
+    ("stored_at", "Timesheet Stored"),
     ("validation_status", "Validation"),
     ("approval_status", "Approval"),
     ("source_file_count", "Source Files"),
 ]
 
 
-def _empty_row_dict(employee: Any, month: int, year: int, status: str) -> dict[str, Any]:
+def _fmt_dt(dt: datetime | None) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M") if dt else ""
+
+
+def _empty_row_dict(
+    employee: Any, month: int, year: int, status: str, received_at: datetime | None = None,
+) -> dict[str, Any]:
     return {
         "employee_id": employee.employee_id or "",
         "employee_name": employee.name or "",
@@ -85,11 +95,18 @@ def _empty_row_dict(employee: Any, month: int, year: int, status: str) -> dict[s
         "account_manager": employee.account_manager or "",
         "location": employee.location or "",
         "project": employee.project or "",
-        "employee_email": employee.employee_email_id or "",
+        "personal_email": employee.personal_email or "",
+        "work_email": employee.work_email or "",
         "contact_no": employee.contact_no or "",
         "month_label": calendar.month_name[month],
         "year": year,
         "status": status,
+        # Not yet filed (that's the whole point of this being the "empty" row
+        # builder) — but the pipeline may still have received something for
+        # them (status RECEIVED_NOT_STORED), so received_at can be non-empty
+        # even here. stored_at can't be — there's no record.
+        "received_at": _fmt_dt(received_at),
+        "stored_at": "",
         "validation_status": "",
         "approval_status": "",
         "source_file_count": 0,
@@ -98,7 +115,10 @@ def _empty_row_dict(employee: Any, month: int, year: int, status: str) -> dict[s
     }
 
 
-def _row_dict(record: Any, employee: Any | None, month: int, year: int, status: str) -> dict[str, Any]:
+def _row_dict(
+    record: Any, employee: Any | None, month: int, year: int, status: str,
+    received_at: datetime | None = None,
+) -> dict[str, Any]:
     attr_map = {
         "annual": "annual_leave_dates",
         "remote": "remote_work_dates",
@@ -120,11 +140,14 @@ def _row_dict(record: Any, employee: Any | None, month: int, year: int, status: 
         "account_manager": record.account_manager or "",
         "location": (employee.location if employee else "") or "",
         "project": (employee.project if employee else "") or "",
-        "employee_email": (employee.employee_email_id if employee else "") or "",
+        "personal_email": (employee.personal_email if employee else "") or "",
+        "work_email": (employee.work_email if employee else "") or "",
         "contact_no": (employee.contact_no if employee else "") or "",
         "month_label": calendar.month_name[month],
         "year": year,
         "status": status,
+        "received_at": _fmt_dt(received_at),
+        "stored_at": _fmt_dt(record.created_at),
         "validation_status": record.validation_status or "",
         "approval_status": record.approval_status or "",
         "source_file_count": record.source_file_count,
@@ -218,16 +241,19 @@ def employees_grid_rows(
     month: int,
     year: int,
     received_pks: set[str] | None = None,
+    received_dates: dict[str, datetime] | None = None,
 ) -> list[dict[str, Any]]:
     """One export row per matcher employee; empty leave cells when not filed."""
     received_pks = received_pks or set()
+    received_dates = received_dates or {}
     out: list[dict[str, Any]] = []
     for emp in employees:
         rec = records_by_pk.get(emp.id)
         status = status_for(bool(rec), emp.id, received_pks)
+        received_at = received_dates.get(emp.id)
         if rec:
-            out.append(_row_dict(rec, emp, month, year, status))
+            out.append(_row_dict(rec, emp, month, year, status, received_at))
         else:
-            out.append(_empty_row_dict(emp, month, year, status))
+            out.append(_empty_row_dict(emp, month, year, status, received_at))
     out.sort(key=lambda r: (r.get("employee_name") or "").lower())
     return out

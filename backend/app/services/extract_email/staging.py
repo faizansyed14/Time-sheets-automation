@@ -27,6 +27,13 @@ def sheet_summaries(sheets: list[dict]) -> list[dict]:
         "employee_name": s["employee_name"], "employee_id": s["employee_id"],
         "month": s["month"], "year": s["year"],
         "manager_signature": s.get("manager_signature", False),
+        # WHAT was detected, not just whether — every path that sets
+        # manager_signature also computes this (roster's _row_approval,
+        # thread_extract's signature_evidence), but until now it was
+        # computed and then dropped here, so Compare & Fix could only ever
+        # show a bare true/false with no explanation of what was actually seen.
+        "approval_evidence": s.get("approval_evidence", ""),
+        "approval_named_only": bool(s.get("approval_named_only")),
         "leave_days": sum(len(s.get(b) or []) for b in BUCKETS),
         "working_days": len(s.get("working_days") or []),
         "weekend_days": len(s.get("weekend_days") or []),

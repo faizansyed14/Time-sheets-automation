@@ -24,8 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import datacache
 from app.core.database import get_db
+from app.services.bulk_roster.roster_cache import extract_roster_cached
 from app.services.bulk_roster.roster_codes import distribute_days, verify_row_totals
-from app.services.bulk_roster.roster_extract import extract_roster
 from app.services.bulk_roster.roster_stage import stage_roster
 
 router = APIRouter(prefix="/bulk-upload", tags=["bulk-upload"])
@@ -101,7 +101,7 @@ async def preview_bulk_roster(
 
     filename, _ct, data = await _read_upload(file)
     try:
-        doc = await extract_roster(filename, data, month=month, year=year)
+        doc = await extract_roster_cached(filename, data, month=month, year=year)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except RuntimeError as e:      # vision not configured
@@ -109,8 +109,11 @@ async def preview_bulk_roster(
 
     # Fetched ONCE and reused for every row below — see roster_stage.py's
     # build_groups() for why (match_employee() otherwise re-fetches the whole
-    # employee table per roster row).
-    all_employees = (await db.execute(select(Employee))).scalars().all()
+    # employee table per roster row). Active only — a deactivated row must
+    # never compete with the real, current employee.
+    all_employees = (await db.execute(
+        select(Employee).where(Employee.active.is_(True))
+    )).scalars().all()
 
     rows: list[RosterPreviewRow] = []
     matched_count = 0
@@ -157,7 +160,7 @@ async def upload_bulk_roster(
     """Read the roster and stage one review item per employee on it."""
     filename, content_type, data = await _read_upload(file)
     try:
-        doc = await extract_roster(filename, data, month=month, year=year)
+        doc = await extract_roster_cached(filename, data, month=month, year=year)
         result = await stage_roster(
             db, filename=filename, content_type=content_type, data=data, doc=doc)
     except ValueError as e:

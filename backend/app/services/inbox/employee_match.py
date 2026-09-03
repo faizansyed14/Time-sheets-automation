@@ -41,7 +41,10 @@ async def match_sender(
     if not candidates:
         return None
 
-    rows = (await db.execute(select(Employee))).scalars().all()
+    # Active only — a deactivated employee's stale address must never win
+    # over the real, current person sharing it (see matching.py's own
+    # _match_by_name docstring for the same rule on the sheet-name path).
+    rows = (await db.execute(select(Employee).where(Employee.active.is_(True)))).scalars().all()
     index: dict[str, Employee] = {}
     for emp in rows:
         for e in (_split_emails(emp.employee_email_id)

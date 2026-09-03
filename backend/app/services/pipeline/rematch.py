@@ -35,7 +35,11 @@ async def rematch_unmatched(db: AsyncSession) -> dict:
     never guesses — anything still genuinely unmatched or ambiguous is left
     exactly as it was, still flagged for a human in Compare & Fix.
     """
-    all_employees = (await db.execute(select(Employee))).scalars().all()
+    # Active only — a deactivated employee must never win a rematch over the
+    # real, current person (see matching.py's _match_by_name docstring).
+    all_employees = (await db.execute(
+        select(Employee).where(Employee.active.is_(True))
+    )).scalars().all()
 
     pk_path = PipelineFile.extraction_meta["staged"]["employee_pk"].as_string()
     rows = (await db.execute(

@@ -200,16 +200,34 @@ const COLUMNS: Col[] = [
     get: (r) => r.project ?? "",
   },
   {
-    key: "employee_email",
-    header: "Email",
+    key: "personal_email",
+    header: "Personal Email",
     width: "min-w-[180px]",
-    get: (r) => r.employee_email ?? "",
+    get: (r) => r.personal_email ?? "",
+  },
+  {
+    key: "work_email",
+    header: "Work Email",
+    width: "min-w-[180px]",
+    get: (r) => r.work_email ?? "",
   },
   {
     key: "contact_no",
     header: "Contact",
     width: "min-w-[110px]",
     get: (r) => r.contact_no ?? "",
+  },
+  {
+    key: "received_at",
+    header: "Timesheet Received",
+    width: "min-w-[150px]",
+    get: (r) => r.received_at ?? "",
+  },
+  {
+    key: "stored_at",
+    header: "Timesheet Stored",
+    width: "min-w-[150px]",
+    get: (r) => r.stored_at ?? "",
   },
   {
     key: "validation_status",

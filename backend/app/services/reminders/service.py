@@ -51,7 +51,7 @@ def month_label(month: int, year: int) -> str:
 
 def resolve_email_with_source(e: Employee, *, prefer: str = EmailPreference.WORK) -> tuple[str | None, str]:
     """(address, source) for the reminders send path specifically — unlike
-    chat_tools/exports (which just want ANY usable address), reminders lets
+    exports (which just want ANY usable address), reminders lets
     the sender choose which of the two SEPARATE addresses to actually use.
 
     source is "work" or "personal" — whichever was actually used, which is

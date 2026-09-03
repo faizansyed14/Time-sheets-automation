@@ -48,7 +48,6 @@ export default function Login() {
   const [loginToken, setLoginToken] = useState("");
   const [otp, setOtp] = useState("");
   const [totp, setTotp] = useState("");
-  const [debugOtp, setDebugOtp] = useState<string | null>(null);
   const [totpQr, setTotpQr] = useState<string | null>(null);
   const [totpEnrolling, setTotpEnrolling] = useState(false);
 
@@ -115,7 +114,6 @@ export default function Login() {
       await refreshCaptcha();
     } else if (res.status === "otp_required") {
       setLoginToken(res.login_token!);
-      setDebugOtp(res.debug_otp ?? null);
       setStage("otp");
       toast("info", "Verification code sent", res.message ?? undefined);
     } else if (res.status === "totp_required") {
@@ -191,8 +189,7 @@ export default function Login() {
 
   const onResend = async () => {
     try {
-      const res = await authResendOtp(loginToken);
-      setDebugOtp(res.debug_otp ?? null);
+      await authResendOtp(loginToken);
       toast("success", "New code sent");
     } catch (e: any) {
       toast("error", "Could not resend", e?.response?.data?.detail ?? "");
@@ -378,11 +375,6 @@ export default function Login() {
                     <ShieldCheck className="h-4 w-4 shrink-0" />
                     Check your inbox for the code
                   </div>
-                  {debugOtp && (
-                    <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                      Dev mode — code: <b className="font-mono text-sm">{debugOtp}</b>
-                    </p>
-                  )}
                   <Input
                     value={otp}
                     onChange={(e) => setOtp(e.target.value.replace(/\D/g, ""))}

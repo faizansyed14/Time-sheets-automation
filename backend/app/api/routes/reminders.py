@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_admin
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.http_headers import content_disposition
 from app.models.auth import User
@@ -71,6 +72,15 @@ def _config_out(cfg) -> dict:
         "send_hour_uae": service.SEND_HOUR_UAE,
         "updated_at": cfg.updated_at.isoformat() if cfg.updated_at else None,
         "updated_by": cfg.updated_by,
+        # Read-only, env-controlled — not something this page can flip, but the
+        # page needs to KNOW their state to explain itself honestly: the
+        # auto_send_enabled toggle above still flips fine in the DB even when
+        # scheduled_check_enabled is false, but it can never actually fire
+        # (the beat task doesn't exist), and every send on this page —
+        # scheduled or manual — is unconditionally blocked when
+        # sending_enabled is false, regardless of auto_send_enabled.
+        "scheduled_check_enabled": settings.reminder_scheduled_check_enabled,
+        "sending_enabled": settings.reminder_sending_enabled,
     }
 
 

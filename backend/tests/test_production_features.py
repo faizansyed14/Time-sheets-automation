@@ -4,11 +4,52 @@ Production-hardening features:
   - pipeline raw-copy retention purge (60-day cleanup)
   - File Vault: upload into a month folder, delete a file, streaming ZIP
     download (whole + scoped to a subtree)
+  - _assert_prod_secrets: refuse to boot in prod with a weak JWT secret or the
+    hardcoded default admin password
 """
 import io
 import zipfile
 
 from tests.conftest import auth_headers
+
+
+# --------------------------------------------------------- prod-boot guards
+def test_assert_prod_secrets_refuses_the_default_admin_password():
+    from app.core.config import settings
+    from app.main import _assert_prod_secrets
+
+    orig_env, orig_jwt, orig_pw = settings.environment, settings.jwt_secret, settings.default_admin_password
+    try:
+        settings.environment = "prod"
+        settings.jwt_secret = "a" * 40  # long enough to clear the JWT check on its own
+        settings.default_admin_password = "admin"
+        try:
+            _assert_prod_secrets()
+            assert False, "must refuse to boot with the default admin password in prod"
+        except RuntimeError as e:
+            assert "admin" in str(e).lower()
+
+        # A real, non-default password clears it.
+        settings.default_admin_password = "a-genuinely-strong-unique-password"
+        _assert_prod_secrets()  # must not raise
+    finally:
+        settings.environment, settings.jwt_secret, settings.default_admin_password = orig_env, orig_jwt, orig_pw
+
+
+def test_assert_prod_secrets_is_a_no_op_outside_prod():
+    """The exact same weak values must never block LOCAL/DEV — this is a
+    prod-only gate, not a general-purpose lint."""
+    from app.core.config import settings
+    from app.main import _assert_prod_secrets
+
+    orig_env, orig_jwt, orig_pw = settings.environment, settings.jwt_secret, settings.default_admin_password
+    try:
+        settings.environment = "dev"
+        settings.jwt_secret = "change-me"
+        settings.default_admin_password = "admin"
+        _assert_prod_secrets()  # must not raise
+    finally:
+        settings.environment, settings.jwt_secret, settings.default_admin_password = orig_env, orig_jwt, orig_pw
 
 
 # --------------------------------------------------------------- CAPTCHA limit

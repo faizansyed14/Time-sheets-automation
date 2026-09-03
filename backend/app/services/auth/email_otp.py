@@ -52,9 +52,20 @@ def _body(code: str) -> str:
 
 
 def send_otp_email(email: str, code: str) -> bool:
-    """Synchronous send (invoked inside the Celery task). Returns True on send."""
+    """Synchronous send (invoked inside the Celery task). Returns True on send.
+
+    settings.otp_sending_enabled is a hard kill-switch checked first, before
+    Graph config is even looked at — completely independent of reminders'
+    own kill-switch (settings.reminder_sending_enabled). Set false in .env
+    and no OTP email ever actually goes out; login only still works if
+    settings.debug_otp_enabled is ALSO on for this box (off by default on
+    every real deployment — see its own docstring in core/config.py), same
+    as today's "Graph not configured" fallback below."""
     if not email:
         return False
+    if not settings.otp_sending_enabled:
+        log.warning("[OTP SENDING DISABLED] %s -> %s (OTP_SENDING_ENABLED=false; not emailed)", email, code)
+        return True
     if not _graph_configured():
         # Dev / no Graph creds: log the code (the login response also returns a
         # `debug_otp` when not running in prod, so the flow stays testable).

@@ -90,3 +90,65 @@ async def test_name_fallback_when_id_fails(eid, name, code, matched):
     r = await _match(eid, name)
     assert r.code == code, (eid, name, r.code, r.note)
     assert (r.employee.name if r.employee else None) == matched
+
+
+async def test_deactivated_ghost_row_never_competes_with_the_real_employee():
+    """A deactivated employee's row is kept forever (their vault history /
+    filed records still point at it — see Employee.active's own docstring),
+    but it must never be a MATCH CANDIDATE for a brand new sheet — otherwise a
+    same-named ghost row silently steals (or ties with, forcing "ambiguous")
+    a sheet that should go to the real, active person. This is the exact bug
+    class already seen in production (duplicate "Priya Dey" rows)."""
+    import uuid
+    from sqlalchemy import select
+    from app.core.database import SessionLocal
+    from app.models.employee import Employee
+
+    async with SessionLocal() as db:
+        real = Employee(id=str(uuid.uuid4()), employee_id="MT-GHOST-REAL",
+                         name="Priya Dey", location="DXB", active=True)
+        ghost = Employee(id=str(uuid.uuid4()), employee_id="MT-GHOST-OLD",
+                          name="Priya Dey", location="DXB", active=False)
+        db.add_all([real, ghost])
+        await db.commit()
+
+    try:
+        # Name-only path: with the ghost excluded, "Priya Dey" resolves
+        # uniquely to the real row instead of tying between two candidates
+        # (which would otherwise return no_match — see _match_by_name).
+        r = await _match(None, "Priya Dey")
+        assert r.employee is not None and r.employee.id == real.id
+
+        # Name still resolves first even when the client ID on the sheet
+        # happens to be the now-inactive ghost's old id — matching is
+        # name-primary by design (client Emp No is not the matcher's id), so
+        # this correctly lands on the real employee, not the ghost, and not
+        # a "no_match" either.
+        r2 = await _match("MT-GHOST-OLD", "Priya Dey")
+        assert r2.employee is not None and r2.employee.id == real.id
+
+        # Force the ID fallback path specifically: a name that does NOT
+        # agree with "Priya Dey" (so _match_by_name finds nothing) plus the
+        # ghost's own id — _match_by_id's candidate query must now exclude
+        # the inactive ghost, so this correctly falls through to no_match
+        # rather than resolving to the deactivated row.
+        r2b = await _match("MT-GHOST-OLD", "Someone Else Entirely")
+        assert r2b.employee is None
+        assert r2b.code == M.MatchCode.NO_MATCH
+
+        # Pre-fetched-list callers (bulk roster staging, rematch, bulk
+        # upload) must filter the same way at the call site — confirmed here
+        # by mirroring what those call sites now do before passing the list in.
+        async with SessionLocal() as db:
+            active_only = (await db.execute(
+                select(Employee).where(Employee.active.is_(True))
+            )).scalars().all()
+            r3 = await M.match_employee(db, None, "Priya Dey", all_employees=active_only)
+            assert r3.employee is not None and r3.employee.id == real.id
+    finally:
+        async with SessionLocal() as db:
+            for pk in (real.id, ghost.id):
+                obj = await db.get(Employee, pk)
+                if obj:
+                    await db.delete(obj)
+            await db.commit()

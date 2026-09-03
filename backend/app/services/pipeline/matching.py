@@ -158,9 +158,18 @@ async def _match_by_name(
     `all_employees`, when given, is used directly instead of querying the DB
     — lets a caller matching MANY rows in one request (e.g. a bulk roster)
     fetch the table once and reuse it, rather than re-fetching it per row.
-    Omit it (the default) for the normal one-off call — unchanged behavior."""
+    Omit it (the default) for the normal one-off call — unchanged behavior.
+
+    Only ACTIVE employees are ever candidates here — a deactivated row (its
+    timesheet history and vault files stay intact, see Employee.active's own
+    docstring) must never compete with the real, current person of the same
+    or similar name for a NEW sheet. A caller passing `all_employees` in is
+    responsible for having filtered it the same way (roster_stage.py /
+    bulk_upload.py / rematch.py all do)."""
     if all_employees is None:
-        all_employees = (await db.execute(select(Employee))).scalars().all()
+        all_employees = (await db.execute(
+            select(Employee).where(Employee.active.is_(True))
+        )).scalars().all()
     agreeing = [e for e in all_employees if _name_agrees(name_norm, e.name)]
     if len(agreeing) == 1:
         return agreeing[0]
@@ -225,7 +234,9 @@ async def _match_by_id(
     from sqlalchemy import func
     candidates = (
         await db.execute(select(Employee).where(
-            func.upper(Employee.employee_id) == id_norm.upper()))
+            func.upper(Employee.employee_id) == id_norm.upper(),
+            Employee.active.is_(True),
+        ))
     ).scalars().all()
     if not candidates:
         return None
