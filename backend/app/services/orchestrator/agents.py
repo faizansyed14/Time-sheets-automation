@@ -84,8 +84,16 @@ class ThreadAgent(Agent):
 
         # Full debug trace of this run (raw prompts/responses per pass-1/
         # pass-2 call, dropped-item images) — a temporary testing aid, see
-        # /admin/debug. Captured unconditionally for now; best-effort only,
-        # a debug-write failure must never break real extraction.
+        # /admin/debug. Captured in memory for every run (cheap, no DB
+        # write), but only PERSISTED when this run had something wrong with
+        # it — a clean run that found and extracted at least one sheet with
+        # no errors leaves nothing worth keeping. This is deliberately not
+        # "any dropped item" (routine noise filtering — e.g. a small
+        # signature logo — isn't a failure) and not "zero sheets" alone in
+        # every case; here it just IS, since `errors` already covers the
+        # "nothing here at all" case too (see thread_extract.py's own
+        # `errors: ["empty thread"]`). Best-effort only — a debug-write
+        # failure must never break real extraction.
         from app.services.extract_email import debug_capture
         cap = debug_capture.DebugCapture()
         cap_token = debug_capture.set_capture(cap)
@@ -94,19 +102,28 @@ class ThreadAgent(Agent):
                 messages, cached_sheets=cached, calendars=calendars)
         finally:
             debug_capture.reset_capture(cap_token)
-        try:
-            from app.models.extraction_debug_run import ExtractionDebugRun
-            ctx.db.add(ExtractionDebugRun(
-                id=cap.run_id, source_kind=ctx.source_kind, source_id=ctx.source_id,
-                thread_key=ctx.thread_key, subject=getattr(ctx.source, "subject", None),
-                model=model, calls=meta.get("calls", 0), reused_sheets=meta.get("reused_sheets", 0),
-                pass1_calls=cap.pass1_calls, pass2_calls=cap.pass2_calls,
-                dropped_items=cap.dropped_items, triage=meta.get("triage") or [],
-                sheets=sheets, errors=meta.get("errors") or [],
-            ))
-            await ctx.db.commit()
-        except Exception:
-            await ctx.db.rollback()
+        # Carried into extraction_meta.full_email_extract.snapshot_at (see
+        # AgentContext.snapshot_at's docstring) — the correct watermark for
+        # "was a given message read by this run", replacing PipelineFile.
+        # updated_at for that comparison. None for any caller that never set
+        # it, which just means that run falls back to today's behavior.
+        meta["snapshot_at"] = ctx.snapshot_at.isoformat() if ctx.snapshot_at else None
+        errors = meta.get("errors") or []
+        had_a_problem = bool(errors) or not sheets
+        if had_a_problem:
+            try:
+                from app.models.extraction_debug_run import ExtractionDebugRun
+                ctx.db.add(ExtractionDebugRun(
+                    id=cap.run_id, source_kind=ctx.source_kind, source_id=ctx.source_id,
+                    thread_key=ctx.thread_key, subject=getattr(ctx.source, "subject", None),
+                    model=model, calls=meta.get("calls", 0), reused_sheets=meta.get("reused_sheets", 0),
+                    pass1_calls=cap.pass1_calls, pass2_calls=cap.pass2_calls,
+                    dropped_items=cap.dropped_items, triage=meta.get("triage") or [],
+                    sheets=sheets, errors=errors,
+                ))
+                await ctx.db.commit()
+            except Exception:
+                await ctx.db.rollback()
 
         # A signature/approval found in an EARLIER run — possibly on a message
         # outside this run's window — must never be forgotten just because

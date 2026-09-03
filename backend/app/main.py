@@ -31,6 +31,7 @@ from app.api.routes import (
     portal_auth,
     portal_employee,
     reminders,
+    system_health,
     timesheets,
     upload,
 )
@@ -195,6 +196,7 @@ app.include_router(agentic_chat.router, prefix=settings.api_prefix, dependencies
 # so only admin can see or act on it, unlike the "any full-access role" tier
 # calendars/portal-users/reminders-adjacent business routes use.
 app.include_router(reminders.router, prefix=settings.api_prefix, dependencies=[Depends(require_admin)])
+app.include_router(system_health.router, prefix=settings.api_prefix, dependencies=[Depends(require_admin)])
 
 
 @app.get("/health")

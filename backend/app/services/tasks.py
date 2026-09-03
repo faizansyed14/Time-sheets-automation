@@ -264,6 +264,27 @@ def run_reminder_scheduled_check_task():
     return _run_coro(_run)
 
 
+@celery_app.task(name="system_health.check")
+def system_health_check_task():
+    """Fires every settings.system_health_check_interval_hours via Celery
+    beat (see core/celery_app.py), gated by settings.system_health_check_enabled
+    at the beat-registration level — same on/off-at-startup technique as
+    inbox_auto_sync_enabled and reminder_scheduled_check_enabled. Checks the
+    LLM key/credits + Graph credential and emails an admin on any state
+    change; see services/system_health/monitor.py for the actual checks and
+    alerting rule. Deliberately NOT wrapped in self.retry — a transient
+    network hiccup checking health is not itself worth Celery's retry/backoff
+    machinery, and monitor.run_health_check already never raises."""
+    from app.core.database import SessionLocal
+    from app.services.system_health import monitor
+
+    async def _run():
+        async with SessionLocal() as db:
+            return await monitor.run_health_check(db)
+
+    return _run_coro(_run)
+
+
 @celery_app.task(name="portal.extract_submission", bind=True, max_retries=2, default_retry_delay=15)
 def run_portal_extraction_task(self, submission_id: str, only_kind: str | None = None):
     """Runs immediately after the employee hits Submit — NOT gated on the

@@ -114,14 +114,31 @@ async def test_no_capture_active_is_a_pure_no_op(mock_vision_calls):
     # record_* are silent no-ops with no active capture — nothing raised above.
 
 
-async def test_extract_full_email_persists_a_debug_run(mock_vision_calls):
-    """End-to-end through ThreadAgent — the whole point of capturing is a
-    persisted ExtractionDebugRun row a human can browse afterward, not just
-    an in-memory object that dies with the request."""
+async def _get_or_sync_msg0001(db):
+    from sqlalchemy import select
+
+    from app.models.email_message import EmailMessage
+
+    row = (await db.execute(select(EmailMessage).where(
+        EmailMessage.provider_message_id == "MSG-0001"))).scalar_one_or_none()
+    if row is None:
+        from app.services.email_provider import get_email_provider
+        from app.services.inbox.sync import sync_message
+        msg = await get_email_provider().get_message("MSG-0001")
+        row = await sync_message(db, msg)
+        await db.commit()
+        await db.refresh(row)
+    return row
+
+
+async def test_extract_full_email_clean_success_does_not_persist_a_debug_run(mock_vision_calls):
+    """A run that went cleanly (extracted at least one sheet, no errors)
+    must leave NOTHING in the debug table — this is a failure log now, not
+    a trace of every run. The in-memory capture (tested above) still
+    happens either way; only the DB write is conditional."""
     from sqlalchemy import select
 
     from app.core.database import SessionLocal
-    from app.models.email_message import EmailMessage
     from app.models.extraction_debug_run import ExtractionDebugRun
     from app.services.agents import full_email_extract as fx
 
@@ -143,30 +160,38 @@ async def test_extract_full_email_persists_a_debug_run(mock_vision_calls):
     ])
 
     async with SessionLocal() as db:
-        row = (await db.execute(select(EmailMessage).where(
-            EmailMessage.provider_message_id == "MSG-0001"))).scalar_one_or_none()
-        if row is None:
-            from app.services.inbox.sync import sync_message
-            from app.services.email_provider import get_email_provider
-            msg = await get_email_provider().get_message("MSG-0001")
-            row = await sync_message(db, msg)
-            await db.commit()
-            await db.refresh(row)
-
+        row = await _get_or_sync_msg0001(db)
         before = (await db.execute(select(ExtractionDebugRun.id))).scalars().all()
         res = await fx.extract_full_email(db, row)
         assert res["groups"] == 1, res["message"]
 
+        after = (await db.execute(select(ExtractionDebugRun.id))).scalars().all()
+        assert len(after) == len(before), "a clean, successful run must not create a debug row"
+
+
+async def test_extract_full_email_persists_a_debug_run_when_pass1_errors(mock_vision_calls):
+    """The other half of the same rule: a run that hit a real problem (here,
+    a pass-1 batch raising — see mock_vision_calls' own docstring for how to
+    script that) DOES get a persisted, browsable ExtractionDebugRun row."""
+    from sqlalchemy import select
+
+    from app.core.database import SessionLocal
+    from app.models.extraction_debug_run import ExtractionDebugRun
+    from app.services.agents import full_email_extract as fx
+
+    mock_vision_calls([RuntimeError("simulated pass-1 failure")])
+
+    async with SessionLocal() as db:
+        row = await _get_or_sync_msg0001(db)
+        before = (await db.execute(select(ExtractionDebugRun.id))).scalars().all()
+        await fx.extract_full_email(db, row)
+
         after = (await db.execute(select(ExtractionDebugRun)
                                   .order_by(ExtractionDebugRun.created_at.desc()))).scalars().all()
-        assert len(after) == len(before) + 1, "extract_full_email must create exactly one debug run"
+        assert len(after) == len(before) + 1, "a run with a pass-1 error must create exactly one debug row"
         run = after[0]
         assert run.source_kind == "email"
-        assert run.calls == 2
-        assert len(run.pass1_calls) == 1
-        assert len(run.pass2_calls) == 1
-        assert run.sheets, "the full (unabridged) sheets JSON must be stored, not just counts"
-        assert run.sheets[0]["employee_name"] == "Mohammed Ali"
+        assert run.errors and "simulated pass-1 failure" in run.errors[0]
 
         await db.delete(run)
         await db.commit()

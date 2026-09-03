@@ -276,100 +276,8 @@ def _item_thumb(it: Item) -> str | None:
     return _thumb_uri(it.images[0]) if it.images else None
 
 
-# A whole "Approved By: <name>" / "Approval Date: <date>" line (either word
-# order) is approval metadata end-to-end — strip the label AND its value, or
-# the approver's name/date leaks through as content the unsigned copy never
-# had. Matched and stripped before the standalone-word pass below.
-_APPROVAL_LINE_RE = re.compile(
-    r"(?i)\b(?:approved\s*by|approval\s*date|date\s*(?:of\s*)?approval)\s*:?\s*[^\n]*"
-)
-# Standalone tokens that flip between an unsigned timesheet and the same
-# sheet after manager approval / regenerate — strip before near-dup compare.
-# Includes generic workflow-status words (status/submitted/pending/present)
-# since those are exactly what differs between "awaiting sign-off" and
-# "signed" copies of one sheet, the same way approved/signed/manager are.
-_APPROVAL_NOISE_RE = re.compile(
-    r"(?i)\b("
-    r"approval|approved|approver|"
-    r"signature|signed|signatory|stamp|"
-    r"line\s*manager|manager|\blm\b|"
-    r"status|submitted|pending|present"
-    r")\b"
-)
-
-
 def _is_email_body(it: Item) -> bool:
     return (it.name or "").lower().startswith("email body")
-
-
-# A staff/employee number embedded in a filename — either an explicit label
-# ("Staff No: 46533", "Emp ID 46533") or the bare "(46533)" convention a
-# forwarded-per-employee attachment is commonly renamed to. Used ONLY to STOP
-# a same-template dedup between two clearly different, named employees (a
-# bulk send of one identical timesheet layout per person scores as "near
-# duplicate" on text alone) — never to positively match, so a filename with
-# no such number falls through to today's text-only behaviour unchanged.
-_FILENAME_ID_RE = re.compile(
-    r"(?:staff\s*no\.?|staff\s*number|emp(?:loyee)?\s*(?:id|no)\.?)\s*[:#]?\s*(\d{3,})"
-    r"|\((\d{3,})\)",
-    re.I,
-)
-
-
-def _filename_identity(name: str) -> str | None:
-    m = _FILENAME_ID_RE.search(name or "")
-    if not m:
-        return None
-    return m.group(1) or m.group(2)
-
-
-def _sheet_text_fingerprint(text: str) -> str:
-    """Normalize OCR/PDF text for near-dup: collapse whitespace, drop
-    approval/sign/manager/workflow-status noise that differs between unsigned
-    vs signed regenerations of the same timesheet."""
-    t = (text or "").lower()
-    t = _APPROVAL_LINE_RE.sub(" ", t)
-    t = _APPROVAL_NOISE_RE.sub(" ", t)
-    t = re.sub(r"[^a-z0-9]+", " ", t)
-    return " ".join(t.split())
-
-
-def _texts_near_match(a: str, b: str, *, min_chars: int = 40, ratio: float = 0.92) -> bool:
-    """True when two sheets share the same core content after approval-noise
-    strip (exact fingerprint or very high SequenceMatcher ratio)."""
-    from difflib import SequenceMatcher
-
-    fa, fb = _sheet_text_fingerprint(a), _sheet_text_fingerprint(b)
-    if not fa or not fb:
-        return False
-    if fa == fb:
-        return True
-    if min(len(fa), len(fb)) < min_chars:
-        return False
-    return SequenceMatcher(None, fa, fb).ratio() >= ratio
-
-
-def _approval_signal_score(it: Item) -> tuple:
-    """Prefer the copy that carries manager approval / sign. Higher = keep."""
-    t = (it.text or "").lower()
-    score = 0
-    for kw, w in (
-        ("approved by", 8),
-        ("date of approval", 4),
-        ("approved", 3),
-        ("signature", 3),
-        ("signed", 3),
-        ("approver", 3),
-        ("line manager", 2),
-        ("manager", 1),
-    ):
-        if kw in t:
-            score += w
-    # Later reply often has the regenerated signed PDF.
-    score += it.msg_index * 2
-    # Signatures add a few KB; cap so size alone cannot dominate.
-    score += min(max(it.size, 0) // 2000, 40)
-    return (score, len(it.text or ""), it.msg_index, it.key)
 
 
 def _record_dropped(th: Thread, entry: dict, image: bytes | None) -> None:
@@ -391,12 +299,26 @@ def _record_dropped(th: Thread, entry: dict, image: bytes | None) -> None:
 
 
 def _dedupe_sheet_items(th: Thread) -> None:
-    """Collapse byte-identical and near-identical sheet attachments.
+    """Collapse byte-identical sheet attachments ONLY.
 
-    Exact same bytes → keep one. Same core OCR/PDF text with only small
-    manager-sign / Approved By diffs → keep the stronger approval copy,
-    drop the other into ``th.dropped`` with ``filter=dup`` for the Extract UI.
-    Email bodies are never merged.
+    Exact same bytes -> keep one (zero information loss either way, so which
+    copy survives is a harmless tie-break, not a guess).
+
+    This used to ALSO collapse "near-identical" text — e.g. an unsigned
+    timesheet vs. the same sheet regenerated after manager sign-off — keeping
+    whichever scored higher on a keyword count (_approval_signal_score:
+    "approved", "signature", "manager", ...) and silently discarding the
+    other with no reviewer-visible flag. That heuristic is gone: a BLANK,
+    unsigned template routinely has those exact words pre-printed as empty
+    field labels ("Approved by: ______"), so it can score as high as — or
+    higher than — a genuinely signed copy that OCR'd poorly (e.g. a lower-
+    quality scan/photo). Confirmed in production: the signed copy lost to
+    the unsigned one, and nothing ever told the reviewer a second file
+    existed. Two sheets that merely LOOK similar are no longer a case this
+    function decides on its own — both now survive into pass 1/2 and
+    grouping, where grouping.py's own overlap flag ("two sheets claim the
+    same days") surfaces it for a human instead of an algorithm silently
+    picking a winner. Email bodies are never merged.
     """
     keepers: list[Item] = []
     for it in th.items:
@@ -404,41 +326,24 @@ def _dedupe_sheet_items(th: Thread) -> None:
             keepers.append(it)
             continue
         matched_idx: int | None = None
-        exact = False
         for i, kept in enumerate(keepers):
             if _is_email_body(kept):
                 continue
             if it.digest and kept.digest and it.digest == kept.digest:
                 matched_idx = i
-                exact = True
-                break
-            id_a, id_b = _filename_identity(it.name), _filename_identity(kept.name)
-            if id_a and id_b and id_a != id_b:
-                # Filenames name two different employees (e.g. a bulk send of
-                # one identical timesheet template per person) — never a
-                # duplicate no matter how similar the sheet text scores.
-                continue
-            if _texts_near_match(it.text, kept.text):
-                matched_idx = i
-                exact = False
                 break
         if matched_idx is None:
             keepers.append(it)
             continue
         kept = keepers[matched_idx]
-        if _approval_signal_score(it) > _approval_signal_score(kept):
+        # Byte-identical only, from here on — genuinely the same file, so
+        # preferring the later message (e.g. a plain resend) is a harmless
+        # tie-break, never a signal-guessing decision.
+        if it.msg_index > kept.msg_index:
             winner, loser = it, kept
             keepers[matched_idx] = it
         else:
             winner, loser = kept, it
-        reason = (
-            f"duplicate of [{winner.key}] {winner.name} (identical bytes)"
-            if exact
-            else (
-                f"duplicate of [{winner.key}] {winner.name} "
-                "(same sheet text; kept version with stronger approval/sign)"
-            )
-        )
         _record_dropped(th, {
             "name": loser.name,
             "mime": loser.mime,
@@ -446,7 +351,7 @@ def _dedupe_sheet_items(th: Thread) -> None:
             "msg_index": loser.msg_index,
             "key": loser.key,
             "filter": "dup",
-            "reason": reason,
+            "reason": f"duplicate of [{winner.key}] {winner.name} (identical bytes)",
             "kept_key": winner.key,
             "kept_name": winner.name,
             "thumb": _item_thumb(loser),

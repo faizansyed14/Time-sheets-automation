@@ -333,8 +333,14 @@ def test_exact_same_attachment_bytes_keep_one_sheet():
     assert th.dropped[0]["name"] == "June.pdf"
 
 
-def test_near_same_ocr_prefers_manager_signed_copy():
-    """Unsigned first send + later regen with Approved By → keep signed one."""
+def test_near_same_ocr_no_longer_guesses_which_approval_variant_to_drop():
+    """Real production bug this pins down: an unsigned copy + the same sheet
+    regenerated with Approved By/manager sign used to be collapsed to
+    "whichever scores higher on approval keywords" — and that heuristic
+    picked the WRONG one for a real employee (blank template fields like
+    "Approved by: ______" score too). Both must now survive untouched;
+    picking which is authoritative is grouping.py's overlap-flag + a human's
+    job, never a keyword count's."""
     unsigned = _SHEET_CORE + "Status: Submitted\n"
     signed = (
         _SHEET_CORE
@@ -352,10 +358,8 @@ def test_near_same_ocr_prefers_manager_signed_copy():
         ],
     )
     _dedupe_sheet_items(th)
-    assert [it.key for it in th.items] == ["A2"]
-    assert th.dropped[0]["filter"] == "dup"
-    assert th.dropped[0]["kept_key"] == "A2"
-    assert "approval" in th.dropped[0]["reason"].lower() or "same" in th.dropped[0]["reason"].lower()
+    assert {it.key for it in th.items} == {"A1", "A2"}
+    assert th.dropped == []
 
 
 def test_email_bodies_are_never_deduped_against_attachments():
@@ -378,10 +382,11 @@ def test_email_bodies_are_never_deduped_against_attachments():
 
 def test_same_template_different_employees_in_filename_is_never_deduped():
     """A bulk send of one identical timesheet template, one file per person,
-    must never collapse two different named employees into one — even though
-    the shared boilerplate layout scores as "near-identical" text. Regression
-    for a real bug: 5 of 10 employees in one email were silently dropped as
-    "duplicates" of each other because their sheets used the same template."""
+    must never collapse two different named employees into one. (Originally
+    a regression test for a bug where near-identical-text matching merged
+    different employees' same-template sheets; that whole matching path is
+    gone now — this keeps testing the invariant itself: distinct employees'
+    sheets are never treated as duplicates, byte-identical or otherwise.)"""
     th = Thread(
         subject="June",
         items=[
@@ -396,10 +401,10 @@ def test_same_template_different_employees_in_filename_is_never_deduped():
     assert th.dropped == []
 
 
-def test_same_employee_id_in_filename_still_dedupes_regenerated_copy():
-    """The guard must not block the ORIGINAL, legitimate case it sits next to:
-    the same employee's own sheet resent/regenerated with a stronger
-    signature — same id in both filenames, so dedup still collapses them."""
+def test_same_employee_id_in_filename_also_keeps_both_approval_variants():
+    """Same employee, two versions (unsigned v1 / signed v2 in the filename)
+    — still both kept now, same as the general case above. Nothing about a
+    shared employee id in the filename makes keyword-guessing any safer."""
     unsigned = _SHEET_CORE + "Status: Submitted\n"
     signed = _SHEET_CORE + "Approved By: Ahmed Shukri\nManager signature present\n"
     th = Thread(
@@ -412,9 +417,8 @@ def test_same_employee_id_in_filename_still_dedupes_regenerated_copy():
         ],
     )
     _dedupe_sheet_items(th)
-    assert [it.key for it in th.items] == ["A2"]
-    assert th.dropped[0]["filter"] == "dup"
-    assert th.dropped[0]["kept_key"] == "A2"
+    assert {it.key for it in th.items} == {"A1", "A2"}
+    assert th.dropped == []
 
 
 def test_unrelated_sheets_are_not_merged():

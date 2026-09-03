@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,6 +56,18 @@ class AgentContext:
     # whole thread fresh (the "Re-read entire thread" escape hatch) — set by
     # email.py from the caller's explicit request, read by ThreadAgent.
     force_full: bool = False
+    # Wall-clock moment email.py fetched this thread's messages — the TRUE
+    # "as of" cutoff for what this run could possibly have read. Threaded
+    # into run_meta so it lands in PipelineFile.extraction_meta and becomes
+    # what sheet_cache.last_extraction_at(_bulk) compares against, INSTEAD of
+    # PipelineFile.updated_at (that column is the commit time of the DB
+    # write, which can — and for a long-running, many-batch extraction, will
+    # — postdate a genuinely new reply that arrived mid-run and was never
+    # actually read; comparing against it caused that reply to be silently,
+    # permanently skipped by every later auto-extract scan). None for any
+    # path that doesn't set it (e.g. Upload), which is fine — that path
+    # never consults this watermark at all.
+    snapshot_at: datetime | None = None
 
     def abort(self, reason: str) -> None:
         self.aborted = reason

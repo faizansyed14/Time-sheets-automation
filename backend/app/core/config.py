@@ -95,6 +95,30 @@ class Settings(BaseSettings):
     # tests/conftest.py — so this default doesn't affect what the test suite
     # exercises.)
     reminder_sending_enabled: bool = False
+
+    # ----- System health monitoring (LLM key/credits + Graph credential) -----
+    # A completely SEPARATE feature/mailer/kill-switch from reminders and OTP
+    # above — deliberately so flipping any of THOSE settings can never affect
+    # this, and vice versa (see services/system_health/monitor.py). Purpose:
+    # an expired API key, exhausted LLM credits, or an expired/broken Graph
+    # client secret currently fails SILENTLY — extraction/OTP/reminder sends
+    # just start failing one by one with nothing surfacing it. This runs on
+    # its own schedule and emails an admin the moment either breaks.
+    system_health_check_enabled: bool = True
+    # How often the check runs (Celery beat). Cheap (one lightweight HTTP call
+    # per component), so a modest default interval is fine.
+    system_health_check_interval_hours: int = 6
+    # Once alerted that a component is down/degraded, don't re-send the same
+    # alert again until this many hours have passed AND it's still broken —
+    # keeps a genuinely-still-broken key from spamming an inbox every 6 hours,
+    # while still nudging daily-ish so it's never forgotten.
+    system_health_alert_resend_hours: int = 24
+    # Where the alert email goes. Empty -> falls back to default_admin_email.
+    system_health_alert_email: str = ""
+    # How many days before graph_client_secret_expires_on (above) to start
+    # warning — only meaningful if that date is actually set.
+    system_health_graph_expiry_warn_days: int = 30
+
     # Image attachments smaller than this are signature logos/icons in
     # practice: hidden from attachment lists/counts and never sent to the
     # vision model. Applies ONLY to images — documents of any size still flow.
@@ -214,6 +238,18 @@ class Settings(BaseSettings):
     graph_mailbox: str = ""          # e.g. timesheets@yourcompany.com
     graph_folder: str = "Inbox"      # folder to watch
     graph_otp_sender: str = ""       # mailbox OTP emails are sent FROM (defaults to graph_mailbox)
+    # The Azure app registration's client secret has its OWN expiry (set when
+    # it was created, e.g. Azure's default 6/12/24-month options) — but the
+    # OAuth2 client-credentials token exchange this app already does (see
+    # system_health/monitor.py's Graph check) only proves the secret works
+    # RIGHT NOW; it cannot reveal when it will stop working. Reading that date
+    # from Azure directly needs Application.Read.All + admin consent — a
+    # permission this app doesn't have and isn't requesting just for this.
+    # So it's entered here manually (copy it from Azure Portal -> App
+    # registrations -> Certificates & secrets when you create/rotate it),
+    # "YYYY-MM-DD". Blank = no advance-expiry warning, only the live
+    # already-broken check still applies.
+    graph_client_secret_expires_on: str = ""
 
     # ===================== Infrastructure =====================
     # Redis — caching + Celery broker/result backend + rate-limit windows.

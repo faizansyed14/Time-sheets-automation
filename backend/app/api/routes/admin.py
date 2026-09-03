@@ -25,7 +25,9 @@ business route it's excluded from; see require_full_access):
   PUT    /admin/calendars            upsert (by month+year)
   DELETE /admin/calendars/{id}
 
-Extraction debug runs (RBAC: admin only; temporary, purgeable — see debug_capture.py):
+Extraction debug runs (RBAC: admin only; temporary, purgeable, failed-runs-only
+— see orchestrator/agents.py's ThreadAgent for the exact "something went
+wrong" condition, and extraction_debug_run.py's model docstring):
   GET    /admin/debug/runs           list (summary only)
   GET    /admin/debug/runs/{id}      full detail (prompts, responses, dropped items, sheets)
   GET    /admin/debug/image          serve one saved dropped-item image

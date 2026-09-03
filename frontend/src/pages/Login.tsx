@@ -241,8 +241,8 @@ export default function Login() {
         <div className="w-full max-w-[420px] animate-fade-up">
           <div className="login-card p-7 sm:p-8">
             <div className="mb-6 flex justify-center">
-              <div className="flex h-32 w-32 items-center justify-center overflow-hidden rounded-2xl shadow-card ring-4 ring-brand-100/60">
-                <img src="/timesheets_logo.jpg" alt="Alpha Data" className="h-full w-full object-cover" />
+              <div className="flex h-24 w-44 items-center justify-center overflow-hidden rounded-2xl bg-white shadow-card ring-4 ring-brand-100/60">
+                <img src="/timesheets_logo.jpg" alt="Alpha Data" className="h-full w-full object-contain p-2" />
               </div>
             </div>
             {/* Stage header */}
