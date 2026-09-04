@@ -55,6 +55,10 @@ os.environ.update(
     GRAPH_CLIENT_SECRET="",
     GRAPH_MAILBOX="",
     GRAPH_OTP_SENDER="",
+    # Same isolation reasoning — a real box may have a real expiry date
+    # configured; test_system_health.py sets this explicitly per-test when
+    # it wants to exercise the expiry-warning path.
+    GRAPH_CLIENT_SECRET_EXPIRES_ON="",
     # Explicitly true regardless of whatever the real box's .env says — the
     # actual container this runs in may have REMINDER_SENDING_ENABLED=false
     # for its own real reasons, and that must never leak into the test run

@@ -127,6 +127,42 @@ async def thread_cached_sheets(
     return merged
 
 
+def _snapshot_at_of(extraction_meta: dict | None) -> datetime | None:
+    """The wall-clock moment THIS run actually fetched the thread (see
+    AgentContext.snapshot_at) — None for a row written before this field
+    existed, or one with no full_email_extract meta at all (e.g. Upload)."""
+    raw = ((extraction_meta or {}).get("full_email_extract") or {}).get("snapshot_at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def _effective_watermark(updated_at: datetime | None, extraction_meta: dict | None) -> datetime | None:
+    """Prefer snapshot_at (the TRUE "as of" cutoff for what this run could
+    have read) over updated_at (the row's DB-commit time). Falling back to
+    updated_at when snapshot_at is absent is what makes this change safe for
+    every row already sitting in a real database: a row written before this
+    fix existed is compared EXACTLY as it always was, byte for byte the same
+    behavior — only a NEW extraction run (which now always writes
+    snapshot_at) gets the corrected comparison.
+
+    Why updated_at alone was wrong: it is bumped by func.now() on ANY write
+    to the row (extraction finishing, a later resolve, a rematch — see
+    pipeline_file.py's onupdate=func.now()), and even restricted to genuine
+    extraction runs, it is the moment the DB COMMIT happened, not the moment
+    the thread was actually fetched — for a long-running, many-batch
+    extraction those can differ by the run's own full duration. A reply
+    that arrives in that gap has a received_at earlier than the eventual
+    commit despite never having been read, and every later auto-extract scan
+    repeats the exact same (wrong) comparison forever — see
+    auto_extract.py's _partition_needs_extraction, the only caller of this."""
+    snap = _snapshot_at_of(extraction_meta)
+    return snap or updated_at
+
+
 async def last_extraction_at(db: AsyncSession, thread_key: str | None) -> datetime | None:
     """When Extract Email last ran on this thread (any run started from any
     message in it counts), or None if it never has. Drives incremental
@@ -136,13 +172,15 @@ async def last_extraction_at(db: AsyncSession, thread_key: str | None) -> dateti
     Returns None immediately for a falsy `thread_key` (Upload has none)."""
     if not thread_key:
         return None
-    return (await db.execute(
-        select(func.max(PipelineFile.updated_at)).where(
+    rows = (await db.execute(
+        select(PipelineFile.updated_at, PipelineFile.extraction_meta).where(
             PipelineFile.source_kind == "email",
             PipelineFile.thread_key == thread_key,
             PipelineFile.attachment_id.like(f"{TAG_PREFIX}%"),
         )
-    )).scalar_one_or_none()
+    )).all()
+    watermarks = [w for w in (_effective_watermark(u, m) for u, m in rows) if w is not None]
+    return max(watermarks) if watermarks else None
 
 
 async def last_extraction_at_bulk(
@@ -159,12 +197,16 @@ async def last_extraction_at_bulk(
     if not thread_keys:
         return {}
     rows = (await db.execute(
-        select(PipelineFile.thread_key, func.max(PipelineFile.updated_at))
+        select(PipelineFile.thread_key, PipelineFile.updated_at, PipelineFile.extraction_meta)
         .where(
             PipelineFile.source_kind == "email",
             PipelineFile.thread_key.in_(thread_keys),
             PipelineFile.attachment_id.like(f"{TAG_PREFIX}%"),
         )
-        .group_by(PipelineFile.thread_key)
     )).all()
-    return {thread_key: at for thread_key, at in rows}
+    out: dict[str, datetime] = {}
+    for thread_key, updated_at, extraction_meta in rows:
+        wm = _effective_watermark(updated_at, extraction_meta)
+        if wm is not None and (thread_key not in out or wm > out[thread_key]):
+            out[thread_key] = wm
+    return out

@@ -282,6 +282,123 @@ async def test_last_extraction_at_returns_none_for_falsy_thread_key():
 
 
 # --------------------------------------------------------------------------
+# The race-condition fix: a long-running run's eventual DB-commit time
+# (updated_at) can postdate a reply that arrived mid-run and was genuinely
+# never read. snapshot_at (captured before the fetch) is the correct
+# watermark; updated_at is only a fallback for rows written before this
+# field existed.
+# --------------------------------------------------------------------------
+
+async def test_last_extraction_at_prefers_snapshot_at_over_the_later_commit_time(client, admin_token):
+    """A run that took a long time to commit must not have its watermark
+    read as the LATE commit time — a reply that arrived between the fetch
+    (snapshot_at) and the commit (updated_at) must still show up as new next
+    time, which only works if this function reports the EARLIER snapshot_at."""
+    from app.services.extract_email import sheet_cache
+    from app.services.extract_email.constants import TAG_PREFIX
+
+    thread_key = "conv-snapshot-race"
+    fetched_at = dt.datetime(2026, 3, 1, 10, 0, 0, tzinfo=dt.timezone.utc)
+    committed_at = fetched_at + dt.timedelta(minutes=20)   # long-running run
+
+    async with SessionLocal() as db:
+        row = PipelineFile(
+            filename="thread.eml", content_type="message/rfc822", size_bytes=10,
+            source_kind="email", source_id="msg-race", thread_key=thread_key,
+            attachment_id=f"{TAG_PREFIX}:race1", updated_at=committed_at,
+            extraction_meta={"full_email_extract": {"snapshot_at": fetched_at.isoformat()}},
+        )
+        db.add(row)
+        await db.commit()
+
+        at = await sheet_cache.last_extraction_at(db, thread_key)
+        assert at == fetched_at, (
+            "must report the fetch time, not the later commit time — a "
+            "reply that arrived in between was never actually read"
+        )
+
+        await db.delete(row)
+        await db.commit()
+
+
+async def test_last_extraction_at_falls_back_to_updated_at_without_snapshot_at(client, admin_token):
+    """A row written before this fix existed (no snapshot_at in its meta at
+    all) must be compared EXACTLY as before — updated_at, unchanged — so
+    every row already sitting in a real database keeps its old behaviour."""
+    from app.services.extract_email import sheet_cache
+    from app.services.extract_email.constants import TAG_PREFIX
+
+    thread_key = "conv-legacy-row"
+    committed_at = dt.datetime(2026, 3, 1, 9, 0, 0, tzinfo=dt.timezone.utc)
+
+    async with SessionLocal() as db:
+        for meta in (None, {}, {"full_email_extract": {}}):
+            row = PipelineFile(
+                filename="thread.eml", content_type="message/rfc822", size_bytes=10,
+                source_kind="email", source_id="msg-legacy", thread_key=thread_key,
+                attachment_id=f"{TAG_PREFIX}:legacy1", updated_at=committed_at,
+                extraction_meta=meta,
+            )
+            db.add(row)
+            await db.commit()
+
+            at = await sheet_cache.last_extraction_at(db, thread_key)
+            assert at == committed_at, meta
+
+            await db.delete(row)
+            await db.commit()
+
+
+async def test_last_extraction_at_bulk_takes_the_max_effective_watermark_per_thread(client, admin_token):
+    """Bulk lookup must apply the same snapshot_at-over-updated_at preference
+    as the single-thread lookup, independently per thread_key, and take the
+    latest effective watermark when a thread has more than one tagged row."""
+    from app.services.extract_email import sheet_cache
+    from app.services.extract_email.constants import TAG_PREFIX
+
+    tk_new, tk_legacy = "conv-bulk-new", "conv-bulk-legacy"
+    fetched_at = dt.datetime(2026, 3, 1, 10, 0, 0, tzinfo=dt.timezone.utc)
+    committed_at = fetched_at + dt.timedelta(minutes=20)
+    legacy_committed_at = dt.datetime(2026, 3, 1, 9, 0, 0, tzinfo=dt.timezone.utc)
+    later_snapshot = fetched_at + dt.timedelta(hours=1)
+
+    async with SessionLocal() as db:
+        rows = [
+            PipelineFile(
+                filename="a.eml", content_type="message/rfc822", size_bytes=10,
+                source_kind="email", source_id="msg-bulk-1", thread_key=tk_new,
+                attachment_id=f"{TAG_PREFIX}:bulk1", updated_at=committed_at,
+                extraction_meta={"full_email_extract": {"snapshot_at": fetched_at.isoformat()}},
+            ),
+            # A second, later run on the SAME thread — the max must pick this one.
+            PipelineFile(
+                filename="b.eml", content_type="message/rfc822", size_bytes=10,
+                source_kind="email", source_id="msg-bulk-2", thread_key=tk_new,
+                attachment_id=f"{TAG_PREFIX}:bulk2", updated_at=later_snapshot + dt.timedelta(minutes=20),
+                extraction_meta={"full_email_extract": {"snapshot_at": later_snapshot.isoformat()}},
+            ),
+            PipelineFile(
+                filename="c.eml", content_type="message/rfc822", size_bytes=10,
+                source_kind="email", source_id="msg-bulk-3", thread_key=tk_legacy,
+                attachment_id=f"{TAG_PREFIX}:bulk3", updated_at=legacy_committed_at,
+                extraction_meta=None,
+            ),
+        ]
+        for r in rows:
+            db.add(r)
+        await db.commit()
+
+        result = await sheet_cache.last_extraction_at_bulk(db, [tk_new, tk_legacy, "conv-bulk-absent"])
+        assert result[tk_new] == later_snapshot
+        assert result[tk_legacy] == legacy_committed_at
+        assert "conv-bulk-absent" not in result
+
+        for r in rows:
+            await db.delete(r)
+        await db.commit()
+
+
+# --------------------------------------------------------------------------
 # End-to-end: a reply into an already-extracted thread reuses what's already
 # been found, and only pays for what's genuinely new.
 # --------------------------------------------------------------------------

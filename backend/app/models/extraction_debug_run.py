@@ -2,12 +2,18 @@
 Email/Upload run: every pass-1/pass-2 call's prompt text + response JSON,
 every dropped/noise item, and the unabridged final sheets/triage JSON.
 
+A row is only ever written for a run that had a genuine problem — an error
+during pass 1/pass 2, or zero sheets extracted (which also covers "nothing
+usable in the thread at all") — see orchestrator/agents.py's ThreadAgent for
+the exact condition. A clean run that extracted at least one sheet with no
+errors leaves nothing here; this is a failure log, not a trace of everything.
+
 Everything here is ALSO visible live via progress.py's emit() during a
 streamed run, but that is in-memory/per-request only — gone the moment the
 request ends. This is the same information, persisted, for going back and
-inspecting exactly what a run sent/received/dropped while testing prompt or
-extraction quality. Meant to be bulk-deleted once done (see
-DELETE /admin/debug/runs) — not a permanent audit log.
+inspecting exactly what a problem run sent/received/dropped. Meant to be
+bulk-deleted once done (see DELETE /admin/debug/runs) — not a permanent
+audit log.
 """
 from __future__ import annotations
 

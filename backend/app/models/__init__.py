@@ -12,6 +12,7 @@ from app.models.pipeline_file import (
     PipelineStatus,
 )
 from app.models.portal_auth import PortalRole, PortalUser
+from app.models.system_health import HealthComponent, HealthStatus, SystemHealthCheck
 from app.models.reminder import (
     ReminderConfig,
     ReminderLog,
@@ -64,4 +65,7 @@ __all__ = [
     "ReminderTrigger",
     "ReminderStatus",
     "ChatAccessConfig",
+    "SystemHealthCheck",
+    "HealthComponent",
+    "HealthStatus",
 ]

@@ -69,6 +69,16 @@ celery_app.conf.update(
                 "schedule": max(30.0, float(settings.inbox_auto_sync_interval_seconds)),
             },
         } if settings.inbox_auto_sync_enabled else {}),
+        # SYSTEM_HEALTH_CHECK_ENABLED — same on/off-at-startup technique as
+        # the two gates above, but for an entirely separate feature (see
+        # services/system_health/monitor.py's module docstring for why it's
+        # kept isolated from reminders/OTP rather than reusing either).
+        **({
+            "system-health-check": {
+                "task": "system_health.check",
+                "schedule": max(300.0, settings.system_health_check_interval_hours * 3600.0),
+            },
+        } if settings.system_health_check_enabled else {}),
     },
 )
 

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Loader2, FolderLock } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { portalLogin } from "../../api/client";
 import { usePortalAuth } from "../../lib/portalAuth";
 import { Button, Input, Field } from "../../components/ui";
@@ -31,14 +31,14 @@ export default function PortalLogin() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-slate-50 px-4">
       <div className="w-full max-w-sm rounded-xl border border-slate-200/80 bg-white p-8 shadow-card">
-        <div className="mb-6 flex items-center gap-2.5">
-          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand-600 text-white">
-            <FolderLock className="h-5 w-5" />
+        <div className="mb-6 flex justify-center">
+          <div className="flex h-20 w-36 items-center justify-center overflow-hidden rounded-2xl bg-white shadow-card ring-4 ring-brand-100/60">
+            <img src="/timesheets_logo.jpg" alt="Alpha Data" className="h-full w-full object-contain p-2" />
           </div>
-          <div>
-            <h1 className="text-lg font-bold text-slate-900">Timesheet Portal</h1>
-            <p className="text-xs text-slate-500">Employee sign-in</p>
-          </div>
+        </div>
+        <div className="mb-6 text-center">
+          <h1 className="text-lg font-bold text-slate-900">Timesheet Portal</h1>
+          <p className="text-xs text-slate-500">Employee sign-in</p>
         </div>
         <form onSubmit={submit} className="space-y-4">
           <Field label="Username">

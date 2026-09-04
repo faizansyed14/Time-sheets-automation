@@ -1,6 +1,8 @@
 """Extract Email inbox entry point — runs the agent orchestrator."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.email_message import EmailMessage
@@ -51,6 +53,12 @@ async def extract_full_email(
     # a couple of messages of context) — not the whole conversation again.
     since = None if force_full else await sheet_cache.last_extraction_at(db, thread_key)
 
+    # Captured BEFORE the fetch — the true "as of" cutoff for this run (see
+    # AgentContext.snapshot_at's own docstring for why this, and not the
+    # PipelineFile row's updated_at, is what a later re-check must compare
+    # a new message's received_at against).
+    snapshot_at = datetime.now(timezone.utc)
+
     # The relevant WINDOW of the conversation goes to the model in one call —
     # an approval that arrived three replies later is only visible if that
     # reply (and enough of what it's replying to) is sent together.
@@ -73,6 +81,7 @@ async def extract_full_email(
         source=email, raw_bytes=eml_bytes, raw_name=eml_name,
         content_type="message/rfc822", prior_source=prior_email,
         thread_messages=thread_messages, force_full=force_full,
+        snapshot_at=snapshot_at,
     )
     ctx.notes.extend(thread_notes)
     await Orchestrator(build_thread_pipeline()).run(ctx)

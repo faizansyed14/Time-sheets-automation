@@ -158,8 +158,8 @@ export default function Shell({ children }: { children: ReactNode }) {
         )}
       >
         <div className={cn("flex items-center border-b border-slate-200/70 py-3", collapsed ? "justify-center px-1.5" : "gap-2 px-2.5")}>
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg shadow-sm ring-1 ring-slate-900/10">
-            <img src="/timesheets_logo.jpg" alt="Alpha Data" className="h-full w-full object-cover" />
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white shadow-sm ring-1 ring-slate-900/10">
+            <img src="/timesheets_logo.jpg" alt="Alpha Data" className="h-full w-full object-contain p-0.5" />
           </div>
           {!collapsed && (
             <div className="min-w-0">

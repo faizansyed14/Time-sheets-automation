@@ -555,6 +555,27 @@ export const fetchChatAccess = () =>
 export const updateChatAccess = (enabled_for_others: boolean) =>
   api.put<ChatAccess>("/agentic-chat/access", { enabled_for_others }).then((r) => r.data);
 
+// ===========================================================================
+// System health — LLM key/credits + Microsoft Graph credential, checked on a
+// schedule (see backend services/system_health). Entirely separate feature
+// from reminders/chat access above — its own table, its own mailer.
+// ===========================================================================
+export type HealthStatusValue = "ok" | "degraded" | "down" | "unknown";
+export interface SystemHealthRow {
+  component: "llm" | "graph";
+  status: HealthStatusValue;
+  detail: string | null;
+  last_checked_at: string | null;
+  last_ok_at: string | null;
+  last_alert_sent_at: string | null;
+}
+
+export const fetchSystemHealth = () =>
+  api.get<SystemHealthRow[]>("/system-health").then((r) => r.data);
+
+export const checkSystemHealthNow = () =>
+  api.post<Record<string, any>>("/system-health/check-now").then((r) => r.data);
+
 export type ChatStreamEvent =
   | { type: "token"; text: string }
   | { type: "done"; error?: string | null };
