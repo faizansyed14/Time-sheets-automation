@@ -132,6 +132,150 @@ async def test_pipeline_list_filters_by_month_and_year(client, admin_token):
             await db.commit()
 
 
+async def test_pipeline_list_filters_by_updated_after(client, admin_token):
+    """Backs the "Success" stat card's drill-down (whichever window the user
+    has picked) — must list exactly the rows recent enough to have been
+    counted, not every row."""
+    import datetime as dt
+
+    from app.core.database import SessionLocal
+    from app.models.pipeline_file import PipelineFile, PipelineStatus
+
+    h = auth_headers(admin_token)
+    now = dt.datetime.now(dt.timezone.utc)
+
+    async with SessionLocal() as db:
+        db.add(PipelineFile(
+            filename="recent.pdf", source_kind="upload", source_id="PF-recent-1",
+            status=PipelineStatus.SUCCESS, employee_name="Recent Success Person",
+            updated_at=now - dt.timedelta(days=1),
+        ))
+        db.add(PipelineFile(
+            filename="stale.pdf", source_kind="upload", source_id="PF-stale-1",
+            status=PipelineStatus.SUCCESS, employee_name="Stale Success Person",
+            updated_at=now - dt.timedelta(days=45),
+        ))
+        await db.commit()
+
+    try:
+        cutoff = (now - dt.timedelta(days=30)).isoformat()
+        r = await client.get("/api/v1/pipeline", headers=h,
+                             params={"status": "success", "updated_after": cutoff, "limit": 500})
+        assert r.status_code == 200, r.text
+        names = {f["employee_name"] for f in r.json()["items"]}
+        assert "Recent Success Person" in names
+        assert "Stale Success Person" not in names
+    finally:
+        from sqlalchemy import delete
+        async with SessionLocal() as db:
+            await db.execute(delete(PipelineFile).where(
+                PipelineFile.source_id.in_(["PF-recent-1", "PF-stale-1"])))
+            await db.commit()
+
+
+async def test_pipeline_stats_success_recent_defaults_to_60_days(client, admin_token):
+    """`success` (all-time) must keep counting every success ever — it feeds
+    "Open files" = total - success - resolved — while `success_recent` is a
+    SEPARATE, additive figure (default window 60 days) that's what the
+    "Success" stat card actually displays (an all-time total only grows
+    forever and stops being a meaningful at-a-glance number). A row 45 days
+    old is stale under a narrower window but must still count under the
+    60-day default."""
+    import datetime as dt
+
+    from app.core.database import SessionLocal
+    from app.models.pipeline_file import PipelineFile, PipelineStatus
+
+    from app.core import datacache
+
+    h = auth_headers(admin_token)
+    now = dt.datetime.now(dt.timezone.utc)
+
+    async with SessionLocal() as db:
+        # Bust BEFORE the baseline too — a previous test's cached value could
+        # otherwise still reflect rows that test has since deleted, inflating
+        # this test's "before" snapshot depending on timing.
+        await datacache.bust_pipeline()
+        before = (await client.get("/api/v1/pipeline/stats", headers=h)).json()
+        db.add(PipelineFile(
+            filename="recent.pdf", source_kind="upload", source_id="PF-stats-recent-1",
+            status=PipelineStatus.SUCCESS, employee_name="Stats Recent Person",
+            updated_at=now - dt.timedelta(days=1),
+        ))
+        db.add(PipelineFile(
+            filename="within-60.pdf", source_kind="upload", source_id="PF-stats-within60-1",
+            status=PipelineStatus.SUCCESS, employee_name="Stats Within 60 Person",
+            updated_at=now - dt.timedelta(days=45),
+        ))
+        db.add(PipelineFile(
+            filename="stale.pdf", source_kind="upload", source_id="PF-stats-stale-1",
+            status=PipelineStatus.SUCCESS, employee_name="Stats Stale Person",
+            updated_at=now - dt.timedelta(days=75),
+        ))
+        await db.commit()
+
+    try:
+        await datacache.bust_pipeline()  # /pipeline/stats is cached (short TTL)
+        after = (await client.get("/api/v1/pipeline/stats", headers=h)).json()
+        assert after["success"] - before["success"] == 3, "all-time total must count all three"
+        assert after["success_recent"] - before["success_recent"] == 2, \
+            "default 60-day window must count the 1-day and 45-day rows, not the 75-day one"
+    finally:
+        from sqlalchemy import delete
+        async with SessionLocal() as db:
+            await db.execute(delete(PipelineFile).where(
+                PipelineFile.source_id.in_(
+                    ["PF-stats-recent-1", "PF-stats-within60-1", "PF-stats-stale-1"])))
+            await db.commit()
+
+
+async def test_pipeline_stats_success_window_is_user_selectable(client, admin_token):
+    """The Activity page's "Success" card lets the user pick 60/90/120 days —
+    confirm the window is genuinely respected (not just the default), and
+    that switching windows never hands back a DIFFERENT window's cached
+    count (each window has its own cache entry)."""
+    import datetime as dt
+
+    from app.core.database import SessionLocal
+    from app.models.pipeline_file import PipelineFile, PipelineStatus
+
+    from app.core import datacache
+
+    h = auth_headers(admin_token)
+    now = dt.datetime.now(dt.timezone.utc)
+
+    async with SessionLocal() as db:
+        # Bust BEFORE the baseline too — see the sibling test above for why.
+        await datacache.bust_pipeline()
+        before_60 = (await client.get(
+            "/api/v1/pipeline/stats", headers=h, params={"success_window_days": 60})).json()
+        before_90 = (await client.get(
+            "/api/v1/pipeline/stats", headers=h, params={"success_window_days": 90})).json()
+        db.add(PipelineFile(
+            filename="day-75.pdf", source_kind="upload", source_id="PF-stats-window-1",
+            status=PipelineStatus.SUCCESS, employee_name="Stats Window Person",
+            updated_at=now - dt.timedelta(days=75),  # outside 60d, inside 90d
+        ))
+        await db.commit()
+
+    try:
+        await datacache.bust_pipeline()
+        after_60 = (await client.get(
+            "/api/v1/pipeline/stats", headers=h, params={"success_window_days": 60})).json()
+        after_90 = (await client.get(
+            "/api/v1/pipeline/stats", headers=h, params={"success_window_days": 90})).json()
+        assert after_60["success_recent"] - before_60["success_recent"] == 0, \
+            "a 75-day-old row must NOT count under a 60-day window"
+        assert after_90["success_recent"] - before_90["success_recent"] == 1, \
+            "the same row MUST count under a 90-day window"
+    finally:
+        from sqlalchemy import delete
+        async with SessionLocal() as db:
+            await db.execute(delete(PipelineFile).where(
+                PipelineFile.source_id == "PF-stats-window-1"))
+            await db.commit()
+
+
 async def test_coverage_missing_vs_awaiting_review_vs_submitted(client, admin_token):
     """Missing / Submitted / Awaiting-review must exactly partition the active
     roster for a focus month. An employee with a readable sheet in the

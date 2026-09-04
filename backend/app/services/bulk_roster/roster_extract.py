@@ -41,8 +41,11 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from app.core.config import settings
 from app.services.bulk_roster import roster_prompt
-from app.services.bulk_roster.roster_codes import days_in_month, normalise_code
+from app.services.bulk_roster.roster_codes import (
+    days_in_month, normalise_code, translate_attendance_report_row,
+)
 from app.services.bulk_roster.roster_parse import parse_period, parse_roster_cells
 from app.services.bulk_roster.roster_types import RosterDoc, RosterRow
 
@@ -393,10 +396,278 @@ async def _single_call_roster(images: list[bytes], model: str, api_key: str) -> 
     return doc
 
 
+def _looks_like_attendance_report(data: bytes) -> bool:
+    """Narrow, deterministic fingerprint for a FAZAA-style "Organization-Wise
+    Attendance" export — checked BEFORE any LLM call, so a genuinely
+    different roster/PDF never pays for, or risks being misrouted into, a
+    prompt written for a shape it isn't. Requires BOTH the report's own
+    distinctive title text AND its "SPFID" column-header vocabulary — a
+    combination that does not occur by accident — rather than either alone;
+    reads only page 1, where the title/header row always is regardless of
+    how many pages follow.
+
+    Never raises: any read/parse failure (not a PDF, a corrupt file, no
+    fitz) just means "not this format" — the caller falls through to the
+    existing vision-roster reader exactly as it always has for anything
+    this returns False for."""
+    try:
+        import fitz
+
+        doc = fitz.open(stream=data, filetype="pdf")
+        try:
+            text = " ".join(doc[0].get_text().split()).lower()
+        finally:
+            doc.close()
+    except Exception:
+        return False
+    return "organization-wise attendance" in text and "spfid" in text
+
+
+def _attendance_report_page_texts(data: bytes) -> list[str]:
+    """Each page's own text, reconstructed row-by-row from every word's real
+    (x, y) position rather than trusted to page.get_text()'s default reading
+    order — which flattens a dense, many-column table into one disconnected
+    value per line (a model would then have to reassemble a row by counting
+    position across dozens of separate lines, exactly the kind of misread
+    this replaces). Grouping words by y-proximity first, then sorting each
+    row left-to-right, keeps a whole employee-day's row — AND any "Reason"
+    annotation sharing its y-band — together on ONE tab-separated line.
+
+    This is the SAME reconstruction already proven to work on this exact
+    report via the generic chat's own PDF reader
+    (services/agents/chat_files._extract_pdf_text uses the identical
+    approach) — duplicated here as its own small function rather than
+    importing across features, matching that module's own stated
+    separation from this app's extraction pipeline. A vision/image read of
+    this report was tried first and produced nothing usable (the model
+    reported seeing zero rows on a page that renders perfectly legibly) —
+    reading the report's genuine embedded text layer directly, as plain
+    text, is both cheaper and the version already confirmed to work."""
+    import fitz
+
+    doc = fitz.open(stream=data, filetype="pdf")
+    try:
+        out: list[str] = []
+        for page in doc:
+            words = page.get_text("words")
+            if not words:
+                out.append("")
+                continue
+            words.sort(key=lambda w: (w[1], w[0]))
+            rows: list[list] = []
+            row_y = None
+            for w in words:
+                if row_y is None or w[1] - row_y > 3:
+                    rows.append([])
+                    row_y = w[1]
+                rows[-1].append(w)
+            lines = ["\t".join(w[4] for w in sorted(row, key=lambda r: r[0])) for row in rows]
+            out.append("\n".join(lines))
+        return out
+    finally:
+        doc.close()
+
+
+async def _read_attendance_page(
+    page_text: str, page_label: str, model: str, api_key: str, *, call_label: str,
+) -> tuple[list[dict], str | None]:
+    """One page's reconstructed text, one transcription call. Returns
+    (rows, issue) — issue is a human-readable note when the call/parse
+    failed, or when the model's own rows_visible count disagrees with what
+    it actually listed (the same tripwire _census uses above). Rows already
+    listed are kept either way, never silently discarded — a partial read
+    still contributes what it did manage to see, same as everywhere else in
+    this module."""
+    from app.services.extraction.vision_client import chat_call, text_block
+
+    if not page_text.strip():
+        return [], None  # a genuinely blank page (e.g. a trailing separator) — nothing to read
+
+    try:
+        data = await chat_call(
+            roster_prompt.ATTENDANCE_REPORT_SYSTEM,
+            [text_block(roster_prompt.attendance_report_user_block(page_label, page_text))],
+            model, api_key, label=call_label,
+            # Same reasoning as the GRID pass (roster_extract._read_grid_batch)
+            # and SINGLE_CALL_SYSTEM: this is pure literal transcription of a
+            # long, structured reply — the model's default reasoning trace
+            # competes with the actual JSON answer for the SAME token budget,
+            # and for a reply this size that can mean all of it, leaving
+            # nothing to actually write the rows array (confirmed: leaving
+            # this on produced an empty "rows": [] against real text a
+            # person reads with no difficulty at all).
+            enable_thinking=False,
+        )
+    except Exception as e:
+        return [], f"{page_label} could not be read: {e}"
+    if not isinstance(data, dict):
+        return [], f"{page_label} returned an unreadable reply"
+
+    rows = [r for r in (data.get("rows") or []) if isinstance(r, dict)]
+    claimed = _as_int(data.get("rows_visible"))
+    issue = None
+    if claimed is not None and claimed > len(rows):
+        issue = (f"{page_label}: {claimed} row(s) were visible but only {len(rows)} "
+                 f"were listed — this page may be incomplete, check before accepting")
+    return rows, issue
+
+
+async def _vision_attendance_report(filename: str, data: bytes, api_key: str) -> RosterDoc:
+    """FAZAA-style "Organization-Wise Attendance" reports: one row per
+    employee PER DAY, grouped into date sections, with punch times and a
+    Reason annotation instead of a single per-day code — see
+    _looks_like_attendance_report for how a file lands here, and
+    roster_prompt.py's ATTENDANCE REPORT section for why the model is only
+    ever asked to transcribe, never to classify (roster_codes.
+    translate_attendance_report_row does the actual bucket decision, in
+    plain code, from what got transcribed).
+
+    Uses settings.agent_chat_model, NOT the vision-extraction model the rest
+    of this file calls — confirmed necessary against the real report: the
+    large vision model returns an empty "rows": [] for this exact text no
+    matter how the prompt/JSON-mode/thinking flags are tuned, while the
+    smaller model already proven correct here (the same one the app's
+    generic chat/"Ask AI" feature uses for PDF text) reads it properly. Both
+    models share the same API key/base URL, so only the model string needs
+    to differ; nothing about the REST of this file's vision calls changes.
+
+    This report prints no Leave/Billing-day totals to check a read against
+    — the same situation _vision_roster's own corroborating-second-read
+    branch below already exists for. So every page is read TWICE,
+    independently, and any (employee, date) where the two reads disagree on
+    the resulting bucket is never trusted either way: it is recorded blank,
+    which distribute_days() already turns into an uncertain_days entry for a
+    human to resolve, instead of silently picking one read over the other."""
+    model = settings.agent_chat_model
+    page_texts = _attendance_report_page_texts(data)
+    sem = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
+    calls = 0
+
+    async def _read_one(page_text: str, i: int, tag: str) -> tuple[list[dict], str | None]:
+        label = f"page {i} of {len(page_texts)}" if len(page_texts) > 1 else "the report page"
+        async with sem:
+            return await _read_attendance_page(
+                page_text, label, model, api_key, call_label=f"attendance-report-{tag}-p{i}")
+
+    async def _pass(tag: str) -> tuple[list[dict], list[str]]:
+        nonlocal calls
+        results = await asyncio.gather(*(
+            _read_one(page_text, i, tag) for i, page_text in enumerate(page_texts, 1)
+        ))
+        calls += sum(1 for pt in page_texts if pt.strip())
+        rows: list[dict] = []
+        issues: list[str] = []
+        for page_rows, issue in results:
+            rows.extend(page_rows)
+            if issue:
+                issues.append(issue)
+        return rows, issues
+
+    first_rows, first_issues = await _pass("read1")
+    second_rows, second_issues = await _pass("read2")
+
+    def _by_key(rows: list[dict]) -> dict[tuple[str, str], dict]:
+        out: dict[tuple[str, str], dict] = {}
+        for r in rows:
+            date = _clean_str(r.get("date"))
+            if not date:
+                continue
+            emp_id = _clean_str(r.get("employee_id"))
+            name = _clean_str(r.get("name")) or ""
+            emp_key = emp_id or f"name:{name.strip().lower()}"
+            out[(emp_key, date)] = r
+        return out
+
+    first_by_key = _by_key(first_rows)
+    second_by_key = _by_key(second_rows)
+
+    names: dict[str, str] = {}
+    emp_ids: dict[str, str | None] = {}
+    order: list[str] = []
+    per_employee_days: dict[str, dict[int, str]] = {}
+    per_employee_issues: dict[str, list[str]] = {}
+    month_year_counts: dict[tuple[int, int], int] = {}
+
+    for emp_key, date in sorted(first_by_key.keys() | second_by_key.keys()):
+        r1 = first_by_key.get((emp_key, date))
+        r2 = second_by_key.get((emp_key, date))
+        src = r1 or r2
+        name = _clean_str(src.get("name")) or emp_key
+        emp_id = _clean_str(src.get("employee_id"))
+
+        if emp_key not in names:
+            order.append(emp_key)
+            names[emp_key] = name
+            emp_ids[emp_key] = emp_id
+            per_employee_days[emp_key] = {}
+            per_employee_issues[emp_key] = []
+
+        try:
+            y, m, d = (int(x) for x in date.split("-"))
+        except ValueError:
+            per_employee_issues[emp_key].append(f"a row had an unreadable date {date!r} — skipped")
+            continue
+        month_year_counts[(m, y)] = month_year_counts.get((m, y), 0) + 1
+
+        if r1 is None or r2 is None:
+            per_employee_issues[emp_key].append(
+                f"{date}: only read on one of the two independent passes — "
+                f"cannot corroborate, review this day")
+            per_employee_days[emp_key][d] = ""
+            continue
+
+        code1 = translate_attendance_report_row(
+            r1.get("in_time"), r1.get("out_time"), r1.get("half1"), r1.get("half2"), r1.get("reason"))
+        code2 = translate_attendance_report_row(
+            r2.get("in_time"), r2.get("out_time"), r2.get("half1"), r2.get("half2"), r2.get("reason"))
+        if normalise_code(code1) != normalise_code(code2):
+            per_employee_issues[emp_key].append(
+                f"{date}: the two independent reads disagreed ({code1!r} vs {code2!r}) — "
+                f"check this day against the original file")
+            per_employee_days[emp_key][d] = ""
+        else:
+            per_employee_days[emp_key][d] = code1
+
+    doc = RosterDoc(method="vision-attendance-report", model=model, llm_calls=calls)
+    doc.month, doc.year = (max(month_year_counts, key=month_year_counts.get)
+                           if month_year_counts else (None, None))
+    doc.issues = [*first_issues, *second_issues]
+
+    for i, emp_key in enumerate(order, 1):
+        emp_id = emp_ids[emp_key]
+        rr = RosterRow(
+            sr_no=int(emp_id) if emp_id and emp_id.isdigit() else i,
+            name=names[emp_key], employee_id=emp_id,
+            day_codes=per_employee_days[emp_key], issues=per_employee_issues[emp_key],
+        )
+        doc.rows.append(rr)
+
+    if not doc.rows:
+        raise ValueError(
+            "No employee rows could be read from this attendance report — if it is a "
+            "single employee's timesheet, use the normal Upload tab instead.")
+    if len(doc.rows) > MAX_EMPLOYEES:
+        raise ValueError(
+            f"This report lists {len(doc.rows)} employees, above the {MAX_EMPLOYEES} "
+            f"limit for one upload. Split the file and upload it in parts.")
+    if not (doc.month and doc.year):
+        raise ValueError(
+            "The month and year of this report could not be determined from its dates.")
+
+    doc.calendar_days = days_in_month(doc.month, doc.year)
+    log.info("attendance-report reader finished — %d employee(s), %d total AI call(s)",
+             len(doc.rows), calls)
+    return doc
+
+
 async def _vision_roster(filename: str, data: bytes) -> RosterDoc:
     from app.services.extract_email.thread_extract import require_vision_configured
 
     api_key, model = require_vision_configured()
+
+    if _looks_like_attendance_report(data):
+        return await _vision_attendance_report(filename, data, api_key)
+
     images = _page_images(filename, data)
 
     single = await _single_call_roster(images, model, api_key)

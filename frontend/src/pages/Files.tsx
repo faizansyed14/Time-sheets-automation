@@ -55,6 +55,22 @@ import type { PreviewFile } from "../lib/filePreview";
 type CreateTarget = "manager" | "employee" | "month";
 type ViewMode = "manager" | "project" | "location";
 
+const CUR_YEAR = new Date().getFullYear();
+// Fixed, not derived from the folder names actually present — same reasoning
+// as Dashboard/Export's own YEAR_OPTIONS: immune to a stray/mistyped month
+// folder name ever polluting the dropdown.
+const YEAR_OPTIONS = Array.from({ length: 7 }, (_, i) => CUR_YEAR + 1 - i); // CUR_YEAR+1 down to CUR_YEAR-5
+
+/** A month folder's own year, parsed off its name's "-YYYY" suffix (the
+ * convention every automatically-created month folder follows, e.g.
+ * "July-2026"). A folder created by hand can be named anything, so a name
+ * that doesn't match has no year to filter by — treated as "always visible"
+ * rather than hidden by a year filter it can't be classified against. */
+function monthFolderYear(name: string): number | null {
+  const m = /-(\d{4})$/.exec(name.trim());
+  return m ? Number(m[1]) : null;
+}
+
 /** Shared "jump straight to an employee's vault" search — works the same
  *  way in every view; selecting a result routes into whichever view can
  *  actually show that employee (their own project/location if the current
@@ -134,6 +150,11 @@ export default function FilesPage() {
   const [manager, setManager] = useState<string | null>(null);
   const [employee, setEmployee] = useState<string | null>(null);
   const [month, setMonth] = useState<string | null>(null);
+
+  // Filters the MONTHS list only (shared across all 3 view modes below —
+  // it's a display concern, not tied to a particular navigation branch).
+  // Defaults to the current year, same as Dashboard/Export.
+  const [yearFilter, setYearFilter] = useState<number | "all">(CUR_YEAR);
 
   // ---- Project-wise / location-wise views — alternate READ lenses onto the
   // SAME files, grouped by the Employee Matcher's own `project`/`location`
@@ -289,7 +310,15 @@ export default function FilesPage() {
 
   // The 3rd column renders identically across all three views — same
   // FileItem/MonthFolder shape, just sourced from a different query.
-  const visibleMonths = viewMode === "manager" ? months : viewMode === "project" ? projMonths : locMonths;
+  const rawVisibleMonths = viewMode === "manager" ? months : viewMode === "project" ? projMonths : locMonths;
+  // A folder whose name doesn't parse to a year (hand-created with a custom
+  // label) always stays visible — the filter only ever hides what it can
+  // positively classify as a DIFFERENT year, never something it's unsure of.
+  const visibleMonths = rawVisibleMonths?.filter((mo) => {
+    if (yearFilter === "all") return true;
+    const y = monthFolderYear(mo.name);
+    return y === null || y === yearFilter;
+  });
   const monthsLoading = viewMode === "manager" ? lmo : viewMode === "project" ? lpm : llm;
   const visibleItems = viewMode === "manager" ? items : viewMode === "project" ? projItems : locItems;
   const itemsLoading = viewMode === "manager" ? li : viewMode === "project" ? lpi : lli;
@@ -742,11 +771,25 @@ export default function FilesPage() {
             <h3 className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-slate-500">
               <FolderOpen className="h-4 w-4" /> {col3Month ? `Files — ${col3Month}` : "Months"}
             </h3>
-            {viewMode === "manager" && employee && !month && (
-              <Button size="sm" variant="ghost" onClick={() => { setCreating("month"); setName(""); }}>
-                <Plus className="h-4 w-4" />
-              </Button>
-            )}
+            <div className="flex items-center gap-1">
+              {col3Employee && !col3Month && (
+                <Select
+                  value={String(yearFilter)}
+                  onChange={(e) => setYearFilter(e.target.value === "all" ? "all" : Number(e.target.value))}
+                  className="!py-1 text-xs font-semibold"
+                >
+                  <option value="all">All years</option>
+                  {YEAR_OPTIONS.map((y) => (
+                    <option key={y} value={y}>{y}</option>
+                  ))}
+                </Select>
+              )}
+              {viewMode === "manager" && employee && !month && (
+                <Button size="sm" variant="ghost" onClick={() => { setCreating("month"); setName(""); }}>
+                  <Plus className="h-4 w-4" />
+                </Button>
+              )}
+            </div>
             {col3Employee && col3Month && (
               <div className="flex items-center gap-1">
                 <input

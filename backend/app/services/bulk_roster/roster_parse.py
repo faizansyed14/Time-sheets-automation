@@ -17,7 +17,7 @@ import datetime as _datetime
 import io
 import re
 
-from app.services.bulk_roster.roster_codes import iso, translate_attendance_type
+from app.services.bulk_roster.roster_codes import iso, translate_attendance_type, translate_hhrc_day
 from app.services.bulk_roster.roster_types import RosterDoc, RosterRow
 
 _MONTHS = {m.lower(): i for i, m in enumerate(_calendar.month_name) if m}
@@ -65,6 +65,28 @@ _LONG_COL_PATTERNS: dict[str, tuple[str, ...]] = {
     "attendance_type": ("attendancetype", "type", "status", "daytype"),
 }
 _LONG_REQUIRED = ("employee_id", "name", "date", "attendance_type")
+
+# Column-header synonyms for the HHRC-style export — also long-format (one
+# row per employee PER DAY), but a completely different, non-overlapping
+# header vocabulary from the PGC-style long format above ("Employee
+# Number"/"Date In"/"Type"/"Sub Type" vs PGC's "EmployeeId"/"AttendanceDate"/
+# "AttendanceType"). Every one of _HHRC_REQUIRED must match for a sheet to
+# count as this format — deliberately narrow so it can never fire on either
+# the wide format's header or PGC's own long-format header (verified: PGC's
+# _LONG_REQUIRED needs "employeeid"/"attendancedate", neither of which
+# "employeenumber"/"datein" match).
+_HHRC_COL_PATTERNS: dict[str, tuple[str, ...]] = {
+    "employee_id": ("employeenumber",),
+    "name": ("employeename",),
+    "location": ("organization",),
+    "date": ("datein",),
+    "attendance_type": ("type",),
+    "sub_type": ("subtype",),
+    "time_in": ("timein",),
+    "time_out": ("timeout",),
+    "title": ("jobtitle",),
+}
+_HHRC_REQUIRED = ("employee_id", "name", "date", "attendance_type", "sub_type", "time_in", "time_out")
 
 
 def _squash(v) -> str:
@@ -438,6 +460,116 @@ def _parse_long_format(grid: list[list], header_row: int, cols: dict[str, int]) 
     return doc
 
 
+def _detect_hhrc_format(grid: list[list]) -> tuple[int, dict[str, int]] | None:
+    """Find the HHRC-style header row (all of _HHRC_REQUIRED present) within
+    the first few rows. Returns (row_index, {logical: column_index}) or
+    None — this sheet just isn't laid out that way. Same exact-match
+    mechanism as _detect_long_format above (never a substring match), which
+    is what keeps this from ever colliding with PGC's own long format."""
+    for r, row in enumerate(grid[:5]):
+        cols: dict[str, int] = {}
+        for c, cell in enumerate(row):
+            key = _squash(cell)
+            if not key:
+                continue
+            for logical, pats in _HHRC_COL_PATTERNS.items():
+                if logical in cols:
+                    continue
+                if key in pats:
+                    cols[logical] = c
+        if all(k in cols for k in _HHRC_REQUIRED):
+            return r, cols
+    return None
+
+
+def _parse_hhrc_format(grid: list[list], header_row: int, cols: dict[str, int]) -> RosterDoc:
+    """Pivot an HHRC-style export into the same RosterDoc/RosterRow shape
+    every other format produces, so bucket distribution/employee matching/
+    staging work completely unchanged. See roster_codes.translate_hhrc_day
+    for the one genuinely new wrinkle this format has: some employees carry
+    MORE THAN ONE ROW for the same calendar day (a short Personal/Official
+    segment alongside the day's real Normal segment) — collected here as a
+    LIST per day rather than "first one wins", so the translate function can
+    see every segment together before deciding the day's bucket.
+
+    Date In/Date Out are read as real openpyxl datetime objects (this
+    format's cells are genuinely typed, unlike PGC's which can arrive as
+    either a date object or a string like "01-Jul-2026") — Date In is the
+    one actually used; Date Out is confirmed identical on every real row and
+    carries no extra information."""
+    records: list[dict] = []
+    month_year_counts: dict[tuple[int, int], int] = {}
+    for row in grid[header_row + 1:]:
+        def cell(logical: str):
+            c = cols.get(logical)
+            return row[c] if c is not None and c < len(row) else None
+
+        person = _text(cell("name"))
+        if not person:
+            continue
+        date_val = cell("date")
+        date_parts = ((date_val.day, date_val.month, date_val.year)
+                     if hasattr(date_val, "year") and hasattr(date_val, "month")
+                     and hasattr(date_val, "day") else None)
+        records.append({
+            "name": person,
+            "employee_id": _text(cell("employee_id")) or None,
+            "title": _text(cell("title")) or None,
+            "location": _text(cell("location")) or None,
+            "date_parts": date_parts,
+            "type": _text(cell("attendance_type")) or None,
+            "subtype": _text(cell("sub_type")) or None,
+        })
+        if date_parts:
+            my = (date_parts[1], date_parts[2])
+            month_year_counts[my] = month_year_counts.get(my, 0) + 1
+
+    if not records:
+        raise ValueError("The HHRC-format sheet was found but no employee rows could be read from it.")
+
+    month, year = (max(month_year_counts, key=month_year_counts.get)
+                   if month_year_counts else (None, None))
+
+    groups: dict[str, RosterRow] = {}
+    order: list[str] = []
+    day_entries: dict[str, dict[int, list[tuple[str | None, str | None]]]] = {}
+
+    for rec in records:
+        emp_id = rec["employee_id"]
+        key = emp_id or f"name:{rec['name'].strip().lower()}"
+        if key not in groups:
+            order.append(key)
+            groups[key] = RosterRow(sr_no=0, name=rec["name"], title=rec["title"],
+                                    location=rec["location"], employee_id=emp_id)
+            day_entries[key] = {}
+        rr = groups[key]
+        if not rr.title and rec["title"]:
+            rr.title = rec["title"]
+        if not rr.location and rec["location"]:
+            rr.location = rec["location"]
+
+        dp = rec["date_parts"]
+        if dp is None:
+            rr.issues.append(f"a row for {rec['name']} had no readable date — skipped")
+            continue
+        day, mth, yr = dp
+        if month and (mth, yr) != (month, year):
+            rr.issues.append(
+                f"a row dated {yr:04d}-{mth:02d}-{day:02d} doesn't belong to "
+                f"{_calendar.month_name[month]} {year} — skipped")
+            continue
+        day_entries[key].setdefault(day, []).append((rec["type"], rec["subtype"]))
+
+    doc = RosterDoc(month=month, year=year, method="xlsx-cells-hhrc")
+    for i, key in enumerate(order, 1):
+        rr = groups[key]
+        rr.sr_no = int(rr.employee_id) if rr.employee_id and rr.employee_id.isdigit() else i
+        for day, entries in day_entries[key].items():
+            rr.day_codes[day] = translate_hhrc_day(entries)
+        doc.rows.append(rr)
+    return doc
+
+
 def looks_like_roster_grid(filename: str, data: bytes) -> bool:
     """True when this file's cells are laid out like a multi-employee roster
     (either shape parse_roster_cells() understands — wide day-grid or long
@@ -462,6 +594,8 @@ def looks_like_roster_grid(filename: str, data: bytes) -> bool:
         return False
     if _detect_long_format(grid) is not None:
         return True
+    if _detect_hhrc_format(grid) is not None:
+        return True
     return _find_day_header(grid) is not None
 
 
@@ -484,6 +618,15 @@ def parse_roster_cells(filename: str, data: bytes) -> RosterDoc:
     if long_hit is not None:
         header_row, cols = long_hit
         return _parse_long_format(grid, header_row, cols)
+
+    # HHRC-style long format — checked next, same "narrow fingerprint, never
+    # steals a sheet another shape should handle" reasoning (see
+    # _HHRC_REQUIRED's own docstring for why this can never collide with
+    # PGC's long format above).
+    hhrc_hit = _detect_hhrc_format(grid)
+    if hhrc_hit is not None:
+        header_row, cols = hhrc_hit
+        return _parse_hhrc_format(grid, header_row, cols)
 
     hit = _find_day_header(grid)
     if not hit:

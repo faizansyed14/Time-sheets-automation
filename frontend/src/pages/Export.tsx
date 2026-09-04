@@ -15,6 +15,10 @@ import { Button, Card, Input, PageHeader, Select, Spinner } from "../components/
 
 const CUR_YEAR = new Date().getFullYear();
 const CUR_MONTH = new Date().getMonth() + 1;
+// Fixed, deliberately NOT derived from live row data — see Dashboard.tsx's
+// own YEAR_OPTIONS for why (a single bad/corrupt record can otherwise leak
+// a garbage value straight into this dropdown).
+const YEAR_OPTIONS = Array.from({ length: 7 }, (_, i) => CUR_YEAR + 1 - i); // CUR_YEAR+1 down to CUR_YEAR-5
 
 type Col = {
   key: string;
@@ -297,11 +301,13 @@ export default function ExportPage() {
     queryFn: () => fetchExportByPeriod(month, year),
   });
 
-  const years = useMemo(() => {
-    const ys = new Set<number>([CUR_YEAR, CUR_YEAR - 1, CUR_YEAR - 2, year]);
-    (data ?? []).forEach((r) => ys.add(r.year));
-    return [...ys].sort((a, b) => b - a);
-  }, [data, year]);
+  // A currently-selected year outside the fixed window (a stale URL/bookmark,
+  // say) still needs to appear so the Select doesn't silently fall back to
+  // some other option — everything else is the fixed range.
+  const years = useMemo(
+    () => (YEAR_OPTIONS.includes(year) ? YEAR_OPTIONS : [year, ...YEAR_OPTIONS].sort((a, b) => b - a)),
+    [year],
+  );
 
   const rows = data ?? [];
   const submittedCount = rows.filter((r) => r.status === "Received & Stored").length;

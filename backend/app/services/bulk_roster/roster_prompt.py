@@ -269,3 +269,118 @@ SINGLE_CALL_OUTPUT = """Return EXACTLY this JSON and nothing else (no markdown f
 
 def single_call_user_block() -> str:
     return f"{SINGLE_CALL_USER_RULES}\n\n{SINGLE_CALL_OUTPUT}"
+
+
+# --------------------------------------------------------------------------- #
+# Attendance-report reader — a THIRD, separate prompt pair, for a different
+# roster SHAPE entirely: one row per employee PER DAY (grouped into date
+# sections), with punch times instead of a single per-day code, and a
+# "Reason" annotation printed as a floating label near a specific row on the
+# original page (see roster_extract._looks_like_attendance_report /
+# _vision_attendance_report). Deliberately kept apart from CENSUS/GRID/
+# SINGLE_CALL above — nothing here touches what those ask for.
+#
+# TEXT input, not an image: a vision read of this report's rendered page was
+# tried first and came back empty (the model reported seeing zero rows on a
+# page that renders perfectly legibly to a person) — this report has a real
+# embedded text layer, and reading that directly (reconstructed row-by-row
+# by word position, so a Reason annotation lands on the SAME line as the row
+# it sits next to — see roster_extract._attendance_report_page_texts) is
+# both cheaper and the version already proven to work, since the app's
+# generic chat/"Ask AI" feature reads PDFs the identical way.
+#
+# Kept narrow on purpose either way: the model's ONLY job is to TRANSCRIBE
+# what is printed — it is never asked to decide what a code or a Reason
+# MEANS for timesheet purposes. That classification happens afterward, in
+# code (roster_codes.translate_attendance_report_row), so it stays auditable
+# and testable independent of any model call, and the model has nothing to
+# hallucinate a judgment about.
+# --------------------------------------------------------------------------- #
+ATTENDANCE_REPORT_SYSTEM = """You are reading the extracted TEXT of one page of a
+multi-employee daily attendance report. Each line below is one visual row from the
+original page, reconstructed from the page's real text by vertical position — columns
+within a row are separated by TAB characters, in left-to-right order.
+
+The page is organised into DATE SECTIONS (a line like "01/07/2026 (Wednesday)"), and
+under each date section is a block of employee rows — one row per employee for that
+date. The same employees repeat under every date section on the page.
+
+Some rows carry an extra piece of text sharing that row's line — a "Reason" annotation
+(e.g. "Time off personal", "Sick leave", "Annual Leave"). This was a floating label
+positioned next to that specific row on the original page, and it landed on the same
+line here because it shares that row's vertical position — it is not a normal table
+column, but it DOES belong to the row it appears on.
+
+Your ONLY job is to TRANSCRIBE exactly what is printed for every row — not to decide
+what any of it means. Do not translate a code into a leave type, do not decide whether
+someone was "really" present or absent, and do not invent a Reason for a row that has
+none. If a value is genuinely blank, report it as blank/null — never guess a value to
+fill a gap.
+
+The single most important requirement: list EVERY employee row under EVERY date section
+in this text, with none skipped and none invented. Missing a row is a serious error;
+inventing one that is not really there is equally serious."""
+
+ATTENDANCE_REPORT_USER_RULES = """WHAT TO READ, per employee row under a date section:
+  - employee_id   the User ID / Employee ID printed on the row (e.g. "FAC13763")
+  - name          the employee's name, verbatim
+  - date          the date this row's date SECTION header shows, as YYYY-MM-DD
+  - in_time       the FIRST IN time printed on the row, else null
+  - out_time      the FIRST OUT time printed on the row, else null
+  - half1         the "1st Half" column's code exactly as printed (e.g. "AB", "PR", "WO"),
+                   else null
+  - half2         the "2nd Half" column's code exactly as printed, else null
+  - reason        the Reason annotation sharing THIS row's line, verbatim, else null if
+                   this row's line has no such extra text on it
+
+EACH FIELD HAS A SPECIFIC SHAPE — use it to tell fields apart when a row's columns don't
+line up cleanly (e.g. because some columns are blank, which shifts what looks adjacent):
+  - in_time / out_time are ALWAYS either a clock time like "07:45" or "15:30", or blank/
+    null. NEVER put a word, a leave phrase, or a short code like "AB"/"WO" into these
+    fields, even if it appears in the position where a time would normally sit.
+  - half1 / half2 are ALWAYS a short 2-3 letter code (e.g. "AB", "PR", "WO"), or blank/
+    null. Never a clock time, never a multi-word phrase.
+  - reason is the ONLY field that holds free-form, multi-word text (e.g. "Sick leave",
+    "Time off personal", "Annual Leave", "Forget to stamp out"). If you see text like
+    that anywhere on a row's line, it belongs in reason — even if it sits in a position
+    where a time or a half-code would normally be, because the row's real time/code is
+    blank that day.
+
+RULES
+- Copy names and IDs character-for-character. Do not correct, expand, or reorder them.
+- Do not let "1st Half"/"2nd Half" change what you report for in_time/out_time or
+  reason — report each field exactly as printed, independently of the others.
+- The column headers ("User ID", "Name", "Shift", "IN-SPFID", ...) and the legend line
+  ("SPFID: 1=Official IN, ...") are not employee rows — never transcribe those as a row.
+- Every date section's employee list is usually the SAME people as every other date
+  section on the page — if a section appears to be missing someone the others have,
+  double-check before leaving them out; but never invent a row for a date section that
+  genuinely doesn't show that person (e.g. someone who joined partway through)."""
+
+ATTENDANCE_REPORT_OUTPUT = """Return EXACTLY this JSON and nothing else (no markdown fence):
+{
+  "rows": [
+    {
+      "employee_id": "<string or null>",
+      "name": "<verbatim>",
+      "date": "<YYYY-MM-DD>",
+      "in_time": "<HH:MM or null>",
+      "out_time": "<HH:MM or null>",
+      "half1": "<string or null>",
+      "half2": "<string or null>",
+      "reason": "<string or null>"
+    }
+  ],
+  "rows_visible": <integer: how many employee-rows (across every date section) you could
+                   find in total in this text>
+}"""
+
+
+def attendance_report_user_block(page_label: str, page_text: str) -> str:
+    return (
+        f"{ATTENDANCE_REPORT_USER_RULES}\n\n"
+        f"This is {page_label}. Transcribe every employee row under every date section "
+        f"in the text below.\n\n"
+        f"--- BEGIN EXTRACTED TEXT ---\n{page_text}\n--- END EXTRACTED TEXT ---\n\n"
+        f"{ATTENDANCE_REPORT_OUTPUT}"
+    )

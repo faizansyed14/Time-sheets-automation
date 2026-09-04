@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -60,6 +60,7 @@ function StatCard({
   tone,
   active,
   onClick,
+  caption,
 }: {
   label: string;
   value: number;
@@ -67,6 +68,10 @@ function StatCard({
   tone: string;
   active: boolean;
   onClick: () => void;
+  /** Small qualifier under the label, e.g. "Last 30 days" — for a stat
+   *  that's scoped rather than an all-time total, so the number's window
+   *  is never ambiguous at a glance. */
+  caption?: string;
 }) {
   return (
     <button
@@ -81,7 +86,9 @@ function StatCard({
       </div>
       <div>
         <p className="text-xl font-bold leading-6 text-slate-900">{value}</p>
-        <p className="text-xs font-medium text-slate-500">{label}</p>
+        <p className="text-xs font-medium text-slate-500">
+          {label}{caption && <span className="text-slate-400"> · {caption}</span>}
+        </p>
       </div>
     </button>
   );
@@ -460,15 +467,35 @@ export default function PipelinePage() {
     });
   };
 
+  // How far back the "Success" stat card counts — user-selectable (60/90/120
+  // days) rather than a single fixed window.
+  const [successWindowDays, setSuccessWindowDays] = useState(60);
+
   const { data: stats } = useQuery({
-    queryKey: ["pipeline-stats"],
-    queryFn: fetchPipelineStats,
+    queryKey: ["pipeline-stats", successWindowDays],
+    queryFn: () => fetchPipelineStats({ success_window_days: successWindowDays }),
     refetchInterval: 15_000,
   });
 
   const dq = useDebounced(q, 350);
+  // The "Success" stat card shows a windowed count (see fetchPipelineStats'
+  // success_recent) — its drill-down must list exactly those rows, not
+  // every success ever, or the number and the list below it would disagree.
+  // Memoized on [statusFilter, successWindowDays] (NOT recomputed from
+  // Date.now() on every render) — computing it inline made it a new value,
+  // and therefore a new queryKey, on every single render, which made React
+  // Query treat every render as "a new query" and refetch in an infinite
+  // loop the moment the Success filter was active. This is the confirmed
+  // root cause of that; it only recomputes now when the filter toggles on/
+  // off or the window is actually changed.
+  const successSince = useMemo(
+    () => (statusFilter === "success"
+      ? new Date(Date.now() - successWindowDays * 24 * 60 * 60 * 1000).toISOString()
+      : undefined),
+    [statusFilter, successWindowDays],
+  );
   const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
-    queryKey: ["pipeline", statusFilter, sourceFilter, dq, threadKeyFilter, periodFilter],
+    queryKey: ["pipeline", statusFilter, sourceFilter, dq, threadKeyFilter, periodFilter, successSince],
     queryFn: ({ pageParam }) =>
       fetchPipeline({
         status: statusFilter || undefined,
@@ -477,6 +504,7 @@ export default function PipelinePage() {
         // picked. ("Resolved" also covers backfilled backlog threads that
         // were deliberately marked done without ever being extracted.)
         exclude_status: statusFilter ? undefined : "success,resolved",
+        updated_after: successSince,
         source_kind: sourceFilter || undefined,
         thread_key: threadKeyFilter || undefined,
         month: periodFilter?.month,
@@ -665,14 +693,31 @@ export default function PipelinePage() {
           active={statusFilter === ""}
           onClick={() => setStatusFilter("")}
         />
-        <StatCard
-          label="Success"
-          value={stats?.success ?? 0}
-          icon={<CheckCircle2 className="h-5 w-5 text-emerald-600" />}
-          tone="bg-emerald-50"
-          active={statusFilter === "success"}
-          onClick={() => setStatusFilter(statusFilter === "success" ? "" : "success")}
-        />
+        <div className="relative">
+          <StatCard
+            label="Success"
+            caption={`Last ${successWindowDays} days`}
+            value={stats?.success_recent ?? 0}
+            icon={<CheckCircle2 className="h-5 w-5 text-emerald-600" />}
+            tone="bg-emerald-50"
+            active={statusFilter === "success"}
+            onClick={() => setStatusFilter(statusFilter === "success" ? "" : "success")}
+          />
+          {/* Sibling to the card's own <button>, not nested inside it — a
+              <select> inside a <button> is invalid HTML and would fight the
+              card's click-to-filter behavior. */}
+          <select
+            value={successWindowDays}
+            onChange={(e) => setSuccessWindowDays(Number(e.target.value))}
+            onClick={(e) => e.stopPropagation()}
+            title="How far back Success counts"
+            className="absolute right-1.5 top-1.5 rounded-md border border-slate-200 bg-white px-1 py-0.5 text-[10px] font-semibold text-slate-500 shadow-xs focus:border-brand-500 focus:outline-none"
+          >
+            <option value={60}>60d</option>
+            <option value={90}>90d</option>
+            <option value={120}>120d</option>
+          </select>
+        </div>
         <StatCard
           label="Needs review"
           value={stats?.needs_review ?? 0}
