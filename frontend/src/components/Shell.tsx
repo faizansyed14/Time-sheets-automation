@@ -99,7 +99,7 @@ export default function Shell({ children }: { children: ReactNode }) {
   const { data: health } = useQuery({ queryKey: ["health"], queryFn: fetchHealth, refetchInterval: 60_000 });
   const { data: stats } = useQuery({
     queryKey: ["pipeline-stats"],
-    queryFn: fetchPipelineStats,
+    queryFn: () => fetchPipelineStats(),
     refetchInterval: 15_000,
     // The restricted vault_matcher role has no access to /pipeline at all
     // (403 server-side) — this page's stats/attention badge are irrelevant

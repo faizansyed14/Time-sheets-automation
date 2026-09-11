@@ -15,6 +15,7 @@ a wrong read surfaces as "check this one" instead of as silently bad data.
 from __future__ import annotations
 
 import calendar as _calendar
+import re as _re
 
 # Roster cell code -> where that day belongs in the system's own day model
 # (services/extract_email/constants.py: BUCKETS + DAY_FIELDS).
@@ -35,6 +36,7 @@ CODE_TO_FIELD: dict[str, str] = {
     "WE": "weekend_days",
     "WEEKEND": "weekend_days",
     "OFF": "weekend_days",
+    "WO": "weekend_days",  # "Weekly Off" — FAZAA-style attendance reports
     "PH": "public_holiday",
     "H": "public_holiday",
     "HOL": "public_holiday",
@@ -188,6 +190,143 @@ def translate_attendance_type(raw: str | None) -> tuple[str, str | None]:
     if suffix and ("waiting" in suffix or "pending" in suffix):
         return code, f"marked \"{text}\" — not yet approved, confirm before filing"
     return code, None
+
+
+# --------------------------------------------------------------------------- #
+# FAZAA-style "Organization-Wise Attendance" reports: one row per employee PER
+# DAY (grouped into date sections), carrying punch times, an unreliable
+# "1st Half"/"2nd Half" AB/PR/WO notation, and a "Reason" annotation the
+# reader sees inline with a specific row's own text (see roster_extract.
+# _read_attendance_page / _vision_attendance_report). The bucket decision
+# below is made entirely in CODE, never by the model — the model's only job
+# is to transcribe what's printed; classifying it is deterministic and
+# testable independent of any model call.
+#
+# The client's own printed legend (report footer "Notes"):
+#   Time off - Personal : leave approved by management for personal matters
+#   Time off - Business : leave approved by management for work purposes
+#                          (meetings, etc.)
+#   Event Leave          : leave approved for an official company event
+# None of these map onto an EXISTING bucket (they are neither annual, sick,
+# nor unpaid specifically) — deliberately left UNTRANSLATED below, same as an
+# unrecognised AttendanceType above: it flows through as an unrecognised code
+# -> uncertain_days, so a reviewer picks the right bucket rather than one
+# being guessed. "Forget to stamp out" is not a leave type at all (the
+# employee worked; a punch was simply missed) — same treatment.
+ATTENDANCE_REPORT_REASON_TO_CODE: dict[str, str] = {
+    "sick leave": "SL",
+    # Reused even though "AL" is in AMBIGUOUS_LEAVE_CODES (forcing a mandatory
+    # confirm-in-Review flag elsewhere for a genuinely ambiguous approval-
+    # status code) — deliberately conservative for a brand-new, unproven
+    # format: extra scrutiny on every Annual Leave day here is the safer
+    # default until this reader has a track record, even though FAZAA's own
+    # "Annual Leave" text is not actually ambiguous the way AL/VC are for
+    # other clients.
+    "annual leave": "AL",
+}
+
+# A real punch time always looks like this — one or two digits, a colon, two
+# digits ("7:45", "07:45"). Anything else in an in_time/out_time field is
+# NOT a real time, even if it's a non-null string — confirmed necessary
+# against real model output: the reader occasionally misattributes free-text
+# (e.g. "Sick leave") into the in_time/out_time slots when a row's real
+# times are blank, and treating any non-null string there as "they punched
+# in and out" would silently file a full-day absence as a normal working
+# day. Validating the SHAPE, not just presence, closes that.
+_TIME_RE = _re.compile(r"^\d{1,2}:\d{2}$")
+
+
+def _looks_like_time(v: str | None) -> bool:
+    return bool(v) and bool(_TIME_RE.match(str(v).strip()))
+
+
+def _is_wo(v: str | None) -> bool:
+    return normalise_code(v) == "WO"
+
+
+def translate_attendance_report_row(
+    in_time: str | None, out_time: str | None,
+    half1: str | None, half2: str | None, reason: str | None,
+) -> str:
+    """One employee-day of a FAZAA-style attendance report -> a single short
+    code, in the SAME vocabulary CODE_TO_FIELD already understands — so
+    distribute_days()/verify_row_totals() need ZERO changes to handle this
+    format, exactly like translate_attendance_type() above does for the PGC
+    long-format.
+
+    Deliberately does NOT trust the printed "1st Half"/"2nd Half" AB/PR
+    codes as a presence signal — confirmed against real client data that AB
+    can appear on a row that ALSO has full punch times and a full Work Hrs
+    total (this report's own AB/PR notation does not reliably mean
+    absent/present the way it does on other rosters, and the client
+    themselves does not treat it as authoritative). The only signals trusted
+    here: did the employee actually punch in AND out with values that look
+    like real times (wins regardless of what AB/PR says), then WO (an
+    unambiguous weekly-off marker — checked in in_time/out_time too, since a
+    blank-time row can shift which field the reader puts "WO" into), then
+    the Reason text attached to this row."""
+    if _looks_like_time(in_time) and _looks_like_time(out_time):
+        return "P"
+    if _is_wo(in_time) or _is_wo(out_time) or _is_wo(half1) or _is_wo(half2):
+        return "WO"
+    reason_key = str(reason or "").strip().lower()
+    return ATTENDANCE_REPORT_REASON_TO_CODE.get(reason_key, str(reason or "").strip())
+
+
+# --------------------------------------------------------------------------- #
+# HHRC-style "Outsourced Staff Attendance Report" exports: a genuinely clean
+# XLSX (real typed datetime/time cells, not scanned text), long-format (one
+# row per employee PER DAY) with an explicit Type + Sub Type pair instead of
+# a single code — Type is "Normal"/"Week End"/"On Leave"/"Personal"/
+# "Official", Sub Type refines it ("ANNUAL LEAVE", "Managed by Missed
+# Swipe") when Type alone isn't specific enough. See roster_parse.
+# _parse_hhrc_format for how a file lands here — zero LLM calls, same as the
+# PGC long-format reader, since this is exact cell data, not an image/PDF.
+#
+# The one real wrinkle this format has that PGC/wide don't: SOME employees
+# have MORE THAN ONE ROW for the same calendar day — confirmed real cases
+# are a short "Personal" break (a few minutes) or an "Official" half-day,
+# always seen ALONGSIDE a "Normal" row covering the rest of that day (e.g. a
+# 2-minute personal break, then Normal 8:32-16:00). A genuine "Normal"
+# segment always wins that day's bucket outright, regardless of what else
+# shares the day, because it means the employee demonstrably worked. Never
+# observed in real data: a whole day that is ONLY "Personal"/"Official"
+# with no "Normal" row at all — rather than guess what that would mean, it
+# is left unmapped so it surfaces as an uncertain_days entry for review.
+HHRC_SUBTYPE_TO_CODE: dict[str, str] = {
+    # Reused despite "AL" being in AMBIGUOUS_LEAVE_CODES (mandatory confirm-
+    # in-Review elsewhere) — same deliberately conservative choice as the
+    # FAZAA reader above: extra scrutiny on a brand-new, unproven format is
+    # the safer default, even though this Sub Type spells out "ANNUAL LEAVE"
+    # unambiguously.
+    "annual leave": "AL",
+}
+
+
+def translate_hhrc_day(entries: list[tuple[str | None, str | None]]) -> str:
+    """`entries` is every (Type, Sub Type) pair recorded for ONE employee on
+    ONE calendar day — usually exactly one, occasionally more (see above).
+    Returns a single short code in CODE_TO_FIELD's own vocabulary, so
+    distribute_days()/verify_row_totals() need ZERO changes to handle this
+    format, exactly like translate_attendance_type()/
+    translate_attendance_report_row() above do for their own formats."""
+    types = [(t or "").strip().lower() for t, _ in entries]
+    if "normal" in types:
+        return "P"
+    if len(entries) == 1:
+        typ, subtype = entries[0]
+        typ_norm = (typ or "").strip().lower()
+        if typ_norm == "week end":
+            return "WK"
+        if typ_norm == "on leave":
+            sub_norm = (subtype or "").strip().lower()
+            return HHRC_SUBTYPE_TO_CODE.get(sub_norm, str(subtype or typ or "").strip())
+        # "Personal"/"Official" alone, no Normal row that day — never seen
+        # in real data; surface exactly what was printed rather than guess.
+        return str(subtype or typ or "").strip()
+    # More than one row, none of them Normal, more than one distinct Type —
+    # also never seen in real data; surface the combination, don't guess.
+    return " + ".join(sorted({(t or "").strip() for t, _ in entries if t}))
 
 
 def iso(year: int, month: int, day: int) -> str:

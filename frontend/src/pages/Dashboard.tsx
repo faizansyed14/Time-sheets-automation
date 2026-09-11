@@ -30,6 +30,11 @@ import { useDebounced, useSentinel } from "../lib/useInfinite";
 const NOW = new Date();
 const CUR_YEAR = NOW.getFullYear();
 const CUR_MONTH = NOW.getMonth() + 1;
+// Fixed, deliberately NOT derived from live row data — a single bad/corrupt
+// record (wrong month/year swapped, a stray test row, etc.) can never leak
+// a garbage value into this dropdown, unlike deriving it from whatever years
+// happen to appear in the currently-loaded rows.
+const YEAR_OPTIONS = Array.from({ length: 7 }, (_, i) => CUR_YEAR + 1 - i); // CUR_YEAR+1 down to CUR_YEAR-5
 
 type QuickFilter = "all" | CoverageStatus;
 
@@ -236,11 +241,13 @@ export default function Dashboard() {
   const filteredTotal = cov?.filtered_total ?? rows.length;
   const reviewCount = cov?.awaiting_review_this_month ?? 0;
 
-  const years = useMemo(() => {
-    const ys = new Set<number>([CUR_YEAR, CUR_YEAR - 1, CUR_YEAR - 2, year]);
-    rows.forEach((r) => r.years.forEach((y) => ys.add(y)));
-    return [...ys].sort((a, b) => b - a);
-  }, [rows, year]);
+  // A currently-selected year outside the fixed window (reached via a stale
+  // URL/bookmark, say) still needs to appear so the Select doesn't silently
+  // fall back to some other option — everything else is the fixed range.
+  const years = useMemo(
+    () => (YEAR_OPTIONS.includes(year) ? YEAR_OPTIONS : [year, ...YEAR_OPTIONS].sort((a, b) => b - a)),
+    [year],
+  );
 
   const rowKey = (r: DashboardRow) =>
     r.employee_pk ?? `unmatched::${(r.employee_name ?? "Unknown").toLowerCase()}`;

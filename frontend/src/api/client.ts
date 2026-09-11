@@ -315,7 +315,8 @@ export interface PipelineFile {
 export interface PipelineStats {
   total: number;
   processing: number;
-  success: number;
+  success: number;         // all-time — feeds "Open files" = total - success - resolved
+  success_recent: number;  // last 30 days — what the "Success" stat card shows
   needs_review: number;
   failed: number;
   resolved: number;
@@ -737,6 +738,9 @@ export const fetchPipeline = (params?: {
    *  Pipeline" deep link for a specific awaiting-review period. */
   month?: number;
   year?: number;
+  /** ISO instant — only rows updated at/after this (backs the "Success (last
+   *  30 days)" stat card's drill-down, so the list matches what it counted). */
+  updated_after?: string;
   q?: string;
   offset?: number;
   limit?: number;
@@ -753,6 +757,7 @@ export const fetchPipeline = (params?: {
         auto_accepted: params?.auto_accepted ?? undefined,
         month: params?.month || undefined,
         year: params?.year || undefined,
+        updated_after: params?.updated_after || undefined,
         q: params?.q || undefined,
         offset: params?.offset ?? 0,
         limit: params?.limit ?? PAGE_SIZE,
@@ -760,8 +765,12 @@ export const fetchPipeline = (params?: {
     })
     .then((r) => r.data);
 
-export const fetchPipelineStats = () =>
-  api.get<PipelineStats>("/pipeline/stats").then((r) => r.data);
+export const fetchPipelineStats = (params?: { success_window_days?: number }) =>
+  api
+    .get<PipelineStats>("/pipeline/stats", {
+      params: { success_window_days: params?.success_window_days || undefined },
+    })
+    .then((r) => r.data);
 
 export const retryPipelineFile = (id: string) =>
   api.post<PipelineFile>(`/pipeline/${id}/retry`).then((r) => r.data);

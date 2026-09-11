@@ -5,7 +5,7 @@ extraction pipeline: where it is, where it failed and why, plus Review
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import json as _json
 
@@ -91,6 +91,12 @@ async def list_pipeline_files(
         default=None, description="true = AI recommends accept (not yet filed)"),
     month: int | None = Query(default=None, ge=1, le=12, description="Filter by PipelineFile.month"),
     year: int | None = Query(default=None, ge=2000, le=2100, description="Filter by PipelineFile.year"),
+    updated_after: datetime | None = Query(
+        default=None,
+        description="Only rows whose PipelineFile.updated_at is at/after this instant — "
+                     "backs the Activity page's scoped 'Success (last 30 days)' card, so "
+                     "clicking it lists exactly the rows the card counted, not every "
+                     "success ever."),
     q: str | None = Query(default=None, description="search filename / employee (whole table)"),
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -117,6 +123,8 @@ async def list_pipeline_files(
         base = base.where(PipelineFile.month == month)
     if year:
         base = base.where(PipelineFile.year == year)
+    if updated_after:
+        base = base.where(PipelineFile.updated_at >= updated_after)
     if auto_accepted is not None:
         # Filter in SQL, not on the page: successes are mostly human accepts,
         # so client-side filtering would drop auto-accepts past the first page.
@@ -140,19 +148,36 @@ async def list_pipeline_files(
 
 
 @router.get("/stats", response_model=PipelineStats)
-async def pipeline_stats(db: AsyncSession = Depends(get_db)):
+async def pipeline_stats(
+    success_window_days: int = Query(default=60, ge=1, le=365,
+        description="How far back success_recent counts — the Activity page's "
+                    "'Success' stat card lets the user pick 60/90/120 days."),
+    db: AsyncSession = Depends(get_db),
+):
     async def _compute() -> dict:
         rows = (await db.execute(select(PipelineFile))).scalars().all()
         by_status: dict[str, int] = {}
         by_failure: dict[str, int] = {}
+        # "success" (below) is the all-time total — needed as-is for the
+        # Activity page's "Open files" math (total - success - resolved), so
+        # it must never be scoped down. success_recent is a SEPARATE, purely
+        # additive figure: an all-time count only grows forever and stops
+        # being a meaningful "at a glance" health indicator after the app has
+        # been in use for months/years — this is what the "Success" stat
+        # CARD actually displays instead, over a window the user can widen.
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(days=success_window_days)
+        success_recent = 0
         for t in rows:
             by_status[t.status] = by_status.get(t.status, 0) + 1
             if t.status in (PipelineStatus.FAILED, PipelineStatus.NEEDS_REVIEW) and t.failure_code:
                 by_failure[t.failure_code] = by_failure.get(t.failure_code, 0) + 1
+            if t.status == PipelineStatus.SUCCESS and t.updated_at and t.updated_at >= recent_cutoff:
+                success_recent += 1
         return {
             "total": len(rows),
             "processing": by_status.get(PipelineStatus.PROCESSING, 0),
             "success": by_status.get(PipelineStatus.SUCCESS, 0),
+            "success_recent": success_recent,
             "needs_review": by_status.get(PipelineStatus.NEEDS_REVIEW, 0),
             "failed": by_status.get(PipelineStatus.FAILED, 0),
             "resolved": by_status.get(PipelineStatus.RESOLVED, 0),
@@ -161,7 +186,10 @@ async def pipeline_stats(db: AsyncSession = Depends(get_db)):
         }
 
     # Cached (short TTL) — the UI polls this every 15s from several screens.
-    data = await datacache.get_or_set(datacache.NS_PIPELINE, "stats", datacache.TTL_STATS, _compute)
+    # Keyed by the window too: otherwise switching 60 -> 90 days inside the
+    # TTL would silently hand back the OTHER window's cached success_recent.
+    data = await datacache.get_or_set(
+        datacache.NS_PIPELINE, f"stats:{success_window_days}", datacache.TTL_STATS, _compute)
     return PipelineStats(**data)
 
 

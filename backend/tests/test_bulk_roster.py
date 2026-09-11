@@ -551,3 +551,337 @@ def test_roster_guard_never_crashes_on_a_non_spreadsheet_file():
     guard must defer to the normal pipeline, not raise."""
     assert looks_like_roster_grid("notes.pdf", b"not a spreadsheet at all") is False
     assert looks_like_roster_grid("photo.jpg", b"\xff\xd8\xff\xe0") is False
+
+
+# --------------------------------------------------------------------------- #
+# FAZAA-style "Organization-Wise Attendance" reports — a PDF, one row per
+# employee PER DAY, punch times + an unreliable AB/PR/WO notation + a
+# "Reason" annotation, read via text (not vision/image — see
+# roster_extract._vision_attendance_report's own docstring for why) and
+# classified in code (roster_codes.translate_attendance_report_row).
+# --------------------------------------------------------------------------- #
+from app.services.bulk_roster.roster_codes import translate_attendance_report_row
+from app.services.bulk_roster.roster_extract import (
+    _attendance_report_page_texts,
+    _looks_like_attendance_report,
+)
+
+
+def _fitz_pdf(lines: list[str]) -> bytes:
+    """A minimal one-page PDF with the given lines of text — just enough for
+    fitz's own text extraction to read something back, not a realistic
+    render of the actual report."""
+    import fitz
+
+    doc = fitz.open()
+    page = doc.new_page()
+    y = 50
+    for line in lines:
+        page.insert_text((50, y), line)
+        y += 20
+    buf = doc.tobytes()
+    doc.close()
+    return buf
+
+
+def test_attendance_report_fingerprint_fires_only_on_the_real_combination():
+    real = _fitz_pdf([
+        "FAZAA", "Organization-Wise Attendance From 01/07/2026 To 31/07/2026",
+        "User ID Name Shift IN-SPFID OUT-SPFID 1st Half 2nd Half",
+    ])
+    assert _looks_like_attendance_report(real) is True
+
+    # Title alone, no SPFID vocabulary — must NOT fire (a different roster
+    # style could plausibly share generic attendance-report wording).
+    title_only = _fitz_pdf(["Organization-Wise Attendance From 01/07/2026 To 31/07/2026"])
+    assert _looks_like_attendance_report(title_only) is False
+
+    # SPFID alone, no title — must NOT fire either.
+    spfid_only = _fitz_pdf(["User ID Name Shift IN-SPFID OUT-SPFID"])
+    assert _looks_like_attendance_report(spfid_only) is False
+
+    # An unrelated roster/PDF, and outright non-PDF bytes — never raises.
+    unrelated = _fitz_pdf(["Approved Monthly Timesheet - July 2026", "Sr No Name Title"])
+    assert _looks_like_attendance_report(unrelated) is False
+    assert _looks_like_attendance_report(b"not a pdf at all") is False
+    assert _looks_like_attendance_report(b"") is False
+
+
+def test_attendance_report_page_texts_reconstructs_rows_by_position():
+    """Word-position reconstruction — not asserting exact spacing, just that
+    words on the same visual line end up on the same output line, in
+    left-to-right order, which is the property the reader's prompt depends
+    on for a Reason annotation to land next to its own row."""
+    pdf = _fitz_pdf(["FAC13763 07:45 15:30 AB AB"])
+    texts = _attendance_report_page_texts(pdf)
+    assert len(texts) == 1
+    words = texts[0].split()
+    assert words == ["FAC13763", "07:45", "15:30", "AB", "AB"]
+
+
+def test_attendance_report_page_texts_handles_a_blank_page():
+    import fitz
+
+    doc = fitz.open()
+    doc.new_page()  # no text at all
+    buf = doc.tobytes()
+    doc.close()
+    assert _attendance_report_page_texts(buf) == [""]
+
+
+# ---- translate_attendance_report_row: the actual bucket decision ----
+
+def test_translate_attendance_report_row_present_when_real_times_punched():
+    assert translate_attendance_report_row("07:45", "15:30", "AB", "AB", None) == "P"
+
+
+def test_translate_attendance_report_row_ignores_ab_pr_as_a_presence_signal():
+    """Confirmed against real client data: AB/PR do not reliably mean
+    absent/present on this report — real punch times must win regardless."""
+    assert translate_attendance_report_row("07:45", "15:30", "AB", "AB", None) == "P"
+    assert translate_attendance_report_row(None, None, "PR", "PR", None) == ""
+
+
+def test_translate_attendance_report_row_weekly_off():
+    assert translate_attendance_report_row(None, None, "WO", "WO", None) == "WO"
+    # WO can land in the wrong field slot when times are blank — still caught.
+    assert translate_attendance_report_row("WO", "WO", None, None, None) == "WO"
+
+
+def test_translate_attendance_report_row_known_reasons_map_to_existing_codes():
+    assert translate_attendance_report_row(None, None, None, None, "Sick leave") == "SL"
+    assert translate_attendance_report_row(None, None, None, None, "Annual Leave") == "AL"
+    # Case/whitespace-insensitive.
+    assert translate_attendance_report_row(None, None, None, None, "  SICK LEAVE  ") == "SL"
+
+
+def test_translate_attendance_report_row_unmapped_reasons_pass_through_uncertain():
+    """"Time off - Personal"/"Time off - Business"/"Event Leave"/"Forget to
+    stamp out" have no existing bucket — never guessed, passed through
+    verbatim so distribute_days() turns them into an uncertain_days entry
+    with the reviewer seeing the exact original text."""
+    assert translate_attendance_report_row(None, None, None, None, "Time off personal") == "Time off personal"
+    assert translate_attendance_report_row(None, None, None, None, "Forget to stamp out") == "Forget to stamp out"
+
+
+def test_translate_attendance_report_row_blank_row_with_no_signal_is_blank():
+    assert translate_attendance_report_row(None, None, None, None, None) == ""
+
+
+def test_translate_attendance_report_row_never_trusts_garbled_non_time_fields_as_present():
+    """The real, confirmed bug this guard exists for: the reader can
+    misattribute free text (e.g. "Sick leave") into the in_time/out_time
+    slots when a row's real times are blank. Without validating the SHAPE of
+    those fields, a non-null-but-garbled in_time/out_time would wrongly
+    resolve to "P" — silently filing a full-day absence as a normal working
+    day. Must land blank (uncertain) instead."""
+    assert translate_attendance_report_row("Sick leave", "AB", None, None, None) == ""
+    assert translate_attendance_report_row("14:5", "15:30", None, None, None) != "P"  # malformed time shape
+
+
+# ---- end-to-end: detection -> two independent reads -> merge/corroborate ----
+
+async def test_attendance_report_end_to_end_corroborates_reads_and_flags_disagreement(mock_vision_calls):
+    from app.services.bulk_roster.roster_extract import extract_roster
+
+    pdf = _fitz_pdf([
+        "FAZAA", "Organization-Wise Attendance From 01/07/2026 To 31/07/2026",
+        "User ID Name Shift IN-SPFID OUT-SPFID 1st Half 2nd Half",
+        "01/07/2026 (Wednesday)",
+        "E1 Ada Lovelace GS 07:45 15:30 AB AB",
+        "02/07/2026 (Thursday)",
+        "E1 Ada Lovelace GS AB AB",
+    ])
+
+    # Both reads AGREE on 07-01 (a real working day) — trusted as-is.
+    # Both reads DISAGREE on 07-02 — one says Sick Leave, the other blank —
+    # must never be trusted either way.
+    read1 = {"rows": [
+        {"employee_id": "E1", "name": "Ada Lovelace", "date": "2026-07-01",
+         "in_time": "07:45", "out_time": "15:30", "half1": "AB", "half2": "AB", "reason": None},
+        {"employee_id": "E1", "name": "Ada Lovelace", "date": "2026-07-02",
+         "in_time": None, "out_time": None, "half1": "AB", "half2": "AB", "reason": "Sick leave"},
+    ], "rows_visible": 2}
+    read2 = {"rows": [
+        {"employee_id": "E1", "name": "Ada Lovelace", "date": "2026-07-01",
+         "in_time": "07:45", "out_time": "15:30", "half1": "AB", "half2": "AB", "reason": None},
+        {"employee_id": "E1", "name": "Ada Lovelace", "date": "2026-07-02",
+         "in_time": None, "out_time": None, "half1": "AB", "half2": "AB", "reason": None},
+    ], "rows_visible": 2}
+    mock_vision_calls([read1, read2])
+
+    doc = await extract_roster("rptDtAttendance.pdf", pdf)
+
+    assert doc.method == "vision-attendance-report"
+    assert doc.month == 7 and doc.year == 2026
+    assert len(doc.rows) == 1
+    row = doc.rows[0]
+    assert row.employee_id == "E1"
+    assert row.day_codes[1] == "P"     # agreed -> trusted
+    assert row.day_codes[2] == ""      # disagreed (SL vs blank) -> never trusted, uncertain
+    assert any("disagreed" in issue for issue in row.issues)
+
+
+# --------------------------------------------------------------------------- #
+# HHRC-style "Outsourced Staff Attendance Report" — a genuinely clean XLSX
+# (real typed datetime/time cells), long-format (one row per employee PER
+# DAY) with a Type + Sub Type pair instead of a single code. Zero LLM calls,
+# same class as the PGC long-format reader above — see roster_parse.
+# _parse_hhrc_format / roster_codes.translate_hhrc_day for the design.
+# --------------------------------------------------------------------------- #
+from app.services.bulk_roster.roster_codes import translate_hhrc_day
+from app.services.bulk_roster.roster_parse import _detect_hhrc_format, _load_grid
+
+
+def _hhrc_workbook(rows: list[tuple]) -> bytes:
+    """rows: (employee_number, name, date, type, subtype, time_in, time_out) —
+    a miniature of the real HHRC export's own column layout."""
+    import datetime as dt
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Employee Number", "Employee Name", "Employee Email", "Organization",
+               "Date In", "Date Out", "Type", "Sub Type", "Time In", "Time Out",
+               "Work Remotely Flag", "Hours", "Job Title", "Shift Name",
+               "Supervisor Number", "Supervisor Name"])
+    for emp_id, name, date, typ, subtype, tin, tout in rows:
+        ws.append([emp_id, name, f"{name}@example.ae", "IT Department",
+                   date, date, typ, subtype, tin, tout, "No",
+                   dt.time(0, 0), "IT Consultant", "Normal Shift", 999, "Some Manager"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_hhrc_format_is_detected_and_read_without_any_llm():
+    import datetime as dt
+
+    data = _hhrc_workbook([
+        (500003, "Salman Ahmed", dt.datetime(2026, 7, 1), "Normal", None,
+         dt.time(7, 45), dt.time(15, 30)),
+        (500003, "Salman Ahmed", dt.datetime(2026, 7, 2), "Week End", None,
+         dt.time(0, 0), dt.time(0, 0)),
+        (500003, "Salman Ahmed", dt.datetime(2026, 7, 3), "On Leave", "ANNUAL LEAVE",
+         dt.time(0, 0), dt.time(0, 0)),
+    ])
+    doc = parse_roster_cells("hhrc.xlsx", data)
+    assert doc.method == "xlsx-cells-hhrc"
+    assert doc.llm_calls == 0
+    assert (doc.month, doc.year) == (7, 2026)
+    assert doc.headcount == 1
+    row = doc.rows[0]
+    assert row.employee_id == "500003"
+    assert row.sr_no == 500003
+    assert row.day_codes == {1: "P", 2: "WK", 3: "AL"}
+
+
+def test_hhrc_format_never_misfires_on_pgc_long_format_or_the_wide_format():
+    """Detection is checked against every OTHER shape, not just "does HHRC
+    parse" — the three formats' header vocabularies must never collide."""
+    import datetime as dt
+
+    pgc_data = _long_format_workbook([
+        ("E1", "Ada Lovelace", "Engineer", dt.date(2026, 7, 1), "Daily Present"),
+    ])
+    assert _detect_hhrc_format(_load_grid("pgc.xlsx", pgc_data)) is None
+
+    assert _detect_hhrc_format(_load_grid("roster.xlsx", _sample_workbook())) is None
+
+    hhrc_data = _hhrc_workbook([
+        (500003, "Salman Ahmed", dt.datetime(2026, 7, 1), "Normal", None,
+         dt.time(7, 45), dt.time(15, 30)),
+    ])
+    assert _detect_hhrc_format(_load_grid("hhrc.xlsx", hhrc_data)) is not None
+    from app.services.bulk_roster.roster_parse import _detect_long_format
+    assert _detect_long_format(_load_grid("hhrc.xlsx", hhrc_data)) is None
+
+
+def test_hhrc_format_skips_a_trailing_footer_row_with_no_name():
+    """The real file this reader was built against has a trailing
+    "Information Classification: Confidential" row (text in the Employee
+    Number column, every other column blank) — must be silently skipped via
+    the same blank-name guard the PGC reader already uses, not treated as a
+    14th employee."""
+    import datetime as dt
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Employee Number", "Employee Name", "Employee Email", "Organization",
+               "Date In", "Date Out", "Type", "Sub Type", "Time In", "Time Out",
+               "Work Remotely Flag", "Hours", "Job Title", "Shift Name",
+               "Supervisor Number", "Supervisor Name"])
+    ws.append([500003, "Salman Ahmed", "s@example.ae", "IT", dt.datetime(2026, 7, 1),
+               dt.datetime(2026, 7, 1), "Normal", None, dt.time(7, 45), dt.time(15, 30),
+               "No", dt.time(7, 45), "IT Consultant", "Shift", 999, "Manager"])
+    ws.append(["Information Classification: Confidential", None, None, None,
+               None, None, None, None, None, None, None, None, None, None, None, None])
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    doc = parse_roster_cells("hhrc.xlsx", buf.getvalue())
+    assert doc.headcount == 1
+    assert doc.rows[0].employee_id == "500003"
+
+
+def test_hhrc_format_merges_multiple_rows_for_the_same_employee_day():
+    """The one real wrinkle this format has: a short Personal/Official
+    segment recorded as its OWN row alongside a Normal row for the same
+    calendar day — confirmed real cases in the actual file. Both rows must
+    merge into ONE day_codes entry, and a real Normal segment must win the
+    day's bucket regardless of what else shares that day."""
+    import datetime as dt
+
+    data = _hhrc_workbook([
+        (500024, "Rehab Ghoneim", dt.datetime(2026, 7, 13), "Normal", None,
+         dt.time(8, 32), dt.time(16, 0)),
+        (500024, "Rehab Ghoneim", dt.datetime(2026, 7, 13), "Personal", None,
+         dt.time(8, 30), dt.time(8, 32)),
+        (500024, "Rehab Ghoneim", dt.datetime(2026, 7, 28), "Official", None,
+         dt.time(8, 30), dt.time(10, 13)),
+        (500024, "Rehab Ghoneim", dt.datetime(2026, 7, 28), "Normal", None,
+         dt.time(10, 13), dt.time(15, 36)),
+    ])
+    doc = parse_roster_cells("hhrc.xlsx", data)
+    row = doc.rows[0]
+    assert row.day_codes[13] == "P"
+    assert row.day_codes[28] == "P"
+
+
+# ---- translate_hhrc_day: the actual per-day bucket decision ----
+
+def test_translate_hhrc_day_normal_alone():
+    assert translate_hhrc_day([("Normal", None)]) == "P"
+
+
+def test_translate_hhrc_day_normal_wins_over_any_other_segment_sharing_the_day():
+    assert translate_hhrc_day([("Personal", None), ("Normal", None)]) == "P"
+    assert translate_hhrc_day([("Official", None), ("Normal", None)]) == "P"
+
+
+def test_translate_hhrc_day_week_end():
+    assert translate_hhrc_day([("Week End", None)]) == "WK"
+
+
+def test_translate_hhrc_day_on_leave_known_subtype():
+    assert translate_hhrc_day([("On Leave", "ANNUAL LEAVE")]) == "AL"
+    # Case/whitespace-insensitive.
+    assert translate_hhrc_day([("On Leave", "  annual leave  ")]) == "AL"
+
+
+def test_translate_hhrc_day_on_leave_unknown_subtype_is_uncertain_not_guessed():
+    """No dedicated bucket for an unrecognised Sub Type — surfaced verbatim
+    so distribute_days() turns it into an uncertain_days entry, same "never
+    guess" treatment as every other format's unmapped reason/code."""
+    assert translate_hhrc_day([("On Leave", "SICK LEAVE")]) == "SICK LEAVE"
+    assert translate_hhrc_day([("On Leave", None)]) == "On Leave"
+
+
+def test_translate_hhrc_day_personal_alone_with_no_normal_is_never_guessed():
+    """Never observed in the real file (Personal/Official always come with
+    a Normal segment) — must not be silently assumed to mean "present"."""
+    result = translate_hhrc_day([("Personal", None)])
+    assert result not in ("P", "WK", "AL")

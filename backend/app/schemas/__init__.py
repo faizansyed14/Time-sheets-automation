@@ -360,7 +360,8 @@ class PipelineFileOut(BaseModel):
 class PipelineStats(BaseModel):
     total: int
     processing: int
-    success: int
+    success: int              # all-time — feeds "Open files" = total - success - resolved
+    success_recent: int       # last 30 days — what the "Success" stat card actually shows
     needs_review: int
     failed: int
     resolved: int
