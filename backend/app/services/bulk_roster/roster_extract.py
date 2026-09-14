@@ -46,7 +46,7 @@ from app.services.bulk_roster import roster_prompt
 from app.services.bulk_roster.roster_codes import (
     days_in_month, normalise_code, translate_attendance_report_row,
 )
-from app.services.bulk_roster.roster_parse import parse_period, parse_roster_cells
+from app.services.bulk_roster.roster_parse import parse_hhrc_pdf, parse_period, parse_roster_cells
 from app.services.bulk_roster.roster_types import RosterDoc, RosterRow
 
 # A roster this big is almost certainly a mis-upload (or would cost far more
@@ -840,6 +840,16 @@ async def extract_roster(
             # rather than refusing the upload outright.
             doc = await _vision_roster(filename, data)
             doc.issues.append(f"read as an image: the spreadsheet's cells could not be parsed ({e})")
+    elif name.endswith(".pdf"):
+        # Try the deterministic HHRC-style table reader first — narrow by
+        # construction (see parse_hhrc_pdf's own docstring), so this is a
+        # strict addition: any PDF that isn't that exact export shape raises
+        # immediately, doc stays None, and the vision path below runs
+        # completely unchanged, exactly as it did before this branch existed.
+        try:
+            doc = parse_hhrc_pdf(filename, data)
+        except Exception:
+            doc = None
 
     if doc is None:
         doc = await _vision_roster(filename, data)

@@ -300,6 +300,7 @@ HHRC_SUBTYPE_TO_CODE: dict[str, str] = {
     # the safer default, even though this Sub Type spells out "ANNUAL LEAVE"
     # unambiguously.
     "annual leave": "AL",
+    "sick leave": "SL",
 }
 
 

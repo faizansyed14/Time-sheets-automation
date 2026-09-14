@@ -952,8 +952,11 @@ export interface RosterPreviewRow {
 }
 export interface RosterPreview {
   filename: string;
-  /** "xlsx-cells" (read straight from the spreadsheet, no AI) or
-   *  "vision-roster" (census + chunked day-grid reads). */
+  /** How the file was read — see roster_extract.py's own module docstring.
+   *  Zero-LLM (llm_calls is 0): "xlsx-cells" (wide day-grid), "xlsx-cells-long"
+   *  (PGC-style), "xlsx-cells-hhrc" (HHRC via spreadsheet), "pdf-table-hhrc"
+   *  (HHRC via PDF table). AI-based: "vision-attendance-report" (FAZAA),
+   *  "vision-roster"/"vision-roster-single-call" (generic census + grid). */
   method: string;
   month: number | null;
   year: number | null;

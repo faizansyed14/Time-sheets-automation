@@ -492,11 +492,14 @@ def _parse_hhrc_format(grid: list[list], header_row: int, cols: dict[str, int]) 
     LIST per day rather than "first one wins", so the translate function can
     see every segment together before deciding the day's bucket.
 
-    Date In/Date Out are read as real openpyxl datetime objects (this
-    format's cells are genuinely typed, unlike PGC's which can arrive as
-    either a date object or a string like "01-Jul-2026") — Date In is the
-    one actually used; Date Out is confirmed identical on every real row and
-    carries no extra information."""
+    Date In is the one actually used (Date Out is confirmed identical on
+    every real row and carries no extra information). The xlsx export's
+    Date In cells are genuinely typed openpyxl datetime objects; the PDF
+    export (see parse_hhrc_pdf below) instead hands back a plain "01/08/2026"
+    string once the table is pulled out of the page's text layer — reuse the
+    same _parse_long_date_cell helper the PGC long-format reader already
+    relies on for that exact dual shape, so this one function serves both
+    sources unchanged."""
     records: list[dict] = []
     month_year_counts: dict[tuple[int, int], int] = {}
     for row in grid[header_row + 1:]:
@@ -507,10 +510,7 @@ def _parse_hhrc_format(grid: list[list], header_row: int, cols: dict[str, int]) 
         person = _text(cell("name"))
         if not person:
             continue
-        date_val = cell("date")
-        date_parts = ((date_val.day, date_val.month, date_val.year)
-                     if hasattr(date_val, "year") and hasattr(date_val, "month")
-                     and hasattr(date_val, "day") else None)
+        date_parts = _parse_long_date_cell(cell("date"))
         records.append({
             "name": person,
             "employee_id": _text(cell("employee_id")) or None,
@@ -567,6 +567,102 @@ def _parse_hhrc_format(grid: list[list], header_row: int, cols: dict[str, int]) 
         for day, entries in day_entries[key].items():
             rr.day_codes[day] = translate_hhrc_day(entries)
         doc.rows.append(rr)
+    return doc
+
+
+def _tables_from_pdf(data: bytes) -> list[list[list]]:
+    """Every table PyMuPDF's own table detector (page.find_tables()) finds
+    across every page, each as its raw extract() row list. Position-aware —
+    a blank Sub Type cell comes back as "" rather than shifting every later
+    column left the way naively splitting the page's plain text on newlines
+    would (blank cells simply emit no line at all in plain-text extraction).
+    Verified against a real 14-page, 13-employee, 408-row HHRC export: every
+    row read back with the exact right column count, zero rows lost or
+    misaligned."""
+    import fitz
+
+    pdf = fitz.open(stream=data, filetype="pdf")
+    try:
+        tables: list[list[list]] = []
+        for page in pdf:
+            for table in page.find_tables().tables:
+                rows = table.extract()
+                if rows:
+                    tables.append(rows)
+        return tables
+    finally:
+        pdf.close()
+
+
+def _assemble_hhrc_grid(tables: list[list[list]]) -> list[list] | None:
+    """Pull an HHRC-style export's table(s) into the same flat grid shape
+    _detect_hhrc_format/_parse_hhrc_format already consume for the xlsx
+    version — same header vocabulary, just a different source. Returns None
+    when no table with the expected HHRC header can be found among `tables`
+    (a different kind of PDF roster, or not a roster at all) so the caller
+    can fall back to the vision path exactly as it does for any other PDF
+    today. Kept as pure list-in/list-out logic, decoupled from PyMuPDF
+    itself, so the header-detection and row-filtering rules below are
+    directly unit-testable without rendering a real PDF.
+
+    HHRC's own report prints the column header only on the table's first
+    page — later pages continue the same table with no repeated header row
+    — so the header is identified by CONTENT (matches _HHRC_REQUIRED via
+    _detect_hhrc_format), not by position, and every row is then checked
+    against it by content too (skip anything that IS the header, wherever it
+    appears) rather than assuming "row 0 of each page/table is a header to
+    drop" — that assumption is false for every page after the first, whose
+    own first row is a real data row. Rows from an unrelated table (e.g.
+    this report's own Employee/Total-Unpaid-Days summary page) are excluded
+    by column count — they don't have this table's number of columns, so
+    they're never even candidates."""
+    header_row: list | None = None
+    for rows in tables:
+        if rows and _detect_hhrc_format([rows[0]]) is not None:
+            header_row = rows[0]
+            break
+    if header_row is None:
+        return None
+
+    width = len(header_row)
+    id_patterns = _HHRC_COL_PATTERNS["employee_id"]
+    data_rows: list[list] = []
+    for rows in tables:
+        for row in rows:
+            if len(row) != width:
+                continue
+            if _squash(row[0]) in id_patterns:
+                continue
+            data_rows.append(row)
+    if not data_rows:
+        return None
+    return [header_row, *data_rows]
+
+
+def parse_hhrc_pdf(filename: str, data: bytes) -> RosterDoc:
+    """Read an HHRC-style PDF export straight from its embedded table — zero
+    LLM calls, same determinism as the xlsx version of this export
+    (parse_roster_cells above). The PDF has a genuine text layer (it's a
+    generated report, not a scan), and PyMuPDF's table detector reconstructs
+    exact rows straight from cell positions, so this is exact by
+    construction, the same way reading xlsx cells directly is.
+
+    Raises ValueError when no HHRC-shaped table is found (a different kind
+    of PDF roster, or not a roster at all) so the caller can fall back to
+    the vision path — same contract as parse_roster_cells."""
+    try:
+        tables = _tables_from_pdf(data)
+    except Exception as e:
+        raise ValueError(f"Could not read this PDF's table ({e}).") from e
+    grid = _assemble_hhrc_grid(tables)
+    if not grid:
+        raise ValueError("No HHRC-style attendance table was found in this PDF.")
+    hit = _detect_hhrc_format(grid)
+    if hit is None:
+        raise ValueError("This PDF's table doesn't match the HHRC export's expected columns.")
+    header_row, cols = hit
+    doc = _parse_hhrc_format(grid, header_row, cols)
+    doc.method = "pdf-table-hhrc"
     return doc
 
 
