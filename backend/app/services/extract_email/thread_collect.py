@@ -43,7 +43,15 @@ def build_thread_bundle(
         # would only add a layer for the reviewer to click through.
         return messages[0][1], eml_filename(subject)
 
-    outer = _MimeMessage()
+    # policy=SMTP is not optional here — the default policy's line separator
+    # is a bare "\n", not the "\r\n" MIME actually requires. That's fine for
+    # Python's OWN (lenient) parser reading it back, which is why this looked
+    # fine in-app — but it silently turns every quoted-printable soft line
+    # break ("=\r\n") into "=\n", which Outlook's stricter parser does NOT
+    # recognise as a soft break. It shows the literal "=" instead of joining
+    # the line, corrupting exactly the words/entities that happened to wrap
+    # mid-token (confirmed by reproducing this exact byte sequence directly).
+    outer = _MimeMessage(policy=_email.policy.SMTP)
     outer["Subject"] = f"[Thread] {subject or '(no subject)'}"
     outer["Date"] = formatdate(localtime=True)
     outer["X-Timesheet-Thread-Messages"] = str(len(messages))

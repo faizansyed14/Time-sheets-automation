@@ -74,6 +74,62 @@ def test_single_message_thread_is_not_wrapped():
     assert data == raw
 
 
+def test_wrapped_nested_message_uses_crlf_not_bare_lf():
+    """Regression: the outer wrapper MUST be built with policy=SMTP (CRLF
+    line endings), not the default policy (bare LF). A quoted-printable soft
+    line break is only valid as "=\\r\\n" per RFC 2045 — Python's own
+    (lenient) parser silently accepts "=\\n" too, which is why this bug was
+    invisible in this app's own preview, but Outlook's stricter parser does
+    NOT accept the bare-LF form: it shows the literal "=" instead of joining
+    the line, corrupting exactly the words/entities that happened to wrap
+    mid-token (e.g. "August" -> "Augu=t", "&nbsp;" -> "&nb=p;"). Confirmed by
+    reproducing the exact byte sequence before this fix."""
+    from email import policy
+    from email.message import EmailMessage as _MimeMessage
+
+    # Content long/repetitive enough to force quoted-printable line wrapping
+    # (a short body wouldn't trigger a soft break at all, and would pass
+    # even with the bug present).
+    html = (
+        "<html><body><p>Kindly requesting you to approve the attendance "
+        "sheet for the month of August - 2026.</p>"
+        "<td>" + "&nbsp;" * 10 + "</td></body></html>"
+    )
+
+    def _html_msg(subject: str) -> bytes:
+        m = _MimeMessage(policy=policy.SMTP)
+        m["Subject"] = subject
+        m.set_content("plain text body")
+        m.add_alternative(html, subtype="html")
+        return m.as_bytes()
+
+    msgs = [("msg 1", _html_msg("TIMESHEET August")),
+            ("msg 2", _html_msg("RE: TIMESHEET August"))]
+    data, _name = build_thread_bundle(msgs, "TIMESHEET August")
+
+    # This is the ACTUAL bug: a soft break written as "=\n" instead of the
+    # RFC-correct "=\r\n" — strip every correct CRLF first, then anything
+    # left matching "=\n" is a bare-LF (broken) soft break.
+    assert b"=\n" not in data.replace(b"\r\n", b""), (
+        "wrapped thread bundle contains a bare-LF quoted-printable soft "
+        "break — Outlook will show a literal '=' instead of joining the "
+        "line (this is the exact cause of the 'Augu=t'/'&nb=p;' corruption "
+        "reported against a real downloaded timesheet)")
+
+    # And it must still decode correctly end-to-end (the fix must not have
+    # broken anything else).
+    from email import message_from_bytes
+    reparsed = message_from_bytes(data, policy=policy.default)
+    nested_html = []
+    for part in reparsed.walk():
+        if part.get_content_type() == "message/rfc822":
+            for p2 in part.get_payload(0).walk():
+                if p2.get_content_type() == "text/html":
+                    nested_html.append(p2.get_content())
+    assert len(nested_html) == 2
+    assert all("August - 2026" in h and "&nbsp;" * 10 in h for h in nested_html)
+
+
 # --------------------------------------------------------------------------
 # Idempotent re-extraction
 # --------------------------------------------------------------------------
