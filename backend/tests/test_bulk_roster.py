@@ -870,13 +870,14 @@ def test_translate_hhrc_day_on_leave_known_subtype():
     assert translate_hhrc_day([("On Leave", "ANNUAL LEAVE")]) == "AL"
     # Case/whitespace-insensitive.
     assert translate_hhrc_day([("On Leave", "  annual leave  ")]) == "AL"
+    assert translate_hhrc_day([("On Leave", "SICK LEAVE")]) == "SL"
 
 
 def test_translate_hhrc_day_on_leave_unknown_subtype_is_uncertain_not_guessed():
     """No dedicated bucket for an unrecognised Sub Type — surfaced verbatim
     so distribute_days() turns it into an uncertain_days entry, same "never
     guess" treatment as every other format's unmapped reason/code."""
-    assert translate_hhrc_day([("On Leave", "SICK LEAVE")]) == "SICK LEAVE"
+    assert translate_hhrc_day([("On Leave", "MATERNITY LEAVE")]) == "MATERNITY LEAVE"
     assert translate_hhrc_day([("On Leave", None)]) == "On Leave"
 
 
@@ -885,3 +886,179 @@ def test_translate_hhrc_day_personal_alone_with_no_normal_is_never_guessed():
     a Normal segment) — must not be silently assumed to mean "present"."""
     result = translate_hhrc_day([("Personal", None)])
     assert result not in ("P", "WK", "AL")
+
+
+# --------------------------------------------------------------------------- #
+# HHRC-style export arriving as a PDF instead of xlsx — same report, same
+# columns, just printed as a table rather than saved as a workbook. Read via
+# PyMuPDF's own table detector (page.find_tables()), which is position-aware
+# (a blank Sub Type cell comes back as "" rather than shifting every later
+# column left), so this is exact by construction — zero LLM calls, same
+# class as the xlsx reader above. _assemble_hhrc_grid is pure list-in/
+# list-out logic, decoupled from PyMuPDF itself, so it's tested directly
+# here with hand-built table lists (what page.find_tables() would return)
+# rather than needing to render a real PDF. See roster_parse.
+# _assemble_hhrc_grid's own docstring for why a naive "row 0 of every table
+# is a header to drop" rule would be wrong — HHRC's own export prints the
+# header only on the FIRST page; every later page's table continues with no
+# repeated header, so its own row 0 is real data.
+# --------------------------------------------------------------------------- #
+from app.services.bulk_roster.roster_extract import extract_roster
+from app.services.bulk_roster.roster_parse import (
+    _assemble_hhrc_grid,
+    parse_hhrc_pdf,
+)
+
+_HHRC_PDF_HEADER = ["Employee Number", "Employee Name", "Employee Email", "Organization",
+                     "Date In", "Date Out", "Type", "Sub Type", "Time In", "Time Out",
+                     "Work Remotely Flag", "Hours"]
+
+
+def _hhrc_pdf_row(emp_id, name, date, typ, subtype, tin="0:00", tout="0:00") -> list:
+    return [str(emp_id), name, f"{name}@example.ae", "IT Department", date, date,
+            typ, subtype, tin, tout, "No", "0:00"]
+
+
+def test_assemble_hhrc_grid_merges_pages_with_no_repeated_header():
+    """Page 1's table carries the real header row; page 2's table (the same
+    logical table, continued) starts straight into data with no header of
+    its own — both must land as data, in order, under the ONE header found."""
+    page1 = [
+        _HHRC_PDF_HEADER,
+        _hhrc_pdf_row(500003, "Salman Ahmed", "01/08/2026", "Week End", ""),
+    ]
+    page2 = [
+        # page 2's own row 0 — real data, NOT a header, even though
+        # find_tables() reports it as this table's first extracted row.
+        _hhrc_pdf_row(500004, "Vinoth Inbasekaran", "01/08/2026", "On Leave", "ANNUAL LEAVE"),
+    ]
+    grid = _assemble_hhrc_grid([page1, page2])
+    assert grid[0] == _HHRC_PDF_HEADER
+    assert len(grid) == 3
+    assert grid[1][0] == "500003"
+    assert grid[2][0] == "500004"
+
+
+def test_assemble_hhrc_grid_excludes_a_different_table_by_column_count():
+    """The real report's own page-1 summary table (Employee Name | Total
+    Number of Unpaid Days — 2 columns) must never be mistaken for this
+    table's data just because it shares the document, even before any
+    header row is found."""
+    summary_table = [["Employee Name", "Total Number of Unpaid Days"],
+                      ["Salman Ahmed", "4"]]
+    main_table = [
+        _HHRC_PDF_HEADER,
+        _hhrc_pdf_row(500003, "Salman Ahmed", "01/08/2026", "Week End", ""),
+    ]
+    grid = _assemble_hhrc_grid([summary_table, main_table])
+    assert grid[0] == _HHRC_PDF_HEADER
+    assert len(grid) == 2
+
+
+def test_assemble_hhrc_grid_returns_none_when_no_hhrc_header_found():
+    """A PDF with SOME table, just not this export's shape — must return
+    None (not raise, not fabricate a grid) so the caller falls back to the
+    vision path, unchanged from today's behavior for any other PDF roster."""
+    other_table = [["Name", "Role"], ["Ada Lovelace", "Engineer"]]
+    assert _assemble_hhrc_grid([other_table]) is None
+    assert _assemble_hhrc_grid([]) is None
+
+
+def test_assemble_hhrc_grid_skips_a_repeated_header_row_wherever_it_appears():
+    """Defensive: even if some future export DOES repeat the header on every
+    page (unlike the real file, which only prints it once), a row is
+    recognised as the header by CONTENT, not by position — so a repeat
+    never becomes a fake employee row."""
+    page1 = [
+        _HHRC_PDF_HEADER,
+        _hhrc_pdf_row(500003, "Salman Ahmed", "01/08/2026", "Week End", ""),
+    ]
+    page2 = [
+        _HHRC_PDF_HEADER,
+        _hhrc_pdf_row(500004, "Vinoth Inbasekaran", "02/08/2026", "Week End", ""),
+    ]
+    grid = _assemble_hhrc_grid([page1, page2])
+    assert len(grid) == 3
+    assert [row[0] for row in grid[1:]] == ["500003", "500004"]
+
+
+def test_parse_hhrc_pdf_end_to_end_via_assembled_grid(monkeypatch):
+    """parse_hhrc_pdf's own dispatch — from raw PDF bytes through to a fully
+    bucketed RosterDoc — with PyMuPDF's page-reading step (_tables_from_pdf)
+    stubbed out so the test exercises everything else (grid assembly,
+    _parse_hhrc_format, translate_hhrc_day, date-string parsing) without
+    needing to render a real PDF. Mirrors the real file: multi-row day
+    (Personal + Normal), a Holiday day, an unfamiliar On-Leave subtype."""
+    tables = [[
+        _HHRC_PDF_HEADER,
+        _hhrc_pdf_row(500003, "Salman Ahmed", "01/08/2026", "Week End", ""),
+        _hhrc_pdf_row(500003, "Salman Ahmed", "02/08/2026", "Normal", "", "8:00", "16:00"),
+        _hhrc_pdf_row(500003, "Salman Ahmed", "03/08/2026", "On Leave", "ANNUAL LEAVE"),
+        _hhrc_pdf_row(500003, "Salman Ahmed", "28/08/2026", "Holiday", ""),
+        _hhrc_pdf_row(500003, "Salman Ahmed", "29/08/2026", "Personal", "", "8:00", "8:05"),
+        _hhrc_pdf_row(500003, "Salman Ahmed", "29/08/2026", "Normal", "", "8:05", "16:00"),
+    ]]
+    monkeypatch.setattr(
+        "app.services.bulk_roster.roster_parse._tables_from_pdf", lambda data: tables)
+
+    doc = parse_hhrc_pdf("HHRC report.pdf", b"irrelevant-stub-bytes")
+    assert doc.method == "pdf-table-hhrc"
+    assert doc.llm_calls == 0
+    row = doc.rows[0]
+    assert row.employee_id == "500003"
+    assert row.day_codes[1] == "WK"
+    assert row.day_codes[2] == "P"
+    assert row.day_codes[3] == "AL"
+    assert row.day_codes[28] == "Holiday"  # normalises to public_holiday downstream
+    assert row.day_codes[29] == "P"  # Normal wins over the Personal segment sharing the day
+
+
+def test_parse_hhrc_pdf_raises_when_no_hhrc_table_found(monkeypatch):
+    """Anything that isn't this export's shape must raise — not return an
+    empty/garbage doc — so extract_roster()'s caller falls back to vision."""
+    monkeypatch.setattr(
+        "app.services.bulk_roster.roster_parse._tables_from_pdf", lambda data: [])
+    with pytest.raises(ValueError):
+        parse_hhrc_pdf("something-else.pdf", b"irrelevant")
+
+
+async def test_extract_roster_routes_an_hhrc_pdf_deterministically(monkeypatch):
+    """The actual entry point every upload goes through: a .pdf filename
+    whose table matches the HHRC shape must be read deterministically
+    (zero LLM calls), never touching the vision fallback."""
+    tables = [[
+        _HHRC_PDF_HEADER,
+        _hhrc_pdf_row(500003, "Salman Ahmed", "01/08/2026", "Week End", ""),
+        _hhrc_pdf_row(500003, "Salman Ahmed", "02/08/2026", "Normal", "", "8:00", "16:00"),
+    ]]
+    monkeypatch.setattr(
+        "app.services.bulk_roster.roster_parse._tables_from_pdf", lambda data: tables)
+
+    async def _fail_vision(*a, **k):
+        raise AssertionError("vision fallback must not be used for a real HHRC PDF")
+    monkeypatch.setattr(
+        "app.services.bulk_roster.roster_extract._vision_roster", _fail_vision)
+
+    doc = await extract_roster("HHRC Outsourced Staff - Attendance Report 08.2026.pdf", b"stub")
+    assert doc.method == "pdf-table-hhrc"
+    assert doc.llm_calls == 0
+    assert (doc.month, doc.year) == (8, 2026)
+
+
+async def test_extract_roster_falls_back_to_vision_for_a_non_hhrc_pdf(monkeypatch):
+    """A .pdf that isn't HHRC-shaped (e.g. a genuinely different report,
+    or FAZAA's own PDF format) must fall straight through to the existing
+    vision path, completely unaffected by the new branch."""
+    monkeypatch.setattr(
+        "app.services.bulk_roster.roster_parse._tables_from_pdf", lambda data: [])
+
+    from app.services.bulk_roster.roster_types import RosterDoc, RosterRow
+
+    async def _fake_vision(filename, data):
+        return RosterDoc(month=7, year=2026, method="vision-roster",
+                          rows=[RosterRow(sr_no=1, name="Someone")])
+    monkeypatch.setattr(
+        "app.services.bulk_roster.roster_extract._vision_roster", _fake_vision)
+
+    doc = await extract_roster("some-other-report.pdf", b"stub")
+    assert doc.method == "vision-roster"

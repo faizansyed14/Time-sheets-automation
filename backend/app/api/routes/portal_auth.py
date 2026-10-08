@@ -13,12 +13,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.portal_deps import get_current_portal_user
 from app.core.cache import cache
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import (
     create_portal_access_token,
@@ -30,8 +31,30 @@ from app.core.security import (
 from app.models.employee import Employee
 from app.models.portal_auth import PortalUser
 from app.schemas.portal import PortalLoginIn, PortalTokenResult, PortalUserOut
+from app.services.auth import rate_limit
 
 router = APIRouter(prefix="/portal/auth", tags=["portal"])
+
+
+def _client_ip(request: Request) -> str:
+    """Real client IP for rate-limiting keys — same precedence as auth.py's
+    own _client_ip (kept as a separate copy rather than a cross-module import
+    so this route file has no dependency on the internal /auth router).
+
+    Our nginx sets `X-Real-IP $remote_addr` (the actual socket IP) and
+    OVERWRITES any client-supplied value, so it cannot be spoofed — prefer it.
+    Never trust the FIRST X-Forwarded-For entry (the client controls it); if
+    XREAL is absent fall back to the LAST XFF hop (the one our proxy appended
+    via proxy_add_x_forwarded_for), then the direct socket."""
+    xreal = (request.headers.get("x-real-ip") or "").strip()
+    if xreal:
+        return xreal
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        hops = [p.strip() for p in fwd.split(",") if p.strip()]
+        if hops:
+            return hops[-1]
+    return request.client.host if request.client else "unknown"
 
 
 async def portal_user_out(db: AsyncSession, u: PortalUser) -> PortalUserOut:
@@ -50,7 +73,21 @@ async def portal_user_out(db: AsyncSession, u: PortalUser) -> PortalUserOut:
 
 
 @router.post("/login", response_model=PortalTokenResult)
-async def login(body: PortalLoginIn, db: AsyncSession = Depends(get_db)):
+async def login(body: PortalLoginIn, request: Request, db: AsyncSession = Depends(get_db)):
+    # Portal accounts are single-factor (password only, no OTP/TOTP — see
+    # this file's own module docstring), so this is the ONLY brute-force
+    # defense they get. A distinct "rl:portal-login" scope (not "rl:login")
+    # keeps this bucket separate from the internal /auth/login one, so the
+    # two user populations sharing an office IP can never exhaust each
+    # other's attempt budget. Same threshold as /auth/login (settings.
+    # login_rate_max/window) — same security stance, no new config to add.
+    ip = _client_ip(request)
+    allowed, retry = await rate_limit.hit(
+        "rl:portal-login", f"{body.username.lower()}:{ip}",
+        settings.login_rate_max, settings.login_rate_window_seconds)
+    if not allowed:
+        raise HTTPException(429, f"Too many login attempts. Try again in {retry}s.")
+
     user = (await db.execute(select(PortalUser).where(PortalUser.username == body.username))).scalar_one_or_none()
     if not user or not user.is_active or not verify_password(body.password, user.password_hash):
         raise HTTPException(401, "Incorrect username or password")

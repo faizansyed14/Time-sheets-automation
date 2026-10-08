@@ -150,7 +150,6 @@ async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_
         return LoginResult(
             status="captcha_required",
             login_token=login_token,
-            user=_user_out(user),
             message="Solve the CAPTCHA to finish signing in.",
         )
 
@@ -161,14 +160,12 @@ async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_
             return LoginResult(
                 status="totp_enrollment_required",
                 login_token=login_token,
-                user=_user_out(user),
                 message="Scan the QR code in your authenticator app, then enter the 6-digit code.",
                 **_totp_enrollment_payload(user, secret),
             )
         return LoginResult(
             status="totp_required",
             login_token=login_token,
-            user=_user_out(user),
             message="Enter the 6-digit code from your authenticator app.",
         )
 
@@ -176,7 +173,7 @@ async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_
     res = await otp_svc.start(flow_id, user.id, user.email)
     send_otp_email_task.delay(user.email or "", res.code or "")
     return LoginResult(
-        status="otp_required", login_token=login_token, user=_user_out(user),
+        status="otp_required", login_token=login_token,
         message=f"A code was sent to {_mask_email(user.email)}.",
         debug_otp=(res.code if settings.debug_otp_enabled else None),
     )

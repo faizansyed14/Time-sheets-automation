@@ -35,6 +35,35 @@ async def test_inline_captcha_still_completes_in_one_request(client):
     assert r.json()["status"] == "authenticated"
 
 
+async def test_pending_2fa_responses_never_expose_user_details(client, admin_token):
+    """Email, role, and activity data must not be disclosed before the second
+    factor is verified — a correct password guess alone should reveal
+    nothing beyond "a challenge is required". Regression test for a real
+    leak: these responses used to include the full user object (email/role/
+    last_seen_at/online) at every pending-2FA stage, none of which the
+    frontend even reads until AFTER the challenge succeeds — Login.tsx only
+    uses login_token/message/totp_qr_png from this response; the real
+    session only starts from the SECOND call's (verify-*) response."""
+    # captcha mode (admin's own bootstrap mode)
+    r = await _login(client, "admin", "admin")
+    assert r.status_code == 200
+    assert not r.json().get("user")
+
+    # otp mode
+    await _make_user(client, admin_token, username="leaktest-otp", mode="otp", email="leaktest@example.com")
+    r = await _login(client, "leaktest-otp", "Password123")
+    assert r.status_code == 200
+    assert not r.json().get("user")
+
+    # totp mode, enrollment stage
+    await _make_user(client, admin_token, username="leaktest-totp", mode="totp", email="leaktest2@example.com")
+    r = await _login(client, "leaktest-totp", "Password123")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "totp_enrollment_required"
+    assert not body.get("user")
+
+
 async def test_challenges_never_stack_and_captcha_cannot_replace_otp(client, admin_token):
     """An otp-mode user gets NO captcha (single challenge), and their login
     token must never complete through the captcha endpoint instead."""

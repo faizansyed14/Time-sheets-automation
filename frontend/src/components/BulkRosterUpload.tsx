@@ -27,11 +27,28 @@ import {
 } from "lucide-react";
 import { bulkRosterPreview, bulkRosterUpload, MONTHS_LONG } from "../api/client";
 import { cn, formatBytes } from "../lib/utils";
-import { Button, Card, Field, Select } from "./ui";
+import { Badge, Button, Card, Field, Select } from "./ui";
 import { useToast } from "./toast";
 import { useUploadSession } from "../lib/uploadSession";
 
 const ACCEPT = ".pdf,.xlsx,.xls,.csv,.png,.jpg,.jpeg,.docx";
+
+// Friendly names for roster_extract.py's RosterDoc.method values — purely
+// cosmetic (never drives parsing), so an unrecognised future method just
+// falls back to showing its raw name rather than breaking. Whether "no AI"
+// is shown is derived from llm_calls itself, NOT from matching a method
+// name here — that's what actually determines whether AI was used, and
+// keeps this label correct for any new zero-LLM reader added later without
+// needing this map updated in lockstep.
+const ROSTER_FORMAT_LABELS: Record<string, string> = {
+  "xlsx-cells": "Wide format",
+  "xlsx-cells-long": "Long format",
+  "xlsx-cells-hhrc": "HHRC format",
+  "pdf-table-hhrc": "HHRC format (PDF)",
+  "vision-attendance-report": "FAZAA attendance report",
+  "vision-roster": "Read with AI",
+  "vision-roster-single-call": "Read with AI",
+};
 
 function StatPill({
   icon, label, value, tone,
@@ -238,13 +255,19 @@ export default function BulkRosterUpload({ onStaged }: { onStaged: () => void })
                 value={preview.flagged} tone="bg-rose-50 text-rose-700"
               />
             )}
-            <p className="ml-auto text-xs text-slate-400">
-              {preview.month ? `${MONTHS_LONG[preview.month]} ${preview.year}` : "period unknown"}
-              {preview.calendar_days ? ` · ${preview.calendar_days} days` : ""} ·{" "}
-              {preview.method === "xlsx-cells"
-                ? "read from cells (no AI)"
-                : `read as images (${preview.llm_calls} AI call${preview.llm_calls === 1 ? "" : "s"})`}
-            </p>
+            <div className="ml-auto flex items-center gap-2">
+              <span className="text-xs text-slate-400">
+                {preview.month ? `${MONTHS_LONG[preview.month]} ${preview.year}` : "period unknown"}
+                {preview.calendar_days ? ` · ${preview.calendar_days} days` : ""}
+              </span>
+              <Badge tone={preview.llm_calls === 0 ? "success" : "brand"}>
+                {ROSTER_FORMAT_LABELS[preview.method] ?? preview.method}
+                {" · "}
+                {preview.llm_calls === 0
+                  ? "no AI"
+                  : `${preview.llm_calls} AI call${preview.llm_calls === 1 ? "" : "s"}`}
+              </Badge>
+            </div>
           </div>
 
           {preview.issues.length > 0 && (
