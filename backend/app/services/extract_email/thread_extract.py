@@ -383,6 +383,13 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
                         inline: bool, depth: int) -> None:
         if not payload:
             return
+        # Malformed/truncated MIME headers (RFC 2047 encoded-words, RFC 2231
+        # filename* continuations) occasionally decode a filename containing
+        # an embedded NUL byte. That's syntactically valid JSON (\u0000) so
+        # it writes fine into extraction_meta, but Postgres can't convert it
+        # back to text on ANY later read of that json/jsonb document — strip
+        # it here, at the source, before it reaches "skipped"/"noise"/etc.
+        name = name.replace("\x00", "") if name else name
         ext = os.path.splitext(name)[1].lower()
         is_image = ext in IMAGE_EXTS or (ctype or "").startswith("image/")
 
@@ -500,7 +507,7 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
                 if sub is not None and depth + 1 <= MAX_EML_DEPTH:
                     # Outlook lists these as named .eml attachments — record
                     # the outer filename for the Extracted badge.
-                    fname = part.get_filename()
+                    fname = (part.get_filename() or "").replace("\x00", "") or None
                     if fname:
                         try:
                             raw = sub.as_bytes() if hasattr(sub, "as_bytes") else b""

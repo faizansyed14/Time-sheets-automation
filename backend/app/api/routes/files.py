@@ -15,8 +15,10 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import require_full_access
 from app.core.database import get_db
 from app.core.http_headers import content_disposition
+from app.models.auth import User
 from app.models.employee import Employee
 from app.models.timesheet_record import TimesheetRecord
 from app.services import storage_provider as sp
@@ -486,13 +488,19 @@ def rename_folder(body: RenameFolder):
 
 
 @router.delete("/folder")
-def delete_folder(rel_path: str = Query(...)):
+def delete_folder(rel_path: str = Query(...), user: User = Depends(require_full_access)):
+    """Admin/user only — require_full_access overrides this router's default
+    require_write (which would otherwise let vault_matcher delete too) down
+    to the same roles as the rest of the app's destructive actions.
+    vault_matcher keeps every other File Vault action (browse/upload/move/
+    rename) via the router-level dependency; this is the one exception."""
     sp.get_storage_provider().delete_folder(rel_path)
     return {"deleted": rel_path}
 
 
 @router.delete("/file")
-def delete_file(rel_path: str = Query(...)):
+def delete_file(rel_path: str = Query(...), user: User = Depends(require_full_access)):
+    """Admin/user only — see delete_folder's docstring for why."""
     sp.get_storage_provider().delete_file(rel_path)
     return {"deleted": rel_path}
 

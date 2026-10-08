@@ -15,6 +15,18 @@ import re
 from typing import Any
 
 
+def _strip_nul(s: str) -> str:
+    """Drop embedded NUL bytes. Postgres's ``json``/``jsonb`` columns accept
+    the \\u0000 escape as syntactically valid JSON (so a write silently
+    succeeds), but can't convert it back to text on a later read — any
+    column, even an unrelated sibling key in the same JSON document, then
+    raises UntranslatableCharacterError the moment anything extracts a
+    field from it. Malformed/truncated MIME headers (RFC 2047 encoded-words,
+    RFC 2231 filename* continuations) occasionally decode into a NUL here —
+    strip it right at the source so it can never reach extraction_meta."""
+    return s.replace("\x00", "") if s else s
+
+
 def _decode_header_value(raw: str | None) -> str:
     if not raw:
         return ""
@@ -25,7 +37,7 @@ def _decode_header_value(raw: str | None) -> str:
             out += fragment.decode(charset or "utf-8", errors="replace")
         else:
             out += fragment
-    return out
+    return _strip_nul(out)
 
 
 def _decode_text(part) -> str:
@@ -173,7 +185,7 @@ def parse_eml(raw: bytes, filename: str | None = None) -> dict[str, Any]:
         cid = (part.get("Content-Id") or "").strip().strip("<>")
         is_attachment = "attachment" in disp
         is_multipart = ct.startswith("multipart/")
-        fn = part.get_filename() or ""
+        fn = _strip_nul(part.get_filename() or "")
 
         if is_multipart:
             continue

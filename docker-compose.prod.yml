@@ -86,6 +86,17 @@ services:
       CELERY_TASK_ALWAYS_EAGER: "false"
       AUTO_CREATE_TABLES: "false"
       DB_NULLPOOL: "true"
+    # Overrides the image's own HEALTHCHECK (backend/Dockerfile curls
+    # localhost:8000/health, which only uvicorn serves) — without this the
+    # worker inherits it and reports "unhealthy" forever. Cosmetic either way
+    # (nothing restarts or waits on worker health), but this reflects whether
+    # Celery is actually alive. `$$` = a literal `$` after compose interpolation.
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.core.celery_app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 5 | grep -q OK"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
     restart: unless-stopped
     depends_on:
       redis: { condition: service_healthy }
