@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.timesheets import to_out
@@ -15,6 +15,7 @@ from app.models.employee import Employee
 from app.models.pipeline_file import PipelineFile
 from app.models.timesheet_record import ApprovalStatus, TimesheetRecord, ValidationStatus
 from app.schemas import DashboardRow, DashboardSummary, TimesheetOut
+from app.services.employee.activity import in_month_clause
 from app.services.pipeline.coverage import received_subq as _received_subq, staged_employee_pk
 
 router = APIRouter(prefix="/employees", tags=["employees"])
@@ -26,6 +27,8 @@ async def coverage(
     month: int | None = Query(default=None),
     q: str | None = Query(default=None, description="search name / ID / manager (whole matcher)"),
     location: str | None = Query(default=None, description="DXB | AUH"),
+    project: str | None = Query(default=None, description="exact project / client (case-insensitive)"),
+    account_manager: str | None = Query(default=None, description="exact account manager (case-insensitive)"),
     status: str | None = Query(
         default=None,
         description=(
@@ -71,27 +74,44 @@ async def coverage(
     received_subq = _received_subq(focus_month, focus_year)
     staged_pk = staged_employee_pk()
 
+    # Who belongs in THIS month's view. Month-wise, not a blanket "active only":
+    # an inactive employee is still expected (and shown) for the month they were
+    # inactivated in and every month before it, and drops off from the next —
+    # unless they have data that month (a filed record or a received sheet).
+    # Rule + the matching Python form used by the export: services/employee/activity.py.
+    in_scope = in_month_clause(focus_month, focus_year, submitted_subq, received_subq)
+
+    # Project / Account Manager filters narrow EVERYTHING below — headline
+    # counts and the rows — so "PGC · Missing" means PGC's missing, not the
+    # whole matcher's.
+    project_f = (project or "").strip().lower()
+    manager_f = (account_manager or "").strip().lower()
+    if project_f:
+        in_scope = and_(in_scope, func.lower(func.trim(func.coalesce(Employee.project, ""))) == project_f)
+    if manager_f:
+        in_scope = and_(in_scope, func.lower(func.trim(func.coalesce(Employee.account_manager, ""))) == manager_f)
+
     # ---- global headline counts (cached per focus month; busted on writes) ----
-    # Inactive employees are excluded from every headline count and from the
-    # "missing" roll-up — they're kept in the matcher (records/vault files
-    # intact) but no longer expected to submit.
+    # Employees out of scope for the focus month are excluded from every
+    # headline count and from the "missing" roll-up — they're kept in the
+    # matcher (records/vault files intact) but no longer expected to submit.
     async def _aggregates() -> dict:
         total = (await db.execute(
-            select(func.count()).select_from(Employee).where(Employee.active.is_(True)))).scalar_one()
+            select(func.count()).select_from(Employee).where(in_scope))).scalar_one()
         submitted = (await db.execute(
             select(func.count()).select_from(
-                select(Employee.id).where(Employee.active.is_(True), Employee.id.in_(submitted_subq)).subquery()
+                select(Employee.id).where(in_scope, Employee.id.in_(submitted_subq)).subquery()
             ))).scalar_one()
         received = (await db.execute(
             select(func.count()).select_from(
-                select(Employee.id).where(Employee.active.is_(True), Employee.id.in_(received_subq)).subquery()
+                select(Employee.id).where(in_scope, Employee.id.in_(received_subq)).subquery()
             ))).scalar_one()
         # Received but not yet a filed record — sitting in Compare & Fix /
         # Activity awaiting a human Accept (or mid-reprocessing).
         awaiting = (await db.execute(
             select(func.count()).select_from(
                 select(Employee.id).where(
-                    Employee.active.is_(True),
+                    in_scope,
                     Employee.id.in_(received_subq),
                     Employee.id.not_in(submitted_subq),
                 ).subquery()
@@ -107,7 +127,7 @@ async def coverage(
         missing = (await db.execute(
             select(func.count()).select_from(
                 select(Employee.id).where(
-                    Employee.active.is_(True),
+                    in_scope,
                     Employee.id.not_in(submitted_subq),
                     Employee.id.not_in(received_subq),
                 ).subquery()
@@ -118,18 +138,18 @@ async def coverage(
             .where(TimesheetRecord.year == focus_year,
                    TimesheetRecord.validation_status == ValidationStatus.MANUAL_REVIEW,
                    TimesheetRecord.matched_employee_pk.is_not(None),
-                   Employee.active.is_(True)))).scalar_one()
+                   in_scope))).scalar_one()
         pend = (await db.execute(
             select(func.count(func.distinct(TimesheetRecord.matched_employee_pk)))
             .select_from(TimesheetRecord).join(Employee, Employee.id == TimesheetRecord.matched_employee_pk)
             .where(TimesheetRecord.year == focus_year,
                    TimesheetRecord.approval_status != ApprovalStatus.APPROVED,
                    TimesheetRecord.matched_employee_pk.is_not(None),
-                   Employee.active.is_(True)))).scalar_one()
+                   in_scope))).scalar_one()
         # Sample for the KPI tooltip — same NOT-submitted-AND-NOT-received test as `missing` above.
         sample = (await db.execute(
             select(Employee.name).where(
-                Employee.active.is_(True),
+                in_scope,
                 Employee.id.not_in(submitted_subq),
                 Employee.id.not_in(received_subq),
             ).order_by(Employee.name).limit(50))).scalars().all()
@@ -139,7 +159,7 @@ async def coverage(
                 "needs_review": nrev, "pending_approval": pend, "missing_sample": list(sample)}
 
     agg = await datacache.get_or_set(
-        datacache.NS_COVERAGE, f"agg:{focus_year}-{focus_month}", datacache.TTL_COVERAGE, _aggregates)
+        datacache.NS_COVERAGE, f"agg:{focus_year}-{focus_month}:{project_f}:{manager_f}", datacache.TTL_COVERAGE, _aggregates)
     total_employees = agg["total_employees"]
     submitted_this_month = agg["submitted_this_month"]
     received_this_month = agg["received_this_month"]
@@ -160,7 +180,7 @@ async def coverage(
     awaiting_review_pct = _pct(awaiting_review_this_month)
 
     # ---- filtered + paginated employee rows ----
-    emp_q = select(Employee).where(Employee.active.is_(True))
+    emp_q = select(Employee).where(in_scope)
     if location:
         emp_q = emp_q.where(Employee.location == location)
     if q and q.strip():
@@ -251,8 +271,17 @@ async def coverage(
             awaiting_review_this_month=bool(e.id in page_received_pks and not focus_rec),
         ))
 
+    # Dropdown choices for the Project / Account Manager filters: every distinct
+    # value in the matcher (not narrowed by the current filter, so you can switch).
+    def _options(col):
+        return select(func.min(func.trim(col))).where(func.trim(func.coalesce(col, "")) != "") \
+            .group_by(func.lower(func.trim(col))).order_by(func.lower(func.min(func.trim(col))))
+    project_options = list((await db.execute(_options(Employee.project))).scalars().all())
+    manager_options = list((await db.execute(_options(Employee.account_manager))).scalars().all())
+
     # missing_sample (for the KPI tooltip) is part of the cached aggregates above.
     return DashboardSummary(
+        project_options=project_options, account_manager_options=manager_options,
         year=focus_year, month=focus_month,
         total_employees=total_employees,
         submitted_this_month=submitted_this_month,

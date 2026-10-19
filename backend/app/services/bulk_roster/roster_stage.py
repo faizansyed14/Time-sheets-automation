@@ -219,6 +219,7 @@ async def stage_roster(
     flagged = sum(1 for g in groups if g["issues"])
     return {
         "staged": staged,
+        "thread_key": key,
         "headcount": doc.headcount,
         "month": doc.month, "year": doc.year,
         "method": doc.method,

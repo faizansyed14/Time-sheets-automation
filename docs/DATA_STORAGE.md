@@ -30,6 +30,8 @@ Everything the app persists as rows lives in Postgres:
   status, failure code, and the `record_id` it produced
 - `timesheet_records` — the extracted monthly leave data per employee
 - `app_config` — admin-managed runtime settings (secrets encrypted)
+- `extraction_debug_runs` — Admin → Extraction debug: prompts/replies of Extract
+  runs that **had a problem** (temporary; cleared by hand — see below)
 
 When `DATABASE_URL` points at RDS, **all of this is stored in RDS** — not in the
 project folder and not in a Docker volume. This is exactly the data you called
@@ -82,6 +84,26 @@ original around.
 - `pipeline_files.raw_path` stores the relative key (`<id>/<file>`).
 - These copies are **not business-critical**: they only power the Retry button.
   Successfully filed files already live in the S3 vault.
+- **Safety-net purge:** a Celery-beat task (`maintenance.purge_pipeline_raw`, every
+  `PIPELINE_RAW_PURGE_INTERVAL_HOURS` — default 24, so daily)
+  deletes anything in this store older than `PIPELINE_RAW_RETENTION_DAYS`
+  (default **120**) — by S3 object `LastModified`, or by folder modified-time on
+  local disk. It bounds the store for files that stay failed/needs-review forever.
+
+#### Extraction-debug images (same store, `debug/` sub-prefix)
+
+Pictures of items the extractor dropped (logos, banners, tiny images) are saved at
+full resolution under `debug/<run_id>/` in this same raw store —
+`<S3_PREFIX>/<S3_RAW_PREFIX>/debug/<run_id>/…` on S3, `data/pipeline_raw/debug/`
+locally — so Admin → Extraction debug can show what was dropped. They are written
+during **every** extraction run, but a database row (`extraction_debug_runs`) is
+only kept for runs with errors or zero sheets.
+
+- They are removed by the same 120-day purge above (not by Accept or Retry).
+- Admin → Extraction debug → **Clear all** deletes every `extraction_debug_runs`
+  row and the local `debug/` folder; on S3 it does **not** delete the objects —
+  they age out via the purge. DB rows are never removed automatically.
+- Full detail: [`EXTRACTION_TWO_PASS.md`](EXTRACTION_TWO_PASS.md) §10.
 
 ---
 

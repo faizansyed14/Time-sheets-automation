@@ -5,6 +5,7 @@ import {
   createEmployee,
   fetchEmployeeMatcher,
   importEmployees,
+  MONTHS,
   previewEmployeeImport,
   setEmployeeStatus,
   updateEmployee,
@@ -18,6 +19,9 @@ import { avatarColor, cn, initials } from "../lib/utils";
 import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton } from "../components/ui";
 import EmployeeImportPlanModal from "../components/EmployeeImportPlanModal";
 import { useToast } from "../components/toast";
+
+/** 202610 -> "Oct 2026" (the month an employee was marked inactive). */
+const inactiveSince = (ym: number) => `${MONTHS[ym % 100]} ${Math.floor(ym / 100)}`;
 
 const EMPTY: EmployeeInput = {
   employee_id: "",
@@ -331,9 +335,19 @@ export default function EmployeesPage() {
                       {r.personal_email ?? "—"}
                     </td>
                     <td className="px-2 py-1.5">
-                      <Badge tone={r.active ? "success" : "slate"} className="px-1.5 py-0 text-[10px]">
-                        {r.active ? "Active" : "Inactive"}
-                      </Badge>
+                      <span
+                        title={
+                          r.active
+                            ? undefined
+                            : r.inactive_ym
+                              ? `Inactive since ${inactiveSince(r.inactive_ym)} — shown in Dashboard/Export up to and including that month, not after.`
+                              : "Inactive — shown in Dashboard/Export only for months where they have a record or sheet."
+                        }
+                      >
+                        <Badge tone={r.active ? "success" : "slate"} className="px-1.5 py-0 text-[10px]">
+                          {r.active ? "Active" : r.inactive_ym ? `Inactive · ${inactiveSince(r.inactive_ym)}` : "Inactive"}
+                        </Badge>
+                      </span>
                     </td>
                     <td className="px-2 py-1.5">
                       <div className="flex items-center justify-end gap-0.5">
@@ -351,7 +365,7 @@ export default function EmployeesPage() {
                             if (
                               !next &&
                               !confirm(
-                                `Mark ${r.name} (${r.employee_id}) inactive? Their records and files are kept — this only hides them from active counts.`
+                                `Mark ${r.name} (${r.employee_id}) inactive? Their records and files are kept. They stay in the Dashboard and Export for this month and earlier months, and drop off from next month.`
                               )
                             )
                               return;

@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import datacache
 from app.core.database import get_db
 from app.models.employee import Employee
+from app.services.employee.activity import set_active
 from app.schemas import (
     EmployeeIn,
     EmployeeOut,
@@ -34,6 +35,7 @@ def _out(e: Employee) -> EmployeeOut:
         work_email=e.work_email,
         personal_email=e.personal_email,
         active=e.active,
+        inactive_ym=e.inactive_ym,
     )
 
 
@@ -80,6 +82,8 @@ async def create_employee(body: EmployeeIn, db: AsyncSession = Depends(get_db)):
     if any(_same_identity(r.name, body.name) for r in rows):
         raise HTTPException(409, f"Employee {body.employee_id} / {body.name} already exists.")
     e = Employee(**body.model_dump())
+    if not e.active:
+        set_active(e, False)   # created already inactive -> stamp the month
     _apply_derived_emails(e)
     db.add(e)
     await db.commit()
@@ -96,8 +100,12 @@ async def update_employee(pk: str, body: EmployeeIn, db: AsyncSession = Depends(
     others = (await db.execute(select(Employee).where(Employee.employee_id == body.employee_id))).scalars().all()
     if any(o.id != pk and _same_identity(o.name, body.name) for o in others):
         raise HTTPException(409, f"Employee {body.employee_id} / {body.name} already used by another row.")
-    for k, v in body.model_dump().items():
+    data = body.model_dump()
+    new_active = data.pop("active")
+    for k, v in data.items():
         setattr(e, k, v)
+    if new_active != e.active:
+        set_active(e, new_active)   # only a real change touches the inactivation month
     _apply_derived_emails(e)
     await db.commit()
     await db.refresh(e)
@@ -109,11 +117,16 @@ async def update_employee(pk: str, body: EmployeeIn, db: AsyncSession = Depends(
 async def set_employee_status(pk: str, body: EmployeeStatusIn, db: AsyncSession = Depends(get_db)):
     """Activate/inactivate an employee. Inactivating is the replacement for
     delete: the row, its timesheet records and vault files are all kept —
-    the employee is just excluded from active headline counts and coverage."""
+    the employee is just excluded from active headline counts and coverage.
+
+    Month-wise: the month they are inactivated in is recorded, and they stay in
+    the Dashboard / Export for that month (and earlier ones) but not after —
+    see services/employee/activity.py."""
     e = (await db.execute(select(Employee).where(Employee.id == pk))).scalar_one_or_none()
     if not e:
         raise HTTPException(404, "Employee not found")
-    e.active = body.active
+    if body.active != e.active:
+        set_active(e, body.active)
     await db.commit()
     await db.refresh(e)
     await datacache.bust_employees()

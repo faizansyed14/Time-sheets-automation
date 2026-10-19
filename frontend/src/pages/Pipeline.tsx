@@ -34,6 +34,8 @@ import {
   type RematchResult,
   type ThreadSummary,
 } from "../api/client";
+import BulkAccept from "../components/BulkAccept";
+import { useAuth } from "../lib/auth";
 import PortalSubmissionsTable from "../components/PortalSubmissionsTable";
 import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
 import StoredFilesPreview from "../components/StoredFilesPreview";
@@ -414,6 +416,7 @@ function TechnicalPanel({ file }: { file: PipelineFile }) {
 
 export default function PipelinePage() {
   const qc = useQueryClient();
+  const { canWrite } = useAuth();
   const { toast } = useToast();
   const navigate = useNavigate();
   const [sp, setSp] = useSearchParams();
@@ -768,6 +771,8 @@ export default function PipelinePage() {
             <option value="upload">Upload</option>
             <option value="portal">Portal</option>
           </Select>
+
+          {canWrite && <BulkAccept period={periodFilter} onDone={invalidate} />}
 
           <button
             type="button"

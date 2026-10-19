@@ -32,6 +32,12 @@ docker compose -f docker-compose.dev.yml ps
 docker compose -f docker-compose.dev.yml restart backend
 docker compose -f docker-compose.dev.yml build backend
 
+# ---- changed .env (e.g. OPENAI_VISION_MODEL / AGENT_CHAT_MODEL)? ----
+# `restart` does NOT re-read .env (env_file is read when a container is created).
+# Recreate the services, then restart nginx (the backend gets a new IP):
+docker compose -f docker-compose.dev.yml --env-file .env up -d backend worker
+docker compose -f docker-compose.dev.yml restart nginx
+
 # ---- rebuild frontend ONLY (no backend changes) ----
 docker compose -f docker-compose.dev.yml --env-file .env build frontend
 docker compose -f docker-compose.dev.yml --env-file .env up -d frontend

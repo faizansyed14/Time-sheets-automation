@@ -34,7 +34,8 @@ Related (not vision extract):
 
 - **Manual Entry** — `POST /upload/manual` → vault immediately.
 - **Save .eml to vault** — `POST /inbox/{id}/as-eml/save-to-vault` — files `.eml` only (uses ACO/DCO folder when `employee_pk` is sent).
-- **Auto Extract** — background loop over non-archived threads; skips when already extracted and nothing newer arrived (`last_at >= newest_at`).
+- **Auto Extract** — background extraction of non-archived threads (one Celery task per thread); skips a thread when it was already checked and nothing newer arrived (`checked_at >= newest_at`). **Start / Stop is admin-only** — see §4.3.
+- **Bulk roster upload** — one sheet listing many employees; separate reader, same review queue. See [`BULK_ROSTER.md`](BULK_ROSTER.md).
 
 ```mermaid
 flowchart TD
@@ -163,9 +164,28 @@ SSE live progress on streaming variants. Inbox shows thread summary
 
 ### 4.3 Auto Extract
 
-`services/extract_email/auto_extract.py` — loops non-`ARCHIVED` threads.  
-**Skip** (no Graph fetch, no model) when `sheet_cache.last_extraction_at(thread) >= newest message`.  
+`services/extract_email/auto_extract.py` — works on non-`ARCHIVED` threads, each
+thread as its **own Celery task** (`inbox.extract_one_thread`), so a slow thread
+does not block the rest.
+
+| | |
+|---|---|
+| **Who can turn it on/off** | **Admin only** — `POST /inbox/auto-extract/start` and `/stop` use `require_admin`; the sidebar widget is hidden for everyone else. `GET /inbox/auto-extract/status` is unchanged. |
+| **Start** | Sets the persistent *enabled* flag (Redis, 30-day TTL, refreshed on each Start) and runs a **full catch-up sweep** of the mailbox. This is the only time the whole mailbox is scanned. |
+| **While enabled** | Each inbox sync hands only the **just-arrived** messages to `enqueue_new_threads`, which extracts just those threads. |
+| **Stop** | Clears the *enabled* flag and sets the active run's stop flag: queued tasks exit without working, a task already mid-extraction finishes (never a mid-write kill). Mail that arrives while it is off is picked up by the next **Start** sweep. |
+| **Skip rule** | A thread is skipped (no Graph fetch, no model call) when `max(last extraction watermark, no_sheets_found_at) >= newest message`. A thread whose last real check found nothing counts as already checked. |
+| **Progress** | Per-run counters in Redis (`total/skipped/succeeded/failed`, 6 h TTL), polled by the UI. |
+
 Manual Extract Email may still re-send a thread on purpose; Auto Extract must not.
+
+Failure handling: a thread whose task raises is counted `failed` (the message is
+kept as `last_error` in the status) and is **not retried within the run**; since
+nothing was recorded for it, the next Start sweep includes it again, or re-run it
+from the Inbox. Problems *inside* a pass that the extractor recovers from (a batch
+that errors, a thread with zero sheets) do not raise — they are returned in the
+run's `errors`, the run completes, and that run is saved to **Admin → Extraction
+debug** (see [`EXTRACTION_TWO_PASS.md`](EXTRACTION_TWO_PASS.md) §10).
 
 ### 4.4 Retry
 
@@ -205,11 +225,38 @@ pipeline_manual_fix
 
 ## 6. Inbox UI notes (extract-related)
 
-| Badge | Color | Meaning |
-|-------|-------|---------|
-| New | Dark blue | Email status / attachment not yet covered by last extract |
-| Extracted | Yellow | Extract Email ran (thread) / message covered by watermark |
-| Ingested | Green | Accepted & filed |
+Each message (list row and conversation header) shows **one** state badge,
+chosen by `ThreadStateBadges` in `Inbox.tsx` in this precedence:
+
+| Badge | Color | Shown when |
+|-------|-------|------------|
+| Ingested | Green | The message's status is `ingested` (set when its extracted item is Accepted), **or** the thread has been extracted and *every* staged item of the thread is filed (`EmailListItem.thread_ingested`). |
+| Extracted | Yellow | Extract Email has read this message and something is still awaiting review. Never shown together with New. |
+| New | Dark blue | No run has read this message yet. A reply that arrives **after** a thread's last run is New again until it is extracted. |
+| Archived | — | Unchanged; an Extracted chip may still show next to it. |
+
+Rules behind it:
+
+- **Extract Email is thread-level.** One run reads the conversation and stages
+  one `PipelineFile` per employee+month, keyed by `thread_key`.
+- **"Read" = the run's `snapshot_at`** (stored in `extraction_meta.full_email_extract`;
+  older rows fall back to `updated_at`). A message counts as read when it had
+  arrived by then (`received_at <= snapshot_at`). Using `snapshot_at` instead of
+  `updated_at` matters because Accept / rematch also bump `updated_at`, which
+  would make a never-read reply look read — and, since Ingested replaces
+  Extracted, show it as Ingested.
+- **Ingested is only set by Accept** (`POST /pipeline/{id}/manual-fix` →
+  `mark_source_email_ingested`) on the message the item was extracted from. That
+  flips one message, not the thread's newest one — which is why the thread-level
+  `thread_ingested` (all items `SUCCESS`) exists. A thread with even one item
+  still awaiting review is not Ingested.
+- **Filters match the badges.** The New / Extracted / Ingested filters (and the
+  threaded list) use the same rules (`_apply_inbox_filters` in `inbox.py`) and
+  judge a threaded conversation by its **newest** message, so a filter and the
+  badge on the row cannot disagree.
+- **No sheets.** If Extract found nothing to stage, the message stays New and
+  gets a grey **No sheets** chip (`EmailMessage.no_sheets_found_at`); Auto Extract
+  treats that as already checked.
 
 Attachment **New/Extracted** chips trust the **message extract watermark** (so nested `.eml` wrappers don’t falsely show New after unwrap).  
 Thread summary: `ThreadSummaryBox` with `defaultOpen` on the conversation view.
@@ -227,6 +274,9 @@ Thread summary: `ThreadSummaryBox` with `defaultOpen` on the conversation view.
 | `POST` | `/upload/manual` | Manual → vault |
 | `POST` | `/pipeline/{id}/retry` | Re-analyse raw |
 | `POST` | `/pipeline/{id}/manual-fix` | Accept → vault + record |
+| `POST` | `/inbox/auto-extract/start` · `/stop` | Auto Extract on/off — **admin only** |
+| `GET` | `/inbox/auto-extract/status` | Auto Extract progress (any inbox user) |
+| `POST` | `/bulk-upload/preview` · `/bulk-upload` | Roster read / stage — see [`BULK_ROSTER.md`](BULK_ROSTER.md) |
 
 ---
 
@@ -234,9 +284,9 @@ Thread summary: `ThreadSummaryBox` with `defaultOpen` on the conversation view.
 
 | Step | `pipeline_files` | pipeline-raw | File Vault | `timesheet_records` | Inbox |
 |------|------------------|--------------|------------|---------------------|-------|
-| Extract / Upload / store | NEEDS_REVIEW | yes | no | no | Extracted badge |
+| Extract / Upload / store | NEEDS_REVIEW | yes | no | no | Extracted badge (New if the message arrived after the run) |
 | Retry | update meta | keep | no | no | — |
-| Accept | SUCCESS | purged | yes (deduped; isolated if multi) | yes | → `ingested` |
+| Accept | SUCCESS | purged | yes (deduped; isolated if multi) | yes | source message → `ingested`; thread shows Ingested once all its items are filed |
 | Manual / Save-to-vault | tracker / none | — | yes | yes / no | — |
 
 ---

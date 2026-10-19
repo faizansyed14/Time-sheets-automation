@@ -47,6 +47,7 @@ class RosterPreviewRow(BaseModel):
     matched_name: str | None = None
     matched_employee_id: str | None = None
     issues: list[str] = []
+    thread_key: str = ""      # identifies this roster's staged items (for Bulk accept)
 
 
 class RosterPreview(BaseModel):
@@ -177,5 +178,5 @@ async def upload_bulk_roster(
         unmatched=result["unmatched"],
         flagged=result["flagged"],
         month=result["month"], year=result["year"], method=result["method"],
-        issues=result["issues"],
+        issues=result["issues"], thread_key=result.get("thread_key", ""),
     )

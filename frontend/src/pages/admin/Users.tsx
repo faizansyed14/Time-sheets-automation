@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { UserPlus, Shield, Eye, User as UserIcon, Mail, KeyRound, Trash2, Power, Pencil, Smartphone, FolderLock, Megaphone } from "lucide-react";
+import { UserPlus, Shield, Eye, User as UserIcon, Mail, KeyRound, Trash2, Power, Pencil, Smartphone, FolderLock, Megaphone, ThumbsUp, ChevronDown } from "lucide-react";
 import {
   adminCreateUser,
   adminDeleteUser,
   adminListUsers,
   adminTotpSetup,
   adminUpdateUser,
+  fetchNoticeAcks,
   fetchSystemNotice,
   updateSystemNotice,
   type AuthModeT,
@@ -18,6 +19,61 @@ import { avatarColor, cn, formatRelativeTime, initials } from "../../lib/utils";
 import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton } from "../../components/ui";
 import { useToast } from "../../components/toast";
 import { useAuth } from "../../lib/auth";
+
+/** Who has clicked OK on the notice that is currently showing. A collapsible
+ *  list under the notice card — rendered only while "Show to everyone" is on,
+ *  since there is nothing to acknowledge otherwise. A thumbs-up marks everyone
+ *  who clicked OK; polled so new clicks appear without a reload. */
+function NoticeAcknowledgements() {
+  const [open, setOpen] = useState(false);
+  const { data } = useQuery({
+    queryKey: ["system-notice-acks"],
+    queryFn: fetchNoticeAcks,
+    refetchInterval: 15_000,
+  });
+  if (!data) return null;
+
+  return (
+    <div className="mt-4 rounded-lg border border-slate-200">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left text-sm hover:bg-slate-50"
+      >
+        <ThumbsUp className="h-4 w-4 text-emerald-600" />
+        <span className="font-semibold text-slate-800">Acknowledged</span>
+        <span className="text-slate-500">
+          {data.acknowledged_count} of {data.total} {data.total === 1 ? "user" : "users"} clicked OK
+        </span>
+        <ChevronDown className={cn("ml-auto h-4 w-4 text-slate-400 transition-transform", open && "rotate-180")} />
+      </button>
+      {open && (
+        <ul className="max-h-72 divide-y divide-slate-100 overflow-y-auto border-t border-slate-100">
+          {data.users.map((u) => (
+            <li key={u.user_id} className="flex items-center gap-2.5 px-3.5 py-2">
+              <span className={cn("flex h-7 w-7 items-center justify-center rounded-full text-[10px] font-bold", avatarColor(u.username))}>
+                {initials(u.username)}
+              </span>
+              <span className="text-sm font-semibold text-slate-800">{u.username}</span>
+              <RoleBadge role={u.role} />
+              <span className="ml-auto flex items-center gap-1.5 text-xs">
+                {u.acknowledged ? (
+                  <span className="flex items-center gap-1.5 font-medium text-emerald-600" title={`Clicked OK ${formatRelativeTime(u.acked_at)}`}>
+                    <ThumbsUp className="h-4 w-4" />
+                    <span className="text-slate-500">{formatRelativeTime(u.acked_at)}</span>
+                  </span>
+                ) : (
+                  <span className="text-slate-400">Not yet</span>
+                )}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 function SystemNoticeCard() {
   const { toast } = useToast();
@@ -40,6 +96,7 @@ function SystemNoticeCard() {
       toast("success", "Notice updated");
       setDirty(false);
       qc.invalidateQueries({ queryKey: ["system-notice"] });
+      qc.invalidateQueries({ queryKey: ["system-notice-acks"] });
     },
     onError: (e: any) => toast("error", "Could not update notice", e?.response?.data?.detail ?? String(e)),
   });
@@ -52,6 +109,8 @@ function SystemNoticeCard() {
       </div>
       <p className="mb-3 text-xs text-slate-500">
         One sentence shown as a popup to every signed-in user, including viewers — e.g. "System under maintenance tonight 10pm–11pm."
+        They get a single OK button; once someone clicks it the popup doesn't come back for them. Changing the message or
+        switching it back on shows it to everyone again.
       </p>
       <div className="flex flex-wrap items-end gap-3">
         <div className="min-w-64 flex-1">
@@ -75,6 +134,8 @@ function SystemNoticeCard() {
         </label>
         <Button disabled={saveMut.isPending} onClick={() => saveMut.mutate()}>Save</Button>
       </div>
+      {/* Only while it is actually being shown to everyone (saved + ticked). */}
+      {notice?.enabled && enabled && <NoticeAcknowledgements />}
     </Card>
   );
 }

@@ -12,6 +12,13 @@ Reference for **Pass 1** (classify) and **Pass 2** (transcribe), how the **Admin
 | Calendar DB + admin UI | `month_calendars` table, `frontend/src/pages/admin/Calendars.tsx` |
 | Calendar mismatch flags | `backend/app/services/extract_email/grouping.py` → `calendar_mismatch_flags()` |
 
+**Model:** both passes run on the one vision model set by `OPENAI_VISION_MODEL`
+(via `vision_client.chat_call`: JSON reply, `_MAX_TOKENS = 8000`, 3 attempts).
+Pass 1 keeps the model's reasoning on; Pass 2 turns it off (pure transcription).
+The Ask-AI chat model (`AGENT_CHAT_MODEL`) is separate — see
+[`SYSTEM.md`](SYSTEM.md#ai-models--two-independent-settings). Changing the model
+means editing `.env` and **recreating** the containers (`up -d`).
+
 ---
 
 ## 1. End-to-end flow
@@ -749,8 +756,10 @@ Full-month July 2026 timesheet: 22 working days, 8 weekend days (Sat–Sun), 1 s
 
 Full Accept / vault detail: [`EXTRACTION_FLOWS.md`](EXTRACTION_FLOWS.md) §3 and §5.
 
-**Auto Extract** skips threads where last extraction time ≥ newest message
-(`auto_extract.py`) — no model cost for already-done mail.
+**Auto Extract** skips threads already checked (last extraction watermark or a
+recorded "no sheets" check ≥ newest message — `auto_extract.py`), so there is no
+model cost for already-done mail. Start/Stop is admin-only; details in
+[`EXTRACTION_FLOWS.md`](EXTRACTION_FLOWS.md) §4.3.
 
 ---
 
@@ -761,6 +770,48 @@ Full Accept / vault detail: [`EXTRACTION_FLOWS.md`](EXTRACTION_FLOWS.md) §3 and
 3. Select **weekend weekdays** (e.g. Friday, Saturday).
 4. Add **public holidays** as ISO dates + optional name.
 5. Run **Extract Email** on a thread whose Pass 1 `period_hint` parses to that month (e.g. `"July 2026"`).
-6. In **Admin → Extraction debug**, open the run → **Pass 2** tab → search user prompt for `CALENDAR FOR July 2026`.
+6. In **Admin → Extraction debug**, open the run → **Pass 2** tab → search user prompt for `CALENDAR FOR July 2026`. Note that Extraction debug only holds runs that had a problem (see §10), so a clean run will **not** be listed there.
 
 If no row exists, Pass 2 still gets days-in-month and weekday line, but weekends/PH are not admin-grounded and mismatch flags for weekends/PH are skipped.
+
+---
+
+## 10. Admin → Extraction debug — what is stored, and for how long
+
+A **failure log**, not a trace of every run. A run is saved only when it had a
+problem: `errors` is non-empty **or zero sheets were extracted** (which also
+covers "nothing usable in the thread"). A clean run that staged at least one
+sheet leaves no row. Condition: `orchestrator/agents.py` (`had_a_problem`).
+
+**What a row holds** (`extraction_debug_runs` table, admin-only
+`GET /admin/debug/runs[/{id}]`): the system prompt, user text and parsed reply of
+each Pass 1 / Pass 2 call, every dropped/noise item, the triage and final sheets
+JSON, the model name, call counts and errors.
+
+- Only calls that **returned a reply** appear as cards. A call that failed after
+  its retries raises and is reported in `errors`, not as a card.
+- **"No Pass 2 calls (nothing new confirmed, or fully served from cache)"** means
+  Pass 2 never ran: either Pass 1 confirmed no timesheet / leave certificate (so
+  there was nothing to send — and that zero-sheets outcome is exactly why the run
+  was saved), or every sheet was reused from the per-attachment cache. It is not
+  itself an error.
+
+**Where the images live.** Dropped-item pictures (full resolution) are written
+through `raw_store` under `debug/<run_id>/`: S3 key
+`<S3_PREFIX>/<S3_RAW_PREFIX>/debug/<run_id>/…` (default
+`timesheets/_pipeline-raw/debug/…`, hidden from the File Vault), or
+`data/pipeline_raw/debug/` on local storage. They are written **as the items are
+dropped, during every run**, even though only problem runs keep a database row.
+
+**Retention.**
+
+| What | Removed by | When |
+|------|-----------|------|
+| Images (S3) | daily Celery-beat task `maintenance.purge_pipeline_raw` | object `LastModified` older than `PIPELINE_RAW_RETENTION_DAYS` (default **120**) |
+| Images (local disk) | same task | top-level folder modified-time older than that |
+| DB rows | **Admin → Extraction debug → Clear all** (`DELETE /admin/debug/runs`) only | never automatically |
+
+Consequences worth knowing: after 120 days the images disappear but the row stays
+(its image links go dead); **Clear all** removes every row and the local `debug/`
+folder but **not** the S3 objects, which then age out through the 120-day purge;
+and images from clean runs have no row, so only the purge ever removes them.

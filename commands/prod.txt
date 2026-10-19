@@ -27,9 +27,27 @@ docker compose -f docker-compose.prod.yml logs -f backend worker
 docker compose -f docker-compose.prod.yml ps
 docker compose -f docker-compose.prod.yml up -d --scale worker=3
 
-# ---- rebuild + rolling update after a code change ----
+# ---- deploy a new version (backend and/or frontend code changed) ----
+# scripts/prod/start.sh is just `up --build -d`: it does NOT git pull and does
+# NOT restart nginx. So, in order:
+git pull origin <branch>                                  # 1. get the code first
+bash scripts/prod/start.sh                                # 2. rebuilds changed images, recreates changed containers
+docker compose -f docker-compose.prod.yml restart nginx   # 3. nginx caches upstream IPs; recreated containers get new ones
+docker compose -f docker-compose.prod.yml ps              # 4. backend, worker (healthy = Celery answers ping), frontend, nginx up
+# The frontend image is rebuilt too (that is how UI changes reach users), so a
+# hard refresh (Ctrl+F5) may be needed in the browser afterwards.
+
+# ---- rebuild + rolling update after a code change (manual equivalent) ----
 docker compose -f docker-compose.prod.yml build
 docker compose -f docker-compose.prod.yml up -d
+
+# ---- changing .env (model names, secrets, limits) ----
+# `restart` does NOT re-read .env — compose reads env_file only when a container
+# is CREATED. Recreate instead:
+docker compose -f docker-compose.prod.yml --env-file .env up -d backend worker
+docker compose -f docker-compose.prod.yml restart nginx   # backend got a new IP
+# e.g. OPENAI_VISION_MODEL (all vision extraction, incl. bulk roster) and
+# AGENT_CHAT_MODEL (Ask-AI chat) are independent settings — see docs/SYSTEM.md.
 
 # ---- rebuild frontend ONLY (no backend changes) ----
 docker compose -f docker-compose.prod.yml --env-file .env build frontend

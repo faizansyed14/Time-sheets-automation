@@ -213,6 +213,8 @@ export default function Dashboard() {
   const [month, setMonth] = useState(CUR_MONTH);
   const [q, setQ] = useState("");
   const [loc, setLoc] = useState("");
+  const [project, setProject] = useState("");
+  const [manager, setManager] = useState("");
   const [quickFilter, setQuickFilter] = useState<QuickFilter>("all");
 
   const statusFilter: CoverageStatus | "" =
@@ -221,13 +223,15 @@ export default function Dashboard() {
 
   const dq = useDebounced(q, 300);
   const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
-    queryKey: ["coverage", year, month, dq, loc, statusFilter, onlyMissing],
+    queryKey: ["coverage", year, month, dq, loc, project, manager, statusFilter, onlyMissing],
     queryFn: ({ pageParam }) =>
       fetchCoverage({
         year,
         month,
         q: dq || undefined,
         location: loc || undefined,
+        project: project || undefined,
+        account_manager: manager || undefined,
         status: statusFilter || undefined,
         only_missing: onlyMissing,
         offset: pageParam as number,
@@ -240,6 +244,8 @@ export default function Dashboard() {
   const rows = data?.pages.flatMap((p) => p.rows) ?? [];
   const filteredTotal = cov?.filtered_total ?? rows.length;
   const reviewCount = cov?.awaiting_review_this_month ?? 0;
+  const projectOptions = cov?.project_options ?? [];
+  const managerOptions = cov?.account_manager_options ?? [];
 
   // A currently-selected year outside the fixed window (reached via a stale
   // URL/bookmark, say) still needs to appear so the Select doesn't silently
@@ -328,6 +334,34 @@ export default function Dashboard() {
                 <option key={y} value={y}>{y}</option>
               ))}
             </Select>
+            <span className="ml-2 text-xs font-bold uppercase tracking-wide text-slate-400">Filter</span>
+            <Select
+              value={project}
+              onChange={(e) => setProject(e.target.value)}
+              className="w-[150px] truncate py-1.5 text-xs"
+              aria-label="Project"
+            >
+              <option value="">All projects</option>
+              {projectOptions.map((p) => <option key={p} value={p}>{p}</option>)}
+            </Select>
+            <Select
+              value={manager}
+              onChange={(e) => setManager(e.target.value)}
+              className="w-[160px] truncate py-1.5 text-xs"
+              aria-label="Account manager"
+            >
+              <option value="">All account managers</option>
+              {managerOptions.map((m) => <option key={m} value={m}>{m}</option>)}
+            </Select>
+            {(project || manager) && (
+              <button
+                type="button"
+                onClick={() => { setProject(""); setManager(""); }}
+                className="text-xs font-semibold text-brand-600 hover:underline"
+              >
+                Clear
+              </button>
+            )}
           </div>
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex flex-wrap gap-1.5">

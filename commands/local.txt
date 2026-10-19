@@ -33,6 +33,14 @@ docker compose -f docker-compose.local.yml ps
 docker compose -f docker-compose.local.yml restart backend frontend nginx
 docker compose -f docker-compose.local.yml build backend frontend
 
+# ---- changed .env (e.g. OPENAI_VISION_MODEL / AGENT_CHAT_MODEL)? ----
+# `restart` does NOT re-read .env (env_file is read when a container is created).
+# Recreate the services instead:
+docker compose -f docker-compose.local.yml --env-file .env up -d backend worker
+docker compose -f docker-compose.local.yml restart nginx   # backend got a new IP
+# Changed frontend code? The frontend image must be rebuilt (see next block),
+# otherwise the browser keeps showing the old UI.
+
 # ---- rebuild frontend ONLY (no backend changes) ----
 docker compose -f docker-compose.local.yml --env-file .env build frontend
 docker compose -f docker-compose.local.yml --env-file .env up -d frontend

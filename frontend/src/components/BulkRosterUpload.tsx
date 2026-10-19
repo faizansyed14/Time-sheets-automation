@@ -15,6 +15,7 @@ import { Fragment, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  CheckCheck,
   ChevronDown,
   ChevronRight,
   FileSpreadsheet,
@@ -25,7 +26,11 @@ import {
   UserX,
   X,
 } from "lucide-react";
-import { bulkRosterPreview, bulkRosterUpload, MONTHS_LONG } from "../api/client";
+import {
+  bulkAcceptPipeline, bulkRosterPreview, bulkRosterUpload, MONTHS_LONG,
+  type BulkAcceptHeld, type BulkAcceptedItem,
+} from "../api/client";
+import BulkAcceptReport, { type BulkAcceptReportData } from "./BulkAcceptReport";
 import { cn, formatBytes } from "../lib/utils";
 import { Badge, Button, Card, Field, Select } from "./ui";
 import { useToast } from "./toast";
@@ -86,6 +91,7 @@ export default function BulkRosterUpload({ onStaged }: { onStaged: () => void })
     clearBulkRoster,
   } = useUploadSession();
   const [dragging, setDragging] = useState(false);
+  const [report, setReport] = useState<BulkAcceptReportData | null>(null);
   // Which row's issue list is expanded open — the note text used to be
   // hidden behind a hover-only browser tooltip, easy to miss and invisible
   // on touch. Clicking now shows it directly in the table.
@@ -126,6 +132,46 @@ export default function BulkRosterUpload({ onStaged }: { onStaged: () => void })
       );
     } catch (e: any) {
       toast("error", "Could not stage this roster", e?.response?.data?.detail ?? String(e));
+    } finally {
+      setStaging(false);
+    }
+  };
+
+  // Stage, then file everything that is clean. Rows with leave days, notes or
+  // flags (anything beyond missing manager approval / "no totals") stay in the
+  // review queue. Missing approval is recorded as "not approved".
+  const stageAndAccept = async () => {
+    if (!file) return;
+    setStaging(true);
+    try {
+      const r = await bulkRosterUpload(file, month || undefined, year || undefined);
+      setResult(r);
+      setPreview(null);
+      let accepted = 0;
+      const items: BulkAcceptedItem[] = [];
+      const failed: string[] = [];
+      let held: BulkAcceptHeld[] = [];
+      for (;;) {
+        const a = await bulkAcceptPipeline({ thread_key: r.thread_key, no_leaves: true });
+        accepted += a.accepted;
+        items.push(...a.accepted_items);
+        held = a.held;
+        failed.push(...a.failed.map((f) => `${f.employee_name ?? f.id}: ${f.error}`));
+        if (a.remaining <= 0 || a.accepted === 0) break;
+      }
+      onStaged();
+      setReport({ accepted: items, held, failed });
+      const kept = Math.max(0, r.staged - accepted);
+      toast(
+        failed.length ? "warning" : "success",
+        `${accepted} accepted · ${kept} kept for review`,
+        failed.length
+          ? `${failed.length} failed — ${failed[0]}`
+          : kept ? "Rows with maternity/unpaid/absent days, notes or flags are waiting in the Activity log." : undefined,
+      );
+    } catch (e: any) {
+      toast("error", "Bulk accept stopped", e?.response?.data?.detail ?? String(e));
+      onStaged();
     } finally {
       setStaging(false);
     }
@@ -221,6 +267,14 @@ export default function BulkRosterUpload({ onStaged }: { onStaged: () => void })
               <Button onClick={stage} disabled={staging || analysing || !preview}>
                 {staging ? <Loader2 className="h-4 w-4 animate-spin" /> : <UploadCloud className="h-4 w-4" />}
                 {preview ? `Stage ${preview.headcount} employee${preview.headcount === 1 ? "" : "s"}` : "Stage for review"}
+              </Button>
+              <Button
+                onClick={stageAndAccept}
+                disabled={staging || analysing || !preview}
+                title="Stage everyone, then accept all rows except those with maternity, unpaid, absent or other days, notes or flags. Sick and annual leave are accepted. The rest stay in review. Missing manager approval and 'no totals' don't hold a row back."
+              >
+                <CheckCheck className="h-4 w-4" />
+                Bulk accept
               </Button>
             </div>
           </div>
@@ -382,6 +436,7 @@ export default function BulkRosterUpload({ onStaged }: { onStaged: () => void })
           </p>
         </div>
       )}
+      <BulkAcceptReport report={report} onClose={() => setReport(null)} />
     </Card>
   );
 }

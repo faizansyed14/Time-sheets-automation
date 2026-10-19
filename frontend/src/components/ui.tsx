@@ -142,6 +142,7 @@ export function Modal({
   subtitle,
   children,
   wide,
+  dismissible = true,
 }: {
   open: boolean;
   onClose: () => void;
@@ -149,10 +150,13 @@ export function Modal({
   subtitle?: string;
   children: ReactNode;
   wide?: boolean;
+  /** false = no close "X", Escape and backdrop clicks do nothing — the caller
+   *  must offer its own button (used by the system notice's single "OK"). */
+  dismissible?: boolean;
 }) {
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && dismissible && onClose();
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     window.addEventListener("keydown", onKey);
@@ -160,12 +164,15 @@ export function Modal({
       document.body.style.overflow = prevOverflow;
       window.removeEventListener("keydown", onKey);
     };
-  }, [open, onClose]);
+  }, [open, onClose, dismissible]);
 
   if (!open) return null;
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-slate-900/50 backdrop-blur-sm animate-overlay-in" onClick={onClose} />
+      <div
+        className="absolute inset-0 bg-slate-900/50 backdrop-blur-sm animate-overlay-in"
+        onClick={dismissible ? onClose : undefined}
+      />
       <div
         className={cn(
           "relative max-h-[90vh] w-full overflow-y-auto rounded-xl border border-slate-200 bg-white p-6 shadow-pop animate-scale-in",
@@ -177,14 +184,16 @@ export function Modal({
             <h3 className="text-lg font-bold text-slate-900">{title}</h3>
             {subtitle && <p className="mt-1 text-sm text-slate-500">{subtitle}</p>}
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
-          >
-            <X className="h-5 w-5" />
-          </button>
+          {dismissible && (
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close"
+              className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+            >
+              <X className="h-5 w-5" />
+            </button>
+          )}
         </div>
         {children}
       </div>
