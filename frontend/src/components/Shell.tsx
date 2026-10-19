@@ -297,7 +297,11 @@ export default function Shell({ children }: { children: ReactNode }) {
                 </span>
               </span>
             )}
-            {!isVaultMatcherOnly && <AutoExtractWidget />}
+            {/* Admin-only: starting/stopping auto-extract controls mailbox-wide
+                AI spend and what gets auto-filed without review, so only admin
+                sees this control at all (not just the buttons disabled) — see
+                AutoExtractWidget's own gate for the defense-in-depth copy. */}
+            {isAdmin && <AutoExtractWidget />}
             <button
               onClick={reload}
               disabled={refreshing}

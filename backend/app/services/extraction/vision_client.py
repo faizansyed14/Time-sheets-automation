@@ -29,6 +29,10 @@ from app.core.pii import scrub_text
 # Fixed to match the prompt lab this pipeline was ported from — not tunable
 # per-deployment the way batching/detail/DPI are.
 _TEMPERATURE = 0.0
+# Don't raise this without adding a cross-check to the single-call roster read:
+# a reasoning model (e.g. Claude Haiku) on a sideways scan overruns 8k, which
+# drops the read to the slower double-read fallback — accurate (22/22). At 16k
+# the same scan finishes in one unverified call and was wrong (17/22).
 _MAX_TOKENS = 8000
 
 
@@ -131,14 +135,10 @@ async def chat_call(
             payload["response_format"] = {"type": "json_object"}
         if not enable_thinking:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
-        if vision_provider() == "openrouter":
-            # OpenRouter hosts the same open model across several providers at
-            # different prices (e.g. Qwen3-VL: DeepInfra vs Alibaba Cloud vs
-            # NovitaAI can differ 30-50%). `sort: "price"` always routes to
-            # whichever is cheapest right now for THIS exact model — same
-            # weights, same quality, no accuracy tradeoff (unlike quantization
-            # filtering, which is not enabled here on purpose for that reason).
-            payload["provider"] = {"sort": "price"}
+        # No `provider` preference on purpose: pinning `sort: "price"` sent every
+        # call to the cheapest (often slowest) OpenRouter host — a scanned
+        # 22x30 roster took ~9 min in one request. Default routing lets
+        # OpenRouter balance across providers and skip slow/unhealthy ones.
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(settings.openai_timeout)) as client:
                 r = await client.post(f"{api_root}/v1/chat/completions", json=payload, headers=headers)

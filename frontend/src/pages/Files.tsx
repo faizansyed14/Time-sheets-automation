@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useAuth } from "../lib/auth";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   FolderOpen,
@@ -145,6 +146,12 @@ export default function FilesPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
   const navigate = useNavigate();
+  // vault_matcher has full read/write on the File Vault but, per the backend
+  // (api/deps.require_full_access on DELETE /files/folder and /files/file),
+  // cannot delete — mirror that here so the trash icon doesn't appear only
+  // to 403 when clicked.
+  const { isVaultMatcherOnly } = useAuth();
+  const canDelete = !isVaultMatcherOnly;
 
   // ---- Manager-wise view (the vault's real physical layout) ----
   const [manager, setManager] = useState<string | null>(null);
@@ -626,12 +633,12 @@ export default function FilesPage() {
                       setMonth(null);
                     }}
                     onRename={() => { setRenaming({ rel: m.rel_path, name: m.name }); setName(m.name); }}
-                    onDelete={() => {
+                    onDelete={canDelete ? () => {
                       if (confirm(`Delete folder "${m.name}" and everything inside?`)) {
                         deleteMut.mutate(m.rel_path);
                         setManager(null);
                       }
-                    }}
+                    } : undefined}
                   />
                 ))
               )
@@ -712,9 +719,9 @@ export default function FilesPage() {
                       setMonth(null);
                     }}
                     onRename={() => { setRenaming({ rel: e.rel_path, name: e.name }); setName(e.name); }}
-                    onDelete={() => {
+                    onDelete={canDelete ? () => {
                       if (confirm(`Delete folder "${e.name}"?`)) deleteMut.mutate(e.rel_path);
-                    }}
+                    } : undefined}
                     onMove={() => setMovingFolder({ relPath: e.rel_path, name: e.name })}
                   />
                 ))
@@ -857,18 +864,20 @@ export default function FilesPage() {
                         >
                           <FolderInput className="h-4 w-4" />
                         </button>
-                        <button
-                          type="button"
-                          title="Delete this file"
-                          disabled={deleteFileMut.isPending}
-                          onClick={() => {
-                            if (confirm(`Delete "${f.name}"? This cannot be undone.`))
-                              deleteFileMut.mutate(f.rel_path);
-                          }}
-                          className="shrink-0 rounded-lg p-2 text-slate-400 transition-colors hover:bg-rose-50 hover:text-rose-500"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
+                        {canDelete && (
+                          <button
+                            type="button"
+                            title="Delete this file"
+                            disabled={deleteFileMut.isPending}
+                            onClick={() => {
+                              if (confirm(`Delete "${f.name}"? This cannot be undone.`))
+                                deleteFileMut.mutate(f.rel_path);
+                            }}
+                            className="shrink-0 rounded-lg p-2 text-slate-400 transition-colors hover:bg-rose-50 hover:text-rose-500"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        )}
                       </div>
                     );
                   })}
@@ -889,9 +898,9 @@ export default function FilesPage() {
                     meta={`${mo.file_count} file${mo.file_count !== 1 ? "s" : ""}`}
                     onClick={() => setMonth(mo.name)}
                     onRename={() => { setRenaming({ rel: mo.rel_path, name: mo.name }); setName(mo.name); }}
-                    onDelete={() => {
+                    onDelete={canDelete ? () => {
                       if (confirm(`Delete folder "${mo.name}"?`)) deleteMut.mutate(mo.rel_path);
-                    }}
+                    } : undefined}
                     onView={() => viewRecordMut.mutate({ month: mo.name, by: { manager: manager!, employeeFolder: employee! } })}
                   />
                 ) : viewMode === "project" ? (

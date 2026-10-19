@@ -45,6 +45,13 @@ _KEEP_IMAGE_NAME_RE = re.compile(
 )
 
 
+def _strip_nul(s: str) -> str:
+    """Drop embedded NUL bytes a malformed MIME header can decode into —
+    see eml_parser._strip_nul for why this matters before anything derived
+    from it reaches a stored json/jsonb column."""
+    return s.replace("\x00", "") if s else s
+
+
 # ---------------------------------------------------------------------------
 # Shared date / attendance-grid scanning (used by the mock + vision engines)
 # ---------------------------------------------------------------------------
@@ -505,7 +512,7 @@ def _focus_timesheet_text(text: str) -> str:
 
 def _part_file_type(part, payload: bytes) -> str | None:
     """Resolve file type from filename, content-type, or magic bytes."""
-    filename = part.get_filename() or ""
+    filename = _strip_nul(part.get_filename() or "")
     ftype = detect_file_type(filename, payload)
     if ftype != "unknown":
         return ftype
@@ -582,7 +589,7 @@ def _eml_collect_attachments(eml_bytes: bytes) -> list[tuple[str, bytes, str]]:
         if not payload:
             continue
 
-        filename = part.get_filename() or ""
+        filename = _strip_nul(part.get_filename() or "")
         disposition = (part.get_content_disposition() or "").lower()
         cid = (part.get("Content-Id") or "").strip()
         ftype = _part_file_type(part, payload)
@@ -815,13 +822,13 @@ def _resolve_eml_html_cids(eml_bytes: bytes, html_body: str) -> str:
         payload = part.get_payload(decode=True)
         if not payload or not _likely_pasted_timesheet_image(payload):
             continue
-        if _LOGO_NAME_RE.search(part.get_filename() or ""):
+        if _LOGO_NAME_RE.search(_strip_nul(part.get_filename() or "")):
             continue
         ctype = (part.get_content_type() or "image/png").split(";")[0]
         uri = f"data:{ctype};base64,{base64.b64encode(payload).decode()}"
         cid_map[cid.lower()] = uri
         cid_map[cid.split("@")[0].lower()] = uri
-        fn = (part.get_filename() or "").strip().lower()
+        fn = _strip_nul(part.get_filename() or "").strip().lower()
         if fn:
             cid_map[fn] = uri
 

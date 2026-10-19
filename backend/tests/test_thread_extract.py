@@ -905,3 +905,31 @@ async def test_pass2_batch_whose_retry_also_fails_is_recorded_not_raised(mock_vi
     assert sheets == []
     assert meta["errors"]
     assert any("retry failed" in e for e in meta["errors"])
+
+
+def test_collect_thread_strips_nul_from_attachment_and_nested_message_filenames():
+    """A malformed RFC 2231 `filename*=` can decode into a real NUL byte.
+    Postgres json/jsonb accepts the \u0000 escape on write but raises on any
+    later read of that document, so neither a top-level attachment name nor a
+    nested forwarded-message name (which lands in opened_containers ->
+    extraction_meta) may carry one."""
+    import base64
+
+    pdf = base64.b64encode(b"%PDF-1.4\n" + b"0" * 5000)
+    inner = (b"From: x@y.z\r\nSubject: inner\r\nMIME-Version: 1.0\r\n"
+             b"Content-Type: text/plain\r\n\r\ninner body\r\n")
+    raw = (b"From: a@b.c\r\nTo: d@e.f\r\nSubject: t\r\nMIME-Version: 1.0\r\n"
+           b'Content-Type: multipart/mixed; boundary="BB"\r\n\r\n'
+           b"--BB\r\nContent-Type: text/plain\r\n\r\nhi\r\n"
+           b"--BB\r\nContent-Type: application/pdf\r\n"
+           b"Content-Disposition: attachment; filename*=utf-8''sheet%00one.pdf\r\n"
+           b"Content-Transfer-Encoding: base64\r\n\r\n" + pdf + b"\r\n"
+           b"--BB\r\nContent-Type: message/rfc822\r\n"
+           b"Content-Disposition: attachment; filename*=utf-8''fwd%00mail.eml\r\n\r\n"
+           + inner + b"\r\n--BB--\r\n")
+
+    th = collect_thread([("msg 1", raw)])
+
+    names = [i.name for i in th.items] + [c["name"] for c in th.opened_containers]
+    assert "sheetone.pdf" in names and "fwdmail.eml" in names
+    assert all("\x00" not in n for n in names)

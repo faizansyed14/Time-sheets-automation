@@ -22,7 +22,12 @@ import { useToast } from "./toast";
  * Extract Email uses), not here — this stays a compact counts-only pill. */
 export default function AutoExtractWidget() {
   const qc = useQueryClient();
-  const { canWrite } = useAuth();
+  // Admin-only, not the general canWrite (admin/user/vault_matcher) — this
+  // mode controls mailbox-wide AI spend and what gets auto-filed without a
+  // human looking first. Shell.tsx already only mounts this component for
+  // isAdmin; this internal gate is defense-in-depth so the component stays
+  // correct on its own if it's ever mounted somewhere else later.
+  const { isAdmin } = useAuth();
   const { toast } = useToast();
   const [detailsOpen, setDetailsOpen] = useState(false);
   const detailsRef = useRef<HTMLDivElement>(null);
@@ -79,9 +84,9 @@ export default function AutoExtractWidget() {
   const isRunning = status.state === "running" || status.state === "stopping";
   const showRun = status.total > 0 && (isRunning || status.state === "completed" || status.state === "stopped");
 
-  // Read-only roles see the widget only while there's something to see —
-  // an active run, or the watch mode being on. Nothing to show otherwise.
-  if (!canWrite && !isRunning && !enabled) return null;
+  // Non-admins see the widget only while there's something to see — an
+  // active run, or the watch mode being on. Nothing to show otherwise.
+  if (!isAdmin && !isRunning && !enabled) return null;
 
   const remaining = Math.max(0, status.total - status.processed);
 
@@ -111,7 +116,7 @@ export default function AutoExtractWidget() {
       title={tooltip}
       className={cn("inline-flex items-center gap-1 rounded-md border px-1.5 py-1 text-[11px]", tone)}
     >
-      {canWrite && (
+      {isAdmin && (
         <button
           type="button"
           onClick={() => startMut.mutate()}
@@ -164,7 +169,7 @@ export default function AutoExtractWidget() {
         <span className="hidden text-emerald-700 sm:inline">Watching for new mail</span>
       ) : null}
 
-        {canWrite && (
+        {isAdmin && (
           <button
             type="button"
             onClick={() => stopMut.mutate()}

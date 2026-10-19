@@ -9,11 +9,13 @@ from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import require_admin
 from app.core import datacache
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.cache import cache
 from app.core.http_headers import content_disposition
+from app.models.auth import User
 from app.models.email_message import EmailMessage, EmailStatus
 from app.models.pipeline_file import PipelineFile
 from app.schemas import (
@@ -381,16 +383,25 @@ async def list_threads(
 # Fixed paths — MUST stay registered before GET/{provider_message_id} below,
 # or FastAPI matches "auto-extract" itself as a provider_message_id.
 @router.post("/auto-extract/start")
-async def auto_extract_start():
+async def auto_extract_start(admin: User = Depends(require_admin)):
     """Start (or return the already-running) bulk Extract Email job — every
-    thread in the inbox, one at a time, in a background Celery worker."""
+    thread in the inbox, one at a time, in a background Celery worker.
+
+    Admin-only: this toggle controls mailbox-wide AI spend and what gets
+    auto-filed without a human looking first, so it's scoped tighter than
+    the router's own default (require_full_access, which would otherwise
+    let the "user" role start/stop it too) — require_admin overrides that
+    down to admin alone. GET /auto-extract/status is unaffected (still
+    readable by anyone with inbox access) so a non-admin can still see
+    whether a run is active, just not start or stop one."""
     from app.services.extract_email import auto_extract
     return await auto_extract.start()
 
 
 @router.post("/auto-extract/stop")
-async def auto_extract_stop():
-    """Ask the running job to stop after its current thread finishes."""
+async def auto_extract_stop(admin: User = Depends(require_admin)):
+    """Ask the running job to stop after its current thread finishes.
+    Admin-only — see auto_extract_start's docstring for why."""
     from app.services.extract_email import auto_extract
     return await auto_extract.request_stop()
 
