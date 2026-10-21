@@ -6,13 +6,17 @@ Email-driven timesheet leave extraction with manager approval.
 > see **[docs/SYSTEM.md](docs/SYSTEM.md)**.  
 > **Extract / Accept / vault:** **[docs/EXTRACTION_FLOWS.md](docs/EXTRACTION_FLOWS.md)** ·
 > **[docs/EXTRACTION_TWO_PASS.md](docs/EXTRACTION_TWO_PASS.md)**.  
-> Run tests with `bash scripts/test.sh`. Default admin: `admin` / `admin`.
+> **Bulk roster upload (many employees, one sheet):** **[docs/BULK_ROSTER.md](docs/BULK_ROSTER.md)**.  
+> **Roles, login hardening, data protection:** **[docs/SECURITY.md](docs/SECURITY.md)**.  
+> Run tests with `bash scripts/test.sh`. Default admin: `admin` / `admin` — change it before going live.
 
 ## Product flow (current)
 
 1. **Inbox** — sync mail, preview attachments, **Extract Email** (two-pass vision
-   over the thread). Status badges: **New** (dark blue), **Extracted** (yellow),
-   **Ingested** (green). Thread summary expands by default.
+   over the thread). Each message shows one status badge: **New** (dark blue — no
+   extract has read it yet, including a fresh reply in an already-extracted
+   thread), **Extracted** (yellow — read, items awaiting review) or **Ingested**
+   (green — filed; replaces Extracted). Thread summary expands by default.
 2. **Pipeline / Compare & Fix** — one review row per **employee + month**. AI may
    *recommend* Accept; nothing is filed until a human presses Accept.
 3. **Accept** — writes `timesheet_records` + File Vault under  
@@ -20,14 +24,36 @@ Email-driven timesheet leave extraction with manager approval.
    - Multi-employee email → only that person’s attachment(s).  
    - Same filename again → dated copy (never overwrite).
 4. **Upload / Manual Entry / Save .eml to Vault** — same extract core or direct filing.
+5. **Bulk upload** — one roster sheet listing many employees → one review item per
+   employee, same Accept step. The reader is picked automatically and the preview
+   shows the detected format and whether AI was used.
 
 ## What's included
-- **Email Inbox** — read, Extract Email, Auto Extract, Save .eml to vault, archive.
+- **Email Inbox** — read, Extract Email, Auto Extract (Start/Stop is **admin-only**),
+  Save .eml to vault, archive.
 - **Upload** — PDF/DOCX/XLSX/images/`.eml`; same two-pass extract → review queue.
+- **Bulk upload** — monthly rosters: wide / long / HHRC spreadsheets and HHRC PDFs are
+  read from their cells with **no AI**; FAZAA attendance reports and scanned rosters
+  use the vision model. See [docs/BULK_ROSTER.md](docs/BULK_ROSTER.md).
 - **Files** — File Vault browse / upload / ZIP download (ACO/DCO folder names).
-- **Employee Matcher** — CRUD + Excel import; ACO and DCO numbers.
-- **Dashboard / Records** — roll-ups, leave buckets, approval sign-off.
+- **Employee Matcher** — create / edit / deactivate + Excel import; ACO and DCO numbers.
+  An inactive employee stays in the Dashboard and Export for the month they were
+  inactivated in (and earlier months) and drops off from the next.
+- **Dashboard / Records** — month-wise roll-ups, leave buckets, approval sign-off.
+- **System notice** — admin popup for all users with a single OK; the admin sees who
+  clicked OK (see [docs/SYSTEM.md](docs/SYSTEM.md#system-notice)).
 - **Pipeline** — staged extracts, Compare & Fix, Retry from raw copy.
+
+## Roles
+| Role | Access |
+|------|--------|
+| `admin` | Everything, incl. user admin, Auto Extract Start/Stop, extraction debug |
+| `user` | All business pages, read + write + delete |
+| `viewer` | Read-only everywhere (can download); no writes |
+| `vault_matcher` | Employee Matcher + File Vault only; **cannot delete**; every other page is blocked at the API |
+
+Enforced in the API, not just the UI — matrix and details in
+[docs/SECURITY.md](docs/SECURITY.md).
 
 ## Swappable providers (mock → real, all config-only)
 | Concern | Config | Now | Later |
@@ -92,9 +118,10 @@ Extract / Accept / vault: **[docs/EXTRACTION_FLOWS.md](docs/EXTRACTION_FLOWS.md)
 backend/app/
   core/      config · database · cache · celery_app · security · crypto · pii
   models/    auth_users · all_employee_data (aco_number, dco_number) · email · timesheet · pipeline
-  api/       deps (RBAC) · routes/ (auth, admin, inbox, pipeline, employees, upload, files)
-  services/  auth/ · employee/ · extract_email/ · extraction/ · llm/ · pipeline/ ·
-             storage_provider/{local,s3,onedrive} · tasks (Celery)
+  api/       deps (RBAC) · routes/ (auth, admin, inbox, pipeline, employees, employee_matcher,
+             upload, bulk_upload, files, portal_*, …)
+  services/  auth/ · employee/ · extract_email/ · bulk_roster/ · extraction/ · llm/ ·
+             pipeline/ · storage_provider/{local,s3,onedrive} · tasks (Celery)
   seed/  alembic/ (migrations through 0022+)  tests/
 frontend/src/  api/client.ts · components/ · pages/ (Dashboard, Inbox, Upload,
                Pipeline, Employees, Files, Record, Login, admin/…)
@@ -143,7 +170,18 @@ EXTRACTION_ENGINE=vision
 OPENAI_API_KEY=sk-...
 OPENAI_VISION_MODEL=gpt-4o
 ```
-Details: [`docs/EXTRACTION_TWO_PASS.md`](docs/EXTRACTION_TWO_PASS.md).
+Two model settings, independent of each other:
+
+| Setting | Drives |
+|---------|--------|
+| `OPENAI_VISION_MODEL` | **All vision extraction** — Extract Email passes 1 & 2, previews, bulk-roster vision reads |
+| `AGENT_CHAT_MODEL` | Ask-AI chat (and the FAZAA attendance-report reader) |
+
+Use any OpenAI-compatible gateway by setting `LLM_PROVIDER` and `OPENAI_BASE_URL`
+(e.g. OpenRouter). After editing `.env`, **recreate** the containers
+(`docker compose … up -d`) — `restart` does not re-read it.
+Details: [`docs/EXTRACTION_TWO_PASS.md`](docs/EXTRACTION_TWO_PASS.md),
+[`docs/SYSTEM.md`](docs/SYSTEM.md#ai-models--two-independent-settings).
 
 ### Use your Postgres
 ```
@@ -152,13 +190,27 @@ docker compose -f docker-compose.postgres.yml up -d
 DATABASE_URL=postgresql+asyncpg://timesheet:timesheet@localhost:5432/timesheet_db
 # uncomment asyncpg in requirements.txt
 ```
-Schema migrations: Alembic (`alembic upgrade head` — current head includes
-`0022_employee_aco_number`). See [`docs/DATABASE_MIGRATIONS.md`](docs/DATABASE_MIGRATIONS.md).
+Schema migrations: Alembic (`alembic upgrade head` — current head is
+`0033_notice_ack`; migrations also run automatically when the backend starts).
+See [`docs/DATABASE_MIGRATIONS.md`](docs/DATABASE_MIGRATIONS.md).
 
 ### Other production notes
-- Auth is built in (JWT + OTP / CAPTCHA / RBAC) — configure before exposing publicly.
+- Auth is built in (JWT + OTP / TOTP / CAPTCHA / RBAC, with rate limiting on both the
+  internal and the employee-portal login) — configure before exposing publicly.
 - For large mailboxes, Graph **delta** sync + Celery; Auto Extract skips already-done threads.
 - Storage swaps to S3 via `STORAGE_PROVIDER=s3` — see [`docs/DATA_STORAGE.md`](docs/DATA_STORAGE.md).
+
+### Deploying a new version (Docker, prod)
+`scripts/prod/start.sh` is just `docker compose … up --build -d`. It does **not**
+`git pull` and does **not** restart nginx, so:
+```
+git pull origin <branch>
+bash scripts/prod/start.sh          # rebuilds backend + frontend images, recreates changed containers
+docker compose -f docker-compose.prod.yml restart nginx   # re-resolve the recreated containers' IPs
+```
+The worker reports `healthy` only while Celery answers a ping (prod compose
+overrides the image's HTTP healthcheck). More commands: `commands/prod.txt`,
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ---
 

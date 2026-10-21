@@ -65,6 +65,10 @@ class EmailListItem(BaseModel):
     conversation_id: str | None = None
     thread_id: str | None = None
     thread_message_count: int = 1
+    # Every staged item of this message's thread has been filed (Accepted) —
+    # drives the Ingested badge. The per-message `status` can't: Accepting an
+    # item only flips the one message it was extracted from.
+    thread_ingested: bool = False
 
 
 class EmailDetail(EmailListItem):
@@ -238,6 +242,8 @@ class DashboardSummary(BaseModel):
     needs_review: int                # employees with at least one flagged record (global)
     pending_approval: int            # employees with at least one unapproved record (global)
     missing_employees: list[str] = []  # sample of names missing the focus month
+    project_options: list[str] = []          # distinct Project values (filter dropdown)
+    account_manager_options: list[str] = []  # distinct Account Manager values (filter dropdown)
     # ---- paginated rows (infinite scroll) ----
     rows: list[DashboardRow] = []
     filtered_total: int = 0          # rows matching the q / location / only_missing filter
@@ -291,6 +297,9 @@ class EmployeeIn(BaseModel):
 
 class EmployeeOut(EmployeeIn):
     id: str
+    # Month they were marked inactive as year*100+month in UAE time (202610 =
+    # Oct 2026); None while active, or for rows inactivated before this was recorded.
+    inactive_ym: int | None = None
 
 
 class EmployeeStatusIn(BaseModel):

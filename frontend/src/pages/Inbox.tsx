@@ -133,6 +133,30 @@ function ExtractedBadge({ at }: { at: string | null | undefined }) {
   );
 }
 
+/** Where this thread stands, as ONE badge — never "New" and "Extracted"
+ *  together. Ingested (every staged item filed) > Extracted (read by Extract
+ *  Email, something still awaiting review) > New (no run has read this
+ *  message yet — so a fresh reply in an already-extracted thread is New
+ *  again). Archived is unchanged. Mirrors the New/Extracted/Ingested filters
+ *  (inbox.py _apply_inbox_filters). */
+function ThreadStateBadges({
+  item,
+}: {
+  item: Pick<EmailListItem, "status" | "extract_email_at" | "thread_ingested">;
+}) {
+  if (item.status === "archived")
+    return (
+      <>
+        <StatusBadge status="archived" />
+        <ExtractedBadge at={item.extract_email_at} />
+      </>
+    );
+  if (item.status === "ingested" || (item.extract_email_at && item.thread_ingested))
+    return <StatusBadge status="ingested" />;
+  if (item.extract_email_at) return <ExtractedBadge at={item.extract_email_at} />;
+  return <StatusBadge status="new" />;
+}
+
 // Persisted so this email is never re-processed by hand just to rediscover
 // the same empty result — see EmailMessage.no_sheets_found_at.
 function NoSheetsBadge({ at, note }: { at: string | null | undefined; note: string | null | undefined }) {
@@ -1486,8 +1510,7 @@ export default function InboxPage() {
                     </span>
                     <span className="block truncate text-[10px] leading-snug text-slate-500">{m.subject}</span>
                     <span className="mt-0.5 flex flex-wrap items-center gap-1">
-                      <StatusBadge status={m.status} />
-                      <ExtractedBadge at={m.extract_email_at} />
+                      <ThreadStateBadges item={m} />
                       <NoSheetsBadge at={m.no_sheets_found_at} note={m.no_sheets_note} />
                       <span className="flex items-center gap-0.5 text-[9px] text-slate-400">
                         <Paperclip className="h-2.5 w-2.5" />
@@ -1575,8 +1598,7 @@ export default function InboxPage() {
                       <div className="flex shrink-0 flex-col items-end gap-2">
                         <div className="flex items-center gap-1.5">
                           {fetchingDetail && <Spinner className="h-3.5 w-3.5" />}
-                          <StatusBadge status={detail.status} />
-                          <ExtractedBadge at={detail.extract_email_at} />
+                          <ThreadStateBadges item={detail} />
                           <NoSheetsBadge at={detail.no_sheets_found_at} note={detail.no_sheets_note} />
                           <button
                             type="button"

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
-from sqlalchemy import func, or_, select
+from sqlalchemy import DateTime, and_, case, cast, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_admin
@@ -17,7 +17,7 @@ from app.core.cache import cache
 from app.core.http_headers import content_disposition
 from app.models.auth import User
 from app.models.email_message import EmailMessage, EmailStatus
-from app.models.pipeline_file import PipelineFile
+from app.models.pipeline_file import PipelineFile, PipelineStatus
 from app.schemas import (
     AttachmentOut,
     DecisionIn,
@@ -164,17 +164,13 @@ async def _extract_email_times(
     # Thread-level: any run on this conversation marks all of its messages.
     convs = {r.conversation_id for r in (rows or []) if r.conversation_id}
     if convs:
-        by_conv = {
-            key: at for key, at in (await db.execute(
-                select(PipelineFile.thread_key, func.max(PipelineFile.updated_at))
-                .where(
-                    PipelineFile.source_kind == "email",
-                    PipelineFile.thread_key.in_(convs),
-                    PipelineFile.attachment_id.like(f"{_EXTRACT_EMAIL_TAG}%"),
-                )
-                .group_by(PipelineFile.thread_key)
-            )).all() if key
-        }
+        # The run's own snapshot_at (when the thread was actually read), NOT
+        # PipelineFile.updated_at: that also moves when a reviewer Accepts or
+        # rematches the item, which would make a reply that arrived between the
+        # run and the Accept look already-read — and, now that Ingested
+        # replaces Extracted, show a never-read reply as Ingested.
+        from app.services.extract_email import sheet_cache
+        by_conv = await sheet_cache.last_extraction_at_bulk(db, list(convs))
         for r in (rows or []):
             at = by_conv.get(r.conversation_id)
             if not at:
@@ -207,20 +203,47 @@ async def _thread_extraction_state(
     )).all()
 
     names: list[str] = []
-    latest: datetime | None = None
-    for meta, at in rows:
-        if at and (latest is None or at > latest):
-            latest = at
+    for meta, _at in rows:
         for s in (((meta or {}).get("full_email_extract") or {}).get("sheets") or []):
             fn = s.get("filename")
             if fn and fn not in names:
                 names.append(fn)
+    # Same watermark as the list badges (the run's snapshot_at, not the row's
+    # updated_at — see _extract_email_times), so a message is labelled the
+    # same way in the list and inside its thread.
+    from app.services.extract_email import sheet_cache
+    latest = await sheet_cache.last_extraction_at(db, thread_id) if rows else None
     return names, latest
+
+
+async def _filed_thread_keys(db: AsyncSession, rows: list[EmailMessage]) -> set[str]:
+    """Threads (keyed the way Extract Email keys them: conversation id, else the
+    message's provider id) whose staged items have ALL been filed (Accepted).
+    A thread with even one item still awaiting review is not "ingested" — and
+    the status flag alone can't say: Accepting an item only flips the single
+    message it was extracted from, not the thread's newest message."""
+    keys = {r.conversation_id or r.provider_message_id for r in rows}
+    if not keys:
+        return set()
+    res = await db.execute(
+        select(
+            PipelineFile.thread_key,
+            func.count(PipelineFile.id),
+            func.sum(case((PipelineFile.status == PipelineStatus.SUCCESS, 1), else_=0)),
+        )
+        .where(
+            PipelineFile.source_kind == "email",
+            PipelineFile.thread_key.in_(keys),
+            PipelineFile.attachment_id.like(f"{_EXTRACT_EMAIL_TAG}%"),
+        )
+        .group_by(PipelineFile.thread_key)
+    )
+    return {k for k, total, ok in res.all() if k and total and int(ok or 0) == total}
 
 
 def _to_list_item(
     row: EmailMessage, extract_email_at: datetime | None = None,
-    thread_message_count: int = 1,
+    thread_message_count: int = 1, thread_ingested: bool = False,
 ) -> EmailListItem:
     visible_atts = [
         AttachmentOut(
@@ -251,28 +274,96 @@ def _to_list_item(
         conversation_id=row.conversation_id,
         thread_id=row.conversation_id or row.id,
         thread_message_count=thread_message_count,
+        thread_ingested=thread_ingested,
     )
 
 
-def _apply_inbox_filters(base, q: str | None, status: str | None):
-    """Shared status/search filtering for both the flat and threaded list."""
-    if status == "extracted":
-        # Not a lifecycle status — "Extract Email has been run on this email",
-        # the same condition that shows the green Extracted badge. Matches any
-        # new/ingested/archived row with an extract-tagged pipeline item.
-        base = base.where(
-            select(PipelineFile.id).where(
-                PipelineFile.source_kind == "email",
-                PipelineFile.source_id == EmailMessage.provider_message_id,
-                PipelineFile.attachment_id.like(f"{_EXTRACT_EMAIL_TAG}%"),
-            ).exists()
+def _covered_by_extraction():
+    """SQL twin of _extract_email_times: this message had already arrived when
+    its thread was last read by Extract Email, so it is part of what was
+    extracted. Uses each run's own snapshot_at (falling back to updated_at for
+    older rows) — see sheet_cache.last_extraction_at for why not updated_at."""
+    snapshot = cast(
+        PipelineFile.extraction_meta["full_email_extract"]["snapshot_at"].as_string(),
+        DateTime(timezone=True),
+    )
+    wm = (
+        select(
+            PipelineFile.thread_key.label("tk"),
+            func.max(func.coalesce(snapshot, PipelineFile.updated_at)).label("wm"),
         )
-    elif status == "no_sheets":
+        .where(
+            PipelineFile.source_kind == "email",
+            PipelineFile.thread_key.isnot(None),
+            PipelineFile.attachment_id.like(f"{_EXTRACT_EMAIL_TAG}%"),
+        )
+        .group_by(PipelineFile.thread_key)
+        .subquery()
+    )
+    by_thread = exists().where(
+        wm.c.tk == func.coalesce(EmailMessage.conversation_id, EmailMessage.provider_message_id),
+        wm.c.wm >= EmailMessage.received_at,
+    )
+    # A run started from exactly this message always covers it (older rows
+    # written before thread_key existed are only reachable this way).
+    by_message = exists(select(PipelineFile.id).where(
+        PipelineFile.source_kind == "email",
+        PipelineFile.source_id == EmailMessage.provider_message_id,
+        PipelineFile.attachment_id.like(f"{_EXTRACT_EMAIL_TAG}%"),
+    ))
+    return or_(by_message, by_thread)
+
+
+def _thread_fully_filed():
+    """SQL twin of _filed_thread_keys: every staged item of this message's
+    thread has been filed (status success) — at least one exists, none pending."""
+    filed = (
+        select(PipelineFile.thread_key.label("tk"))
+        .where(
+            PipelineFile.source_kind == "email",
+            PipelineFile.thread_key.isnot(None),
+            PipelineFile.attachment_id.like(f"{_EXTRACT_EMAIL_TAG}%"),
+        )
+        .group_by(PipelineFile.thread_key)
+        .having(func.sum(case((PipelineFile.status == PipelineStatus.SUCCESS, 0), else_=1)) == 0)
+        .subquery()
+    )
+    return exists().where(
+        filed.c.tk == func.coalesce(EmailMessage.conversation_id, EmailMessage.provider_message_id))
+
+
+def _status_clause(status: str | None):
+    """SQL condition for the status filter (None = no status filter).
+
+    New / Extracted / Ingested mirror the badges (Inbox.tsx ThreadStateBadges),
+    each message in exactly one of them: Ingested once its thread's items are
+    all filed; Extracted once Extract Email has read it but something is still
+    awaiting review; New only while no extraction run has read it yet — so a
+    fresh reply in an already-extracted thread is New again."""
+    if status == "extracted":
+        return or_(
+            and_(EmailMessage.status == EmailStatus.ARCHIVED, _covered_by_extraction()),
+            and_(EmailMessage.status == EmailStatus.NEW,
+                 _covered_by_extraction(), ~_thread_fully_filed()),
+        )
+    if status == "new":
+        return and_(EmailMessage.status == EmailStatus.NEW, ~_covered_by_extraction())
+    if status == "ingested":
+        return or_(
+            EmailMessage.status == EmailStatus.INGESTED,
+            and_(EmailMessage.status == EmailStatus.NEW,
+                 _covered_by_extraction(), _thread_fully_filed()),
+        )
+    if status == "no_sheets":
         # Extract Email was run and found nothing to stage — surfaced so it
         # never needs to be reprocessed just to rediscover the same result.
-        base = base.where(EmailMessage.no_sheets_found_at.isnot(None))
-    elif status:
-        base = base.where(EmailMessage.status == status)
+        return EmailMessage.no_sheets_found_at.isnot(None)
+    if status:
+        return EmailMessage.status == status
+    return None
+
+
+def _apply_search(base, q: str | None):
     if q and q.strip():
         # Sender-only search: every word must match the sender's name or
         # address, in any order — "ritta ibrahim" or "ritta.m.ibrahim@gmail.com".
@@ -285,6 +376,16 @@ def _apply_inbox_filters(base, q: str | None, status: str | None):
                 func.lower(EmailMessage.sender_email).like(like, escape="\\"),
             ))
     return base
+
+
+def _apply_inbox_filters(base, q: str | None, status: str | None):
+    """Status + search on the same message row — for the flat, one-row-per-
+    message list. (The threaded list applies status to each thread's NEWEST
+    message instead; see list_threads.)"""
+    clause = _status_clause(status)
+    if clause is not None:
+        base = base.where(clause)
+    return _apply_search(base, q)
 
 
 @router.get("", response_model=Page[EmailListItem])
@@ -307,7 +408,12 @@ async def list_inbox(
         base.order_by(EmailMessage.received_at.desc()).limit(limit).offset(offset)
     )).scalars().all()
     times = await _extract_email_times(db, [r.provider_message_id for r in rows], rows)
-    items = [_to_list_item(r, times.get(r.provider_message_id)) for r in rows]
+    filed = await _filed_thread_keys(db, rows)
+    items = [
+        _to_list_item(r, times.get(r.provider_message_id),
+                      thread_ingested=(r.conversation_id or r.provider_message_id) in filed)
+        for r in rows
+    ]
     return Page(items=items, total=total, limit=limit, offset=offset,
                 has_more=offset + len(items) < total)
 
@@ -323,19 +429,22 @@ async def list_threads(
     """Outlook-style conversation view: one row per THREAD (grouped by Graph
     conversationId; a message with none is its own singleton thread), showing
     the newest message's summary + how many messages the thread has. Same
-    search/status semantics as GET /inbox, but matching ANY message in the
-    thread — e.g. searching a manager's name finds the thread even when the
-    newest message is from the employee."""
+    search semantics as GET /inbox, but matching ANY message in the thread —
+    e.g. searching a manager's name finds the thread even when the newest
+    message is from the employee. The status filter is judged on the newest
+    message (what the row shows), so filter and badge always agree."""
     if offset == 0:
         await sync_inbox(db)
 
     thread_key = func.coalesce(EmailMessage.conversation_id, EmailMessage.id)
 
-    # Every message that matches the filters, tagged with its thread key —
-    # this is what decides WHICH threads qualify (any matching message pulls
-    # the whole thread in).
-    matching = _apply_inbox_filters(
-        select(EmailMessage.id, thread_key.label("thread_key")), q, status
+    # Every message that matches the SEARCH, tagged with its thread key — any
+    # matching message pulls the whole thread in. Status is deliberately NOT
+    # applied here: it is judged on the thread's newest message below, the one
+    # the row displays, so a thread listed under "Ingested" never shows a "New"
+    # badge (an old ingested message with a fresh unread reply is New).
+    matching = _apply_search(
+        select(EmailMessage.id, thread_key.label("thread_key")), q
     ).subquery()
 
     # Total message count per thread — over ALL messages in the conversation,
@@ -358,9 +467,13 @@ async def list_threads(
     newest_orm = select(EmailMessage).select_from(
         newest.join(EmailMessage, EmailMessage.id == newest.c.id)
     )
+    status_clause = _status_clause(status)
+    if status_clause is not None:
+        newest_orm = newest_orm.where(status_clause)
 
+    # One row per qualifying thread, so counting these rows counts threads.
     total = (await db.execute(
-        select(func.count()).select_from(select(matching.c.thread_key).distinct().subquery())
+        select(func.count()).select_from(newest_orm.subquery())
     )).scalar_one()
 
     rows_with_counts = (await db.execute(
@@ -372,8 +485,10 @@ async def list_threads(
 
     rows = [r[0] for r in rows_with_counts]
     times = await _extract_email_times(db, [r.provider_message_id for r in rows], rows)
+    filed = await _filed_thread_keys(db, rows)
     items = [
-        _to_list_item(row, times.get(row.provider_message_id), thread_message_count=count)
+        _to_list_item(row, times.get(row.provider_message_id), thread_message_count=count,
+                      thread_ingested=(row.conversation_id or row.provider_message_id) in filed)
         for row, count in rows_with_counts
     ]
     return Page(items=items, total=total, limit=limit, offset=offset,
@@ -434,6 +549,8 @@ async def _build_email_detail(db: AsyncSession, provider, row: EmailMessage) -> 
         row,
         (await _extract_email_times(db, [row.provider_message_id], [row]))
         .get(row.provider_message_id),
+        thread_ingested=(row.conversation_id or row.provider_message_id)
+        in await _filed_thread_keys(db, [row]),
     )
     # Same visible set as the list row (docs + real images; logos/tiny
     # images already stripped by `_is_body_junk_image`). Always include size

@@ -79,6 +79,10 @@ export interface EmailListItem {
   conversation_id: string | null;
   thread_id: string | null;
   thread_message_count: number;
+  // Every staged item of this message's thread has been filed (Accepted) —
+  // drives the Ingested badge (`status` alone can't: Accepting only flips the
+  // one message an item was extracted from).
+  thread_ingested?: boolean;
 }
 
 /** One row per Outlook-style conversation in the threaded inbox list —
@@ -262,6 +266,9 @@ export interface DashboardSummary {
   needs_review: number;
   pending_approval: number;
   missing_employees: string[];
+  /** Distinct Project / Account Manager values in the matcher — filter dropdown choices. */
+  project_options: string[];
+  account_manager_options: string[];
   rows: DashboardRow[];
   filtered_total: number;
   limit: number;
@@ -646,6 +653,8 @@ export const fetchCoverage = (params: {
   month?: number;
   q?: string;
   location?: string;
+  project?: string;
+  account_manager?: string;
   status?: CoverageStatus | "";
   only_missing?: boolean;
   offset?: number;
@@ -658,6 +667,8 @@ export const fetchCoverage = (params: {
         month: params.month,
         q: params.q || undefined,
         location: params.location || undefined,
+        project: params.project || undefined,
+        account_manager: params.account_manager || undefined,
         status: params.status || undefined,
         only_missing: params.only_missing || undefined,
         offset: params.offset ?? 0,
@@ -799,6 +810,38 @@ export interface RematchResult {
  *  re-extraction, no LLM call — safe to run over the whole backlog. */
 export const rematchUnmatchedPipelineFiles = () =>
   api.post<RematchResult>("/pipeline/rematch-unmatched").then((r) => r.data);
+
+/** Projects whose review queue can be accepted in one go (mirrors the backend). */
+export const BULK_ACCEPT_PROJECTS = ["PGC", "MOD"] as const;
+export interface BulkAcceptHeld { id: string; employee_name: string | null; project: string | null; reasons: string[]; }
+export interface BulkAcceptedItem {
+  id: string;
+  employee_name: string | null;
+  employee_id: string | null;
+  project: string | null;
+  month: number;
+  year: number;
+  buckets: Record<string, string[]>;   // non-empty leave buckets -> ISO dates
+  working_days: number;
+  weekend_days: number;
+  approved: boolean;
+}
+export interface BulkAcceptResult {
+  ready: number;                       // clean items that can be accepted
+  by_project: Record<string, number>;
+  held: BulkAcceptHeld[];              // first 50 items that need a human, with why
+  held_count: number;
+  accepted: number;                    // filed by THIS call (0 for a dry run)
+  accepted_items: BulkAcceptedItem[];  // who was filed by THIS call, with their data
+  failed: { id: string; employee_name: string | null; error: string }[];
+  remaining: number;                   // still to do after this call
+}
+export const bulkAcceptPipeline = (p: {
+  project?: string; month?: number; year?: number; dry_run?: boolean;
+  /** Limit to one uploaded roster (any project) … */ thread_key?: string;
+  /** … and keep out rows that have leave days. */ no_leaves?: boolean;
+}) =>
+  api.post<BulkAcceptResult>("/pipeline/bulk-accept", p, { timeout: 300_000 }).then((r) => r.data);
 
 // ---------------------------------------------------------------------------
 // Files / folders (3-level: Manager → Employee → Month)
@@ -981,6 +1024,8 @@ export interface BulkStageResult {
   year: number | null;
   method: string;
   issues: string[];
+  /** Identifies this roster's staged items — passed to Bulk accept. */
+  thread_key: string;
 }
 
 function rosterForm(file: File, month?: number, year?: number): FormData {
@@ -1157,8 +1202,12 @@ export interface Employee {
   work_email: string | null;
   personal_email: string | null;
   active: boolean;
+  /** Month they were marked inactive, as year*100+month in UAE time (202610 =
+   *  Oct 2026). Dashboard/Export keep them through that month and drop them from
+   *  the next. null while active, or for rows inactivated before this was recorded. */
+  inactive_ym?: number | null;
 }
-export type EmployeeInput = Omit<Employee, "id">;
+export type EmployeeInput = Omit<Employee, "id" | "inactive_ym">;
 
 export const fetchEmployeeMatcher = () => api.get<Employee[]>("/employee-matcher").then((r) => r.data);
 export const createEmployee = (e: EmployeeInput) =>
@@ -1515,6 +1564,8 @@ export const fetchReminderRun = (id: string) =>
 export interface SystemNotice {
   message: string;
   enabled: boolean;
+  /** Has the CURRENT user already clicked OK on this announcement? */
+  acknowledged: boolean;
   updated_at: string | null;
   updated_by: string | null;
 }
@@ -1522,6 +1573,26 @@ export const fetchSystemNotice = () =>
   api.get<SystemNotice>("/notice").then((r) => r.data);
 export const updateSystemNotice = (patch: { message?: string; enabled?: boolean }) =>
   api.put<SystemNotice>("/notice", patch).then((r) => r.data);
+/** "OK" on the popup. `message` is the text the user was looking at — the server
+ *  ignores the click if the admin has changed it since. */
+export const ackSystemNotice = (message: string) =>
+  api.post<SystemNotice>("/notice/ack", { message }).then((r) => r.data);
+
+export interface NoticeAckUser {
+  user_id: string;
+  username: string;
+  role: AuthRole;
+  acknowledged: boolean;
+  acked_at: string | null;
+}
+export interface NoticeAcks {
+  enabled: boolean;
+  total: number;
+  acknowledged_count: number;
+  users: NoticeAckUser[];
+}
+/** Admin only — who has clicked OK on the current notice. */
+export const fetchNoticeAcks = () => api.get<NoticeAcks>("/notice/acks").then((r) => r.data);
 
 // ===========================================================================
 // Admin — extraction debug runs (temporary, purgeable full LLM trace)

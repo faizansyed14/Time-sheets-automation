@@ -7,7 +7,7 @@ suite.
 ```
 ┌──────────┐     ┌─────────────────────────── backend (FastAPI) ───────────────────────────┐
 │ frontend │ ──► │ api/routes  auth · admin · inbox · pipeline · employees · upload · files  │
-│  (React) │     │ api/deps    RBAC (require_user / require_write / require_admin)           │
+│  (React) │     │ api/deps    RBAC (require_user / write / full_access / admin)             │
 │  nginx   │     │ services    auth/ · config/ · employee/ · extract_email/ · extraction/   │
 └──────────┘     │             llm/ · pipeline/ · storage_provider/ · tasks (Celery)         │
                  │ core        config · database · cache · celery_app · security · crypto    │
@@ -26,8 +26,9 @@ suite.
 ```
 backend/app/
   api/
-    deps.py                 RBAC dependencies (require_user / require_admin)
-    routes/                 auth, admin, inbox, pipeline, employees, upload, files, timesheets
+    deps.py                 RBAC dependencies (require_user / require_write / require_full_access / require_admin)
+    routes/                 auth, admin, inbox, pipeline, employees, employee_matcher, upload,
+                            bulk_upload, files, timesheets, portal_auth, portal_employee, …
   core/                     config, database, cache, celery_app, security, crypto, pii
   models/                   auth_users, timesheet_records, pipeline_files, email_message, employee, …
   schemas/                  pydantic request/response models
@@ -47,6 +48,8 @@ backend/app/
       auto_extract.py       background extract; skip if nothing newer
       email.py / upload.py  Inbox + Upload entry points
       sheet_cache.py        Extracted/New filename record + last_extraction_at
+    bulk_roster/            ★ one sheet, many employees (xlsx/PDF cells first, vision fallback)
+                            — see BULK_ROSTER.md
     extraction/             vision_client, parser, file rendering, mock engine
     llm/                    LangChain provider factory
     pipeline/               ingestion (Accept / isolate / ACO folders) + matching
@@ -63,8 +66,8 @@ frontend/src/
 
 | Route | Role |
 |-------|------|
-| `/inbox` | Sync mail, Extract Email, Auto Extract, thread summary (expanded by default) |
-| `/upload` | Drag-drop files / .eml → same two-pass extract |
+| `/inbox` | Sync mail, Extract Email, Auto Extract (Start/Stop widget is **admin-only**), thread summary (expanded by default) |
+| `/upload` | Drag-drop files / .eml → same two-pass extract. **Bulk upload** tab: one roster sheet listing many employees → [`BULK_ROSTER.md`](BULK_ROSTER.md) |
 | `/pipeline` | Review queue — **AI recommends** vs **Held**; Compare & Fix |
 | `/files` | File Vault (`Manager/<Employee ACO/DCO>/<Month-Year>/`) |
 | `/employees` | Matcher list (includes ACO / DCO numbers) |
@@ -91,7 +94,7 @@ Upload use **one conversation, two vision calls**:
 └───────────────────────────────┬────────────────────────────────┘
                                 │
               ┌─────────────────▼─────────────────┐
-              │  PASS 1 — TRIAGE (gpt-4o)         │
+              │  PASS 1 — TRIAGE (vision model)   │
               │  Classify items, employee,        │
               │  format_id, approval, summary.    │
               │  Do NOT list leave dates.         │
@@ -100,7 +103,7 @@ Upload use **one conversation, two vision calls**:
               └─────────────────┬─────────────────┘
                                 │ only timesheet + leave_certificate
               ┌─────────────────▼─────────────────┐
-              │  PASS 2 — EXTRACT (gpt-4o)        │
+              │  PASS 2 — EXTRACT (vision model)  │
               │  Read confirmed sheets only.      │
               │  Transcribe leave buckets +       │
               │  coverage (days_covered, …).      │
@@ -204,11 +207,21 @@ date checks are server-side.
 
 ### Inbox badges
 
+A message shows **exactly one** of these (plus *Archived*) — never "New" and
+"Extracted" together:
+
 | Badge | Colour | Meaning |
 |-------|--------|---------|
-| New | Dark blue | Status `new`, or attachment after last extract |
-| Extracted | Yellow | Extract Email watermark covers this thread/message |
-| Ingested | Green | Accepted and filed |
+| Ingested | Green | Every staged item of the thread has been Accepted and filed, or the message itself was marked ingested on Accept. Wins over Extracted. |
+| Extracted | Yellow | Extract Email has read this message (it had already arrived when the thread was last read) and something is still awaiting review. |
+| New | Dark blue | No Extract Email run has read this message yet — including a **new reply in an already-extracted thread**, which goes back to New until it is extracted. |
+
+"Read" is judged by the run's own `snapshot_at` (when the thread was actually
+collected), not by the review row's `updated_at`, so Accepting or re-matching an
+item can't make a reply that arrived afterwards look already-read. The
+New / Extracted / Ingested **filters** use the same rules and judge a threaded
+conversation by its newest message, so a filter and the badge on the row never
+disagree. Details: [`EXTRACTION_FLOWS.md`](EXTRACTION_FLOWS.md) §6.
 
 ### Key guarantees
 
@@ -252,34 +265,122 @@ Full Pass 1 / Pass 2 prompt text, calendar injection, and JSON shapes live in
 
 ## Authentication (production-ready)
 
-Two-step login with per-user second factor and RBAC (`admin` / `user`):
+Two-step login with a per-user second factor and RBAC (`admin` / `user` /
+`viewer` / `vault_matcher` — see [`SECURITY.md`](SECURITY.md) for the role matrix):
 
-1. `POST /auth/login` — username + password (bcrypt). On success:
-   - **admin** → bypasses 2FA, gets an access token immediately;
+1. `POST /auth/login` — username + password (bcrypt). On success exactly **one**
+   challenge follows, chosen per user by an admin (**every role, admins
+   included**):
    - **OTP user** → a 6-digit code is emailed (Graph) and a short-lived
      *login token* is returned;
+   - **TOTP user** → authenticator-app code (QR enrolment on first login);
    - **CAPTCHA user** → a word-CAPTCHA challenge + login token.
-2. `POST /auth/verify-otp` / `verify-captcha` → access token (JWT).
 
-Security controls: **sliding-window rate limiting** (login + OTP verify),
-**OTP expiry / max attempts / resend limit + cooldown**, single-use codes,
-**device-fingerprint binding** of the login flow, constant-time comparisons,
-encrypted secrets at rest, and the admin OTP bypass. CAPTCHA has a **refresh**
+   The response for a still-pending login carries only the challenge and login
+   token — **no user details** (name / email / role).
+2. `POST /auth/verify-otp` / `verify-totp` / `verify-captcha` → access token
+   (JWT) plus the user object.
+
+Security controls: **sliding-window rate limiting** (login + every verify
+endpoint), **OTP expiry / max attempts / resend limit + cooldown**, single-use
+codes, **device-fingerprint binding** of the login flow, constant-time
+comparisons and encrypted secrets at rest. CAPTCHA has a **refresh**
 (`GET /auth/captcha`).
 
-Default admin (`admin`/`admin`) is seeded from `.env` and configurable.
+The employee portal has its own password-only login (`POST /portal/auth/login`),
+separate token namespace, and its own rate-limit bucket (`rl:portal-login`,
+429 when exceeded).
+
+Default admin (`admin`/`admin`) is seeded from `.env` and configurable — change
+it before exposing the app.
 
 ## Admin panel
 
 - **Users & access** (`/admin/users`): create users, assign OTP emails, switch a
   user between **OTP** and **CAPTCHA**, enable/disable, set roles.
+- **System notice** (card on the Users & access page): one sentence shown as a
+  popup to every signed-in user, any role. See [System notice](#system-notice).
 - **AI Settings** (`/admin/settings`): read-only view of active OpenAI models and
-  key status. All tuning lives in `.env`; restart backend after changes.
+  key status. All tuning lives in `.env`; recreate the containers after changes.
 
-## LangChain (provider-agnostic AI)
+## System notice
+
+An admin writes one message and ticks **Show to everyone**; every signed-in user
+(admin, user, viewer, vault_matcher) then gets a popup with a single **OK**
+button — no close “X”, Escape and clicking outside do nothing.
+
+- **OK is remembered on the server** against the user (`system_notice.acked_by`, a
+  JSON `{user_id: time}` column on the one notice row — no extra table), so the
+  popup never returns for them on any browser or device.
+- **Admin sees who clicked.** Under the notice card, only while it is being shown to
+  everyone, a collapsible **Acknowledged — N of M users clicked OK** list shows a
+  👍 and the time next to each user who clicked, and “Not yet” for the rest (active
+  users only; refreshes every 15 s).
+- **A new announcement resets everyone.** Changing the message, or switching the
+  notice off and on again, clears `acked_by` so it shows to everyone again. Saving
+  the same text with the same setting does not. A click on a message the admin has
+  since changed is ignored.
+- A click is not an admin edit: it does not change `updated_at` / `updated_by`.
+- API: `GET /notice` (all roles; includes `acknowledged` for the caller),
+  `POST /notice/ack` (all roles), `PUT /notice` and `GET /notice/acks` (admin).
+
+## Inactive employees are month-wise
+
+Marking an employee **inactive** keeps their row, records and vault files. The
+month it happens in is recorded (`all_employee_data.inactivated_at` plus
+`inactive_ym`, year×100+month in UAE time, e.g. `202610`), and the **Dashboard**
+and the **Export** (preview and XLSX) then use the same rule per month `M`:
+
+| Employee is shown for month `M` when… |
+|---|
+| they are **active**, or |
+| they were inactivated **in `M` or later** (so: that month and every earlier month), or |
+| the pipeline has **data for them in `M`** — a filed record or a received sheet |
+
+So someone inactivated in October still appears for October and earlier months, and
+is gone from November on (unless a record/sheet exists for them in a later month,
+which is never hidden). Headline counts and the “missing” list follow the same
+rule. Reactivating clears the month. Editing an inactive employee does not move it,
+and re-marking one inactive keeps the original month.
+
+Employees that were already inactive **before** this was introduced have no recorded
+month (`inactive_ym` is empty), so they only appear in months where they have data.
+Rule code: `services/employee/activity.py` (SQL form for the Dashboard, Python form
+for the Export). The Employees page shows “Inactive · Oct 2026” on the badge.
+
+## AI models — two independent settings
+
+| Setting | Used by | Code |
+|---------|---------|------|
+| `OPENAI_VISION_MODEL` | **All vision extraction** — Extract Email Pass 1 / Pass 2, previews, bulk-roster vision reads | `services/extraction/vision_client.py` (`model_for`, `chat_call`) |
+| `AGENT_CHAT_MODEL` | **Ask-AI chat** (`/chat`), plus the FAZAA attendance-report reader | `services/llm/provider.py` (LangChain) |
+
+`EXTRACTION_MODEL` is only read by the LangChain factory (`provider.py`, the
+"extraction" kind and the Admin → AI Settings display); vision calls do not use it.
+Keep it equal to `OPENAI_VISION_MODEL` so the settings page shows the model that
+is really in use.
+
+The two main settings can be different models (e.g. a vision-capable model for
+extraction and the cheapest model for chat). Provider/base URL come from
+`LLM_PROVIDER` / `OPENAI_BASE_URL`; with an OpenRouter-style gateway, pages are
+rendered to images client-side first.
+
+`vision_client.chat_call` notes:
+- No OpenRouter provider preference is sent (a `sort: "price"` pin used to route
+  to the cheapest, slowest host — see [`BULK_ROSTER.md`](BULK_ROSTER.md)). The
+  LangChain chat factory (`provider.py`, used for Ask-AI chat) still pins
+  `sort: "price"` for OpenRouter.
+- `_MAX_TOKENS = 8000` per call (reasoning tokens count), 3 attempts, per-attempt
+  timeout `OPENAI_TIMEOUT` (default 120 s).
+- A reasoning model that truncates its JSON reply makes the call fail over to the
+  retry / fallback path rather than returning partial data.
+
+**Changing a model:** edit `.env`, then **recreate** the containers
+(`docker compose … up -d`). `restart` is not enough — compose reads `env_file` only
+when a container is created.
 
 `services/llm/provider.py` builds a LangChain OpenAI chat model from `.env`
-settings, so model/key changes are an env + restart change, not a code change.
+settings, so model/key changes are an env change, not a code change.
 Uses a `ChatPromptTemplate | model | StrOutputParser` chain and an LRU on
 construction. Vision extract uses `services/extraction/vision_client.py`
 directly (not this chat chain).
@@ -299,6 +400,12 @@ adds hot-reload + volume mounts.
 | Worker | `--concurrency 1` | `--concurrency 4` |
 | Frontend | Vite (hot reload) | nginx (built SPA) |
 | Limits | small | large |
+
+Prod worker health: the worker image inherits the backend's HTTP healthcheck,
+which can never pass for a Celery process, so `docker-compose.prod.yml` overrides
+it with `celery … inspect ping` against the worker's own node. `docker ps` now
+shows the worker `healthy` only when Celery is actually alive (cosmetic — nothing
+restarts or waits on it).
 
 - `backend/Dockerfile`, `frontend/Dockerfile` (dev + nginx prod targets).
 - `.env.example` — **only** committed env template (active keys + commented

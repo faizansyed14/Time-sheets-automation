@@ -23,7 +23,7 @@ backend/
 │   └── versions/
 │       ├── 0001_baseline.py    # baseline tables
 │       ├── …                   # incremental revisions
-│       └── 0022_employee_aco_number.py   # current head (adds aco_number)
+│       └── 0033_notice_ack.py  # current head (system_notice.acked_by)
 └── app/
     ├── core/database.py
     └── models/                 # SQLAlchemy models = desired schema
@@ -126,9 +126,12 @@ on, `alembic upgrade head` only applies *new* migrations.
 **Important:** stamping `0001_baseline` alone is only correct if that DB’s
 schema truly matches the baseline. For databases that have already been
 upgraded (or created more recently), stamp / upgrade to the **current head**
-instead — today that is `0022_employee_aco_number` (adds `all_employee_data.aco_number`;
-`dco_number` existed earlier). Prefer `alembic upgrade head` on empty DBs;
-use `stamp` only for legacy DBs that already match a known revision.
+instead — today that is `0033_notice_ack` (the two most recent are
+`0032_employee_inactivated`, which adds `all_employee_data.inactivated_at` /
+`inactive_ym`, and `0033_notice_ack`, which adds `system_notice.acked_by`; both are
+nullable/defaulted columns, so they apply safely to a live database). Prefer
+`alembic upgrade head` on empty DBs; use `stamp` only for legacy DBs that already
+match a known revision. Check the actual head with `alembic heads`.
 
 ---
 

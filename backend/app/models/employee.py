@@ -14,7 +14,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, String, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Integer, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -63,5 +63,15 @@ class Employee(Base):
     # vault file that references it) intact — just excluded from active
     # headline counts and matching going forward.
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    # WHEN they were marked inactive, so Dashboard/Export can stay month-wise:
+    # an inactive employee still appears for the month they were inactivated
+    # (and every month before it) and drops off from the NEXT month. NULL while
+    # active, and for rows that were already inactive before these columns
+    # existed (their month is unknown — they only show in months where they
+    # have data). `inactive_ym` is that moment's calendar month in UAE time as
+    # year*100+month (e.g. 202610), so the month test is one integer compare in
+    # SQL. Always set through services/employee/activity.set_active().
+    inactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    inactive_ym: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

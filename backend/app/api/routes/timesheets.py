@@ -15,6 +15,7 @@ from app.core.http_headers import content_disposition
 from app.models.employee import Employee
 from app.models.timesheet_record import ApprovalStatus, TimesheetRecord
 from app.schemas import ApprovalIn, TimesheetExportOut, TimesheetOut, TimesheetUpdate
+from app.services.employee.activity import in_month
 from app.services.export.timesheet_export import _fmt_dt, build_timesheet_xlsx, employees_grid_rows, status_for
 from app.services.pipeline.coverage import received_employee_dates, received_employee_pks
 
@@ -143,11 +144,16 @@ def empty_export_out(
 async def _export_grid(
     db: AsyncSession, month: int, year: int,
 ) -> tuple[list[Employee], dict[str, TimesheetRecord], set[str], dict[str, Any]]:
-    """All matcher employees + any filed record for that month keyed by employee
-    PK, the set of employee PKs the pipeline received a sheet for (whether
-    or not it's been filed yet) — same source as the dashboard's coverage —
-    and, per employee PK, the earliest moment the pipeline received one."""
-    employees = (
+    """The matcher employees IN SCOPE for that month + any filed record for it
+    keyed by employee PK, the set of employee PKs the pipeline received a sheet
+    for (whether or not it's been filed yet) — same source as the dashboard's
+    coverage — and, per employee PK, the earliest moment the pipeline received one.
+
+    "In scope" is month-wise, same rule as the Dashboard (see
+    services/employee/activity.py): active employees, employees inactivated in
+    this month or later, and anyone with a record/sheet this month. An employee
+    inactivated in an earlier month no longer appears."""
+    all_employees = (
         await db.execute(select(Employee).order_by(Employee.name))
     ).scalars().all()
     period_records = (
@@ -162,7 +168,9 @@ async def _export_grid(
     records_by_pk = {r.matched_employee_pk: r for r in period_records if r.matched_employee_pk}
     received_pks = await received_employee_pks(db, month, year)
     received_dates = await received_employee_dates(db, month, year)
-    return list(employees), records_by_pk, received_pks, received_dates
+    data_pks = set(records_by_pk) | received_pks
+    employees = [e for e in all_employees if in_month(e, month, year, data_pks)]
+    return employees, records_by_pk, received_pks, received_dates
 
 
 @router.get("/export")
@@ -171,7 +179,9 @@ async def export_period(
     year: int = Query(..., ge=2000),
     db: AsyncSession = Depends(get_db),
 ):
-    """Download all matcher employees for one month as XLSX (empty cells if not filed)."""
+    """Download the matcher employees in scope for one month as XLSX (empty cells
+    if not filed). Inactive employees appear up to and including the month they
+    were inactivated in."""
     employees, records_by_pk, received_pks, received_dates = await _export_grid(db, month, year)
     rows = employees_grid_rows(employees, records_by_pk, month, year, received_pks, received_dates)
     data = build_timesheet_xlsx(rows, month, year)
@@ -189,7 +199,7 @@ async def list_by_period(
     year: int = Query(..., ge=2000),
     db: AsyncSession = Depends(get_db),
 ):
-    """All matcher employees for one month — filed rows filled, others empty."""
+    """The matcher employees in scope for one month — filed rows filled, others empty."""
     employees, records_by_pk, received_pks, received_dates = await _export_grid(db, month, year)
     out: list[TimesheetExportOut] = []
     for emp in employees:

@@ -293,9 +293,18 @@ docker compose -f docker-compose.dev.yml logs -f backend
 docker compose -f docker-compose.dev.yml logs -f worker
 docker compose -f docker-compose.dev.yml logs nginx --tail 50
 
-# pull latest dev + rebuild
+# pull latest dev + rebuild  (the start scripts do NOT git pull — pull first)
 git pull origin dev
 docker compose -f docker-compose.dev.yml --env-file .env up -d --build
+# `up --build -d` rebuilds the backend AND frontend images, so UI changes are
+# included. nginx caches the upstream IPs it resolved at start, so restart it
+# after containers were recreated, or the site can 502 until you do:
+docker compose -f docker-compose.dev.yml restart nginx
+
+# changed .env (model names, secrets, limits)? `restart` does NOT re-read it —
+# compose reads env_file only when a container is created. Recreate:
+docker compose -f docker-compose.dev.yml --env-file .env up -d backend worker
+docker compose -f docker-compose.dev.yml restart nginx
 
 # restart gateway after editing nginx/gateway.conf or nginx/frontend.conf
 docker compose -f docker-compose.dev.yml restart nginx frontend

@@ -8,12 +8,15 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import json as _json
+import re
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_full_access
+from app.models.employee import Employee
 from app.core import datacache
 from app.core.http_headers import content_disposition
 from app.core.database import get_db
@@ -583,6 +586,200 @@ async def pipeline_manual_fix(
     await db.refresh(t)
     await datacache.bust_pipeline()
     return _out(t)
+
+
+# ---------------------------------------------------------------------------
+# Bulk accept — PGC and MOD
+# ---------------------------------------------------------------------------
+# Projects (Employee.project, case-insensitive) whose review queue can be
+# accepted in one go. Their sheets are regular, high-volume rosters, so a
+# reviewer who has checked the roster once shouldn't have to open 100 items.
+BULK_ACCEPT_PROJECTS = ("PGC", "MOD")
+
+
+def _project_clause(group: str):
+    """SQL test for 'this employee belongs to PGC / MOD'. The matcher's Project
+    column holds the real names: PGC is three projects ("PGC- TECHNICAL SUPPORT",
+    "PGC-MULTIMEDIA", "PGC-PROGRAMMING"), MOD is "MINISTRY OF DEFENCE"."""
+    p = func.lower(func.trim(func.coalesce(Employee.project, "")))
+    if group == "PGC":
+        return p.like("pgc%")
+    return p.in_(("ministry of defence", "mod"))
+
+
+def _project_group(project: str | None) -> str:
+    p = (project or "").strip().lower()
+    return "PGC" if p.startswith("pgc") else "MOD" if p in ("ministry of defence", "mod") else p.upper()
+BULK_ACCEPT_BATCH = 25   # items filed per request — each Accept writes to the vault, keep requests short
+# Blockers that don't hold an item back from a bulk accept: rosters rarely carry
+# sign-off, and PGC-style rosters never print Leave/Billing totals to check
+# against (the day-by-day cells are still read). Everything else — incomplete
+# coverage, unrecognised codes, unmatched employee — keeps the item for a human.
+_NO_TOTALS_BLOCKER = (
+    "validation flags: this roster prints no Leave/Billing-day totals to check the day grid against "
+    "— nothing here has been independently verified; review the day-by-day cells directly before accepting"
+)
+_APPROVAL_PREFIX = "no manager approval evidence found"
+
+
+_NO_TOTALS_FLAG = _NO_TOTALS_BLOCKER[len("validation flags: "):]
+
+
+def _flag_tolerated(flag: str) -> bool:
+    """Individual validation flags a bulk accept looks past: the roster prints no
+    totals, the reader's "rotated scan / verify cells" notes, and "N day(s)
+    marked only as VC". Everything else — National Service (NS) days, a second
+    read that disagreed, unrecognised codes, uncertain days — keeps the row."""
+    f = str(flag).strip()
+    return (f == _NO_TOTALS_FLAG or f.startswith("reader note:")
+            or re.match(r'^\d+ day\(s\) marked only as "VC"', f) is not None)
+
+
+def _tolerated(blocker: str) -> bool:
+    # Exact match for the totals flag: the blocker text joins ALL validation flags,
+    # so a prefix match would also let through a row that has this flag PLUS a real one.
+    b = str(blocker)
+    return b.startswith(_APPROVAL_PREFIX) or b == _NO_TOTALS_BLOCKER
+
+
+class BulkAcceptIn(BaseModel):
+    project: str | None = None      # "PGC" | "MOD"; None = both
+    month: int | None = None
+    year: int | None = None
+    dry_run: bool = False           # only count what would be accepted / held
+    # Accept straight after a roster upload: limit to that roster's items (any
+    # project) and keep out every row with maternity, unpaid, absent or other days — those need a look.
+    thread_key: str | None = None
+    no_leaves: bool = False
+
+
+# Buckets that keep a row in review in the post-upload Bulk accept. Annual and
+# sick leave are ordinary and ACCEPTED; these are the ones worth a human look.
+# Remote (a worked day) and public holidays never hold a row back.
+_LEAVE_BUCKETS = ("maternity", "unpaid", "absent", "other")
+
+
+def _bulk_split(rows, no_leaves: bool = False) -> tuple[list[tuple[PipelineFile, Employee | None]], list[dict]]:
+    """(ready, held). Ready = a matched employee and NO blocker other than the
+    missing-approval one (rosters rarely carry sign-off; the reviewer is making
+    that call by pressing the button). Anything else — validation flags,
+    incomplete coverage, uncertain days, empty sheets — stays held for a human."""
+    ready, held = [], []
+    for t, emp in rows:
+        meta = t.extraction_meta or {}
+        staged = meta.get("staged") or {}
+        flags = staged.get("flags") or []
+        blockers = []
+        for b in ((meta.get("auto_accept") or {}).get("blockers") or []):
+            if _tolerated(b):
+                continue
+            if str(b).startswith("validation flags:") and flags:
+                # The blocker joins every flag into one string — judge each flag on its own.
+                rest = [f for f in flags if not _flag_tolerated(f)]
+                if rest:
+                    blockers.append("validation flags: " + "; ".join(rest[:3]))
+                continue
+            blockers.append(b)
+        if not staged.get("employee_pk"):
+            blockers.append("employee is not matched")
+        if no_leaves:
+            n = sum(len(d) for b, d in (staged.get("buckets") or {}).items() if b in _LEAVE_BUCKETS)
+            if n:
+                blockers.append(f"has {n} maternity/unpaid/absent/other day{'s' if n != 1 else ''} — review")
+        if blockers:
+            held.append({"id": t.id, "employee_name": t.employee_name or (emp.name if emp else None),
+                         "project": emp.project if emp else None, "reasons": blockers[:3]})
+        else:
+            ready.append((t, emp))
+    return ready, held
+
+
+@router.post("/bulk-accept")
+async def bulk_accept(body: BulkAcceptIn, db: AsyncSession = Depends(get_db)):
+    """File every clean needs-review item of the PGC / MOD employees at once.
+
+    Same filing as pressing Accept in Compare & Fix on each item (it calls the
+    same code), but only for items whose matched employee's project is PGC (any
+    "PGC…" project) or MOD ("Ministry of Defence") and that have no blocker besides missing approval evidence. Approval is
+    recorded exactly as the Compare & Fix default: approved only when the sheet
+    carried evidence, otherwise "not approved" — sign it off later on the record.
+    Processes up to BULK_ACCEPT_BATCH per call and reports `remaining`; the UI
+    calls again until it reaches 0. `dry_run` only counts."""
+    if body.thread_key:
+        wanted = []
+    elif body.project:
+        if body.project.strip().upper() not in BULK_ACCEPT_PROJECTS:
+            raise HTTPException(400, f"Bulk accept is only available for: {', '.join(BULK_ACCEPT_PROJECTS)}.")
+        wanted = [body.project.strip().upper()]
+    else:
+        wanted = list(BULK_ACCEPT_PROJECTS)
+
+    from app.services.pipeline.coverage import staged_employee_pk
+
+    if body.thread_key:
+        # One uploaded roster, any project; unmatched rows are listed as held.
+        q = (select(PipelineFile, Employee)
+             .outerjoin(Employee, Employee.id == staged_employee_pk())
+             .where(PipelineFile.status == PipelineStatus.NEEDS_REVIEW,
+                    PipelineFile.thread_key == body.thread_key)
+             .order_by(PipelineFile.created_at))
+    else:
+        q = (select(PipelineFile, Employee)
+             .join(Employee, Employee.id == staged_employee_pk())
+             .where(PipelineFile.status == PipelineStatus.NEEDS_REVIEW,
+                    or_(*[_project_clause(g) for g in wanted]))
+             .order_by(PipelineFile.created_at))
+    if body.month:
+        q = q.where(PipelineFile.month == body.month)
+    if body.year:
+        q = q.where(PipelineFile.year == body.year)
+    ready, held = _bulk_split((await db.execute(q)).all(), body.no_leaves)
+
+    by_project: dict[str, int] = {}
+    for _t, emp in ready:
+        key = _project_group(emp.project if emp else None)
+        by_project[key] = by_project.get(key, 0) + 1
+    if body.dry_run:
+        return {"ready": len(ready), "by_project": by_project, "held": held[:500],
+                "held_count": len(held), "accepted": 0, "accepted_items": [], "failed": [], "remaining": len(ready)}
+
+    # Snapshot what each call needs BEFORE the first commit expires the rows.
+    batch = [(t.id, t.employee_name, (t.extraction_meta or {}), emp.project if emp else None) for t, emp in ready[:BULK_ACCEPT_BATCH]]
+    accepted, failed, accepted_items = 0, [], []
+    for pid, name, meta, project in batch:
+        staged = meta.get("staged") or {}
+        approval = ((meta.get("full_email_extract") or {}).get("approval")) or {}
+        approved = bool(approval.get("detected"))
+        buckets = {**(staged.get("buckets") or {}),
+                   "working": staged.get("working_days") or [],
+                   "weekend": staged.get("weekend_days") or []}
+        try:
+            await pipeline_manual_fix(
+                pipeline_id=pid, employee_pk=staged["employee_pk"],
+                month=int(staged["month"]), year=int(staged["year"]),
+                buckets=_json.dumps(buckets),
+                note=("Bulk accepted" + (f" ({_project_group(project)})" if project else "") + "."),
+                approval_status="approved" if approved else "not_approved",
+                approval_detail=(approval.get("detail") or "") if approved else None,
+                files=[], db=db,
+            )
+            accepted += 1
+            accepted_items.append({
+                "id": pid, "employee_name": name,
+                "employee_id": staged.get("matched_employee_id"), "project": project,
+                "month": int(staged["month"]), "year": int(staged["year"]),
+                "buckets": {b: d for b, d in buckets.items() if d and b not in ("working", "weekend")},
+                "working_days": len(buckets.get("working") or []),
+                "weekend_days": len(buckets.get("weekend") or []),
+                "approved": approved,
+            })
+        except Exception as e:   # one bad item must not stop the rest
+            await db.rollback()
+            detail = getattr(e, "detail", None) or str(e)
+            failed.append({"id": pid, "employee_name": name, "error": str(detail)[:200]})
+    return {"ready": len(ready), "by_project": by_project, "held": held[:500], "held_count": len(held),
+            "accepted": accepted, "failed": failed, "accepted_items": accepted_items,
+            "remaining": max(0, len(ready) - len(batch))}
 
 
 @router.get("/{pipeline_id}/raw-preview")
