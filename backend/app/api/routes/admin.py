@@ -423,16 +423,13 @@ async def clear_debug_runs(db: AsyncSession = Depends(get_db)):
     (S3-backed deployments: this clears the DB rows; the S3 objects under
     the debug/ prefix are left for the bucket's own lifecycle rules — not
     implemented here since this app's storage_provider is local.)"""
-    import shutil
-
-    from app.core.config import settings
-
     count = (await db.execute(select(func.count()).select_from(ExtractionDebugRun))).scalar_one()
     await db.execute(delete(ExtractionDebugRun))
     await db.commit()
 
-    debug_dir = settings.pipeline_raw_path / "debug"
-    shutil.rmtree(debug_dir, ignore_errors=True)
+    # Remove the saved pictures from wherever they live — S3 or local disk.
+    from app.services.pipeline import raw_store
+    raw_store.delete_prefix("debug")
     return {"deleted": count}
 
 

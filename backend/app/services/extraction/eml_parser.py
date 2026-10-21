@@ -180,7 +180,7 @@ def parse_eml(raw: bytes, filename: str | None = None) -> dict[str, Any]:
     attachments: list[dict[str, Any]] = []
 
     for part in _walk_parts(msg):
-        ct = part.get_content_type()
+        ct = _strip_nul(part.get_content_type())
         disp = str(part.get("Content-Disposition", "")).lower()
         cid = (part.get("Content-Id") or "").strip().strip("<>")
         is_attachment = "attachment" in disp

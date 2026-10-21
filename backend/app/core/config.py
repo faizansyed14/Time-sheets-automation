@@ -57,10 +57,6 @@ class Settings(BaseSettings):
     # this is its own root/prefix, never repurposing pipeline_raw. (Local-disk
     # providers only — S3 uses s3_portal_prefix below.)
     portal_uploads_root: str = str(BACKEND_ROOT / "data" / "portal_uploads")
-    # Retry copies are normally deleted as soon as a file succeeds; this caps how
-    # long a STILL-failed file's original is kept before it is purged, so the
-    # raw store can never grow without bound. 0 disables the age purge.
-    pipeline_raw_retention_days: int = 120
 
     # Which email provider to use: "mock" now, "graph" later.
     email_provider: str = "mock"
@@ -263,11 +259,6 @@ class Settings(BaseSettings):
     celery_broker_url: str = ""      # defaults to redis_url
     celery_result_backend: str = ""  # defaults to redis_url
     celery_task_always_eager: bool = True
-
-    # ---- Scheduled background jobs (Celery beat) — intervals configurable ----
-    # How often the S3 / disk pipeline-raw retry copies are purged. Default once
-    # a day. Set in hours; e.g. 24 = daily, 12 = twice a day, 168 = weekly.
-    pipeline_raw_purge_interval_hours: float = 24.0
 
     # ===================== Auth / Security =====================
     auth_enabled: bool = True

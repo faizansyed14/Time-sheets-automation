@@ -87,6 +87,12 @@ async def test_capture_records_pass1_and_pass2_calls_and_a_dropped_image(mock_vi
     dropped = cap.dropped_items[0]
     assert dropped["filter"] == "size"
     assert dropped["name"] == "logo.png"
+    # Nothing is written during the run itself — the picture is only held until
+    # the caller decides the run is worth keeping.
+    assert dropped["image_path"] is None and dropped["_image"]
+    from app.services.pipeline import raw_store as _rs
+    cap.save_images(_rs.save_raw)
+    assert "_image" not in dropped
     assert dropped["image_path"], "a small dropped image must get a saved full-resolution image_path"
     assert dropped["image_path"].startswith(f"debug/{cap.run_id}/")
 
@@ -273,3 +279,31 @@ async def test_read_portal_file_rejects_path_traversal_outside_its_own_root():
         assert portal_store.read_portal_file(traversal) is None
     finally:
         secret.unlink(missing_ok=True)
+
+
+async def test_clear_all_deletes_the_saved_debug_images_too(client, admin_token):
+    """Clear all on the debug page removes the pictures as well as the rows."""
+    from app.services.pipeline import raw_store
+    from tests.conftest import auth_headers
+
+    rel = raw_store.save_raw("debug/clear-test-run", "dropped-0-logo.jpg", b"\xff\xd8fake")
+    assert rel and raw_store.read_raw(rel) == b"\xff\xd8fake"
+    r = await client.delete("/api/v1/admin/debug/runs", headers=auth_headers(admin_token))
+    assert r.status_code == 200, r.text
+    assert raw_store.read_raw(rel) is None
+
+
+async def test_a_clean_run_writes_no_debug_images(mock_vision_calls):
+    """Dropped pictures are only held in memory; discarding (a clean run) leaves
+    nothing in storage, and the held bytes never end up in the DB row."""
+    from app.services.pipeline import raw_store
+
+    cap = debug_capture.DebugCapture()
+    debug_capture.set_capture(cap)
+    try:
+        debug_capture.record_dropped(name="logo.png", filter="size", image_path=None, _image=("dropped-0-logo.png", b"abc"))
+    finally:
+        debug_capture.set_capture(None)
+    cap.discard_images()
+    assert "_image" not in cap.dropped_items[0] and cap.dropped_items[0]["image_path"] is None
+    assert raw_store.read_raw(f"debug/{cap.run_id}/dropped-0-logo.png") is None

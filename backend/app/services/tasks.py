@@ -127,16 +127,6 @@ def _run_coro(coro_factory):
     return result
 
 
-@celery_app.task(name="maintenance.purge_pipeline_raw")
-def purge_pipeline_raw_task():
-    """Scheduled cleanup: delete pipeline retry copies older than the retention
-    window (settings.pipeline_raw_retention_days). Runs daily via Celery beat;
-    also invoked once on app startup as a safety net."""
-    from app.services.pipeline import raw_store
-    removed = raw_store.purge_old()
-    return {"removed": removed}
-
-
 @celery_app.task(name="inbox.auto_extract_scan")
 def auto_extract_scan_task(run_id: str):
     """The full-mailbox catch-up scan behind POST /inbox/auto-extract/start:

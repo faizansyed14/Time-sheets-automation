@@ -110,9 +110,13 @@ class ThreadAgent(Agent):
         meta["snapshot_at"] = ctx.snapshot_at.isoformat() if ctx.snapshot_at else None
         errors = meta.get("errors") or []
         had_a_problem = bool(errors) or not sheets
+        if not had_a_problem:
+            cap.discard_images()    # clean run: its dropped pictures are never written anywhere
         if had_a_problem:
             try:
                 from app.models.extraction_debug_run import ExtractionDebugRun
+                from app.services.pipeline import raw_store
+                cap.save_images(raw_store.save_raw)
                 ctx.db.add(ExtractionDebugRun(
                     id=cap.run_id, source_kind=ctx.source_kind, source_id=ctx.source_id,
                     thread_key=ctx.thread_key, subject=getattr(ctx.source, "subject", None),
