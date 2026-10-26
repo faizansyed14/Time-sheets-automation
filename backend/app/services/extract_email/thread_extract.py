@@ -290,12 +290,10 @@ def _record_dropped(th: Thread, entry: dict, image: bytes | None) -> None:
     cap = debug_capture.get_capture()
     if cap is None:
         return
-    image_path = None
-    if image:
-        from app.services.pipeline import raw_store
-        fname = f"dropped-{len(cap.dropped_items)}-{entry.get('name') or 'item'}"
-        image_path = raw_store.save_raw(f"debug/{cap.run_id}", fname, image)
-    debug_capture.record_dropped(**entry, image_path=image_path)
+    # Held in memory, NOT written here: the caller saves it only if this run ends
+    # up in the debug log (see DebugCapture.save_images / ThreadAgent).
+    held = (f"dropped-{len(cap.dropped_items)}-{entry.get('name') or 'item'}", image) if image else None
+    debug_capture.record_dropped(**entry, image_path=None, _image=held)
 
 
 def _dedupe_sheet_items(th: Thread) -> None:
@@ -384,12 +382,17 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
         if not payload:
             return
         # Malformed/truncated MIME headers (RFC 2047 encoded-words, RFC 2231
-        # filename* continuations) occasionally decode a filename containing
-        # an embedded NUL byte. That's syntactically valid JSON (\u0000) so
-        # it writes fine into extraction_meta, but Postgres can't convert it
+        # filename* continuations) occasionally decode a filename OR a
+        # content-type string containing an embedded NUL byte (seen live:
+        # "image/jpeg\u0000" from get_content_type() on a deeply-nested
+        # forwarded part). That's syntactically valid JSON (\u0000) so it
+        # writes fine into extraction_meta, but Postgres can't convert it
         # back to text on ANY later read of that json/jsonb document — strip
-        # it here, at the source, before it reaches "skipped"/"noise"/etc.
+        # BOTH fields here, at the source, before either reaches
+        # "skipped"/"noise"/etc. (name-only was the Oct-6 fix; ctype slipped
+        # through and re-poisoned the same row via its "mime" field).
         name = name.replace("\x00", "") if name else name
+        ctype = ctype.replace("\x00", "") if ctype else ctype
         ext = os.path.splitext(name)[1].lower()
         is_image = ext in IMAGE_EXTS or (ctype or "").startswith("image/")
 

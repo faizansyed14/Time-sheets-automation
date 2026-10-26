@@ -35,7 +35,6 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True,
     # Periodic maintenance (runs under `celery worker -B` or a dedicated beat).
     # Interval configurable from .env (see config.Settings):
-    #   PIPELINE_RAW_PURGE_INTERVAL_HOURS  — purge S3/disk retry copies (default daily)
     #   INBOX_AUTO_SYNC_INTERVAL_SECONDS   — background Outlook/Graph pull (default 60s)
     #   REMINDER_SCHEDULED_CHECK_ENABLED   — env kill-switch, default on (see below)
     #
@@ -53,10 +52,6 @@ celery_app.conf.update(
     #      also on AND it's the 28th/9am UAE AND today's run hasn't already
     #      happened — see services/reminders/service.py's run_scheduled_check.
     beat_schedule={
-        "purge-pipeline-raw": {
-            "task": "maintenance.purge_pipeline_raw",
-            "schedule": max(60.0, settings.pipeline_raw_purge_interval_hours * 3600.0),
-        },
         **({
             "reminders-scheduled-check": {
                 "task": "reminders.scheduled_check",

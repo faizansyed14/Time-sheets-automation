@@ -84,11 +84,12 @@ original around.
 - `pipeline_files.raw_path` stores the relative key (`<id>/<file>`).
 - These copies are **not business-critical**: they only power the Retry button.
   Successfully filed files already live in the S3 vault.
-- **Safety-net purge:** a Celery-beat task (`maintenance.purge_pipeline_raw`, every
-  `PIPELINE_RAW_PURGE_INTERVAL_HOURS` — default 24, so daily)
-  deletes anything in this store older than `PIPELINE_RAW_RETENTION_DAYS`
-  (default **120**) — by S3 object `LastModified`, or by folder modified-time on
-  local disk. It bounds the store for files that stay failed/needs-review forever.
+- **No age-based purge.** A retry copy is deleted **only** when its pipeline item
+  is Accepted or Deleted — never because it got old. A failed / needs-review item
+  keeps its original until someone resolves or deletes it. The old scheduled purge
+  (beat job, boot-time run, `purge_old()`, its task and the
+  `PIPELINE_RAW_RETENTION_DAYS` / `PIPELINE_RAW_PURGE_INTERVAL_HOURS` settings) has
+  been removed entirely; leftover lines for those two in an old `.env` are ignored.
 
 #### Extraction-debug images (same store, `debug/` sub-prefix)
 
@@ -99,10 +100,11 @@ locally — so Admin → Extraction debug can show what was dropped. They are wr
 during **every** extraction run, but a database row (`extraction_debug_runs`) is
 only kept for runs with errors or zero sheets.
 
-- They are removed by the same 120-day purge above (not by Accept or Retry).
-- Admin → Extraction debug → **Clear all** deletes every `extraction_debug_runs`
-  row and the local `debug/` folder; on S3 it does **not** delete the objects —
-  they age out via the purge. DB rows are never removed automatically.
+- Nothing removes them automatically any more (the age-based purge is gone, and
+  Accept / Retry don't touch them). Admin → Extraction debug → **Clear all**
+  deletes every `extraction_debug_runs` row and the local `debug/` folder; on S3 it
+  does **not** delete the objects, so they stay until removed by hand or by a
+  bucket lifecycle rule on the `debug/` prefix. DB rows are never removed automatically.
 - Full detail: [`EXTRACTION_TWO_PASS.md`](EXTRACTION_TWO_PASS.md) §10.
 
 ---

@@ -1,7 +1,6 @@
 """
 Production-hardening features:
   - CAPTCHA issuance rate limiting (refresh/get-new throttle)
-  - pipeline raw-copy retention purge (60-day cleanup)
   - File Vault: upload into a month folder, delete a file, streaming ZIP
     download (whole + scoped to a subtree)
   - _assert_prod_secrets: refuse to boot in prod with a weak JWT secret or the
@@ -72,31 +71,6 @@ async def test_captcha_issuance_rate_limited(client):
         assert codes[3] == 429, codes
     finally:
         settings.captcha_rate_max = orig
-
-
-# --------------------------------------------------------- raw retention purge
-def test_pipeline_raw_purge_removes_only_old(tmp_path, monkeypatch):
-    import os
-    import time
-    from app.services.pipeline import raw_store
-    from app.core.config import settings
-
-    # Point the raw store at a temp dir and force the local code path.
-    monkeypatch.setattr(settings, "pipeline_raw_root", str(tmp_path))
-    monkeypatch.setattr(raw_store, "_use_s3", lambda: False)
-
-    old = tmp_path / "old-id"
-    new = tmp_path / "new-id"
-    old.mkdir(); (old / "f.pdf").write_bytes(b"x")
-    new.mkdir(); (new / "f.pdf").write_bytes(b"y")
-    # age the "old" folder to 90 days ago
-    ninety = time.time() - 90 * 86400
-    os.utime(old, (ninety, ninety))
-
-    removed = raw_store.purge_old(max_age_days=60)
-    assert removed == 1
-    assert not old.exists()
-    assert new.exists()
 
 
 # ---------------------------------------------------------------- vault upload

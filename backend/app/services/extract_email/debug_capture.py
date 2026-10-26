@@ -46,6 +46,22 @@ class DebugCapture:
     def record_dropped(self, **kwargs) -> None:
         self.dropped_items.append(kwargs)
 
+    # Dropped-item pictures are held in memory (under "_image": (filename, bytes))
+    # and only written to storage if the run is actually saved to the debug page.
+    # A clean run's logos/banners are never written at all, so nothing is left
+    # behind that no debug row points at.
+    def save_images(self, save_fn) -> None:
+        """Write the held pictures via `save_fn(folder, filename, bytes) -> path`
+        and point each item's image_path at the result."""
+        for item in self.dropped_items:
+            img = item.pop("_image", None)
+            if img:
+                item["image_path"] = save_fn(f"debug/{self.run_id}", img[0], img[1])
+
+    def discard_images(self) -> None:
+        for item in self.dropped_items:
+            item.pop("_image", None)
+
 
 _CAPTURE: contextvars.ContextVar[DebugCapture | None] = contextvars.ContextVar(
     "extract_debug_capture", default=None)

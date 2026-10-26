@@ -807,11 +807,12 @@ dropped, during every run**, even though only problem runs keep a database row.
 
 | What | Removed by | When |
 |------|-----------|------|
-| Images (S3) | daily Celery-beat task `maintenance.purge_pipeline_raw` | object `LastModified` older than `PIPELINE_RAW_RETENTION_DAYS` (default **120**) |
-| Images (local disk) | same task | top-level folder modified-time older than that |
+| Images (local disk) | **Clear all** only (removes the whole `debug/` folder) | on demand |
+| Images (S3) | nothing in the app — a bucket lifecycle rule on `…/_pipeline-raw/debug/` or manual deletion | the age-based purge was removed |
 | DB rows | **Admin → Extraction debug → Clear all** (`DELETE /admin/debug/runs`) only | never automatically |
 
-Consequences worth knowing: after 120 days the images disappear but the row stays
-(its image links go dead); **Clear all** removes every row and the local `debug/`
-folder but **not** the S3 objects, which then age out through the 120-day purge;
-and images from clean runs have no row, so only the purge ever removes them.
+Consequences worth knowing: **Clear all** removes every row and the local `debug/`
+folder but **not** the S3 objects; and because images are written for every run but
+only problem runs keep a row, the S3 images of clean runs build up with nothing in
+the app to remove them. Add an S3 lifecycle expiry on the `debug/` prefix if that
+matters.
