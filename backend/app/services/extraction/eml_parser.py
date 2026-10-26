@@ -108,7 +108,14 @@ def _nested_message_bytes(part) -> bytes:
     inner = _nested_inner(part)
     if inner is not None:
         try:
-            return inner.as_bytes()
+            # CRLF, not the stdlib's bare "\n": these bytes are what gets
+            # DOWNLOADED as a .eml and opened in Outlook, whose parser does not
+            # treat a quoted-printable soft break written "=\n" as a break — it
+            # shows the literal "=" and mangles every word that wrapped there
+            # (e.g. "<span" -> "<=pan", "<o:p>" -> "=o:p>"). Same lesson as
+            # thread_collect.build_thread_bundle's policy=SMTP. Only the line
+            # separator changes: headers, text and attachments are untouched.
+            return inner.as_bytes(policy=inner.policy.clone(linesep="\r\n"))
         except Exception:
             pass
     payload = part.get_payload()
