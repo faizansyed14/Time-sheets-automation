@@ -42,11 +42,12 @@ import StoredFilesPreview from "../components/StoredFilesPreview";
 import { ThreadSummaryBox } from "../components/ThreadSummaryBox";
 import { cn, formatBytes, formatDateTime } from "../lib/utils";
 import { leaveBucketDefs } from "../lib/theme";
-import { Button, Card, EmptyState, Select, Skeleton, Spinner } from "../components/ui";
+import { Button, Card, EmptyState, Select } from "../components/ui";
 import { FailureChip, PipelineStatusBadge, StageTimeline } from "../components/status";
 import { useToast } from "../components/toast";
 import { useDebounced, useSentinel } from "../lib/useInfinite";
 
+import { ListSkeleton, MoreRowsSkeleton } from "../components/skeletons";
 type Filter = "" | "failed" | "needs_review" | "success" | "processing";
 type OutcomeFilter = "" | "auto_accepted" | "held";
 
@@ -802,11 +803,7 @@ export default function PipelinePage() {
         </div>
 
         {isLoading ? (
-          <div className="space-y-2 p-6">
-            <Skeleton className="h-12" />
-            <Skeleton className="h-12" />
-            <Skeleton className="h-12" />
-          </div>
+          <ListSkeleton label="Loading activity" columns={["File", "Employee", "Period", "Status", "Updated"]} widths={["w-56", "w-36", "w-20", "w-24", "w-24"]} />
         ) : visibleItems.length === 0 ? (
           <EmptyState
             icon={<Activity className="h-6 w-6" />}
@@ -1003,9 +1000,7 @@ export default function PipelinePage() {
 
             <div ref={sentinelRef} />
             {isFetchingNextPage && (
-              <div className="flex items-center justify-center gap-2 py-4 text-xs text-slate-400">
-                <Spinner className="h-4 w-4" /> Loading more…
-              </div>
+              <MoreRowsSkeleton />
             )}
           </div>
         )}

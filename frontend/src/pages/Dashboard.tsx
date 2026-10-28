@@ -23,10 +23,11 @@ import {
 } from "../api/client";
 import { locationBadgeTone, type BadgeTone } from "../lib/theme";
 import { avatarColor, cn, initials } from "../lib/utils";
-import { Badge, Card, EmptyState, Input, Select, Skeleton, Spinner } from "../components/ui";
+import { Badge, Card, EmptyState, Input, Select } from "../components/ui";
 import { ApprovalBadge, ValidationBadge } from "../components/status";
 import { useDebounced, useSentinel } from "../lib/useInfinite";
 
+import { ListSkeleton, MoreRowsSkeleton } from "../components/skeletons";
 const NOW = new Date();
 const CUR_YEAR = NOW.getFullYear();
 const CUR_MONTH = NOW.getMonth() + 1;
@@ -421,11 +422,7 @@ export default function Dashboard() {
         </div>
 
         {isLoading ? (
-          <div className="space-y-2 p-4">
-            <Skeleton className="h-11" />
-            <Skeleton className="h-11" />
-            <Skeleton className="h-11" />
-          </div>
+          <ListSkeleton label="Loading employees" columns={["Employee", "ID", "Loc", "Manager", "Status", "Months"]} widths={["w-44", "w-20", "w-12", "w-32", "w-24", "w-40"]} />
         ) : rows.length === 0 ? (
           <EmptyState
             title={quickFilter === "missing" ? "Nobody missing" : "No employees found"}
@@ -551,9 +548,7 @@ export default function Dashboard() {
             </table>
             <div ref={sentinelRef} />
             {isFetchingNextPage && (
-              <div className="flex items-center justify-center gap-2 py-4 text-xs text-slate-400">
-                <Spinner className="h-4 w-4" /> Loading more…
-              </div>
+              <MoreRowsSkeleton />
             )}
             <p className="border-t border-slate-100 px-4 py-2 text-center text-[11px] text-slate-400">
               {rows.length} of {filteredTotal} employees

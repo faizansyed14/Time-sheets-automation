@@ -11,8 +11,9 @@ import {
 import { downloadFile } from "../lib/filePreview";
 import { useDebounced } from "../lib/useInfinite";
 import { cn } from "../lib/utils";
-import { Button, Card, Input, PageHeader, Select, Spinner } from "../components/ui";
+import { Button, Card, Input, PageHeader, Select } from "../components/ui";
 
+import { ListSkeleton } from "../components/skeletons";
 const CUR_YEAR = new Date().getFullYear();
 const CUR_MONTH = new Date().getMonth() + 1;
 // Fixed, deliberately NOT derived from live row data — see Dashboard.tsx's
@@ -356,9 +357,7 @@ export default function ExportPage() {
 
       <Card className="flex min-h-0 flex-1 flex-col overflow-hidden p-0">
         {isLoading ? (
-          <div className="flex flex-1 items-center justify-center py-16">
-            <Spinner className="h-7 w-7" />
-          </div>
+          <ListSkeleton label="Loading export" columns={["Employee", "Manager", "Location", "Status", "Annual", "Sick", "Absent"]} rows={10} />
         ) : (
           <>
             {isFetching && (
