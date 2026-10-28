@@ -156,3 +156,42 @@ def test_eml_collect_attachments_strips_nul_from_filename():
 
     names = [a[0] for a in _eml_collect_attachments(_NUL_FILENAME_EML)]
     assert names == ["sheetone.pdf"]
+
+
+def test_nested_email_bytes_use_crlf_so_outlook_reads_quoted_printable_soft_breaks():
+    """An email opened inside another and downloaded must keep CRLF line endings.
+
+    Python serializes a parsed nested message with bare "\n" by default, which
+    turns every quoted-printable soft break "=\r\n" into "=\n". Outlook does not
+    treat that as a soft break, so "<span" showed up as "<=pan" and "<o:p>" as
+    "=o:p>" in the downloaded file."""
+    import base64
+    import re
+
+    inner = (
+        b"From: a@example.com\r\nTo: b@example.com\r\nSubject: Inner approval\r\n"
+        b"MIME-Version: 1.0\r\nContent-Type: text/html; charset=windows-1256\r\n"
+        b"Content-Transfer-Encoding: quoted-printable\r\n\r\n"
+        b"<p class=3D\"x\">Approved.<o:p></o:p></p>=\r\n<span style=3D\"font-size:10pt\">Best regards</s=\r\npan>\r\n"
+    )
+    outer = (
+        b"From: c@example.com\r\nTo: d@example.com\r\nSubject: Outer\r\nMIME-Version: 1.0\r\n"
+        b"Content-Type: multipart/mixed; boundary=\"BB\"\r\n\r\n"
+        b"--BB\r\nContent-Type: text/plain\r\n\r\nSee the forwarded mail.\r\n"
+        b"--BB\r\nContent-Type: message/rfc822\r\nContent-Disposition: attachment; filename=\"inner.eml\"\r\n\r\n"
+        + inner + b"\r\n--BB--\r\n"
+    )
+    parsed = parse_eml(outer)
+    att = next(a for a in parsed["attachments"] if a["content_type"] == "message/rfc822")
+    data = base64.b64decode(att["data_b64"])
+
+    assert not re.search(rb"(?<!\r)\n", data), "every line break must be CRLF"
+    assert b"=\n" not in data
+    assert b"=\r\n" in data, "the quoted-printable soft breaks must survive as =CRLF"
+
+    # And it still reads back to the same email.
+    from email import message_from_bytes
+    back = message_from_bytes(data, policy=policy.default)
+    assert back["Subject"] == "Inner approval"
+    html = back.get_body(preferencelist=("html",)).get_content()
+    assert "<span" in html and "<o:p>" in html and "<=pan" not in html
