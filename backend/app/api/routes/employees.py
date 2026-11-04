@@ -264,6 +264,10 @@ async def coverage(
             record_count=len(scoped), needs_review_count=nrev, pending_approval_count=pend,
             years=sorted({r.year for r in items}),
             submitted_months=sorted({r.month for r in scoped}),
+            issue_months=sorted({
+                r.month for r in scoped
+                if r.validation_status == ValidationStatus.MANUAL_REVIEW
+                or r.approval_status != ApprovalStatus.APPROVED}),
             in_matcher=True, has_records=bool(items),
             focus_record_id=focus_rec.id if focus_rec else None,
             focus_validation_status=focus_rec.validation_status if focus_rec else None,

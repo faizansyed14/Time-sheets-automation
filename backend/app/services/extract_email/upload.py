@@ -56,9 +56,7 @@ def as_thread_messages(filename: str, data: bytes) -> list[tuple[str, bytes]]:
 
 
 async def analyse_upload(db: AsyncSession, *, filename: str, data: bytes) -> dict:
-    """Analysis WITHOUT staging — used by the chat-store preview AND by Retry
-    (ingestion.retry_pipeline_file re-reads the stored original and calls this
-    again). Returns {sheets, groups, approval, run_meta}."""
+    """Analysis WITHOUT staging — used by the chat-store preview. Returns {sheets, groups, approval, run_meta}."""
     from app.services.extract_email.thread_extract import require_vision_configured
     from app.services.orchestrator import AgentContext, Orchestrator, build_thread_pipeline
 
@@ -99,11 +97,22 @@ async def extract_upload(
     await Orchestrator(build_thread_pipeline()).run(ctx)
 
     approval = ctx.approval or {"detected": False, "detail": "No approval check ran."}
+    run_errors = [str(e) for e in ((ctx.run_meta or {}).get("errors") or [])]
+    incomplete = bool((ctx.run_meta or {}).get("incomplete"))
+    flags = {"incomplete": incomplete, "errors": run_errors}
     if not ctx.groups:
+        if incomplete:
+            # A model call failed: "no timesheet found" would be a lie - say what happened.
+            return {**build_result(
+                [], [], ctx.sheets, approval,
+                "Extraction FAILED - nothing could be read: " + "; ".join(run_errors[:3])
+                + ". Upload it again."), **flags}
         kinds = ", ".join(f"{s['name']} ({s['kind']})" for s in ctx.sheets) or "nothing readable"
-        return build_result([], [], ctx.sheets, approval,
-                            f"Nothing to stage — no timesheet or certificate found ({kinds}).")
+        return {**build_result([], [], ctx.sheets, approval,
+                               f"Nothing to stage — no timesheet or certificate found ({kinds})."), **flags}
     message = staged_message(ctx.groups, approval)
+    if incomplete:
+        message = f"{message} INCOMPLETE - " + "; ".join(run_errors[:3]) + "."
     if ctx.notes:
         message = f"{message} " + " ".join(ctx.notes[:3])
-    return build_result(ctx.staged, ctx.groups, ctx.sheets, approval, message)
+    return {**build_result(ctx.staged, ctx.groups, ctx.sheets, approval, message), **flags}

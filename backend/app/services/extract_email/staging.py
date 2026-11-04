@@ -4,6 +4,7 @@ from __future__ import annotations
 import calendar
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.email_message import EmailMessage
@@ -72,7 +73,8 @@ def group_flags(g: dict) -> list[str]:
     if not (g.get("month") and g.get("year")):
         flags.append("No usable month/year on these sheets — pick the period.")
     for s in g.get("sheets") or []:
-        miss = s.get("missing_days") or []
+        miss = [d for d in (s.get("missing_days") or [])
+                if d in (g.get("missing_days") or [])]    # not covered by another sheet
         if miss and s.get("kind") == "timesheet":
             shown = ", ".join(str(d) for d in miss[:8]) + (" …" if len(miss) > 8 else "")
             flags.append(f'Sheet "{s.get("name")}" has {len(miss)} missing day(s): {shown}')
@@ -82,11 +84,92 @@ def group_flags(g: dict) -> list[str]:
     return list(dict.fromkeys(flags))
 
 
+def _alternates_for(g: dict, alternates: list[dict]) -> list[dict]:
+    """The alternate-copy records whose kept sheet belongs to this group."""
+    names = {s.get("name") for s in (g.get("sheets") or [])}
+    return [a for a in alternates if a.get("kept") in names]
+
+
+def _alternate_note(a: dict) -> str:
+    stored = ", ".join(a.get("stored_only") or [])
+    diff = (a.get("differences") or "").strip().rstrip(".")
+    return (f'Also received {stored} - the same timesheet as "{a.get("kept")}"'
+            + (f" ({diff})" if diff else "")
+            + f'. It is stored with this item; only "{a.get("kept")}" was read '
+            f'({a.get("how_chosen")}).')
+
+
+def group_approval(g: dict, approval: dict, n_groups: int) -> dict:
+    """The approval verdict for ONE employee+month group.
+
+    The thread-wide `approval` is derived across every sheet of the email. With
+    one group that is exactly right. With several (one email, several
+    employees' timesheets) a signature found on employee A's sheet must NOT
+    approve employee B's:
+      * a sheet in THIS group carries a real signature/stamp -> approved, with
+        that sheet's own evidence;
+      * the thread-wide approval is conversation-level (a reply / separate
+        approval screenshot) -> inherited, with a note when it may not be
+        specific to this employee;
+      * the thread-wide approval came from another group's sheet -> NOT
+        inherited."""
+    own = [s for s in (g.get("sheets") or [])
+           if s.get("manager_signature") and not s.get("approval_named_only")]
+    if own:
+        ev = next((s.get("approval_evidence") for s in own if s.get("approval_evidence")), "")
+        return {**approval, "detected": True, "where": "sheet",
+                "evidence": ev or approval.get("evidence", ""),
+                "source": own[0].get("name"),
+                "detail": f"Approval found: {ev[:200]}" if ev else "Approval found on this employee's sheet."}
+    if n_groups <= 1 or not approval.get("detected"):
+        return approval
+    if approval.get("where") == "conversation":
+        return {**approval, "detail": approval.get("detail", "Approval found.")
+                + " (conversation-level - confirm it covers this employee)"}
+    return {**approval, "detected": False, "where": "none", "evidence": "", "source": "",
+            "detail": "No manager approval found for THIS employee - the approval in this email "
+                      "is on another employee's sheet."}
+
+
+def _signature(buckets: dict, working, weekend, uncertain, sheet_names) -> tuple:
+    """What a group's extraction says, in a comparable shape: the leave days per
+    category, worked / weekend / uncertain days, and which files it came from."""
+    def days(v):
+        return tuple(sorted(str(d.get("date") if isinstance(d, dict) else d) for d in (v or [])))
+    return (
+        tuple(sorted((b, days(v)) for b, v in (buckets or {}).items() if v)),
+        days(working), days(weekend), days(uncertain),
+        tuple(sorted(str(n) for n in (sheet_names or []))),
+    )
+
+
+def _signature_of_group(g: dict) -> tuple:
+    return _signature(g.get("buckets"), g.get("working_days"), g.get("weekend_days"),
+                      g.get("uncertain_days"), [s.get("name") for s in (g.get("sheets") or [])])
+
+
+def _approval_gained(t: PipelineFile, g_approval: dict) -> bool:
+    """A manager's approval is on record now that was not when this item was staged -
+    new information even though the days and sheets are identical."""
+    old = ((t.extraction_meta or {}).get("full_email_extract") or {}).get("approval") or {}
+    return bool(g_approval.get("detected")) and not old.get("detected")
+
+
+def _signature_of_item(t: PipelineFile) -> tuple | None:
+    meta = t.extraction_meta or {}
+    st = meta.get("staged")
+    if not isinstance(st, dict):
+        return None
+    fe = meta.get("full_email_extract") or {}
+    return _signature(st.get("buckets"), st.get("working_days"), st.get("weekend_days"),
+                      st.get("uncertain_days"), [x.get("filename") for x in (fe.get("sheets") or [])])
+
+
 async def stage_groups(
     db: AsyncSession, *, source_kind: str, source_id: str,
     raw_bytes: bytes, raw_name: str, content_type: str,
     groups: list[dict], approval: dict, run_meta: dict,
-    thread_key: str | None = None,
+    thread_key: str | None = None, keep_existing_raw: bool = False,
 ) -> list[PipelineFile]:
     """One item per employee+month group — the SINGLE staging path for every
     entry point (Extract Email, Upload, chat store).
@@ -121,27 +204,91 @@ async def stage_groups(
     existing = (await db.execute(select(PipelineFile).where(*where))).scalars().all()
     by_tag = {t.attachment_id: t for t in existing}
 
+    # ---- run-level health --------------------------------------------------
+    # An INCOMPLETE run (a model call failed, a message would not download)
+    # never silently looks like a clean one: every item it stages carries the
+    # problem as a flag + auto-accept blocker, it counts attempts so the retry
+    # logic is bounded, and it must not delete previously staged items (the
+    # missing piece may be exactly what those items came from).
+    incomplete = bool(run_meta.get("incomplete"))
+    run_flags: list[str] = []
+    if incomplete:
+        errs = [str(e) for e in (run_meta.get("errors") or [])]
+        run_flags.append("EXTRACTION INCOMPLETE - " + "; ".join(errs[:3])
+                         + (" …" if len(errs) > 3 else "")
+                         + " - it will be retried; verify before accepting.")
+    run_flags.extend(str(w) for w in (run_meta.get("warnings") or []))
+    prior_attempts = 0
+    for t0 in existing:
+        prev = (t0.extraction_meta or {}).get("full_email_extract") or {}
+        if prev.get("incomplete"):
+            prior_attempts = max(prior_attempts, int(prev.get("incomplete_attempts") or 1))
+    run_meta = {**run_meta, "incomplete_attempts": (prior_attempts + 1) if incomplete else 0}
+
     staged: list[PipelineFile] = []
     used: set[str] = set()
     for g in groups:
         month, year = g["month"], g["year"]
-        flags = group_flags(g)
-        summary = f"{summarize_group(g)} {approval['detail']}"
+        g_approval = group_approval(g, approval, len(groups))
+        group_alts = _alternates_for(g, run_meta.get("alternates") or [])
+        flags = list(dict.fromkeys(group_flags(g) + run_flags + [_alternate_note(a) for a in group_alts]))
+        summary = f"{summarize_group(g)} {g_approval['detail']}"
 
-        decision = auto_accept.evaluate(g, approval=approval)
+        decision = auto_accept.evaluate(g, extra_flags=run_flags, approval=g_approval)
 
         display = raw_name if len(groups) == 1 else \
             f"{g['name'] or 'Unassigned sheets'} — {raw_name}"
         tag = g["tag"]
         used.add(tag)
         t = by_tag.get(tag)
+        # An item that is already FILED (accepted -> a record exists) and whose thread
+        # was just re-read in full with exactly the same result: a later "Thanks!" /
+        # "ok" reply changed nothing for this month. Leave it filed - do not bounce it
+        # back into the review queue - and only move its watermark so the thread is
+        # not re-read again and again. (An incomplete run proves nothing; it takes the
+        # normal path so it is flagged and retried.)
+        if (t is not None and t.record_id and not incomplete
+                and t.status in (PipelineStatus.SUCCESS, PipelineStatus.RESOLVED)
+                and _signature_of_item(t) == _signature_of_group(g)
+                and not _approval_gained(t, g_approval)):
+            meta = dict(t.extraction_meta or {})
+            fe = dict(meta.get("full_email_extract") or {})
+            fe["snapshot_at"] = run_meta.get("snapshot_at") or fe.get("snapshot_at")
+            fe["rechecked_at"] = now_iso()
+            meta["full_email_extract"] = fe
+            t.extraction_meta = meta
+            t.events = (t.events or []) + [{
+                "stage": PipelineStage.EXTRACTION, "status": "ok",
+                "detail": "Thread re-read after a new message: nothing new for this month, "
+                          "it stays filed.",
+                "at": now_iso()}]
+            staged.append(t)
+            continue
+        was_filed = bool(t is not None and t.record_id)
+        approval_gained = bool(t is not None and _approval_gained(t, g_approval))
         if t is None:
             t = PipelineFile(
                 filename=display, content_type=content_type,
                 size_bytes=len(raw_bytes), source_kind=source_kind,
                 source_id=source_id, thread_key=thread_key, attachment_id=tag)
-            db.add(t)
-            await db.flush()
+            try:
+                # SAVEPOINT: if another writer inserted this very item between
+                # our lookup and now (the partial unique index in migration 0034
+                # refuses the duplicate), only this insert is rolled back - the
+                # groups already prepared in this run are kept - and we adopt
+                # the winner's row instead of creating a second one.
+                async with db.begin_nested():
+                    db.add(t)
+                    await db.flush()
+            except IntegrityError:
+                winner = (await db.execute(select(PipelineFile).where(
+                    PipelineFile.source_kind == source_kind,
+                    PipelineFile.thread_key == thread_key,
+                    PipelineFile.attachment_id == tag))).scalars().first()
+                if winner is None:
+                    raise
+                t = winner
+                existing = list(existing) + [winner]
         t.filename = display
         # Point at the message that triggered THIS run, so a retry re-fetches
         # the newest message rather than the one first seen weeks ago.
@@ -152,9 +299,10 @@ async def stage_groups(
         # LONGER thread, and the item must show what was actually read. Written
         # under the same key, so a thread stores one copy however often it is
         # re-extracted.
-        if t.raw_path:
-            raw_store.delete_raw(t.raw_path)
-        t.raw_path = raw_store.save_raw(t.id, raw_name, raw_bytes)
+        if not (keep_existing_raw and t.raw_path):
+            if t.raw_path:
+                raw_store.delete_raw(t.raw_path)
+            t.raw_path = raw_store.save_raw(t.id, raw_name, raw_bytes)
         t.employee_id = g["employee_id"]
         t.employee_name = g["name"]
         t.month, t.year = month, year
@@ -180,7 +328,7 @@ async def stage_groups(
             "full_email_extract": {
                 **run_meta,
                 "match_note": g["note"],
-                "approval": approval,
+                "approval": g_approval,
                 "sheets": sheet_summaries(g["sheets"]),
                 # How many employees' groups this SAME run produced — e.g. a
                 # manager sending 8 people's sheets in one email. Read at
@@ -188,6 +336,10 @@ async def stage_groups(
                 # to decide whether it's safe to file just this employee's
                 # own attachment(s) instead of the whole shared thread.
                 "group_count": len(groups),
+                # Copies of this same timesheet that were stored with the item but
+                # not read separately (identical entries; e.g. the unsigned copy of
+                # a signed sheet). Kept so the files travel with the item.
+                "alternates": group_alts,
             },
             "source_kind": source_kind,
         }
@@ -195,7 +347,8 @@ async def stage_groups(
         t.events = (t.events or []) + [{
             "stage": PipelineStage.EXTRACTION, "status": "ok",
             "detail": (f"Full-email extraction: {len(g['sheets'])} sheet(s) → {total} leave day(s)"
-                       f" for {g['name'] or 'unassigned'}. {approval['detail']}"),
+                       f" for {g['name'] or 'unassigned'}. {g_approval['detail']}"
+                       + (" INCOMPLETE - will be retried." if incomplete else "")),
             "at": now_iso(),
         }]
 
@@ -218,6 +371,12 @@ async def stage_groups(
                                 + (f" ({g['name']})" if g["name"] and len(groups) > 1 else "")
                                 + hold)
 
+        if was_filed:
+            t.failure_detail = (
+                ("A manager's approval arrived after this month was filed - accept again to "
+                 "record it. " if approval_gained else
+                 "New data arrived after this month was filed - review it and accept to merge "
+                 "it into the record. ") + (t.failure_detail or ""))
         t.status = PipelineStatus.NEEDS_REVIEW
         t.failure_code = FailureCode.PENDING_REVIEW
         staged.append(t)
@@ -228,6 +387,8 @@ async def stage_groups(
     for t in existing:
         if t.record_id:
             continue
+        if incomplete or run_meta.get("partial_read"):
+            break           # a partial read can't prove an old item is stale
         if t.attachment_id not in used:
             raw_store.delete_raw(t.raw_path)
             await db.delete(t)

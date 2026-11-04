@@ -28,7 +28,7 @@ def _png_bytes(*, big: bool) -> bytes:
 
     from PIL import Image
 
-    side = 400 if big else 20
+    side = 400 if big else 8       # 8x8 -> a few hundred bytes: a tracking-pixel-sized image
     rng = random.Random(0)
     img = Image.new("RGB", (side, side))
     img.putdata([(rng.randrange(256), rng.randrange(256), rng.randrange(256))
@@ -58,7 +58,7 @@ def _pass2_response():
 
 
 async def test_capture_records_pass1_and_pass2_calls_and_a_dropped_image(mock_vision_calls):
-    tiny_png = _png_bytes(big=False)   # well under MIN_IMAGE_BYTES (60KB) -> size-dropped
+    tiny_png = _png_bytes(big=False)   # a few hundred bytes (< 1KB) -> dropped as a tracking pixel
     eml = _mail(plain="See attached.", attachments=[
         ("logo.png", tiny_png, "image", "png"),
         ("sheet.pdf", b"%PDF-1.4 fake sheet", "application", "pdf"),
@@ -175,7 +175,7 @@ async def test_extract_full_email_clean_success_does_not_persist_a_debug_run(moc
         assert len(after) == len(before), "a clean, successful run must not create a debug row"
 
 
-async def test_extract_full_email_persists_a_debug_run_when_pass1_errors(mock_vision_calls):
+async def test_extract_full_email_persists_a_debug_run_when_pass1_errors(monkeypatch):
     """The other half of the same rule: a run that hit a real problem (here,
     a pass-1 batch raising — see mock_vision_calls' own docstring for how to
     script that) DOES get a persisted, browsable ExtractionDebugRun row."""
@@ -185,7 +185,16 @@ async def test_extract_full_email_persists_a_debug_run_when_pass1_errors(mock_vi
     from app.models.extraction_debug_run import ExtractionDebugRun
     from app.services.agents import full_email_extract as fx
 
-    mock_vision_calls([RuntimeError("simulated pass-1 failure")])
+    # Every model call fails (a failed batch is now split and retried down to
+    # single items, so a one-shot scripted failure would be "recovered").
+    from app.services.extract_email import thread_prompt, triage_prompt
+    from app.services.extraction import vision_client
+
+    async def _always_fails(*a, **k):
+        raise RuntimeError("simulated pass-1 failure")
+
+    for mod in (vision_client, triage_prompt, thread_prompt):
+        monkeypatch.setattr(mod, "chat_call", _always_fails)
 
     async with SessionLocal() as db:
         row = await _get_or_sync_msg0001(db)

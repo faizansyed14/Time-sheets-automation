@@ -57,7 +57,7 @@ def evaluate(
 ) -> AutoAcceptDecision:
     """Decide whether this employee+month group may be filed without review.
 
-    approval is the SAME dict stage_groups()/retry_pipeline_file() already
+    approval is the SAME dict stage_groups() already
     carry (from thread_extract.approval_from_triage or the portal
     self-attestation) — pass it and a missing/weak/undetected manager
     approval becomes a blocker; omit it (the default) to leave approval out

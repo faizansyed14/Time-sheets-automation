@@ -21,6 +21,7 @@ from io import BytesIO
 from typing import Any
 
 from sqlalchemy import select
+from app.services.employee.activity import stamp_joined
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.employee import Employee
@@ -592,6 +593,14 @@ async def import_employees_from_bytes(db: AsyncSession, data: bytes) -> dict:
     placeholder_by_name = _index_placeholder_by_name(rows)
 
     inserted = updated = touched = 0
+    # Rows added to a roster that already has people count from today's month on; the very
+    # first bulk load is "since always" so history is not hidden.
+    roster_existed = (await db.execute(select(Employee.id).limit(1))).first() is not None
+    joined_on = None
+    if roster_existed:
+        probe = Employee()
+        stamp_joined(probe)
+        joined_on = probe.joining_date
     with db.no_autoflush:
         for rec in usable:
             existing, id_upgrade = _resolve_existing(index, placeholder_by_name, rec)
@@ -626,6 +635,7 @@ async def import_employees_from_bytes(db: AsyncSession, data: bytes) -> dict:
                     location=_clean(rec.get("location")),
                     work_email=_clean(rec.get("work_email")),
                     personal_email=_clean(rec.get("personal_email")),
+                    joining_date=joined_on,
                 )
                 db.add(row)
                 index[rec["_key"]] = row

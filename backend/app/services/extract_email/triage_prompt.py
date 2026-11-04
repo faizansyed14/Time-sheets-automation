@@ -112,6 +112,12 @@ MANAGER / APPROVAL SIGNAL - treat any of these as approval evidence on the item 
   evidence a human must verify, not confirmed approval - anyone can type a name into a
   field, so do not treat that alone as proof someone actually signed off.
 
+LOOK-ALIKE ITEMS ARE ALL REAL - the same employee may send the same timesheet twice (for
+example one copy signed or stamped and one not, a resend, or a corrected version). Classify
+EVERY copy on its own merits: never file one as "other"/"noise" because it resembles another
+item, and never describe it as a duplicate to be skipped. If two items look the same, say so in
+`notes` and record, per item, whether THAT copy carries a signature/stamp/approval.
+
 WHOSE RECORD IS IT - evaluate every item independently. Never assume shared identity
 across items just because they arrived in the same email or the same batch - a manager
 forwarding several employees' own timesheets in one email is the ordinary case for a
@@ -187,25 +193,68 @@ def build_item_manifest(items) -> str:
     return "\n".join(lines)
 
 
+_BODY_FLOOR = 1500      # chars of a body always kept when the budget forces trimming
+
+
+def budgeted_bodies(thread, budget: int | None = None) -> list[tuple]:
+    """[(message, body_text)] with the total length held under the configured
+    budget. Under budget nothing is trimmed. Over budget every body keeps its
+    HEAD (a reply's new text sits above its quoted history), shrunk evenly but
+    never below a floor, so a short "Approved." can never be trimmed away."""
+    budget = settings.bodies_char_budget if budget is None else budget
+    msgs = list(thread.messages)
+    total = sum(len(m.body or "") for m in msgs)
+    if not budget or total <= budget or not msgs:
+        return [(m, m.body or "") for m in msgs]
+    per = max(_BODY_FLOOR, budget // len(msgs))
+    out = []
+    for m in msgs:
+        body = m.body or ""
+        if len(body) > per:
+            body = body[:per] + (
+                f"\n[… {len(body) - per} more characters of this message omitted (quoted history) …]")
+        out.append((m, body))
+    return out
+
+
 def build_bodies_block(thread) -> str:
     out = ["MESSAGE BODIES (personal data already redacted) - oldest first, for approval context:"]
-    for m in thread.messages:
+    for m, body in budgeted_bodies(thread):
         out.append(
             f"\n--- message {m.index + 1} (depth {m.depth}) ---\n"
             f"Date: {m.date}\nFrom: {m.frm}\nTo: {m.to}\nSubject: {m.subject}\n"
-            f"{m.body or '(no text)'}")
+            f"{body or '(no text)'}")
     return "\n".join(out)
 
 
-def chunk_items_by_count(items, batch_size: int) -> list[list]:
-    """Pass 1 batches by ITEM COUNT, not image count - keeps each batch's set
-    of classification decisions small and independent regardless of how many
-    pages any one attachment happens to have."""
+def chunk_items_by_count(items, batch_size: int, max_images: int | None = None) -> list[list]:
+    """Pass 1 batches by ITEM COUNT - keeps each batch's set of classification
+    decisions small and independent.
+
+    `max_images` additionally closes a batch before it would carry more page
+    images than that: with no page cap, one 40-page PDF plus four neighbours
+    would otherwise be a 50-image request. An item with more pages than the cap
+    simply goes alone (its pages stay together so the verdict sees the whole
+    document)."""
     batch_size = max(1, int(batch_size or 1))
-    return [items[i:i + batch_size] for i in range(0, len(items), batch_size)] or [[]]
+    if not max_images:
+        return [items[i:i + batch_size] for i in range(0, len(items), batch_size)] or [[]]
+    out: list[list] = []
+    cur: list = []
+    n_img = 0
+    for it in items:
+        k = len(getattr(it, "images", None) or [])
+        if cur and (len(cur) >= batch_size or n_img + k > max_images):
+            out.append(cur)
+            cur, n_img = [], 0
+        cur.append(it)
+        n_img += k
+    if cur:
+        out.append(cur)
+    return out or [[]]
 
 
-def pass1_blocks(thread, items, batch_note: str = "") -> list[dict]:
+def pass1_blocks(thread, items, batch_note: str = "", detail: str | None = None) -> list[dict]:
     blocks = [
         text_block(f"EMAIL THREAD: {thread.subject}\n{len(thread.messages)} messages.\n{batch_note}".strip()),
         text_block(build_item_manifest(items)),
@@ -215,22 +264,28 @@ def pass1_blocks(thread, items, batch_note: str = "") -> list[dict]:
     for it in items:
         blocks.append(text_block(f"===== ITEM [{it.key}] {it.name} ====="))
         if it.text:
+            txt = it.text
+            cap = int(settings.supplementary_text_chars or 0)
+            if it.images and cap and len(txt) > cap:
+                txt = txt[:cap] + f"\n[… {len(it.text) - cap} more characters omitted - see the images …]"
             blocks.append(text_block(
                 f"TEXT THAT CAME WITH [{it.key}] (supplementary - the image is the "
-                f"primary evidence):\n{it.text[:6000]}"))
+                f"primary evidence):\n{txt}"))
         for pi, img in enumerate(it.images, 1):
             blocks.append(text_block(f"[{it.key}] page/image {pi} of {len(it.images)} - {it.name}"))
-            blocks.append(image_block(img, settings.pass1_image_detail))
+            blocks.append(image_block(img, detail or settings.pass1_image_detail))
     blocks.append(text_block(PASS1_OUTPUT))
     return blocks
 
 
-async def run_pass1_batch(thread, items, batch_note: str, model: str, api_key: str, *, label: str = "") -> dict:
+async def run_pass1_batch(thread, items, batch_note: str, model: str, api_key: str, *,
+                          label: str = "", detail: str | None = None) -> dict:
     """One pass-1 call for one batch of items. Thinking stays ON (the
     default) — classification benefits from the extra reasoning; pass 2
     turns it off since it is pure transcription."""
-    blocks = pass1_blocks(thread, items, batch_note)
-    data = await chat_call(PASS1_SYSTEM, blocks, model, api_key, label=label)
+    blocks = pass1_blocks(thread, items, batch_note, detail=detail)
+    data = await chat_call(PASS1_SYSTEM, blocks, model, api_key, label=label,
+                           max_tokens=settings.extract_max_output_tokens)
     from app.services.extract_email import debug_capture
     debug_capture.record_pass1(
         label=label, model=model, system_prompt=PASS1_SYSTEM,

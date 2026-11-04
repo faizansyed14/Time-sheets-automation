@@ -17,6 +17,7 @@ import { Search as SearchIcon } from "lucide-react";
 import { cn } from "../lib/utils";
 import { Spinner } from "./ui";
 import { ServerRenderPane } from "./FilePreview";
+import ExcelViewer from "./ExcelViewer";
 
 // Generous ceilings, not a real page size — a long PGC-style roster (one row
 // per employee PER DAY) can genuinely run past 1,000 rows for one month, and
@@ -299,7 +300,7 @@ async function loadWorkbook(url: string) {
   return wb;
 }
 
-export function XlsxPreviewPane({ url }: { url: string }) {
+function LegacyXlsxPane({ url }: { url: string }) {
   const [sheets, setSheets] = useState<SheetModel[] | null>(null);
   const [active, setActive] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -500,6 +501,64 @@ export function XlsxPreviewPane({ url }: { url: string }) {
           </table>
         )}
       </div>
+    </div>
+  );
+}
+
+// Last fetch only, so a remount (switching tabs, reopening the same file) does
+// not download the workbook again.
+let lastFetch: { url: string; buf: ArrayBuffer } | null = null;
+
+async function fetchWorkbookBytes(url: string): Promise<ArrayBuffer> {
+  if (lastFetch && lastFetch.url === url) return lastFetch.buf;
+  const res = await fetch(url, { credentials: "same-origin" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const buf = await res.arrayBuffer();
+  lastFetch = { url, buf };
+  return buf;
+}
+
+/**
+ * Spreadsheet preview used everywhere a .xlsx is shown. Modern workbooks open in
+ * @js-preview/excel (a real spreadsheet grid). Anything it can't take (a legacy
+ * binary .xls, a rights-protected file, or a render error) falls back to the
+ * previous reader, which also shows the specific "download it" messages.
+ */
+export function XlsxPreviewPane({ url }: { url: string }) {
+  const [buf, setBuf] = useState<ArrayBuffer | null>(null);
+  const [fallback, setFallback] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    setBuf(null);
+    setFallback(false);
+    setFailed(null);
+    fetchWorkbookBytes(url)
+      .then((b) => {
+        if (!alive) return;
+        // Old binary .xls / rights-managed files share the OLE2 container.
+        if (isOleCompoundFile(new Uint8Array(b))) setFallback(true);
+        else setBuf(b);
+      })
+      .catch((e) => {
+        if (!alive) return;
+        console.error("XLSX fetch failed:", e);
+        setFailed("Could not load this spreadsheet.");
+      });
+    return () => { alive = false; };
+  }, [url]);
+
+  if (failed) {
+    return <div className="flex h-full items-center justify-center p-8 text-sm text-rose-500">{failed}</div>;
+  }
+  if (fallback) return <LegacyXlsxPane url={url} />;
+  if (!buf) {
+    return <div className="flex h-full items-center justify-center"><Spinner className="h-6 w-6" /></div>;
+  }
+  return (
+    <div className="h-full overflow-hidden bg-white">
+      <ExcelViewer buffer={buf} onError={(e) => { console.error("Excel viewer failed, using fallback:", e); setFallback(true); }} />
     </div>
   );
 }

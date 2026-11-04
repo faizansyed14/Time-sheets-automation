@@ -72,6 +72,25 @@ def build_thread_bundle(
     return outer.as_bytes(), eml_filename(subject)
 
 
+_FETCH_RETRY_DELAY = 1.5      # seconds x attempt between re-downloads of a message
+
+
+class CollectNotes(list):
+    """The human-readable notes list collect_thread_emls returns, plus
+    `.problems`: the subset that means part of the conversation could NOT be
+    read (a message that would not download, a history lookup that failed).
+    Those are retriable — the run is marked incomplete and tried again —
+    whereas a plain note (e.g. "older messages were reused") is informational."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.problems: list[str] = []
+
+    def problem(self, text: str) -> None:
+        self.append(text)
+        self.problems.append(text)
+
+
 def _label(subject: str | None, received) -> str:
     when = ""
     try:
@@ -84,7 +103,7 @@ def _label(subject: str | None, received) -> str:
 
 async def collect_thread_emls(
     provider, email: EmailMessage, prior_email: EmailMessage | None = None,
-    *, since=None, context_messages: int = 2,
+    *, since=None, context_messages: int = 2, only_ids: set[str] | None = None,
 ) -> tuple[list[tuple[str, bytes]], list[str]]:
     """([(label, eml_bytes)], notes) for the conversation, OLDEST FIRST.
 
@@ -112,9 +131,11 @@ async def collect_thread_emls(
     """
     from app.services.inbox.eml_export import build_full_eml
 
+    import asyncio
+
     out: list[tuple[str, bytes]] = []
     seen_ids: set[str] = set()
-    notes: list[str] = []
+    notes = CollectNotes()
 
     async def add(msg_like, subject, received) -> None:
         """Accepts either a DB EmailMessage or a provider ProviderMessage.
@@ -131,19 +152,30 @@ async def collect_thread_emls(
             return
 
         data: bytes | None = None
-        if hasattr(msg_like, "provider_message_id"):
+        last_err = ""
+        # A transient mailbox hiccup (throttling, a dropped connection) must not
+        # silently cost a message — try a few times before giving up on it.
+        for attempt in range(3):
             try:
-                data, _name = await build_full_eml(provider, msg_like)
-            except Exception:
-                data = None
-        elif mid:
-            getter = getattr(provider, "get_message_mime", None)
-            if getter is not None:
-                try:
-                    data = await getter(mid)
-                except Exception:
+                if hasattr(msg_like, "provider_message_id"):
+                    data, _name = await build_full_eml(provider, msg_like, strict=True)
+                elif mid:
+                    getter = getattr(provider, "get_message_mime", None)
+                    data = await getter(mid) if getter is not None else None
+                else:
                     data = None
+            except Exception as e:
+                data = None
+                last_err = str(e)[:120]
+            if data:
+                break
+            if attempt < 2:
+                await asyncio.sleep(_FETCH_RETRY_DELAY * (attempt + 1))
         if not data:
+            if mid or hasattr(msg_like, "provider_message_id"):
+                notes.problem(
+                    f"Could not download the message '{(subject or '(no subject)')[:80]}'"
+                    f"{' (' + last_err + ')' if last_err else ''} — it was NOT read this run.")
             return
         if mid:
             seen_ids.add(mid)
@@ -160,7 +192,7 @@ async def collect_thread_emls(
             # sent whole when almost none of it was: the mailbox fetch broke
             # (one malformed message, a timeout, a permissions edge case) and
             # the code below silently fell back to 1-2 messages. Say so.
-            notes.append(
+            notes.problem(
                 f"Could not fetch this conversation's full message history from "
                 f"the mail server ({str(e)[:160]}) — only the currently open "
                 f"message could be read, not the whole thread. Re-run once the "
@@ -175,6 +207,15 @@ async def collect_thread_emls(
         except Exception:
             pass
 
+        if only_ids:
+            # An explicit selection ("extract just these messages"): fetch exactly
+            # those, nothing else - no incremental window, no context messages.
+            known = {getattr(m, "message_id", None) for m in thread_msgs}
+            missing = only_ids - known
+            thread_msgs = [m for m in thread_msgs if getattr(m, "message_id", None) in only_ids]
+            if missing:
+                notes.problem(f"{len(missing)} selected message(s) were not found in this conversation.")
+            since = None
         if since is not None:
             new_index = next(
                 (i for i, m in enumerate(thread_msgs) if (_when(m) or since) > since), None)
@@ -196,8 +237,8 @@ async def collect_thread_emls(
         # manager's reminder that many people replied to independently (one
         # employee per reply) — either way, the newest messages matter most
         # and an unbounded request isn't safe to send in one call.
-        max_thread_messages = settings.max_thread_messages
-        if len(thread_msgs) > max_thread_messages:
+        max_thread_messages = int(settings.max_thread_messages or 0)
+        if max_thread_messages > 0 and len(thread_msgs) > max_thread_messages:
             dropped = len(thread_msgs) - max_thread_messages
             notes.append(
                 f"This conversation has {len(thread_msgs)} messages — only the "
@@ -213,9 +254,12 @@ async def collect_thread_emls(
     if not out:
         # No conversation support (or the lookup failed) — the clicked message,
         # plus the prior message when this is an approval-only reply.
-        if prior_email is not None:
-            await add(prior_email, prior_email.subject,
-                      getattr(prior_email, "received_at", None))
-        await add(email, email.subject, getattr(email, "received_at", None))
+        if only_ids and email.provider_message_id not in only_ids:
+            notes.problem("None of the selected messages could be found in this conversation.")
+        else:
+            if prior_email is not None and not only_ids:
+                await add(prior_email, prior_email.subject,
+                          getattr(prior_email, "received_at", None))
+            await add(email, email.subject, getattr(email, "received_at", None))
 
     return out, notes

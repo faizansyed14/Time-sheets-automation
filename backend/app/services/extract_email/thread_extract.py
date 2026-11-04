@@ -42,7 +42,23 @@ log = logging.getLogger("extract_email.msg")
 # A forward of a forward of a forward is real; beyond this it is a mail loop,
 # not a timesheet. Applies to .eml/.msg attached as a FILE (not MIME-nested —
 # those are unwrapped for free by the normal MIME walk).
-MAX_EML_DEPTH = 4
+MAX_EML_DEPTH = 12          # default; the live value is settings.max_eml_depth
+# A picture under this many bytes cannot be a readable document (a 1x1 tracking
+# pixel, a bullet). The ONLY unconditional size drop; everything above it is
+# judged by what it is (inline vs attachment, OCR text), not by a size guess.
+_ABSOLUTE_MIN_IMAGE_BYTES = 1024
+# Logos / signature banners / social icons are small pictures that are either EMBEDDED in
+# the body (cid) or carry a generic mail-client name (image001.png, Outlook-xxxx.png).
+# Such a picture under settings.min_image_bytes (30 KB) is dropped - recorded, with its
+# thumbnail - before any model call. A picture the sender deliberately attached under a
+# real file name ("5thSept-11sept.png") is always read, however small.
+_GENERIC_IMAGE_NAME = re.compile(
+    r"^(image\d{0,3}\.(png|jpe?g|gif|bmp)|outlook-.+\.(png|jpe?g|gif|bmp)"
+    r"|c2_signature_.+\.(png|jpe?g|gif)|noname.*|unnamed.*|)$", re.I)
+
+
+def _is_generic_image_name(name: str | None) -> bool:
+    return bool(_GENERIC_IMAGE_NAME.match((name or "").strip()))
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff")
 
 SUMMARY_STATUSES = (
@@ -88,6 +104,10 @@ class Thread:
     # analysable items are the PDFs/images inside). Recorded for Extracted/New
     # badges so nested containers don't look "New" after a successful run.
     opened_containers: list[dict] = field(default_factory=list)
+    # Things that could not be read AT ALL (corrupt file, nesting too deep, a
+    # page that would not render). Permanent, so they are WARNINGS — shown to
+    # the reviewer on every staged item — not retriable errors.
+    unreadable: list[str] = field(default_factory=list)
 
     @property
     def n_images(self) -> int:
@@ -165,9 +185,21 @@ def msg_to_eml_bytes(payload: bytes) -> bytes | None:
                 pass
 
 
+def _max_depth() -> int:
+    return max(1, int(getattr(settings, "max_eml_depth", MAX_EML_DEPTH) or MAX_EML_DEPTH))
+
+
+def _page_limit() -> int:
+    """Pages rendered per document. settings.pdf_max_pages <= 0 means NO cap —
+    the default, because a page silently never read is a leave day silently
+    never booked. A positive value is an explicit operator choice."""
+    n = int(getattr(settings, "pdf_max_pages", 0) or 0)
+    return n if n > 0 else 10_000
+
+
 def _pdf_pages(payload: bytes) -> tuple[list[bytes], str]:
     """Per-page JPEGs (one image per page, never stitched) + the PDF's own
-    concatenated text layer, both capped at settings.pdf_max_pages."""
+    concatenated text layer (every page unless pdf_max_pages is set)."""
     import fitz
 
     from app.services.extraction.file_processor import pdf_to_page_images
@@ -176,14 +208,14 @@ def _pdf_pages(payload: bytes) -> tuple[list[bytes], str]:
     try:
         doc = fitz.open(stream=payload, filetype="pdf")
         try:
-            for i in range(min(doc.page_count, settings.pdf_max_pages)):
+            for i in range(min(doc.page_count, _page_limit())):
                 texts.append(doc.load_page(i).get_text("text") or "")
         finally:
             doc.close()
     except Exception:
         texts = []
     try:
-        images = pdf_to_page_images(payload, dpi=settings.pdf_render_dpi, max_pages=settings.pdf_max_pages)
+        images = pdf_to_page_images(payload, dpi=settings.pdf_render_dpi, max_pages=_page_limit())
     except Exception:
         images = []
     text = scrub_text("\n\n".join(t.strip() for t in texts if t.strip()))
@@ -223,7 +255,7 @@ def _office_pages(payload: bytes, ext: str) -> list[bytes]:
     if not pdf:
         return []
     try:
-        return pdf_to_page_images(pdf, dpi=settings.pdf_render_dpi, max_pages=settings.pdf_max_pages)
+        return pdf_to_page_images(pdf, dpi=settings.pdf_render_dpi, max_pages=_page_limit())
     except Exception:
         return []
 
@@ -278,6 +310,27 @@ def _item_thumb(it: Item) -> str | None:
 
 def _is_email_body(it: Item) -> bool:
     return (it.name or "").lower().startswith("email body")
+
+
+# Words that make a plain-text message worth a second look when the quick first
+# pass filed it as "other": leave / absence / attendance vocabulary in English
+# and the common Arabic terms. Deliberately broad - a false hit costs one extra
+# model call and at worst an item a reviewer dismisses; a miss loses leave data.
+_LEAVE_VOCAB = re.compile(
+    r"leave|sick|vacation|holiday|absent|absence|\boff\b|attendance|timesheet|time sheet|"
+    r"annual|medical|maternity|paternity|compassionate|unpaid|casual|"
+    r"إجازة|اجازة|مرض|غياب|دوام",
+    re.IGNORECASE)
+
+
+def _wants_second_look(it: Item) -> bool:
+    """Whether an item the first pass filed as other/noise is re-checked alone.
+    Every attachment with pictures or native text (screenshots, scans, PDFs,
+    spreadsheets, documents) qualifies; a message body qualifies when it uses
+    leave / attendance vocabulary, so ordinary conversation is not re-read."""
+    if _is_email_body(it):
+        return bool(it.text and _LEAVE_VOCAB.search(it.text))
+    return bool(it.images or it.text)
 
 
 def _record_dropped(th: Thread, entry: dict, image: bytes | None) -> None:
@@ -414,28 +467,43 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
             return
 
         # Size filter FIRST — logos, signature icons and social buttons never
-        # reach any further processing (no OCR call spent on them either).
-        if is_image and settings.min_image_bytes and len(payload) < settings.min_image_bytes:
-            size_jpeg = _image_jpeg(payload)
+        # reach any further processing. Judged by WHAT the picture is, not a
+        # bare byte count: a real weekly-timesheet screenshot is often well
+        # under any size threshold. Only an EMBEDDED (cid) image is a
+        # logo/stamp suspect, and even then it is kept below if OCR finds real
+        # text in it; a real attachment is always read.
+        small_logo = bool(
+            settings.min_image_bytes and len(payload) < settings.min_image_bytes
+            and (inline or _is_generic_image_name(name)))
+        if is_image and (len(payload) < _ABSOLUTE_MIN_IMAGE_BYTES or small_logo):
+            px = _image_jpeg(payload)
             _record_dropped(th, {
                 "name": name, "mime": ctype, "size": len(payload), "msg_index": msg_index,
                 "filter": "size",
-                "reason": f"image under {settings.min_image_bytes // 1024}KB",
-                "thumb": _thumb_uri(size_jpeg),
-            }, size_jpeg)
+                "reason": (f"image under {_ABSOLUTE_MIN_IMAGE_BYTES} bytes (tracking pixel / bullet)"
+                           if len(payload) < _ABSOLUTE_MIN_IMAGE_BYTES else
+                           f"{'embedded' if inline else 'generically named'} image under "
+                           f"{settings.min_image_bytes // 1024}KB (logo / signature / icon)"),
+                "thumb": _thumb_uri(px),
+            }, px)
             return
 
         # An email attached as a FILE (not MIME-nested) — unwrap recursively,
         # same as a forward the mail structure already nests for free.
         if ext in (".eml", ".msg"):
-            if depth + 1 > MAX_EML_DEPTH:
+            if depth + 1 > _max_depth():
+                th.unreadable.append(
+                    f"{name or 'attached email'}: nested {depth + 1} levels deep — not opened.")
                 return
             sub_bytes = msg_to_eml_bytes(payload) if ext == ".msg" else payload
             if not sub_bytes:
+                th.unreadable.append(
+                    f"{name or 'attached email'}: could not be opened (corrupt or unsupported {ext}).")
                 return
             try:
                 sub = _email.message_from_bytes(sub_bytes, policy=_email.policy.default)
             except Exception:
+                th.unreadable.append(f"{name or 'attached email'}: could not be parsed.")
                 return
             # Inbox shows THIS outer filename; remember it so the Extracted
             # badge matches what the user sees (inner PDF names alone don't).
@@ -455,39 +523,51 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
         elif is_image or ftype == "image":
             jpeg = _image_jpeg(payload)
             if jpeg is None:
+                _record_dropped(th, {
+                    "name": name, "mime": ctype, "size": len(payload), "msg_index": msg_index,
+                    "filter": "unreadable",
+                    "reason": "image could not be decoded",
+                }, None)
+                th.unreadable.append(f"{name or 'image'}: image could not be decoded.")
                 return
-            from app.services.extraction.ocr import ocr_status, ocr_text
-            # Only apply the noise filter when OCR can actually run — the
-            # reader returns "" (not an error) on a missing engine binary,
-            # which would otherwise read as "no text, drop it" and silently
-            # discard every real picture attachment. No reader available =
-            # every picture attachment is kept, exactly like the notebook.
-            if ocr_status() == "ready":
-                ocr = ocr_text([jpeg], payload, "image")
-                if len(ocr.strip()) < settings.ocr_min_chars:
-                    _record_dropped(th, {
-                        "name": name, "mime": ctype, "size": len(payload), "msg_index": msg_index,
-                        "filter": "ocr",
-                        "ocr_chars": len(ocr.strip()),
-                        "reason": f"OCR found only {len(ocr.strip())} char(s) "
-                                  f"(<{settings.ocr_min_chars}) - likely a logo/icon",
-                        "thumb": _thumb_uri(jpeg),
-                    }, jpeg)
-                    return
+            # Only an EMBEDDED (cid) picture is a logo/stamp suspect. It is kept
+            # when OCR finds real text in it (a pasted screenshot of a table);
+            # dropped only when OCR ran and found next to nothing. If OCR cannot
+            # run at all the picture is kept — "no reader" must never read as
+            # "no text". A real (non-inline) attachment skips this test: it is
+            # always read, whatever its size.
+            if inline:
+                from app.services.extraction.ocr import ocr_status, ocr_text
+                if ocr_status() == "ready":
+                    ocr = ocr_text([jpeg], payload, "image")
+                    if len(ocr.strip()) < settings.ocr_min_chars:
+                        _record_dropped(th, {
+                            "name": name, "mime": ctype, "size": len(payload), "msg_index": msg_index,
+                            "filter": "ocr",
+                            "ocr_chars": len(ocr.strip()),
+                            "reason": f"embedded image ({len(payload) // 1024}KB) with only "
+                                      f"{len(ocr.strip())} char(s) of text - likely a logo/icon",
+                            "thumb": _thumb_uri(jpeg),
+                        }, jpeg)
+                        return
             it.images = [jpeg]
             it.send_mode = "image (only option for a picture)"
         elif ext in (".xlsx", ".xlsm", ".xls") or ftype == "xlsx":
             _fill_office_item(it, payload, "xlsx", ext or ".xlsx")
         elif ext == ".csv":
-            it.text = scrub_text(payload.decode("utf-8", "replace")[:20000])
+            it.text = scrub_text(payload.decode("utf-8", "replace"))
             it.send_mode = "native"
         elif ext == ".docx" or ftype == "docx":
             _fill_office_item(it, payload, "docx", ext or ".docx")
         elif ext == ".txt":
-            it.text = scrub_text(payload.decode("utf-8", "replace")[:20000])
+            it.text = scrub_text(payload.decode("utf-8", "replace"))
             it.send_mode = "native"
         else:
             it.text = f"[unsupported attachment type {ctype or ftype or 'unknown'}]"
+        if not it.images and not it.text.strip():
+            # Nothing at all could be rendered or read from this attachment
+            # (a PDF that would not open, an office file LibreOffice choked on).
+            th.unreadable.append(f"{it.name}: no pages or text could be read from this file.")
         th.items.append(it)
 
     def walk(msg, depth: int) -> None:
@@ -507,7 +587,10 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
             if ctype == "message/rfc822":
                 payload = part.get_payload()
                 sub = payload[0] if isinstance(payload, list) and payload else payload
-                if sub is not None and depth + 1 <= MAX_EML_DEPTH:
+                if sub is not None and depth + 1 > _max_depth():
+                    th.unreadable.append(
+                        f"forwarded message nested {depth + 1} levels deep — not opened.")
+                if sub is not None and depth + 1 <= _max_depth():
                     # Outlook lists these as named .eml attachments — record
                     # the outer filename for the Extracted badge.
                     fname = (part.get_filename() or "").replace("\x00", "") or None
@@ -554,12 +637,13 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
         html_flat = _html_to_text("\n".join(html_parts)) if html_parts else ""
         if html_flat and len(html_flat.strip()) > len(body):
             body = html_flat
-        m.body = scrub_text(body)[:12000]
+        m.body = scrub_text(body)
 
     for _label, eml_bytes in messages:
         try:
             root = _email.message_from_bytes(eml_bytes, policy=_email.policy.default)
         except Exception:
+            th.unreadable.append(f"message '{_label}': could not be parsed.")
             continue
         walk(root, 0)
 
@@ -570,8 +654,8 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
         if m.body.strip():
             th.items.append(Item(key=new_key(), name=f"email body (message {m.index + 1})",
                                  mime="text/plain", msg_index=m.index, text=m.body))
-    # Collapse re-attached / regenerated copies of the same timesheet before
-    # pass 1 — identical bytes or same core OCR with only manager-sign diffs.
+    # Collapse byte-identical re-attachments before pass 1. Look-alike copies
+    # (e.g. one signed, one not) are DIFFERENT files and are all kept.
     _dedupe_sheet_items(th)
     return th
 
@@ -651,7 +735,12 @@ def _derive_approval(triage: list[dict]) -> dict:
                     "status mark. Needs manual verification.")
             continue
         if m.get("kind") == "approval" or sig:
-            where = "sheet" if sig else "conversation"
+            # An approval REPLY / standalone approval item is conversation-level even
+            # when the model also set manager_signature on it (the prompt tells it
+            # to); only a sheet's OWN signature/stamp is sheet-level. Otherwise, once a
+            # second employee's sheet joined the thread, a manager's "Approved." was
+            # re-labelled "on another employee's sheet" and dropped from everyone.
+            where = "conversation" if m.get("kind") == "approval" else ("sheet" if sig else "conversation")
             if rank[where] >= rank[approval["where"]]:
                 approval = {**approval, "detected": True, "evidence": ev,
                            "source": m.get("source"), "where": where}
@@ -730,6 +819,16 @@ def _ui_pass_item(t: dict, items: list[Item]) -> dict:
     }
 
 
+def _safe_int(v, default: int = 0) -> int:
+    """int() that never raises on a model's "12 days" / "n/a" / None."""
+    if isinstance(v, bool):
+        return default
+    if isinstance(v, (int, float)):
+        return int(v)
+    m = re.search(r"-?\d+", str(v or ""))
+    return int(m.group()) if m else default
+
+
 def _normalise_pass2_sheets(raw_sheets: list, triage: list[dict], items: list[Item]) -> list[dict]:
     """Pass-2 JSON -> the sheet shape grouping.py consumes. Identity/kind come
     from pass 1 (whole-conversation context); the day-by-day account comes
@@ -771,6 +870,9 @@ def _normalise_pass2_sheets(raw_sheets: list, triage: list[dict], items: list[It
             # that might not be unique (two attachments both called
             # "image.png") or stable across a later run's fresh numbering.
             "name": it.name if it is not None else source,
+            # Content hash of the file this sheet was read from: the stable identity
+            # of one copy when an employee sends look-alike copies (grouping.py).
+            "digest": it.digest if it is not None else "",
             "_source_key": source,
             "kind": t.get("kind", "timesheet"),
             "employee_name": (str(s.get("employee_name")).strip() or None)
@@ -779,13 +881,13 @@ def _normalise_pass2_sheets(raw_sheets: list, triage: list[dict], items: list[It
             if s.get("employee_id") else t.get("employee_id"),
             "month": month,
             "year": year,
-            "days_covered": max(0, int(s.get("days_covered") or 0)) if str(s.get("days_covered") or "").strip() else 0,
+            "days_covered": max(0, _safe_int(s.get("days_covered"))),
             "period_type": str(s.get("period_type") or "unknown").lower()
             if str(s.get("period_type") or "").lower() in
                ("full_month", "half_month", "week", "partial", "unknown") else "unknown",
-            "missing_days": [int(d) for d in (s.get("missing_days") or [])
+            "missing_days": [_safe_int(d) for d in (s.get("missing_days") or [])
                             if str(d).strip().lstrip("-").isdigit()
-                            and 1 <= int(d) <= (
+                            and 1 <= _safe_int(d) <= (
                                 calendar.monthrange(year, month)[1]
                                 if month and year else 31)],
             "working_days": s.get("working_days") or [],
@@ -831,6 +933,7 @@ async def extract_thread_sheets(
     messages: list[tuple[str, bytes]],
     *, cached_sheets: dict[str, dict] | None = None,
     calendars: dict[tuple[int, int], dict] | None = None,
+    fresh_window: bool = False,
 ) -> tuple[list[dict], dict, list[dict], dict]:
     """Two passes over one conversation. See the module docstring.
 
@@ -883,7 +986,9 @@ async def extract_thread_sheets(
     if cached_sheets:
         fresh_items = []
         for it in th.items:
-            entry = cached_sheets.get(it.digest) if it.digest else None
+            # fresh_window: the reviewer asked for exactly these messages to be read
+            # again, so nothing in this run's window is served from the record.
+            entry = cached_sheets.get(it.digest) if (it.digest and not fresh_window) else None
             # badge_only entries mark nested .eml containers — never sheets.
             if (entry is not None and entry.get("sheet")
                     and not entry.get("badge_only")):
@@ -906,6 +1011,7 @@ async def extract_thread_sheets(
     empty_meta = {
         "method": "thread-two-pass", "model": None, "calls": 0,
         "sheet_count": len(reused_sheets), "errors": [], "skipped": th.dropped,
+        "warnings": list(th.unreadable), "incomplete": False,
         "conflicts": [], "summary": "", "summary_obj": None,
         "_opened_containers": list(th.opened_containers),
     }
@@ -921,19 +1027,85 @@ async def extract_thread_sheets(
     api_key, model = require_vision_configured()
 
     # ---- PASS 1: classify every item ---------------------------------------
-    batches = triage_prompt.chunk_items_by_count(th.items, settings.pass1_batch_size)
+    batches = triage_prompt.chunk_items_by_count(
+        th.items, settings.pass1_batch_size, max_images=settings.max_images_per_call)
     emit("pass1", "spin",
          f"Pass 1 of 2 — {model} is reading the whole conversation "
          f"({len(batches)} call(s))…",
          pass_no=1, model=model, message_count=len(messages))
 
-    # Collected here rather than only inside `meta` so pass 2's own failures
-    # below can keep appending to the SAME list — one combined picture of
-    # what this run could not read, regardless of which pass hit it.
+    # RETRIABLE problems of this run (a model call that ultimately failed, an
+    # item the model never answered for). Any entry marks the run `incomplete`
+    # so it is retried, never marked "checked" (see meta["incomplete"] below).
+    # Permanent problems (a corrupt attachment) are `warnings` instead.
     batch_errors: list[str] = []
+    pass1_calls = 0
+    thread_summary = ""
+
+    def _reply_keys(reply: list) -> set[str]:
+        keys: set[str] = set()
+        for m in reply:
+            it = resolve_source(str(m.get("source") or ""), th.items)
+            if it is not None:
+                keys.add(it.key)
+        return keys
+
+    async def _pass1_call(batch: list, note: str, label: str, detail: str | None = None) -> dict:
+        nonlocal pass1_calls
+        data = await triage_prompt.run_pass1_batch(
+            th, batch, note, model, api_key, label=label, detail=detail)
+        count_llm()
+        pass1_calls += 1
+        return data
+
+    async def _pass1_resilient(batch: list, note: str, label: str, bi: int) -> list:
+        """Verdicts for `batch`. A failed call is SPLIT and retried (down to one
+        item) instead of losing every item in it; an item the model simply did
+        not answer for is asked about again on its own. Whatever still cannot
+        be classified is recorded in batch_errors — never dropped silently."""
+        nonlocal thread_summary
+        try:
+            data = await _pass1_call(batch, note, label)
+        except Exception as e:
+            if len(batch) > 1:
+                emit("pass1", "warn",
+                     f"Pass 1 batch {bi} failed with {len(batch)} items ({str(e)[:100]}) - "
+                     f"splitting it in two and retrying.",
+                     pass_no=1, model=model, batch_index=bi, batch_total=len(batches),
+                     batch_phase="retry")
+                mid = len(batch) // 2
+                out: list = []
+                for part, suffix in ((batch[:mid], "a"), (batch[mid:], "b")):
+                    out += await _pass1_resilient(part, note, f"{label}{suffix}", bi)
+                return out
+            msg = f"Pass 1: '{batch[0].name}' could not be classified ({str(e)[:140]})."
+            batch_errors.append(msg)
+            emit("pass1", "warn", msg, pass_no=1, model=model, batch_index=bi,
+                 batch_total=len(batches), batch_phase="failed")
+            return []
+        if not thread_summary:
+            thread_summary = (data.get("thread_summary") or "").strip()
+        reply = [m for m in (data.get("items") or []) if isinstance(m, dict)]
+        got = _reply_keys(reply)
+        for it in [x for x in batch if x.key not in got]:
+            emit("pass1", "warn",
+                 f"Pass 1 gave no verdict for '{it.name}' - asking about it on its own…",
+                 pass_no=1, model=model, batch_index=bi, batch_total=len(batches),
+                 batch_phase="retry")
+            try:
+                d2 = await _pass1_call([it], note, f"{label}-{it.key}")
+            except Exception as e:
+                batch_errors.append(
+                    f"Pass 1: '{it.name}' could not be classified ({str(e)[:140]}).")
+                continue
+            r2 = [m for m in (d2.get("items") or []) if isinstance(m, dict)]
+            if it.key in _reply_keys(r2):
+                reply += r2
+            else:
+                batch_errors.append(f"Pass 1: the model returned no verdict for '{it.name}'.")
+        return reply
 
     all_items: list = []
-    thread_summary = ""
     for bi, batch in enumerate(batches, 1):
         note = (f"This is batch {bi} of {len(batches)}. You are seeing SOME of the thread's "
                 f"items below; classify ONLY those. Other batches cover the rest, but all "
@@ -941,43 +1113,79 @@ async def extract_thread_sheets(
                 if len(batches) > 1 else "")
         # Sent -> received bracket around the actual network call, so the live
         # UI can show "waiting for a response" instead of a step that looks
-        # frozen for however long one vision call takes — and, with more than
-        # one batch, exactly which one is in flight right now.
+        # frozen — and, with more than one batch, exactly which one is in flight.
         emit("pass1", "spin",
              f"Pass 1 — sending batch {bi} of {len(batches)} ({len(batch)} item(s)) to {model}…",
              pass_no=1, model=model, batch_index=bi, batch_total=len(batches), batch_phase="sent")
-        # A batch that ultimately fails (the model call's own internal
-        # retries already exhausted) must not throw away every OTHER batch's
-        # results — a long thread with, say, 6 pass-1 calls shouldn't lose
-        # all 6 because call #4 hit a transient error. Its items just don't
-        # get classified this run; everything else still proceeds normally,
-        # and a later re-run picks up exactly this gap (nothing here was
-        # marked as read, so it isn't skipped next time).
-        try:
-            data = await triage_prompt.run_pass1_batch(th, batch, note, model, api_key, label=f"pass1-batch{bi}")
-        except Exception as e:
-            msg = (f"Pass 1 batch {bi}/{len(batches)} failed ({str(e)[:160]}) — "
-                   f"its {len(batch)} item(s) were not classified this run.")
-            batch_errors.append(msg)
-            emit("pass1", "warn", msg, pass_no=1, model=model,
-                 batch_index=bi, batch_total=len(batches), batch_phase="failed")
-            continue
-        count_llm()
+        all_items += await _pass1_resilient(batch, note, f"pass1-batch{bi}", bi)
         emit("pass1", "spin",
              f"Pass 1 — batch {bi} of {len(batches)} received.",
              pass_no=1, model=model, batch_index=bi, batch_total=len(batches), batch_phase="received")
-        all_items += (data.get("items") or [])
-        if not thread_summary:
-            thread_summary = (data.get("thread_summary") or "").strip()
+
+    # One verdict per item. If the same item is judged twice (a model echoing
+    # another batch's label), a timesheet/certificate/approval verdict is never
+    # overwritten by "other"/"noise" — losing a sheet is the costlier mistake.
+    _data_kinds = ("timesheet", "leave_certificate", "approval")
+    verdicts: dict[str, dict] = {}
+    unresolved: list[dict] = []
+    for m in all_items:
+        it = resolve_source(str(m.get("source") or ""), th.items)
+        if it is None:
+            unresolved.append(m)
+            continue
+        prev = verdicts.get(it.key)
+        if prev is None or (str(prev.get("kind") or "").lower() not in _data_kinds
+                            and str(m.get("kind") or "").lower() in _data_kinds):
+            verdicts[it.key] = m
+
+    # ---- second look at everything filed as other/noise that has pictures ----
+    # Pass 1 is a quick triage over several items at once; a dense screenshot of
+    # a weekly timesheet can be waved through as "other". Every picture-bearing
+    # item (never a message body) that came back other/noise is shown AGAIN,
+    # alone, at full detail, with an explicit prompt to look harder. A positive
+    # verdict from the second look wins; an unchanged one stands.
+    if settings.pass1_rescue_other:
+        rescue = [it for it in th.items
+                  if _wants_second_look(it)
+                  and str((verdicts.get(it.key) or {}).get("kind") or "").lower()
+                  not in _data_kinds
+                  and it.key in verdicts]
+        for it in rescue:
+            note = ("SECOND LOOK. A quick first pass filed this item as 'other'/'noise'. Look at "
+                    "it again in full before agreeing: a screenshot, photo, scan or spreadsheet of "
+                    "a timesheet / attendance table, a leave record or certificate, an email that "
+                    "states leave dates (e.g. 'I will be on sick leave from 3 to 5 June'), or an "
+                    "approval message must NOT be filed as other. Keep 'other' only if it is "
+                    "genuinely unrelated (logo, banner, signature block, advertisement, invoice, "
+                    "ordinary conversation).")
+            try:
+                d2 = await _pass1_call([it], note, f"pass1-rescue-{it.key}",
+                                       detail=settings.pass1_rescue_detail)
+            except Exception as e:
+                batch_errors.append(
+                    f"Pass 1 second look: '{it.name}' could not be re-checked ({str(e)[:120]}).")
+                continue
+            r2 = [m for m in (d2.get("items") or []) if isinstance(m, dict)]
+            for m in r2:
+                hit = resolve_source(str(m.get("source") or ""), th.items)
+                if (hit is not None and hit.key == it.key
+                        and str(m.get("kind") or "").lower() in _data_kinds):
+                    verdicts[it.key] = m
+                    emit("pass1", "warn",
+                         f"Second look reclassified '{it.name}' as {m.get('kind')}.",
+                         pass_no=1, model=model)
+                    break
+
+    final_items = list(verdicts.values()) + unresolved
 
     def _noise_label(source: str) -> str:
         it = resolve_source(source, th.items)
         return it.name if it is not None else source
 
-    noise = [_noise_label(str(m.get("source"))) for m in all_items
-             if isinstance(m, dict) and (m.get("kind") or "").lower() == "noise"]
+    noise = [_noise_label(str(m.get("source"))) for m in final_items
+             if (m.get("kind") or "").lower() == "noise"]
     triage = _normalise_pass1_items(
-        [m for m in all_items if isinstance(m, dict) and (m.get("kind") or "").lower() != "noise"])
+        [m for m in final_items if (m.get("kind") or "").lower() != "noise"])
 
     # Approval/summary reason over fresh AND reused sheets together, so a
     # signature found on a message outside this run's window (or already
@@ -991,8 +1199,8 @@ async def extract_thread_sheets(
     # different shape than the per-person sheets pass 2 is built to read —
     # extracting it here would pick one row and silently drop everyone else.
     # Pass 1 already flagged it (triage_prompt.py); route it away from pass 2
-    # entirely rather than let it through as an ordinary timesheet. This is
-    # the ONLY thing that changes pass 2's input — pass 2 itself is untouched.
+    # rather than let it through as an ordinary timesheet. It is surfaced as a
+    # persistent WARNING on every item staged from this thread.
     multi_employee_items = [t for t in confirmed_kind if t.get("covers_multiple_employees")]
     data_items = [t for t in confirmed_kind if not t.get("covers_multiple_employees")]
     multi_employee_labels: list[str] = []
@@ -1018,17 +1226,45 @@ async def extract_thread_sheets(
          summary=full_summary,
          thread_summary=full_summary)
 
+    warnings: list[str] = list(th.unreadable)
+    if multi_employee_labels:
+        warnings.append(
+            "Not extracted — looks like a multi-employee roster (upload it on the Bulk Upload "
+            "page): " + ", ".join(multi_employee_labels))
+
+    # ---- copies of ONE timesheet: read one, keep them all (see alternates.py) ----
+    from app.services.extract_email import alternates as alternates_mod
+    alt = await alternates_mod.resolve(
+        th, data_items, model, api_key, resolve_source=resolve_source, emit=emit)
+    if alt.calls:
+        for _ in range(alt.calls):
+            count_llm()
+    if alt.skip_keys:
+        def _is_skipped(t: dict) -> bool:
+            it = resolve_source(t.get("source"), th.items)
+            return it is not None and it.key in alt.skip_keys
+        data_items = [t for t in data_items if not _is_skipped(t)]
+    warnings.extend(alt.warnings)
+
     meta = {
-        "method": "thread-two-pass", "model": model, "calls": len(batches),
-        "sheet_count": 0, "errors": batch_errors, "skipped": th.dropped, "conflicts": [],
+        "method": "thread-two-pass", "model": model, "calls": pass1_calls,
+        "sheet_count": 0, "errors": batch_errors, "warnings": warnings,
+        "incomplete": bool(batch_errors),
+        "skipped": th.dropped, "conflicts": [],
         "noise": noise, "summary": full_summary.get("headline", ""),
         "summary_obj": full_summary, "triage": triage,
         "thread_summary": full_summary,
         "_opened_containers": list(th.opened_containers),
         "multi_employee_skipped": multi_employee_labels,
+        "alternates": alt.records,
     }
 
+    def _finish_meta() -> None:
+        meta["incomplete"] = bool(batch_errors)
+        meta["warnings"] = warnings
+
     if not data_items:
+        _finish_meta()
         if reused_sheets:
             meta["sheet_count"] = len(reused_sheets)
             meta["reused_sheets"] = len(reused_sheets)
@@ -1038,29 +1274,43 @@ async def extract_thread_sheets(
     # ---- PASS 2: read only the confirmed items -----------------------------
     pairs = thread_prompt.confirmed_sheets(data_items, th.items)
     if not pairs:
+        batch_errors.append("pass 1 confirmed sheets that could not be resolved to any item")
+        emit("extract", "warn", batch_errors[-1])
+        _finish_meta()
         if reused_sheets:
             meta["sheet_count"] = len(reused_sheets)
             meta["reused_sheets"] = len(reused_sheets)
             return reused_sheets, approval, [], meta
-        batch_errors.append("pass 1 confirmed sheets that could not be resolved to any item")
-        emit("extract", "warn", batch_errors[-1])
         return [], approval, [], meta
 
-    batches2: list[list] = []
-    cur: list = []
-    n = 0
-    for pair in pairs:
-        k = max(len(pair[0].images), 1)
-        if cur and n + k > settings.max_images_per_call:
-            batches2.append(cur)
-            cur, n = [], 0
-        cur.append(pair)
-        n += k
-    if cur:
-        batches2.append(cur)
+    def _make_batches(pair_list: list) -> list[list]:
+        out: list[list] = []
+        cur: list = []
+        n = 0
+        # Bound a call by SHEETS as well as images. Each sheet's reply lists every
+        # date of a month, so ~12 one-image sheets in one call (14 weekly/monthly
+        # reports in one email, say) overran the model's output limit, came back
+        # as cut-off JSON, and the whole batch was lost. Image count alone can't
+        # see that.
+        max_sheets = max(int(getattr(settings, "pass2_max_sheets_per_call", 0) or 0), 0)
+        for pair in pair_list:
+            k = max(len(pair[0].images), 1)
+            if cur and (n + k > settings.max_images_per_call
+                        or (max_sheets and len(cur) >= max_sheets)):
+                out.append(cur)
+                cur, n = [], 0
+            cur.append(pair)
+            n += k
+        if cur:
+            out.append(cur)
+        return out
+
+    batches2 = _make_batches(pairs)
 
     needs_body_context = any(it.name.startswith("email body") for it, _ in pairs)
-    body_text = "\n".join(m.body for m in th.messages)[:8000] if needs_body_context else ""
+    body_text = ""
+    if needs_body_context:
+        body_text = "\n".join(b for _m, b in triage_prompt.budgeted_bodies(th))
 
     emit("pass2", "spin",
          f"Pass 2 of 2 — extracting {len(pairs)} confirmed sheet(s) ({len(batches2)} call(s))…",
@@ -1068,25 +1318,55 @@ async def extract_thread_sheets(
 
     raw_sheets: list = []
     pass2_call_count = 0
+    failed_keys: set[str] = set()      # items already reported as failed - not re-tried below
+
+    async def _pass2_adaptive(batch: list, label: str, bi: int) -> dict:
+        """One Pass 2 call; if it fails (incl. a reply cut off at the output
+        limit) and holds more than one sheet, split it in half and retry each
+        half (down to a single sheet) instead of losing the whole batch. A
+        single sheet that still fails raises and is recorded by the caller.
+        Returns {"sheets": [...]}."""
+        nonlocal pass2_call_count
+        try:
+            data = await thread_prompt.run_pass2_batch(
+                batch, body_text, model, api_key, calendars=calendars, label=label)
+            count_llm()
+            pass2_call_count += 1
+            return data
+        except Exception as e:
+            if len(batch) <= 1:
+                raise
+            emit("pass2", "warn",
+                 f"Pass 2 batch {bi} failed with {len(batch)} sheets ({str(e)[:100]}) - "
+                 f"splitting it in two and retrying.",
+                 pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="retry")
+            mid = len(batch) // 2
+            merged: list = []
+            for part, suffix in ((batch[:mid], "a"), (batch[mid:], "b")):
+                try:
+                    merged += (await _pass2_adaptive(part, f"{label}{suffix}", bi)).get("sheets") or []
+                except Exception as e2:
+                    failed_keys.update(it.key for it, _ in part)
+                    names = ", ".join(it.name for it, _ in part)
+                    batch_errors.append(
+                        f"Pass 2: could not read {names} even after splitting ({str(e2)[:120]}).")
+            return {"sheets": merged}
+
     for bi, batch in enumerate(batches2, 1):
-        # Same sent -> received bracket as pass 1: the UI shows "waiting for a
-        # response" for the actual duration of the network call, not a step
-        # that just looks stuck, and (with more than one batch) which one.
+        # Same sent -> received bracket as pass 1.
         emit("pass2", "spin",
              f"Pass 2 — sending batch {bi} of {len(batches2)} ({len(batch)} sheet(s)) to {model}…",
              pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="sent")
-        # Same reasoning as pass 1: one batch's call ultimately failing must
-        # not discard every OTHER batch's already-confirmed sheets. Its own
-        # sheets just don't get extracted this run — noted below, and picked
-        # up by a later re-run since nothing here gets marked as read.
+        # One batch's call ultimately failing must not discard every OTHER
+        # batch's already-confirmed sheets. The failure is recorded (marking
+        # the run incomplete) and its sheets are picked up by the retry.
         try:
-            data = await thread_prompt.run_pass2_batch(
-                batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}")
-            count_llm()
-            pass2_call_count += 1
+            data = await _pass2_adaptive(batch, f"pass2-batch{bi}", bi)
         except Exception as e:
+            failed_keys.update(it.key for it, _ in batch)
+            names = ", ".join(it.name for it, _ in batch)
             msg = (f"Pass 2 batch {bi}/{len(batches2)} failed ({str(e)[:160]}) — "
-                   f"its {len(batch)} sheet(s) were not extracted this run.")
+                   f"not extracted this run: {names}.")
             batch_errors.append(msg)
             emit("pass2", "warn", msg, pass_no=2, model=model,
                  batch_index=bi, batch_total=len(batches2), batch_phase="failed")
@@ -1094,33 +1374,40 @@ async def extract_thread_sheets(
         emit("pass2", "spin",
              f"Pass 2 — batch {bi} of {len(batches2)} received.",
              pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="received")
-        sheets_out = data.get("sheets") or []
-        if not sheets_out and batch:
-            # Every item in this batch was already CONFIRMED by pass 1 (which
-            # read these same images successfully moments earlier), so a
-            # flatly empty reply here is far more likely a bad/degenerate
-            # model generation than "these are genuinely blank documents" —
-            # retry once before accepting nothing for real, confirmed items.
-            emit("pass2", "spin",
-                 f"Pass 2 batch {bi} of {len(batches2)} returned nothing for "
-                 f"{len(batch)} confirmed item(s) — retrying once…",
-                 pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="retry")
-            try:
-                data = await thread_prompt.run_pass2_batch(
-                    batch, body_text, model, api_key, calendars=calendars, label=f"pass2-batch{bi}-retry")
-                count_llm()
-                pass2_call_count += 1
-                emit("pass2", "spin",
-                     f"Pass 2 — batch {bi} of {len(batches2)} received (retry).",
-                     pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="received")
-                sheets_out = data.get("sheets") or []
-            except Exception as e:
-                msg = (f"Pass 2 batch {bi}/{len(batches2)} retry failed ({str(e)[:160]}) — "
-                       f"its {len(batch)} sheet(s) were not extracted this run.")
-                batch_errors.append(msg)
-                emit("pass2", "warn", msg, pass_no=2, model=model,
-                     batch_index=bi, batch_total=len(batches2), batch_phase="failed")
-        raw_sheets += sheets_out
+        raw_sheets += [s for s in (data.get("sheets") or []) if isinstance(s, dict)]
+
+    # ---- coverage check: every confirmed item must have produced a sheet ----
+    # Pass 1 read these same images successfully and called them timesheets /
+    # certificates, so an item missing from the reply is a dropped item (the
+    # model skipped one of several, or returned nothing), not a blank document.
+    # Re-ask for each one on its own; whatever still has no sheet is recorded.
+    def _covered_keys(sheet_list: list) -> set[str]:
+        out: set[str] = set()
+        for sh in sheet_list:
+            hit = resolve_source(str(sh.get("source") or ""), th.items)
+            if hit is not None:
+                out.add(hit.key)
+        return out
+
+    covered = _covered_keys(raw_sheets)
+    # Items already reported as a Pass 2 failure are not re-tried here.
+    for pair in [p for p in pairs if p[0].key not in covered and p[0].key not in failed_keys]:
+        it = pair[0]
+        emit("pass2", "spin",
+             f"Pass 2 returned no sheet for '{it.name}' — reading it again on its own…",
+             pass_no=2, model=model, batch_phase="retry")
+        try:
+            d2 = await _pass2_adaptive([pair], f"pass2-recover-{it.key}", 0)
+        except Exception as e:
+            batch_errors.append(f"Pass 2: '{it.name}' could not be read ({str(e)[:140]}).")
+            continue
+        got = [s for s in (d2.get("sheets") or []) if isinstance(s, dict)]
+        if it.key in _covered_keys(got):
+            raw_sheets += got
+        else:
+            batch_errors.append(
+                f"Pass 2: no timesheet data came back for '{it.name}' although it was "
+                "identified as one.")
 
     fresh_sheets = _normalise_pass2_sheets(raw_sheets, data_items, th.items)
     meta["_fresh_by_digest"] = {
@@ -1137,7 +1424,9 @@ async def extract_thread_sheets(
         for s in sheets)
     # UI gets the model JSON + normalised sheets (minus bulky OCR text).
     ui_sheets = [{k: v for k, v in s.items() if k != "text"} for s in sheets]
-    emit("pass2", "ok", f"Pass 2 done — {len(sheets)} sheet(s), {total_days} day(s) accounted for.",
+    emit("pass2", "ok" if not batch_errors else "warn",
+         f"Pass 2 done — {len(sheets)} sheet(s), {total_days} day(s) accounted for"
+         + (f"; {len(batch_errors)} problem(s) - run incomplete" if batch_errors else "") + ".",
          pass_no=2,
          raw={"sheets": raw_sheets},
          sheets=ui_sheets,
@@ -1149,6 +1438,7 @@ async def extract_thread_sheets(
                                   + sum(len(s.get(b) or []) for b in BUCKETS))}
                   for s in sheets])
 
-    meta["calls"] = len(batches) + pass2_call_count
+    meta["calls"] = pass1_calls + pass2_call_count
     meta["sheet_count"] = len(sheets)
+    _finish_meta()
     return sheets, approval, [], meta

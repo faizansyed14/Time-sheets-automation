@@ -486,4 +486,5 @@ bash scripts/prod/start.sh
 
 Docker command references: `commands/dev.txt`, `commands/prod.txt`.
 Related docs: [`ENVIRONMENTS.md`](ENVIRONMENTS.md), [`EXTRACTION_FLOWS.md`](EXTRACTION_FLOWS.md),
-[`SECURITY.md`](SECURITY.md), [`DATA_STORAGE.md`](DATA_STORAGE.md).
+[`SECURITY.md`](SECURITY.md), [`DATA_STORAGE.md`](DATA_STORAGE.md),
+[`RELIABILITY.md`](RELIABILITY.md) (extraction accuracy, retries, locks, queues).

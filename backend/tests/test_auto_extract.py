@@ -105,6 +105,10 @@ async def test_no_sheets_found_threads_are_also_skipped_not_reprocessed_forever(
     ]
 
     monkeypatch.setattr(sheet_cache, "last_extraction_at_bulk", _never_extracted_bulk)
+    # This test is about "checked after the newest mail"; the separate "mark predates
+    # the rules revision" rule is covered in test_extraction_reliability.py.
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "extract_rules_revision_at", "2000-01-01T00:00:00+00:00")
 
     async with SessionLocal() as db:
         for pmid, checked_at in (("AE-empty-fresh", now), ("AE-empty-stale", now)):

@@ -154,7 +154,7 @@ CORS_ORIGINS=["https://your-domain.com"]
   remove the `db:` service, `pg_data` volume, and `depends_on: db` lines, **or**
   start only what you need:
   ```bash
-  docker compose -f docker-compose.prod.yml --env-file .env up -d backend worker frontend
+  docker compose -f docker-compose.prod.yml --env-file .env up -d backend worker worker-extract frontend
   ```
 - The backend runs `alembic upgrade head` against **prod** RDS on boot.
   **Snapshot prod RDS before each deploy** that includes a new migration.

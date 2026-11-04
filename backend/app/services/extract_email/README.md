@@ -23,7 +23,8 @@ path — a vision model is mandatory for Extract Email / Upload
 | `upload.py` | Upload / chat extract |
 | `preview.py` | LLM egress audit (no API call) |
 | `thread_scope.py` | When to merge prior thread message |
-| `sheet_cache.py` / `thread_summary.py` | Extracted/New record, last extraction watermark, thread summary |
+| `sheet_cache.py` / `thread_summary.py` | Extracted/New record, last extraction watermark (ignored while a run is **incomplete**), thread summary |
+| `thread_lock.py` | Redis lock per conversation (extraction) and per employee+month (Accept) |
 | `streaming.py` / `progress.py` | SSE live progress |
 
 Import: `from app.services.extract_email import extract_full_email`
@@ -41,5 +42,13 @@ Legacy: `from app.services.agents import full_email_extract` (re-exports + `_` a
 
 Single vision model (`OPENAI_VISION_MODEL`) via chat completions. See
 `PASS1_IMAGE_DETAIL`, `PASS1_BATCH_SIZE`, `MAX_IMAGES_PER_CALL`, `PDF_MAX_PAGES`,
-`IMG_MAX_DIM`, `MIN_IMAGE_BYTES`, `OCR_MIN_CHARS`, `ATTACHMENT_MODE`,
-`USE_LIBREOFFICE` in `.env` / `core/config.py`.
+`IMG_MAX_DIM`, `OCR_MIN_CHARS`, `ATTACHMENT_MODE`, `USE_LIBREOFFICE`,
+`EXTRACT_MAX_OUTPUT_TOKENS`, `MAX_THREAD_MESSAGES`, `BODIES_CHAR_BUDGET`,
+`PASS1_RESCUE_OTHER`, `MAX_EML_DEPTH` in `.env` / `core/config.py`.
+(`MIN_IMAGE_BYTES` / `MIN_IMAGE_ATTACHMENT_KB` are no longer read.)
+
+## Reliability
+
+Accuracy first — no cost-driven caps, no silent failures. Retries/splits/second
+looks, incomplete-run handling, locks, queues and duplicate protection are
+documented in [`docs/RELIABILITY.md`](../../../../docs/RELIABILITY.md).

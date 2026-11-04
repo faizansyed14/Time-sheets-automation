@@ -24,8 +24,8 @@ IMAGE_MAX_SIDE = 2200
 STITCH_MAX_WIDTH = 2200
 STITCH_MAX_HEIGHT = 8000
 # Outlook pastes attendance sheets into the HTML body as inline CID images.
-# Keep in sync with settings.min_image_attachment_kb (default 70).
-_INLINE_TIMESHEET_MIN_BYTES = 70 * 1024  # keep — real pasted grids / screenshots
+# Keep in sync with settings.min_image_attachment_kb (default 30).
+_INLINE_TIMESHEET_MIN_BYTES = 30 * 1024  # keep — real pasted grids / screenshots
 _INLINE_JUNK_MAX_BYTES = 12_000          # skip — tiny signature logos/icons
 _CID_REF_RE = re.compile(r"cid:([^\"'\s>)]+)", re.IGNORECASE)
 _GENERIC_INLINE_NAME_RE = re.compile(

@@ -24,6 +24,16 @@ import { ListSkeleton } from "../components/skeletons";
 /** 202610 -> "Oct 2026" (the month an employee was marked inactive). */
 const inactiveSince = (ym: number) => `${MONTHS[ym % 100]} ${Math.floor(ym / 100)}`;
 
+/** "2026-10-05" -> "05 Oct 2026" (full date shown in the table). */
+const fullDate = (iso?: string | null) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso ?? "");
+  return m ? `${m[3]} ${MONTHS[Number(m[2])]} ${m[1]}` : "";
+};
+const todayIso = () => {
+  const n = new Date();
+  return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, "0")}-${String(n.getDate()).padStart(2, "0")}`;
+};
+
 const EMPTY: EmployeeInput = {
   employee_id: "",
   name: "",
@@ -37,6 +47,8 @@ const EMPTY: EmployeeInput = {
   work_email: null,
   personal_email: null,
   active: true,
+  joining_date: null,
+  left_date: null,
 };
 
 type StatusFilter = "active" | "inactive" | "all";
@@ -84,7 +96,7 @@ export default function EmployeesPage() {
   const statusMut = useMutation({
     mutationFn: ({ id, active }: { id: string; active: boolean }) => setEmployeeStatus(id, active),
     onSuccess: (_data, vars) => {
-      toast("info", vars.active ? "Employee reactivated" : "Employee marked inactive");
+      toast("info", vars.active ? "Employee reactivated" : "Employee marked as left");
       invalidate();
     },
     onError: (e: any) => toast("error", "Could not update status", e?.response?.data?.detail ?? String(e)),
@@ -140,7 +152,8 @@ export default function EmployeesPage() {
   );
 
   const openCreate = () => {
-    setForm(EMPTY);
+    // A person added now joins today; clear the date to count them in every month.
+    setForm({ ...EMPTY, joining_date: todayIso() });
     setModal({ mode: "create" });
   };
   const openEdit = (row: Employee) => {
@@ -213,11 +226,11 @@ export default function EmployeesPage() {
             className="max-w-[110px] py-1.5 text-xs"
           >
             <option value="active">Active</option>
-            <option value="inactive">Inactive</option>
+            <option value="inactive">Left</option>
             <option value="all">All statuses</option>
           </Select>
           <p className="ml-auto text-[11px] text-slate-400">
-            {visible.length} of {activeCount} active{(rows?.length ?? 0) > activeCount ? ` · ${(rows?.length ?? 0) - activeCount} inactive` : ""}
+            {visible.length} of {activeCount} active{(rows?.length ?? 0) > activeCount ? ` · ${(rows?.length ?? 0) - activeCount} left` : ""}
           </p>
         </div>
 
@@ -338,12 +351,12 @@ export default function EmployeesPage() {
                           r.active
                             ? undefined
                             : r.inactive_ym
-                              ? `Inactive since ${inactiveSince(r.inactive_ym)} — shown in Dashboard/Export up to and including that month, not after.`
-                              : "Inactive — shown in Dashboard/Export only for months where they have a record or sheet."
+                              ? `Left on ${fullDate(r.left_date) || inactiveSince(r.inactive_ym)} — counted in Dashboard/Export for earlier months, not from that month on. Change it in Edit.`
+                              : "Left (date not recorded) — shown in Dashboard/Export only for months where they have a record or sheet."
                         }
                       >
                         <Badge tone={r.active ? "success" : "slate"} className="px-1.5 py-0 text-[10px]">
-                          {r.active ? "Active" : r.inactive_ym ? `Inactive · ${inactiveSince(r.inactive_ym)}` : "Inactive"}
+                          {r.active ? "Active" : r.left_date ? `Left · ${fullDate(r.left_date)}` : r.inactive_ym ? `Left · ${inactiveSince(r.inactive_ym)}` : "Left"}
                         </Badge>
                       </span>
                     </td>
@@ -357,13 +370,13 @@ export default function EmployeesPage() {
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
                         <button
-                          title={r.active ? "Mark inactive" : "Reactivate"}
+                          title={r.active ? "Mark as left" : "Reactivate"}
                           onClick={() => {
                             const next = !r.active;
                             if (
                               !next &&
                               !confirm(
-                                `Mark ${r.name} (${r.employee_id}) inactive? Their records and files are kept. They stay in the Dashboard and Export for this month and earlier months, and drop off from next month.`
+                                `Mark ${r.name} (${r.employee_id}) as left today? Their records and files are kept. They stay in the Dashboard and Export for earlier months and drop off from this month on (you can change the left date in Edit).`
                               )
                             )
                               return;
@@ -464,6 +477,22 @@ export default function EmployeesPage() {
               onChange={(e) => setForm({ ...form, contact_no: e.target.value || null })}
             />
           </Field>
+          <Field label="Joining date (empty = every month)" name="joining_date">
+            <Input
+              type="date"
+              value={form.joining_date ?? ""}
+              onChange={(e) => setForm({ ...form, joining_date: e.target.value || null })}
+            />
+          </Field>
+          {modal?.mode === "edit" && !form.active && (
+            <Field label="Left date" name="left_date">
+              <Input
+                type="date"
+                value={form.left_date ?? ""}
+                onChange={(e) => setForm({ ...form, left_date: e.target.value || null })}
+              />
+            </Field>
+          )}
         </div>
         <div className="mt-5 flex justify-end gap-2">
           <Button variant="secondary" onClick={() => setModal(null)}>

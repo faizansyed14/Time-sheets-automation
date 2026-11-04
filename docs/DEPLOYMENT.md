@@ -62,7 +62,8 @@ If you don't care about losing in-flight jobs on restart, you can drop it too.
 ```
 redis    — Celery broker + cache (small appendonly volume)
 backend  — FastAPI, uvicorn --workers ${UVICORN_WORKERS:-4}; runs Alembic on boot
-worker   — Celery worker + beat (--concurrency ${CELERY_CONCURRENCY:-3})
+worker   — Celery worker + beat for OTP / reminders / inbox sync (queue `celery`, --concurrency ${CELERY_CONCURRENCY:-3})
+worker-extract — Celery worker for Extract Email (queue `extract`, --concurrency ${EXTRACT_CONCURRENCY:-3}); see RELIABILITY.md §7
 frontend — built SPA (static nginx)
 nginx    — gateway: SPA → frontend, API → backend; published on 127.0.0.1:8080
 ```
@@ -219,7 +220,7 @@ curl -fsS http://localhost:8080/health
 docker compose -f docker-compose.dev.yml logs nginx --tail 30
 ```
 
-You should see four services: `redis`, `backend`, `worker`, `nginx`.
+You should see five services: `redis`, `backend`, `worker`, `worker-extract`, `nginx`.
 
 ---
 
@@ -303,7 +304,7 @@ docker compose -f docker-compose.dev.yml restart nginx
 
 # changed .env (model names, secrets, limits)? `restart` does NOT re-read it —
 # compose reads env_file only when a container is created. Recreate:
-docker compose -f docker-compose.dev.yml --env-file .env up -d backend worker
+docker compose -f docker-compose.dev.yml --env-file .env up -d backend worker worker-extract
 docker compose -f docker-compose.dev.yml restart nginx
 
 # restart gateway after editing nginx/gateway.conf or nginx/frontend.conf

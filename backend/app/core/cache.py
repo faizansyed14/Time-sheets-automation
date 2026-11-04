@@ -73,6 +73,27 @@ class _MemoryCache:
             self._data[key] = (cur, exp)
             return cur
 
+    async def set_if_absent(self, key: str, value: Any, ttl: int) -> bool:
+        async with self._lock:
+            if not self._expired(key):
+                return False
+            self._data[key] = (value, time.time() + ttl)
+            return True
+
+    async def compare_and_delete(self, key: str, value: Any) -> bool:
+        async with self._lock:
+            if self._expired(key) or self._data[key][0] != value:
+                return False
+            self._data.pop(key, None)
+            return True
+
+    async def compare_and_expire(self, key: str, value: Any, ttl: int) -> bool:
+        async with self._lock:
+            if self._expired(key) or self._data[key][0] != value:
+                return False
+            self._data[key] = (value, time.time() + ttl)
+            return True
+
     async def sliding_window_add(self, key: str, window_seconds: int) -> int:
         """Record one event now; return the count within the last window."""
         async with self._lock:
@@ -168,6 +189,38 @@ class Cache:
         pipe.expire(zkey, window_seconds + 1)
         res = await pipe.execute()
         return int(res[2])
+
+    # ---- distributed lock (SET NX EX + token-checked release/extend) --------
+    _UNLOCK_LUA = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('del', KEYS[1]) else return 0 end")
+    _EXTEND_LUA = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end")
+
+    async def acquire_lock(self, key: str, ttl: int, token: str) -> bool:
+        """Atomically take `key` for `ttl` seconds. True when WE hold it now.
+        Redis SET NX EX when available (shared across API + every worker);
+        otherwise the in-process fallback (single-process dev/tests)."""
+        r = await self._client()
+        if r is None:
+            return await self._mem.set_if_absent(key, token, ttl)
+        return bool(await r.set(key, token, nx=True, ex=ttl))
+
+    async def release_lock(self, key: str, token: str) -> bool:
+        """Release only if we still own it (a lock that expired and was taken
+        by someone else must not be deleted by the previous holder)."""
+        r = await self._client()
+        if r is None:
+            return await self._mem.compare_and_delete(key, token)
+        return bool(await r.eval(self._UNLOCK_LUA, 1, key, token))
+
+    async def extend_lock(self, key: str, token: str, ttl: int) -> bool:
+        """Heartbeat: push the expiry out while the owner is still working."""
+        r = await self._client()
+        if r is None:
+            return await self._mem.compare_and_expire(key, token, ttl)
+        return bool(await r.eval(self._EXTEND_LUA, 1, key, token, ttl))
 
     async def ping(self) -> bool:
         return (await self._client()) is not None

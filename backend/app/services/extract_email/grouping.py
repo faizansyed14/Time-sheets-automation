@@ -135,6 +135,21 @@ def normalise_sheet(s: dict, calendar_row: dict | None = None) -> dict:
             n = int(d)
             if 1 <= n <= last:
                 clean_missing.append(n)
+        # A weekly / half-month sheet (or any sheet whose rows span about a week)
+        # only claims its OWN span. The model sometimes lists every other day of the
+        # month as "missing" for such a file - those days are simply not on this
+        # sheet (other weekly files cover them), so they are not gaps. A real gap
+        # INSIDE the sheet's own span, and a sheet that silently stops partway
+        # through a long period, are kept.
+        covered_days = sorted({int(d[8:10]) for b in BUCKETS + DAY_FIELDS for d in out[b]
+                               if d.startswith(pre)}
+                              | {int(u["date"][8:10]) for u in out["uncertain_days"]
+                                 if str(u.get("date", "")).startswith(pre)})
+        if (out.get("kind") == "timesheet" and covered_days
+                and (out.get("period_type") in ("week", "half_month")
+                     or covered_days[-1] - covered_days[0] + 1 <= 8)):
+            lo, hi = covered_days[0], covered_days[-1]
+            clean_missing = [d for d in clean_missing if lo <= d <= hi]
         out["missing_days"] = sorted(set(clean_missing))
         if out.get("period_type") == "full_month":
             accounted = set()
@@ -309,6 +324,85 @@ def calendar_mismatch_flags(month: int, year: int, sheets: list[dict], row: dict
     return flags
 
 
+_MONTH_LABEL = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _ym_of(d) -> tuple[int, int] | None:
+    d = str(d or "").strip()
+    if not _ISO.match(d):
+        return None
+    try:
+        y, m = int(d[:4]), int(d[5:7])
+    except ValueError:
+        return None
+    return (y, m) if 1 <= m <= 12 else None
+
+
+def split_sheet_by_month(s: dict) -> list[dict]:
+    """One sheet -> one sheet PER CALENDAR MONTH it has dates in.
+
+    Records are per employee + month. A weekly sheet for 29 Jun - 5 Jul, a
+    leave certificate for 28 Jun - 3 Jul, or a 26th-25th billing-cycle sheet
+    carries days in two months, but the model gives the sheet ONE (month, year).
+    Left whole, the other month's days sat in the wrong month's group as
+    "outside the month" dates and were never booked to the month they belong to.
+    Each shard keeps only its own month's dates, so each month's record is built
+    from the right days; nothing is dropped.
+
+    A sheet whose dates all fall in its declared month (the normal case) is
+    returned untouched."""
+    month, year = s.get("month"), s.get("year")
+    fields = BUCKETS + DAY_FIELDS
+    by_ym: dict[tuple[int, int], dict[str, list]] = {}
+    for b in fields:
+        for d in s.get(b) or []:
+            ym = _ym_of(d)
+            if ym is not None:
+                by_ym.setdefault(ym, {}).setdefault(b, []).append(str(d).strip())
+    unc_by_ym: dict[tuple[int, int], list] = {}
+    for u in s.get("uncertain_days") or []:
+        d = u.get("date") if isinstance(u, dict) else u
+        ym = _ym_of(d)
+        if ym is not None:
+            unc_by_ym.setdefault(ym, []).append(u)
+    months = set(by_ym) | set(unc_by_ym)
+    if not months:
+        return [s]
+    if not (month and year):
+        # The sheet never named its period (a bare certificate): its own dates
+        # decide. One month -> stamp it; several -> split like below.
+        if len(months) == 1:
+            (y0, m0), = months
+            return [{**s, "year": y0, "month": m0}]
+        declared = None
+    elif months <= {(int(year), int(month))}:
+        return [s]
+    else:
+        declared = (int(year), int(month))
+    shards: list[dict] = []
+    for ym in sorted(months):
+        lists = by_ym.get(ym, {})
+        shard = dict(s)
+        for b in fields:
+            shard[b] = sorted(set(lists.get(b, [])))
+        shard["uncertain_days"] = unc_by_ym.get(ym, [])
+        shard["year"], shard["month"] = ym
+        shard["days_covered"] = sum(len(shard[b]) for b in fields)
+        if ym != declared:
+            shard["period_type"] = "partial"
+            shard["missing_days"] = []         # day numbers belong to the declared month
+        elif s.get("period_type") == "full_month":
+            shard["period_type"] = "partial"   # part of its days now live in the neighbouring month
+        if not (shard["days_covered"] or shard["uncertain_days"]):
+            continue
+        spans = " and ".join(f"{_MONTH_LABEL[m]} {y}" for y, m in sorted(months))
+        shard["notes"] = " ".join(x for x in (
+            str(s.get("notes") or ""),
+            f"[spans {spans} - each month's dates were filed into its own month]") if x).strip()
+        shards.append(shard)
+    return shards or [s]
+
+
 async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]) -> list[dict]:
     """Resolve identity (DB-backed fuzzy match), group by employee + month,
     normalise every sheet's dates, and union coverage across the group — the
@@ -318,7 +412,8 @@ async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]
     from app.models.month_calendar import MonthCalendar
     from app.services.pipeline import matching
 
-    data_sheets = [s for s in sheets if s["kind"] in ("timesheet", "leave_certificate")]
+    data_sheets = [shard for s in sheets if s["kind"] in ("timesheet", "leave_certificate")
+                   for shard in split_sheet_by_month(s)]
     if not data_sheets:
         return []
 
@@ -336,12 +431,32 @@ async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]
     for s in data_sheets:
         key = None
         if s["employee_id"] or s["employee_name"]:
-            m = await matching.match_employee(db, s["employee_id"], s["employee_name"])
+            m = await matching.match_employee(
+                db, s["employee_id"], s["employee_name"],
+                sender_email=getattr(email, "sender_email", None),
+                body_text=getattr(email, "body_text", None), corroborate=True)
             if m.employee:
                 key = f"pk:{m.employee.id}"
                 emp_info.setdefault(key, {
                     "employee_pk": m.employee.id, "name": m.employee.name,
                     "employee_id": m.employee.employee_id, "note": m.note})
+                if getattr(m, "low_confidence", False):
+                    # Corroborated by ID / sender address but the NAME only partly matches:
+                    # a blocker, so it is never recommended for acceptance unseen.
+                    emp_info[key].setdefault("match_issues", [])
+                    if m.note not in emp_info[key]["match_issues"]:
+                        emp_info[key]["match_issues"].append(m.note)
+                # Matched on similar spelling alone (no printed ID that agrees, not an
+                # exact or short-form name): say so on the item, so a one-letter
+                # different person ("Sara" / "Sana") is not accepted unnoticed.
+                sheet_id = (s["employee_id"] or "").strip().upper()
+                if (s["employee_name"] and sheet_id != (m.employee.employee_id or "").strip().upper()
+                        and matching.name_match_strength(s["employee_name"], m.employee.name) == "approximate"):
+                    emp_info[key].setdefault("approx_notes", [])
+                    note_txt = (f'Name on the sheet "{s["employee_name"]}" is only an approximate match for '
+                                f'"{m.employee.name}" in the employee list - check this is the same person.')
+                    if note_txt not in emp_info[key]["approx_notes"]:
+                        emp_info[key]["approx_notes"].append(note_txt)
             else:
                 key = ("raw:" + (s["employee_id"] or "").strip().lower()
                        + "|" + (s["employee_name"] or "").strip().lower())
@@ -407,46 +522,69 @@ async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]
 
         for (month, year), part in by_period.items():
             cal_row = calendars.get((month, year)) if month and year else None
-            normalised = [normalise_sheet({**s, "month": month, "year": year}, cal_row) for s in part]
-            multi_overlap, multi_fold = _multi_sheet_flags(normalised)
-            part_folds = [n for n in fold_notes if any(s["name"] in n for s in part)]
-            part_folds = list(dict.fromkeys(part_folds + multi_fold))
-
-            union: dict[str, set] = {b: set() for b in BUCKETS + DAY_FIELDS}
-            uncertain: dict[str, str] = {}
-            issues: list[str] = []
-            missing: set[int] = set()
-            unaccounted: set[str] = set()
-            days_covered_total = 0
-            for ns in normalised:
-                for b in BUCKETS + DAY_FIELDS:
-                    union[b] |= set(ns.get(b) or [])
-                for u in ns.get("uncertain_days") or []:
-                    uncertain.setdefault(u["date"], u["reason"])
-                issues.extend(ns.get("_issues") or [])
-                missing |= {int(d) for d in (ns.get("missing_days") or [])
-                            if str(d).lstrip("-").isdigit()}
-                unaccounted |= set(ns.get("_unaccounted_days") or [])
-                days_covered_total += int(ns.get("days_covered") or 0)
-            issues.extend(_cross_sheet_date_conflicts(normalised))
-            if month and year and (month, year) in calendars:
-                issues.extend(calendar_mismatch_flags(
-                    month, year, normalised, calendars[(month, year)]))
-
-            groups.append({
-                "tag": tag_for(key, month, year),
-                **emp_info[key],
-                "month": month, "year": year,
-                "sheets": normalised,
-                **{b: sorted(union[b]) for b in DAY_FIELDS},
-                "buckets": {b: sorted(union[b]) for b in BUCKETS},
-                "uncertain_days": [{"date": d, "reason": r} for d, r in sorted(uncertain.items())],
-                "issues": list(dict.fromkeys(issues)),
-                "missing_days": sorted(missing),
-                "unaccounted_days": sorted(unaccounted),
-                "days_covered_total": days_covered_total,
-                "period_types": sorted({s.get("period_type") for s in normalised if s.get("period_type")}),
-                "overlap_flags": multi_overlap,
-                "fold_notes": part_folds,
-            })
+            normalised_all = [normalise_sheet({**s, "month": month, "year": year}, cal_row)
+                              for s in part]
+            groups.append(_build_group(
+                key, month, year, normalised_all, calendars, emp_info[key], fold_notes))
     return groups
+
+
+def _sheet_label(s: dict) -> str:
+    return str(s.get("name") or "?")
+
+
+def _build_group(key: str, month, year, normalised: list[dict], calendars: dict,
+                 emp: dict, fold_notes: list[str]) -> dict:
+    """One review group (one employee + month) from its normalised sheets."""
+    multi_overlap, multi_fold = _multi_sheet_flags(normalised)
+    names = {_sheet_label(s) for s in normalised}
+    part_folds = [n for n in fold_notes if any(nm in n for nm in names)]
+    part_folds = list(dict.fromkeys(part_folds + multi_fold + list(emp.get("approx_notes") or [])))
+
+    tag = tag_for(key, month, year)
+
+    union: dict[str, set] = {b: set() for b in BUCKETS + DAY_FIELDS}
+    uncertain: dict[str, str] = {}
+    issues: list[str] = []
+    missing: set[int] = set()
+    unaccounted: set[str] = set()
+    days_covered_total = 0
+    for ns in normalised:
+        for b in BUCKETS + DAY_FIELDS:
+            union[b] |= set(ns.get(b) or [])
+        for u in ns.get("uncertain_days") or []:
+            uncertain.setdefault(u["date"], u["reason"])
+        issues.extend(ns.get("_issues") or [])
+        missing |= {int(d) for d in (ns.get("missing_days") or [])
+                    if str(d).lstrip("-").isdigit()}
+        unaccounted |= set(ns.get("_unaccounted_days") or [])
+        days_covered_total += int(ns.get("days_covered") or 0)
+    issues.extend(emp.get("match_issues") or [])
+    issues.extend(_cross_sheet_date_conflicts(normalised))
+    if month and year and (month, year) in calendars:
+        issues.extend(calendar_mismatch_flags(
+            month, year, normalised, calendars[(month, year)]))
+
+    # A day another sheet of this same employee+month covers is not missing.
+    covered_nums = {int(d[8:10]) for b in BUCKETS + DAY_FIELDS for d in union[b]
+                    if month and year and d.startswith(f"{int(year):04d}-{int(month):02d}-")}
+    covered_nums |= {int(d[8:10]) for d in uncertain
+                     if month and year and d.startswith(f"{int(year):04d}-{int(month):02d}-")}
+    missing -= covered_nums
+
+    return {
+        "tag": tag,
+        **emp,
+        "month": month, "year": year,
+        "sheets": normalised,
+        **{b: sorted(union[b]) for b in DAY_FIELDS},
+        "buckets": {b: sorted(union[b]) for b in BUCKETS},
+        "uncertain_days": [{"date": d, "reason": r} for d, r in sorted(uncertain.items())],
+        "issues": list(dict.fromkeys(issues)),
+        "missing_days": sorted(missing),
+        "unaccounted_days": sorted(unaccounted),
+        "days_covered_total": days_covered_total,
+        "period_types": sorted({s.get("period_type") for s in normalised if s.get("period_type")}),
+        "overlap_flags": multi_overlap,
+        "fold_notes": part_folds,
+    }

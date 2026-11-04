@@ -40,7 +40,7 @@ def _is_body_junk_image(a: dict, body_html: str | None, *, min_img_bytes: int) -
         return False
     size = a.get("size")
     if isinstance(size, (int, float)) and 0 < size < min_img_bytes:
-        return True
+        return True          # tracking pixel / bullet only (see has_extractable_attachments)
     if a.get("is_inline") is True:
         return True
     cid = (a.get("cid") or "").strip().strip("<>")
@@ -54,9 +54,10 @@ def has_extractable_attachments(email: EmailMessage) -> bool:
 
     Lightweight replies ("Approved.", sick-leave cover notes WITH pdfs) must
     NOT trigger a merge of the prior thread message's attachments."""
-    from app.core.config import settings
-
-    min_img = settings.min_image_attachment_kb * 1024
+    # Size alone no longer decides "logo": a weekly screenshot can be 20-30KB.
+    # Only a tracking-pixel-sized image is ignored; inline/cid/generic-name
+    # signals (below) catch signature graphics.
+    min_img = 1024
     body_html = getattr(email, "body_html", None)
     for a in email.attachments or []:
         if not isinstance(a, dict):

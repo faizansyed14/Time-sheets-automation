@@ -1,7 +1,7 @@
 """API response schemas."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel
@@ -218,6 +218,10 @@ class DashboardRow(BaseModel):
     # Coverage: which months (1-12) this employee submitted in the focus year,
     # whether they are a matcher employee, and whether they have any record yet.
     submitted_months: list[int] = []
+    # Of those months, the ones whose record still has something to check: flagged for
+    # review (validation) or not yet approved. A submitted month NOT listed here is
+    # clean - verified AND approved - and shows green; the others show amber.
+    issue_months: list[int] = []
     in_matcher: bool = True
     has_records: bool = True
     # Record for the dashboard's focus month+year (one-click open from the table).
@@ -293,12 +297,17 @@ class EmployeeIn(BaseModel):
     work_email: str | None = None
     personal_email: str | None = None
     active: bool = True
+    # Both optional: a client that does not send them leaves the stored value alone.
+    #   joining_date - counted in Dashboard/Export from the month it falls in; None = every month.
+    #   left_date    - NOT counted from the month it falls in; None while active, or for rows
+    #                  inactivated before it was recorded.
+    joining_date: date | None = None
+    left_date: date | None = None
 
 
 class EmployeeOut(EmployeeIn):
     id: str
-    # Month they were marked inactive as year*100+month in UAE time (202610 =
-    # Oct 2026); None while active, or for rows inactivated before this was recorded.
+    # left_date's month as year*100+month (202610 = Oct 2026); what the dashboard compares.
     inactive_ym: int | None = None
 
 
@@ -358,7 +367,6 @@ class PipelineFileOut(BaseModel):
     # True when the AI recommends accepting (all checks passed) — still needs
     # human Accept in Review before a record is filed.
     auto_accepted: bool = False
-    can_retry: bool
     can_resolve_assign: bool
     resolved_at: datetime | None
     resolution_note: str | None

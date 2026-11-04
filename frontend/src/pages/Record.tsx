@@ -221,6 +221,7 @@ export default function RecordPage() {
         <div className="mb-4 flex flex-wrap gap-2">
           {siblingRecords.map((r) => {
             const active = r.id === rec.id;
+            const clean = r.validation_status === "verified" && r.approval_status === "approved";
             return (
               <button
                 key={r.id}
@@ -228,11 +229,14 @@ export default function RecordPage() {
                 onClick={() => navigate(`/records/${r.id}`)}
                 className={cn(
                   "rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors",
-                  active
-                    ? "border-brand-300 bg-brand-50 text-brand-700"
-                    : "border-slate-200 bg-white text-slate-600 hover:border-brand-200 hover:bg-brand-50/40"
+                  // Each month shows ITS OWN health: green = verified and approved,
+                  // amber = flagged for review or not yet approved.
+                  clean
+                    ? "border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100"
+                    : "border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100",
+                  active && "ring-2 ring-brand-400 ring-offset-1"
                 )}
-                title={`${MONTHS_LONG[r.month]} ${r.year}`}
+                title={`${MONTHS_LONG[r.month]} ${r.year} - ${clean ? "verified and approved" : "needs a check (flagged or not approved)"}`}
               >
                 {MONTHS_LONG[r.month].slice(0, 3)} {r.year}
               </button>

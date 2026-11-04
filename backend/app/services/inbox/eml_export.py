@@ -25,8 +25,14 @@ def eml_filename(subject: str | None) -> str:
     return f"{base[:120]}.eml"
 
 
-async def build_full_eml(provider, email: EmailMessage) -> tuple[bytes, str]:
-    """Return (eml_bytes, filename) for the complete email."""
+async def build_full_eml(provider, email: EmailMessage, *, strict: bool = False) -> tuple[bytes, str]:
+    """Return (eml_bytes, filename) for the complete email.
+
+    `strict=True` (used by extraction): a provider error is RAISED instead of
+    quietly degrading - a failed MIME download, or an attachment that cannot be
+    fetched while rebuilding the message, would otherwise produce an .eml that
+    is missing content with no sign anything was lost. Download/preview paths
+    keep the lenient behaviour."""
     fname = eml_filename(email.subject)
 
     # ---- 1) native provider MIME (Graph) — the byte-exact original ----
@@ -37,7 +43,9 @@ async def build_full_eml(provider, email: EmailMessage) -> tuple[bytes, str]:
             if mime:
                 return mime, fname
         except Exception:
-            pass  # fall through to the constructed message
+            if strict:
+                raise
+            # fall through to the constructed message
 
     # ---- 2) constructed message from stored data + provider attachments ----
     msg = MimeMessage(policy=policy.SMTP)
@@ -66,6 +74,8 @@ async def build_full_eml(provider, email: EmailMessage) -> tuple[bytes, str]:
             fn = real_fn or fn
             ct = (real_ct or a.get("content_type") or "application/octet-stream").lower()
         except Exception:
+            if strict:
+                raise
             continue
 
         if ct in ("message/rfc822", "application/eml") or fn.lower().endswith(".eml"):

@@ -195,12 +195,44 @@ def mock_vision_calls(monkeypatch):
         queue = list(responses)
 
         async def _fake_chat_call(system_prompt, content_blocks, model, api_key,
-                                  *, label="", retries=3, force_json=True, enable_thinking=True):
+                                  *, label="", retries=3, force_json=True, enable_thinking=True,
+                                  max_tokens=None):
             if not queue:
                 raise AssertionError(f"mock_vision_calls exhausted — unexpected extra call ({label})")
+            import re as _re
+
+            def _manifest_keys() -> list[str]:
+                keys: list[str] = []
+                for blk in content_blocks:
+                    txt = blk.get("text", "") if isinstance(blk, dict) else ""
+                    if txt.startswith("ITEMS PROVIDED"):
+                        keys += _re.findall(r"^\s+\[(A\d+)\]", txt, _re.M)
+                return keys
+
+            # The "second look" at pictures filed as other is answered with a
+            # quiet "other" and does not consume a scripted reply: scripts model
+            # the main passes, and a model re-confirming 'other' is the normal case.
+            if label.startswith("alternates"):
+                # The "are these copies of one timesheet?" comparison: by default the
+                # model finds none, so every sheet is read (scripts model the main passes).
+                return {"items": [], "copy_groups": [], "notes": ""}
+            if label.startswith("pass1-rescue"):
+                return {"thread_summary": "", "items": [
+                    {"source": f"[{k}]", "kind": "other"} for k in _manifest_keys()]}
             item = queue.pop(0)
             if isinstance(item, BaseException):
                 raise item
+            # A real model returns a verdict for EVERY item it is shown. Scripts
+            # list only the interesting ones, so fill in the rest as "other" -
+            # the pipeline (rightly) re-asks about any item a reply omits.
+            if label.startswith("pass1") and isinstance(item, dict) and "items" in item:
+                have = {m for m in (_re.search(r"A\d+", str(x.get("source") or ""))
+                                    for x in item["items"] if isinstance(x, dict)) if m}
+                have_keys = {m.group(0) for m in have}
+                extra = [{"source": f"[{k}]", "kind": "other"}
+                         for k in _manifest_keys() if k not in have_keys]
+                if extra:
+                    item = {**item, "items": list(item["items"]) + extra}
             return item
 
         monkeypatch.setattr(vision_client, "chat_call", _fake_chat_call)

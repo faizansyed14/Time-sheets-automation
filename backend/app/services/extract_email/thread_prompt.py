@@ -375,7 +375,7 @@ def pass2_blocks(
     blocks = [text_block("\n".join(listing)), text_block(PASS2_USER_RULES)]
     if body_text:
         blocks.append(text_block(
-            "EMAIL BODY TEXT (a sheet below is a body-pasted grid):\n" + body_text[:8000]))
+            "EMAIL BODY TEXT (a sheet below is a body-pasted grid):\n" + body_text))
     for it, meta in pairs:
         # Always inject a calendar block when period_hint parses — days-in-month
         # + weekday line even with no admin row; weekends/PH when Admin configured
@@ -393,8 +393,21 @@ def pass2_blocks(
             for pi, img in enumerate(it.images, 1):
                 blocks.append(text_block(f"[{it.key}] page {pi} of {len(it.images)}"))
                 blocks.append(image_block(img, settings.vision_image_detail))
+            # A spreadsheet / Word file is rendered to pictures, but its cell text
+            # is EXACT - send it too as a cross-check for digits and dates the
+            # render may have shrunk or clipped. (A PDF's text layer is not sent:
+            # its pages are already below and it would double the prompt.)
+            if it.text and it.send_mode == "image + native text":
+                cap = int(settings.supplementary_text_chars or 0)
+                txt = it.text
+                if cap and len(txt) > cap:
+                    txt = txt[:cap] + f"\n[… {len(it.text) - cap} more characters omitted …]"
+                blocks.append(text_block(
+                    f"EXACT CELL/TEXT CONTENT OF [{it.key}] (taken straight from the file; the page "
+                    f"images are the primary evidence - use this text to double-check digits and "
+                    f"dates):\n{txt}"))
         elif it.text:
-            blocks.append(text_block(f"TEXT CONTENT OF [{it.key}]:\n{it.text[:15000]}"))
+            blocks.append(text_block(f"TEXT CONTENT OF [{it.key}]:\n{it.text}"))
     blocks.append(text_block(PASS2_OUTPUT))
     return blocks
 
@@ -406,7 +419,9 @@ async def run_pass2_batch(
     """One pass-2 call for one batch of confirmed items. Thinking is turned
     off — pure transcription doesn't need Qwen3-VL's reasoning trace."""
     blocks = pass2_blocks(pairs, body_text, calendars)
-    data = await chat_call(PASS2_SYSTEM, blocks, model, api_key, label=label, enable_thinking=False)
+    from app.core.config import settings
+    data = await chat_call(PASS2_SYSTEM, blocks, model, api_key, label=label, enable_thinking=False,
+                           max_tokens=settings.extract_max_output_tokens)
     from app.services.extract_email import debug_capture
     debug_capture.record_pass2(
         label=label, model=model, system_prompt=PASS2_SYSTEM,

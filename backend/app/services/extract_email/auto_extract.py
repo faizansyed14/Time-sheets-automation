@@ -150,15 +150,19 @@ async def _list_all_thread_anchors(db: AsyncSession) -> list[Anchor]:
     one"). Only used for the full catch-up scan (start()) — the steady-state
     new-mail path never calls this."""
     group_key = func.coalesce(EmailMessage.conversation_id, EmailMessage.id)
+    # Columns only - never whole EmailMessage rows: a mailbox with hundreds of
+    # thousands of threads must not pull every message body into memory just
+    # to learn four fields per thread.
     stmt = (
-        select(EmailMessage)
+        select(EmailMessage.provider_message_id, EmailMessage.subject,
+               EmailMessage.conversation_id, EmailMessage.received_at)
         .where(EmailMessage.status != EmailStatus.ARCHIVED)
         .distinct(group_key)
         .order_by(group_key, EmailMessage.received_at.desc())
     )
-    rows = list((await db.execute(stmt)).scalars().all())
+    rows = (await db.execute(stmt)).all()
     epoch = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
-    rows.sort(key=lambda r: r.received_at or epoch, reverse=True)
+    rows = sorted(rows, key=lambda r: r.received_at or epoch, reverse=True)
     return [
         (r.provider_message_id, r.subject or "(no subject)",
          r.conversation_id or r.provider_message_id, r.received_at)
@@ -168,33 +172,42 @@ async def _list_all_thread_anchors(db: AsyncSession) -> list[Anchor]:
 
 async def _anchors_for_pmids(db: AsyncSession, pmids: list[str]) -> list[Anchor]:
     """Same anchor shape as _list_all_thread_anchors, but scoped to specific
-    messages (the ones sync_inbox just fetched) — for the incremental path,
-    which must never touch the rest of the mailbox."""
+    messages (the ones sync_inbox just fetched) - for the incremental path,
+    which must never touch the rest of the mailbox. Chunked and column-only so
+    a large first sync (tens of thousands of new messages) neither exceeds the
+    driver's bind-parameter limit nor loads every message body."""
     if not pmids:
         return []
-    rows = (await db.execute(
-        select(EmailMessage).where(
-            EmailMessage.provider_message_id.in_(pmids),
-            EmailMessage.status != EmailStatus.ARCHIVED,
-        )
-    )).scalars().all()
-    # Resolve each to its THREAD's actual newest message (a "new" reply may
-    # not itself be the newest anchor if two arrived out of order), deduped
-    # by thread — mirrors _list_all_thread_anchors' grouping, scoped small.
-    thread_keys = {r.conversation_id or r.provider_message_id for r in rows}
+    thread_keys: set[str] = set()
+    for i in range(0, len(pmids), 5000):
+        for pmid, conv in (await db.execute(
+            select(EmailMessage.provider_message_id, EmailMessage.conversation_id).where(
+                EmailMessage.provider_message_id.in_(pmids[i:i + 5000]),
+                EmailMessage.status != EmailStatus.ARCHIVED,
+            )
+        )).all():
+            thread_keys.add(conv or pmid)
     if not thread_keys:
         return []
+    # Resolve each to its THREAD's actual newest message (a "new" reply may
+    # not itself be the newest anchor if two arrived out of order), deduped
+    # by thread - mirrors _list_all_thread_anchors' grouping, scoped small.
     group_key = func.coalesce(EmailMessage.conversation_id, EmailMessage.id)
-    stmt = (
-        select(EmailMessage)
-        .where(
-            EmailMessage.status != EmailStatus.ARCHIVED,
-            func.coalesce(EmailMessage.conversation_id, EmailMessage.provider_message_id).in_(thread_keys),
+    keys = sorted(thread_keys)
+    anchor_rows: list = []
+    for i in range(0, len(keys), 5000):
+        stmt = (
+            select(EmailMessage.provider_message_id, EmailMessage.subject,
+                   EmailMessage.conversation_id, EmailMessage.received_at)
+            .where(
+                EmailMessage.status != EmailStatus.ARCHIVED,
+                func.coalesce(EmailMessage.conversation_id,
+                              EmailMessage.provider_message_id).in_(keys[i:i + 5000]),
+            )
+            .distinct(group_key)
+            .order_by(group_key, EmailMessage.received_at.desc())
         )
-        .distinct(group_key)
-        .order_by(group_key, EmailMessage.received_at.desc())
-    )
-    anchor_rows = list((await db.execute(stmt)).scalars().all())
+        anchor_rows += (await db.execute(stmt)).all()
     epoch = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
     anchor_rows.sort(key=lambda r: r.received_at or epoch, reverse=True)
     return [
@@ -220,11 +233,23 @@ async def _partition_needs_extraction(db: AsyncSession, anchors: list[Anchor]) -
     last_extract_by_thread = await sheet_cache.last_extraction_at_bulk(db, thread_keys)
 
     pmids = [pmid for pmid, _, _, _ in anchors]
-    no_sheets_rows = (await db.execute(
-        select(EmailMessage.provider_message_id, EmailMessage.no_sheets_found_at)
-        .where(EmailMessage.provider_message_id.in_(pmids))
-    )).all()
-    no_sheets_by_pmid = {pmid: at for pmid, at in no_sheets_rows if at is not None}
+    no_sheets_rows: list = []
+    for i in range(0, len(pmids), 5000):      # chunked - see sheet_cache.last_extraction_at_bulk
+        no_sheets_rows += (await db.execute(
+            select(EmailMessage.provider_message_id, EmailMessage.no_sheets_found_at)
+            .where(EmailMessage.provider_message_id.in_(pmids[i:i + 5000]))
+        )).all()
+    # A "nothing here" mark from before the extraction rules last improved is not
+    # trusted - those are exactly the threads whose timesheets the old limits
+    # (size filter, page/message caps, failed calls) could have hidden.
+    from app.core.config import settings
+    try:
+        rules_at = dt.datetime.fromisoformat(settings.extract_rules_revision_at)
+    except (TypeError, ValueError):
+        rules_at = None
+    no_sheets_by_pmid = {
+        pmid: at for pmid, at in no_sheets_rows
+        if at is not None and (rules_at is None or at >= rules_at)}
 
     skip_now: list[Anchor] = []
     need_real: list[Anchor] = []
@@ -286,9 +311,70 @@ async def _extend_run(run_id: str, *, extra_total: int) -> None:
         await cache.incr(_rk(run_id, "total"), ttl=_RUN_TTL)
 
 
+# A thread already queued/being worked for THIS run is not queued again (a sync
+# tick and a catch-up scan can both want the same thread). The marker lives for
+# the run's TTL; run_one_thread clears it when the thread finishes.
+def _queued_key(run_id: str, pmid: str) -> str:
+    return f"auto_extract:run:{run_id}:queued:{pmid}"
+
+
+async def _warn_if_no_extract_worker(run_id: str) -> None:
+    """Extraction tasks are routed to the `extract` queue (served by the
+    worker-extract service). If nothing is consuming it - e.g. someone started
+    only `backend worker` - the run would sit at 0% forever with no explanation.
+    Say so in the run's last_error, which the UI shows. Best-effort, never raises."""
+    import asyncio
+
+    from app.core.celery_app import celery_app
+    from app.core.config import settings
+
+    if settings.celery_task_always_eager:
+        return
+
+    def _probe() -> bool:
+        try:
+            queues = celery_app.control.inspect(timeout=1.5).active_queues() or {}
+        except Exception:
+            return True          # can't tell - don't cry wolf
+        if not queues:
+            return False
+        return any(q.get("name") == "extract" for qs in queues.values() for q in qs)
+
+    try:
+        ok = await asyncio.to_thread(_probe)
+    except Exception:
+        return
+    if not ok:
+        await cache.set(
+            _rk(run_id, "last_error"),
+            "No worker is consuming the 'extract' queue - start the worker-extract service "
+            "(docker compose ... up -d worker-extract). Queued threads will wait until it runs.",
+            ttl=_RUN_TTL)
+
+
 def _dispatch(pmid: str, subject: str, run_id: str) -> None:
     from app.services.tasks import extract_one_thread_task
     extract_one_thread_task.delay(pmid, subject, run_id)
+
+
+async def _dispatch_many(anchors: list[Anchor], run_id: str) -> int:
+    """Queue one task per anchor, skipping any already queued for this run.
+    Returns how many were skipped as duplicates so the caller can keep the
+    run's total/processed arithmetic balanced."""
+    dupes = 0
+    for pmid, subject, _thread_key, _newest_at in anchors:
+        if not await cache.acquire_lock(_queued_key(run_id, pmid), _RUN_TTL, "queued"):
+            dupes += 1
+            continue
+        _dispatch(pmid, subject, run_id)
+    return dupes
+
+
+async def _mark_done_once(run_id: str, pmid: str) -> bool:
+    """True the first time a thread is finished for this run. A redelivered
+    task (worker died after finishing, before acking) must not bump the
+    counters a second time and end the run early."""
+    return await cache.acquire_lock(f"auto_extract:run:{run_id}:done:{pmid}", _RUN_TTL, "done")
 
 
 async def start() -> dict:
@@ -322,9 +408,12 @@ async def _scan_and_dispatch(run_id: str) -> None:
 
     await cache.set(_rk(run_id, "total"), len(anchors), ttl=_RUN_TTL)
     await cache.set(_rk(run_id, "skipped"), len(skip_now), ttl=_RUN_TTL)
-    for pmid, subject, _thread_key, _newest_at in need_real:
-        _dispatch(pmid, subject, run_id)
-    if not need_real:
+    dupes = await _dispatch_many(need_real, run_id)
+    if need_real:
+        await _warn_if_no_extract_worker(run_id)
+    if dupes:
+        await cache.set(_rk(run_id, "skipped"), len(skip_now) + dupes, ttl=_RUN_TTL)
+    if not need_real or dupes == len(need_real):
         await _finish_if_done(run_id)
 
 
@@ -352,8 +441,12 @@ async def enqueue_new_threads(db: AsyncSession, rows: list[EmailMessage]) -> dic
         await _extend_run(run_id, extra_total=len(need_real))
     else:
         run_id = await _new_run(total=len(need_real), skipped=0)
-    for pmid, subject, _thread_key, _newest_at in need_real:
-        _dispatch(pmid, subject, run_id)
+    dupes = await _dispatch_many(need_real, run_id)
+    await _warn_if_no_extract_worker(run_id)
+    for _ in range(dupes):          # already queued: count as processed so the bar balances
+        await cache.incr(_rk(run_id, "skipped"), ttl=_RUN_TTL)
+    if dupes == len(need_real):
+        await _finish_if_done(run_id)
     return await get_status()
 
 
@@ -374,44 +467,77 @@ async def _finish_if_done(run_id: str) -> None:
     await cache.set(_rk(run_id, "current"), None, ttl=_RUN_TTL)
 
 
+# How many times ONE task re-runs a thread whose extraction came back INCOMPLETE
+# (a model call failed, a message would not download) before reporting it
+# failed. Each re-run re-reads only what is missing: everything already
+# extracted is reused from the per-attachment record, not re-sent to the model.
+_INCOMPLETE_ATTEMPTS = 3
+_INCOMPLETE_BACKOFF = 20           # seconds; multiplied by the attempt number
+
+
 async def run_one_thread(pmid: str, subject: str, run_id: str) -> None:
-    """The unit of work for ONE thread — what app.services.tasks.
+    """The unit of work for ONE thread - what app.services.tasks.
     extract_one_thread_task actually runs. A fresh DB session, entirely
     independent of every other thread's task: one slow or failed extraction
     never blocks or poisons another's, and Celery's own worker pool is what
-    provides the parallelism (no in-process loop serialising them)."""
+    provides the parallelism (no in-process loop serialising them).
+
+    Outcome accounting is honest: a thread whose extraction is still INCOMPLETE
+    after its attempts counts as FAILED (with the reason in last_error), never
+    as succeeded. The run counters move exactly once per thread even if Celery
+    redelivers the task."""
+    import asyncio
+
     from app.core.database import SessionLocal
     from app.services.extract_email.thread_scope import prior_message_for_merge
 
     if await _stop_requested(run_id):
-        await cache.incr(_rk(run_id, "stopped_early"), ttl=_RUN_TTL)
+        if await _mark_done_once(run_id, pmid):
+            await cache.incr(_rk(run_id, "stopped_early"), ttl=_RUN_TTL)
+        await cache.delete(_queued_key(run_id, pmid))
         await _finish_if_done(run_id)
         return
 
     await cache.set(_rk(run_id, "current"),
                     {"thread_id": pmid, "subject": subject, "events": []}, ttl=_RUN_TTL)
 
+    outcome, detail = "succeeded", ""
     async with SessionLocal() as db:
         row = (await db.execute(
             select(EmailMessage).where(EmailMessage.provider_message_id == pmid)
         )).scalar_one_or_none()
         if row is None:
-            await cache.incr(_rk(run_id, "failed"), ttl=_RUN_TTL)
+            outcome, detail = "failed", f"{subject}: message no longer in the mailbox"
         else:
             try:
                 prior = await prior_message_for_merge(db, row)
-                await _extract_with_live_progress(db, row, subject, prior, run_id)
-                await cache.incr(_rk(run_id, "succeeded"), ttl=_RUN_TTL)
+                result: dict = {}
+                for attempt in range(1, _INCOMPLETE_ATTEMPTS + 1):
+                    result = await _extract_with_live_progress(db, row, subject, prior, run_id)
+                    if not (result or {}).get("incomplete"):
+                        break
+                    if attempt < _INCOMPLETE_ATTEMPTS:
+                        await asyncio.sleep(_INCOMPLETE_BACKOFF * attempt)
+                        await db.rollback()
+                if (result or {}).get("incomplete"):
+                    errs = (result or {}).get("errors") or []
+                    outcome = "failed"
+                    detail = (f"{subject}: incomplete - "
+                              f"{errs[0] if errs else 'a part of the thread could not be read'}")
             except Exception as e:
-                await cache.incr(_rk(run_id, "failed"), ttl=_RUN_TTL)
-                await cache.set(_rk(run_id, "last_error"), f"{subject}: {str(e)[:180]}", ttl=_RUN_TTL)
+                outcome, detail = "failed", f"{subject}: {str(e)[:180]}"
         from app.core import datacache
         await datacache.bust_pipeline()
 
+    if await _mark_done_once(run_id, pmid):
+        await cache.incr(_rk(run_id, outcome), ttl=_RUN_TTL)
+        if detail:
+            await cache.set(_rk(run_id, "last_error"), detail[:240], ttl=_RUN_TTL)
+    await cache.delete(_queued_key(run_id, pmid))
     await _finish_if_done(run_id)
 
 
-async def _extract_with_live_progress(db, row: EmailMessage, subject: str, prior, run_id: str) -> None:
+async def _extract_with_live_progress(db, row: EmailMessage, subject: str, prior, run_id: str) -> dict:
     """Run extract_full_email through the SAME ProgressSink mechanism the
     manual "Extract Email" SSE stream uses (see streaming.py/progress.py) —
     mirrored into this run's `current` key instead of an HTTP response, so a
@@ -438,7 +564,7 @@ async def _extract_with_live_progress(db, row: EmailMessage, subject: str, prior
     token = set_sink(sink)
     drain_task = asyncio.create_task(_drain())
     try:
-        await extract_full_email(db, row, prior_email=prior)
+        return await extract_full_email(db, row, prior_email=prior)
     finally:
         reset_sink(token)
         sink.close()

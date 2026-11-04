@@ -140,6 +140,29 @@ def _snapshot_at_of(extraction_meta: dict | None) -> datetime | None:
         return None
 
 
+# An incomplete run (a model call failed, a message would not download) is
+# retried by the normal scan / sync triggers until it has failed this many times
+# in a row; after that it is left for a human (the item stays flagged
+# INCOMPLETE and "Re-read entire thread" is always available) so a permanently
+# failing thread can't loop forever.
+MAX_INCOMPLETE_ATTEMPTS = 3
+
+
+def is_open_incomplete(extraction_meta: dict | None) -> bool:
+    """True when the run that produced this row was incomplete AND still has
+    retries left - the thread must then be treated as NOT yet read: its
+    watermark is ignored (so it is re-extracted) and the incremental window is
+    dropped (so the part that failed is re-read, not skipped as 'old')."""
+    fe = (extraction_meta or {}).get("full_email_extract") or {}
+    if not fe.get("incomplete"):
+        return False
+    try:
+        attempts = int(fe.get("incomplete_attempts") or 1)
+    except (TypeError, ValueError):
+        attempts = 1
+    return attempts < MAX_INCOMPLETE_ATTEMPTS
+
+
 def _effective_watermark(updated_at: datetime | None, extraction_meta: dict | None) -> datetime | None:
     """Prefer snapshot_at (the TRUE "as of" cutoff for what this run could
     have read) over updated_at (the row's DB-commit time). Falling back to
@@ -179,6 +202,8 @@ async def last_extraction_at(db: AsyncSession, thread_key: str | None) -> dateti
             PipelineFile.attachment_id.like(f"{TAG_PREFIX}%"),
         )
     )).all()
+    if any(is_open_incomplete(m) for _u, m in rows):
+        return None
     watermarks = [w for w in (_effective_watermark(u, m) for u, m in rows) if w is not None]
     return max(watermarks) if watermarks else None
 
@@ -196,17 +221,26 @@ async def last_extraction_at_bulk(
     identical to last_extraction_at() returning None."""
     if not thread_keys:
         return {}
-    rows = (await db.execute(
-        select(PipelineFile.thread_key, PipelineFile.updated_at, PipelineFile.extraction_meta)
-        .where(
-            PipelineFile.source_kind == "email",
-            PipelineFile.thread_key.in_(thread_keys),
-            PipelineFile.attachment_id.like(f"{TAG_PREFIX}%"),
-        )
-    )).all()
+    # Chunked: one IN (...) with tens of thousands of keys exceeds the driver's
+    # bind-parameter limit (32 767) - a mailbox-wide scan would crash outright.
+    rows: list = []
+    for i in range(0, len(thread_keys), 5000):
+        rows += (await db.execute(
+            select(PipelineFile.thread_key, PipelineFile.updated_at, PipelineFile.extraction_meta)
+            .where(
+                PipelineFile.source_kind == "email",
+                PipelineFile.thread_key.in_(thread_keys[i:i + 5000]),
+                PipelineFile.attachment_id.like(f"{TAG_PREFIX}%"),
+            )
+        )).all()
     out: dict[str, datetime] = {}
+    open_incomplete: set[str] = set()
     for thread_key, updated_at, extraction_meta in rows:
+        if is_open_incomplete(extraction_meta):
+            open_incomplete.add(thread_key)
         wm = _effective_watermark(updated_at, extraction_meta)
         if wm is not None and (thread_key not in out or wm > out[thread_key]):
             out[thread_key] = wm
+    for thread_key in open_incomplete:
+        out.pop(thread_key, None)
     return out

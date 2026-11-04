@@ -79,6 +79,44 @@ async def _headers(text_body: bool = False) -> dict:
     return {"Authorization": f"Bearer {tok}", "Prefer": prefer}
 
 
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 6
+
+
+async def _get(c: httpx.AsyncClient, url: str, *, params: dict | None = None,
+               text_body: bool | None = None, headers: dict | None = None,
+               ok_404: bool = False) -> httpx.Response:
+    """GET with the retry Graph asks for: 429 (throttled) and 5xx are retried
+    with the server's Retry-After (else exponential backoff, capped), and so are
+    transport errors/timeouts. Returns the final response - the caller decides
+    what a non-200 means. A 404 is returned as-is when `ok_404`.
+
+    Before this, ONE throttled or dropped request failed a whole sync page or
+    silently dropped a message from a thread read."""
+    last_exc: Exception | None = None
+    r: httpx.Response | None = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            hdrs = headers if headers is not None else await _headers(text_body=bool(text_body))
+            r = await c.get(url, params=params, headers=hdrs)
+        except (httpx.TransportError, httpx.TimeoutException) as e:
+            last_exc, r = e, None
+        else:
+            if r.status_code not in _RETRY_STATUS:
+                return r
+        if attempt == _MAX_ATTEMPTS - 1:
+            break
+        wait = min(60.0, 2.0 ** attempt)
+        if r is not None:
+            ra = (r.headers.get("retry-after") or "").strip()
+            if ra.isdigit():
+                wait = min(120.0, max(wait, float(ra)))
+        await asyncio.sleep(wait)
+    if r is not None:
+        return r
+    raise RuntimeError(f"Graph request failed after {_MAX_ATTEMPTS} attempts: {last_exc}")
+
+
 def _folder() -> str:
     f = (settings.graph_folder or "inbox").strip()
     return f.lower() if f.lower() in _WELLKNOWN else f
@@ -150,9 +188,10 @@ def _classify(name: str, ctype: str, has_doc: bool, is_inline: bool = False,
     if ctype in _DOC_TYPES or n.endswith((".pdf", ".docx", ".xlsx")):
         return "timesheet"
     if (ctype or "").startswith("image/") or n.endswith((".png", ".jpg", ".jpeg")):
-        # Tiny images are signature logos/icons — a real screenshot of a sheet
-        # is far larger than MIN_IMAGE_ATTACHMENT_KB.
-        if 0 < size < settings.min_image_attachment_kb * 1024:
+        # Only a tracking-pixel-sized image is ruled out by size; a weekly
+        # screenshot can be 20-30KB, so anything bigger is judged by the
+        # inline flag / generic name below, not by its byte count.
+        if 0 < size < 1024:
             return "other"
         # Graph's own "this is embedded in the body" flag is authoritative —
         # never a real screenshot regardless of name. The filename pattern is
@@ -266,9 +305,11 @@ class GraphEmailProvider(EmailProvider):
         if missing:
             raise RuntimeError(f"Graph config missing in .env: {', '.join(missing)}")
 
-    async def list_messages(
-        self, query: str | None = None, since: datetime | None = None,
-    ) -> list[ProviderMessage]:
+    async def iter_message_pages(self, since: datetime | None = None,
+                                 before: datetime | None = None):
+        """Yield the folder newest-first, one Graph page (50) at a time - no
+        message-count cap. The caller commits each page and checkpoints, so a
+        failure mid-way costs one page, not the whole sync."""
         url = f"{GRAPH}/users/{settings.graph_mailbox}/mailFolders/{_folder()}/messages"
         params = {
             "$top": "50",
@@ -276,29 +317,36 @@ class GraphEmailProvider(EmailProvider):
             "$select": _SELECT,
             "$expand": _EXPAND,
         }
+        clauses = []
         if since is not None:
-            # Incremental sync: only messages received after `since` — one
-            # small page instead of paginating the entire folder.
-            iso = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            params["$filter"] = f"receivedDateTime gt {iso}"
-        msgs: list[ProviderMessage] = []
+            # Incremental sync: only messages received after `since`.
+            clauses.append("receivedDateTime gt "
+                           + since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        if before is not None:
+            # Resume an interrupted backfill: only what is older than the oldest
+            # message already stored.
+            clauses.append("receivedDateTime lt "
+                           + before.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+        if clauses:
+            params["$filter"] = " and ".join(clauses)
         next_url: str | None = url
         next_params: dict | None = params
-        # Safety cap — paginate the whole folder, but never loop forever.
-        _MAX_SYNC = 5000
         async with httpx.AsyncClient(timeout=60) as c:
-            while next_url and len(msgs) < _MAX_SYNC:
-                r = await c.get(
-                    next_url,
-                    params=next_params,
-                    headers=await _headers(text_body=True),
-                )
+            while next_url:
+                r = await _get(c, next_url, params=next_params, text_body=True)
                 if r.status_code != 200:
                     raise RuntimeError(f"Graph list error {r.status_code}: {r.text[:400]}")
                 body = r.json()
-                msgs.extend(_build(m) for m in body.get("value", []))
+                yield [_build(m) for m in body.get("value", [])]
                 next_url = body.get("@odata.nextLink")
                 next_params = None  # nextLink is a fully-qualified URL
+
+    async def list_messages(
+        self, query: str | None = None, since: datetime | None = None,
+    ) -> list[ProviderMessage]:
+        msgs: list[ProviderMessage] = []
+        async for page in self.iter_message_pages(since=since):
+            msgs.extend(page)
         if query:
             q = query.lower().strip()
             msgs = [
@@ -314,7 +362,7 @@ class GraphEmailProvider(EmailProvider):
         async with httpx.AsyncClient(timeout=60) as c:
             # text_body=False → Graph returns native HTML body so we can store
             # body_html for rich rendering. body_text is derived via _strip_html.
-            r = await c.get(url, params=params, headers=await _headers(text_body=False))
+            r = await _get(c, url, params=params, text_body=False)
             if r.status_code == 404:
                 return None
             if r.status_code != 200:
@@ -326,9 +374,13 @@ class GraphEmailProvider(EmailProvider):
         forwarded emails) — the highest-fidelity .eml export possible."""
         url = f"{GRAPH}/users/{settings.graph_mailbox}/messages/{message_id}/$value"
         async with httpx.AsyncClient(timeout=120) as c:
-            r = await c.get(url, headers=await _headers())
+            r = await _get(c, url)
+            if r.status_code == 404:
+                return None          # genuinely gone
             if r.status_code != 200 or not r.content:
-                return None
+                # Still failing after the retries: RAISE, so the caller records a
+                # "message not read" problem instead of treating it as empty.
+                raise RuntimeError(f"Graph mime error {r.status_code}: {r.text[:200]}")
             return r.content
 
     async def list_thread_messages(self, conversation_id: str) -> list[ProviderMessage]:
@@ -360,8 +412,8 @@ class GraphEmailProvider(EmailProvider):
         next_url: str | None = url
         next_params: dict | None = params
         async with httpx.AsyncClient(timeout=60) as c:
-            while next_url and len(msgs) < 200:  # a runaway thread still can't hang the UI
-                r = await c.get(next_url, params=next_params, headers=headers)
+            while next_url:
+                r = await _get(c, next_url, params=next_params, headers=headers)
                 if r.status_code != 200:
                     raise RuntimeError(f"Graph thread error {r.status_code}: {r.text[:400]}")
                 body = r.json()
@@ -374,7 +426,7 @@ class GraphEmailProvider(EmailProvider):
     async def get_attachment_bytes(self, message_id: str, attachment_id: str) -> tuple[bytes, str, str]:
         url = f"{GRAPH}/users/{settings.graph_mailbox}/messages/{message_id}/attachments/{attachment_id}"
         async with httpx.AsyncClient(timeout=120) as c:
-            r = await c.get(url, headers=await _headers())
+            r = await _get(c, url)
             if r.status_code == 404:
                 raise FileNotFoundError(attachment_id)
             if r.status_code != 200:
@@ -385,7 +437,7 @@ class GraphEmailProvider(EmailProvider):
             # itemAttachment (a forwarded email) has no contentBytes — its raw
             # MIME (the .eml, with the timesheet PDF inside) is served at /$value.
             if odata.endswith("itemAttachment") or not content:
-                rv = await c.get(f"{url}/$value", headers=await _headers())
+                rv = await _get(c, f"{url}/$value")
                 if rv.status_code != 200 or not rv.content:
                     raise FileNotFoundError(f"No content for {attachment_id}")
                 return rv.content, _as_eml_name(a.get("name")), "message/rfc822"

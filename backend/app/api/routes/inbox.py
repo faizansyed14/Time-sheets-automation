@@ -84,6 +84,8 @@ def _is_image_attachment(a) -> bool:
 # attachment: Outlook's own body-image naming ("image007.png", "Outlook-…"),
 # and signature-management add-ins that inject template icons named
 # "C2_signature_<logo|facebook|instagram|linkedin|x|youtube|banner>_<uuid>".
+# Below this an "image" is a tracking pixel / bullet, never a document.
+_TRACKING_PIXEL_BYTES = 1024
 _GENERIC_INLINE_RE = re.compile(
     r"^(image\d{2,3}\.(png|jpe?g|gif)|outlook-.+\.(png|jpe?g|gif|bmp)"
     r"|c2_signature_.+\.(png|jpe?g|gif))$", re.I)
@@ -94,8 +96,9 @@ def _is_body_junk_image(a, body_html: str | None) -> bool:
     as attachments, and neither do we (list count + detail chips agree).
 
     Four signals, checked in order of trust:
-      - the image is smaller than MIN_IMAGE_ATTACHMENT_KB (logos/icons —
-        real screenshots of sheets are far larger);
+      - the image is a few hundred bytes (a tracking pixel / bullet). Size alone
+        is NOT a verdict on anything bigger: a weekly-timesheet screenshot is
+        often only 20-30KB, so "small" images are judged by the signals below;
       - Graph's own `isInline` flag (authoritative — set at sync time from
         the provider, not guessed from a filename);
       - a CID that's actually referenced in the HTML body (only available
@@ -106,7 +109,7 @@ def _is_body_junk_image(a, body_html: str | None) -> bool:
     if not _is_image_attachment(a):
         return False
     size = a.get("size")
-    if isinstance(size, (int, float)) and 0 < size < settings.min_image_attachment_kb * 1024:
+    if isinstance(size, (int, float)) and 0 < size < _TRACKING_PIXEL_BYTES:
         return True
     if a.get("is_inline") is True:
         return True
@@ -364,18 +367,12 @@ def _status_clause(status: str | None):
 
 
 def _apply_search(base, q: str | None):
-    if q and q.strip():
-        # Sender-only search: every word must match the sender's name or
-        # address, in any order — "ritta ibrahim" or "ritta.m.ibrahim@gmail.com".
-        # Subject/body/attachments are deliberately NOT searched.
-        for term in q.strip().lower().split()[:8]:
-            esc = term.replace("\\", r"\\").replace("%", r"\%").replace("_", r"\_")
-            like = f"%{esc}%"
-            base = base.where(or_(
-                func.lower(EmailMessage.sender_name).like(like, escape="\\"),
-                func.lower(EmailMessage.sender_email).like(like, escape="\\"),
-            ))
-    return base
+    """Outlook-style search: every word anywhere in subject / sender / recipients /
+    attachment names / message text, plus from: to: cc: subject: body: attachment:
+    hasattachment: received: before: after:, "phrases", OR and NOT. See
+    services/inbox/search.py."""
+    from app.services.inbox.search import apply_search
+    return apply_search(base, q)
 
 
 def _apply_inbox_filters(base, q: str | None, status: str | None):
@@ -390,7 +387,7 @@ def _apply_inbox_filters(base, q: str | None, status: str | None):
 
 @router.get("", response_model=Page[EmailListItem])
 async def list_inbox(
-    q: str | None = Query(default=None, description="search the sender's name or email address — every word must match (any order)"),
+    q: str | None = Query(default=None, description="search like Outlook: every word anywhere (subject, sender, recipients, attachment names, text); operators from: to: cc: subject: body: attachment: hasattachment: received: before: after:, \"phrases\", OR, NOT"),
     status: str | None = Query(default=None, description="new | archived | ingested | extracted | no_sheets"),
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -420,7 +417,7 @@ async def list_inbox(
 
 @router.get("/threads", response_model=Page[ThreadListItem])
 async def list_threads(
-    q: str | None = Query(default=None, description="search the sender's name or email address — every word must match (any order)"),
+    q: str | None = Query(default=None, description="search like Outlook: every word anywhere (subject, sender, recipients, attachment names, text); operators from: to: cc: subject: body: attachment: hasattachment: received: before: after:, \"phrases\", OR, NOT"),
     status: str | None = Query(default=None, description="new | archived | ingested | extracted | no_sheets"),
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -765,6 +762,7 @@ async def _resolve_thread_anchor_and_prior(
 
 @router.post("/{provider_message_id}/extract-full")
 async def extract_full(provider_message_id: str, force_full: bool = False,
+                       message_ids: list[str] = Query(default=[]),
                        db: AsyncSession = Depends(get_db)):
     """Extract Email — the one-button flow: convert the whole email to a full
     .eml, analyse EVERY sheet inside it (attachments, forwarded emails and
@@ -775,7 +773,7 @@ async def extract_full(provider_message_id: str, force_full: bool = False,
     Incremental by default: an already-extracted thread only re-reads the new
     message(s) + a couple of prior ones for context, reusing everything else
     already extracted for this conversation. `force_full=true` bypasses that
-    and re-reads the whole thread from scratch — the "Re-read entire thread"
+    and re-reads the whole thread from scratch — the "Select all -> Extract"
     escape hatch, for a suspected stale/wrong past read.
 
     Thread-aware (narrow): when the selected message has no document
@@ -789,7 +787,8 @@ async def extract_full(provider_message_id: str, force_full: bool = False,
     row = await _email_row_or_404(db, provider_message_id)
     prior_row = await prior_message_for_merge(db, row)
     try:
-        res = await extract_full_email(db, row, prior_email=prior_row, force_full=force_full)
+        res = await extract_full_email(db, row, prior_email=prior_row, force_full=force_full,
+                                       only_message_ids=message_ids or None)
     except HTTPException:
         raise
     except Exception as e:
@@ -808,6 +807,7 @@ async def extract_full(provider_message_id: str, force_full: bool = False,
 @router.post("/{provider_message_id}/extract-full/stream")
 async def extract_full_streamed(
     provider_message_id: str, force_full: bool = False,
+    message_ids: list[str] = Query(default=[]),
 ):
     """Same as extract-full, but streams live progress (Server-Sent Events):
     one frame per pipeline stage — unpack, format detected, each LLM call,
@@ -826,7 +826,8 @@ async def extract_full_streamed(
         async with SessionLocal() as db:
             row = await _email_row_or_404(db, provider_message_id)
             prior_row = await prior_message_for_merge(db, row)
-            res = await extract_full_email(db, row, prior_email=prior_row, force_full=force_full)
+            res = await extract_full_email(db, row, prior_email=prior_row, force_full=force_full,
+                                           only_message_ids=message_ids or None)
             await datacache.bust_pipeline()
             return {
                 "staged": [_pipeline_out(t).model_dump(mode="json") for t in res["staged"]],
