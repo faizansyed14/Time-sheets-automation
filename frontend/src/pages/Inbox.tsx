@@ -53,13 +53,14 @@ import { isBodyJunkImage, isImageAttachment } from "../lib/attachmentFilters";
 import { FilePreviewModal } from "../components/FilePreview";
 import { ThreadSummaryBox } from "../components/ThreadSummaryBox";
 import { attachmentRenderUrlIfSupported, buildEmailHtmlDocument, downloadFile } from "../lib/filePreview";
-import { Badge, Button, Card, EmptyState, Modal, Select, Skeleton, Spinner } from "../components/ui";
+import { Badge, Button, Card, EmptyState, Modal, Select, Spinner } from "../components/ui";
 import { useToast } from "../components/toast";
 import { ExtractionActivityModal, type ExtractionRun } from "../components/ExtractionActivity";
 import { useExtractQueue, type ExtractTask } from "../lib/extractQueue";
 import { useDebounced, useSentinel } from "../lib/useInfinite";
 import type { PreviewFile } from "../lib/filePreview";
 
+import { MoreRowsSkeleton, DetailSkeleton } from "../components/skeletons";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1466,11 +1467,7 @@ export default function InboxPage() {
           )}
           <div ref={setScrollRoot} className="min-h-0 flex-1 overflow-y-auto">
             {isLoading ? (
-              <div className="space-y-1.5 p-2">
-                <Skeleton className="h-12" />
-                <Skeleton className="h-12" />
-                <Skeleton className="h-12" />
-              </div>
+              <MoreRowsSkeleton rows={6} />
             ) : !emails.length ? (
               <EmptyState icon={<Mail className="h-5 w-5" />} title="No emails found" />
             ) : (
@@ -1525,9 +1522,7 @@ export default function InboxPage() {
             )}
             <div ref={sentinelRef} />
             {isFetchingNextPage && (
-              <div className="flex items-center justify-center gap-2 py-2 text-[10px] text-slate-400">
-                <Spinner className="h-3.5 w-3.5" /> More…
-              </div>
+              <MoreRowsSkeleton />
             )}
           </div>
         </Card>
@@ -1544,10 +1539,7 @@ export default function InboxPage() {
               detail="Open an email and click “Extract Email” to process it."
             />
           ) : loadingDetail || !detail ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
-              <Spinner className="h-6 w-6" />
-              <p className="text-sm text-slate-500">Loading email…</p>
-            </div>
+            <div className="min-w-0 flex-1 p-5"><DetailSkeleton /></div>
           ) : (
             <>
               {fullscreen ? (

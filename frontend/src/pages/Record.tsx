@@ -35,13 +35,14 @@ import {
 } from "../api/client";
 import { cn, formatBytes, formatDateTime } from "../lib/utils";
 import { EmlPreviewPane, FilePreviewModal, PreviewableFileRow, ServerRenderPane } from "../components/FilePreview";
-import { Badge, Button, Card, PageHeader, Spinner } from "../components/ui";
+import { Badge, Button, Card, PageHeader } from "../components/ui";
 import type { PreviewFile } from "../lib/filePreview";
 import { ApprovalBadge, ValidationBadge } from "../components/status";
 import { useToast } from "../components/toast";
 
 import { LEAVE_BUCKET_LABELS, LEAVE_BUCKET_TONE } from "../lib/theme";
 
+import { DetailSkeleton } from "../components/skeletons";
 const BUCKETS: { key: keyof TimesheetRecord & string; field: string; label: string; tone: string }[] = [
   { key: "annual_leave_dates", field: "annual_leave_dates", label: LEAVE_BUCKET_LABELS.annual!, tone: LEAVE_BUCKET_TONE.annual! },
   { key: "remote_work_dates", field: "remote_work_dates", label: LEAVE_BUCKET_LABELS.remote!, tone: LEAVE_BUCKET_TONE.remote! },
@@ -171,9 +172,7 @@ export default function RecordPage() {
 
   if (isLoading || !rec)
     return (
-      <div className="flex h-64 items-center justify-center">
-        <Spinner className="h-6 w-6" />
-      </div>
+      <DetailSkeleton />
     );
 
   // Working/weekend are day-accounting fields, not leave — excluded from

@@ -16,10 +16,11 @@ import {
 } from "../api/client";
 import { locationBadgeTone } from "../lib/theme";
 import { avatarColor, cn, initials } from "../lib/utils";
-import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton } from "../components/ui";
+import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select } from "../components/ui";
 import EmployeeImportPlanModal from "../components/EmployeeImportPlanModal";
 import { useToast } from "../components/toast";
 
+import { ListSkeleton } from "../components/skeletons";
 /** 202610 -> "Oct 2026" (the month an employee was marked inactive). */
 const inactiveSince = (ym: number) => `${MONTHS[ym % 100]} ${Math.floor(ym / 100)}`;
 
@@ -221,10 +222,7 @@ export default function EmployeesPage() {
         </div>
 
         {isLoading ? (
-          <div className="space-y-2 p-6">
-            <Skeleton className="h-12" />
-            <Skeleton className="h-12" />
-          </div>
+          <ListSkeleton label="Loading employees" columns={["Employee", "ID", "Manager", "Project", "Location", "Status"]} widths={["w-44", "w-16", "w-32", "w-28", "w-12", "w-16"]} />
         ) : visible.length === 0 ? (
           <EmptyState icon={<Users className="h-6 w-6" />} title="No employees" detail="Add one manually or import your Excel (DXB + AUH sheets)." />
         ) : (

@@ -85,4 +85,23 @@
   .login-stage-enter {
     animation: scale-in 0.28s cubic-bezier(0.16, 1, 0.3, 1) both;
   }
+
+  /* Skeleton loading: a quiet shimmer sweep over a neutral block. */
+  .skeleton {
+    position: relative;
+    overflow: hidden;
+    @apply rounded-lg bg-slate-200/60;
+  }
+  .skeleton::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.55), transparent);
+    animation: skeleton-shimmer 1.6s infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton::after { animation: none; }
 }

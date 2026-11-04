@@ -78,6 +78,9 @@ export default {
           "0%": { backgroundPosition: "200% 0" },
           "100%": { backgroundPosition: "-200% 0" },
         },
+        "skeleton-shimmer": {
+          "100%": { transform: "translateX(100%)" },
+        },
         "caret-blink": {
           "0%, 49%": { opacity: "1" },
           "50%, 100%": { opacity: "0" },

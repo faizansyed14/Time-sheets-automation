@@ -215,7 +215,7 @@ export function Spinner({ className }: { className?: string }) {
 }
 
 export function Skeleton({ className }: { className?: string }) {
-  return <div className={cn("animate-pulse rounded-lg bg-slate-200/60", className)} />;
+  return <div aria-hidden className={cn("skeleton", className)} />;
 }
 
 export function EmptyState({

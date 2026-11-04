@@ -24,6 +24,7 @@ import { PortalAuthProvider, usePortalAuth } from "./lib/portalAuth";
 import { UploadSessionProvider } from "./lib/uploadSession";
 import { Spinner } from "./components/ui";
 
+import { WorkspaceSkeleton } from "./components/skeletons";
 // The restricted "vault_matcher" role only ever sees these two pages — every
 // other route redirects to /employees. Mirrors the server-side restriction
 // (api/deps.require_full_access blocks that role on every other router), so
@@ -33,12 +34,7 @@ const VAULT_MATCHER_ALLOWED_PREFIXES = ["/employees", "/files"];
 function Protected({ children, adminOnly }: { children: JSX.Element; adminOnly?: boolean }) {
   const { user, loading, isAdmin, isVaultMatcherOnly } = useAuth();
   const loc = useLocation();
-  if (loading)
-    return (
-      <div className="flex h-screen items-center justify-center">
-        <Spinner className="h-7 w-7" />
-      </div>
-    );
+  if (loading) return <WorkspaceSkeleton />;
   if (!user) return <Navigate to="/login" replace state={{ from: loc.pathname }} />;
   if (adminOnly && !isAdmin) return <Navigate to="/" replace />;
   if (isVaultMatcherOnly && !VAULT_MATCHER_ALLOWED_PREFIXES.some((p) => loc.pathname.startsWith(p))) {
