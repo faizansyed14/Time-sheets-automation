@@ -8,7 +8,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import json as _json
-import re
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
@@ -591,35 +590,8 @@ def _project_group(project: str | None) -> str:
     p = (project or "").strip().lower()
     return "PGC" if p.startswith("pgc") else "MOD" if p in ("ministry of defence", "mod") else p.upper()
 BULK_ACCEPT_BATCH = 25   # items filed per request — each Accept writes to the vault, keep requests short
-# Blockers that don't hold an item back from a bulk accept: rosters rarely carry
-# sign-off, and PGC-style rosters never print Leave/Billing totals to check
-# against (the day-by-day cells are still read). Everything else — incomplete
-# coverage, unrecognised codes, unmatched employee — keeps the item for a human.
-_NO_TOTALS_BLOCKER = (
-    "validation flags: this roster prints no Leave/Billing-day totals to check the day grid against "
-    "— nothing here has been independently verified; review the day-by-day cells directly before accepting"
-)
 _APPROVAL_PREFIX = "no manager approval evidence found"
-
-
-_NO_TOTALS_FLAG = _NO_TOTALS_BLOCKER[len("validation flags: "):]
-
-
-def _flag_tolerated(flag: str) -> bool:
-    """Individual validation flags a bulk accept looks past: the roster prints no
-    totals, the reader's "rotated scan / verify cells" notes, and "N day(s)
-    marked only as VC". Everything else — National Service (NS) days, a second
-    read that disagreed, unrecognised codes, uncertain days — keeps the row."""
-    f = str(flag).strip()
-    return (f == _NO_TOTALS_FLAG or f.startswith("reader note:")
-            or re.match(r'^\d+ day\(s\) marked only as "VC"', f) is not None)
-
-
-def _tolerated(blocker: str) -> bool:
-    # Exact match for the totals flag: the blocker text joins ALL validation flags,
-    # so a prefix match would also let through a row that has this flag PLUS a real one.
-    b = str(blocker)
-    return b.startswith(_APPROVAL_PREFIX) or b == _NO_TOTALS_BLOCKER
+_FLAG_PREFIX = "validation flags:"
 
 
 class BulkAcceptIn(BaseModel):
@@ -627,45 +599,50 @@ class BulkAcceptIn(BaseModel):
     month: int | None = None
     year: int | None = None
     dry_run: bool = False           # only count what would be accepted / held
-    # Accept straight after a roster upload: limit to that roster's items (any
-    # project) and keep out every row with maternity, unpaid, absent or other days — those need a look.
+    # Accept straight after a roster upload: limit to that roster's items (any project).
     thread_key: str | None = None
-    no_leaves: bool = False
+    no_leaves: bool = False         # accepted for old clients; ignored - leave days never hold a row
 
 
-# Buckets that keep a row in review in the post-upload Bulk accept. Annual and
-# sick leave are ordinary and ACCEPTED; these are the ones worth a human look.
-# Remote (a worked day) and public holidays never hold a row back.
-_LEAVE_BUCKETS = ("maternity", "unpaid", "absent", "other")
+_ALL_BUCKETS = ("annual", "sick", "maternity", "unpaid", "absent", "remote", "public_holiday", "other")
+
+
+def _has_data(staged: dict) -> bool:
+    """Did the read produce any day at all (worked, weekend or a leave bucket)?"""
+    if staged.get("working_days") or staged.get("weekend_days"):
+        return True
+    return any((staged.get("buckets") or {}).get(b) for b in _ALL_BUCKETS)
+
+
+def _overridden(meta: dict) -> list[str]:
+    """What the reviewer's Bulk accept looked past on this row - recorded in the filing note so
+    the record still says which checks were open when it was accepted."""
+    staged = meta.get("staged") or {}
+    out = [str(f) for f in (staged.get("flags") or [])]
+    for b in ((meta.get("auto_accept") or {}).get("blockers") or []):
+        b = str(b)
+        if b.startswith(_APPROVAL_PREFIX) or b.startswith(_FLAG_PREFIX):
+            continue        # approval is recorded separately; flags are listed above
+        out.append(b)
+    return out
 
 
 def _bulk_split(rows, no_leaves: bool = False) -> tuple[list[tuple[PipelineFile, Employee | None]], list[dict]]:
-    """(ready, held). Ready = a matched employee and NO blocker other than the
-    missing-approval one (rosters rarely carry sign-off; the reviewer is making
-    that call by pressing the button). Anything else — validation flags,
-    incomplete coverage, uncertain days, empty sheets — stays held for a human."""
+    """(ready, held). The reviewer pressing Bulk accept takes responsibility for everything
+    the reader flagged: leave of any kind, a second read that disagreed, unrecognised codes,
+    uncertain days, missing approval. A row stays held ONLY when it cannot be filed at all:
+    no matched employee, no month/year, or nothing was read from it."""
     ready, held = [], []
     for t, emp in rows:
         meta = t.extraction_meta or {}
         staged = meta.get("staged") or {}
-        flags = staged.get("flags") or []
         blockers = []
-        for b in ((meta.get("auto_accept") or {}).get("blockers") or []):
-            if _tolerated(b):
-                continue
-            if str(b).startswith("validation flags:") and flags:
-                # The blocker joins every flag into one string — judge each flag on its own.
-                rest = [f for f in flags if not _flag_tolerated(f)]
-                if rest:
-                    blockers.append("validation flags: " + "; ".join(rest[:3]))
-                continue
-            blockers.append(b)
         if not staged.get("employee_pk"):
             blockers.append("employee is not matched")
-        if no_leaves:
-            n = sum(len(d) for b, d in (staged.get("buckets") or {}).items() if b in _LEAVE_BUCKETS)
-            if n:
-                blockers.append(f"has {n} maternity/unpaid/absent/other day{'s' if n != 1 else ''} — review")
+        if not (staged.get("month") and staged.get("year")):
+            blockers.append("the month / year could not be read")
+        if not _has_data(staged):
+            blockers.append("nothing was read from this sheet")
         if blockers:
             held.append({"id": t.id, "employee_name": t.employee_name or (emp.name if emp else None),
                          "project": emp.project if emp else None, "reasons": blockers[:3]})
@@ -676,11 +653,13 @@ def _bulk_split(rows, no_leaves: bool = False) -> tuple[list[tuple[PipelineFile,
 
 @router.post("/bulk-accept")
 async def bulk_accept(body: BulkAcceptIn, db: AsyncSession = Depends(get_db)):
-    """File every clean needs-review item of the PGC / MOD employees at once.
+    """File every needs-review item of the PGC / MOD employees at once.
 
     Same filing as pressing Accept in Compare & Fix on each item (it calls the
     same code), but only for items whose matched employee's project is PGC (any
-    "PGC…" project) or MOD ("Ministry of Defence") and that have no blocker besides missing approval evidence. Approval is
+    "PGC…" project) or MOD ("Ministry of Defence"). Leave of any kind and reader flags do
+    not hold an item back (they are listed in the filing note); only an unmatched employee or an
+    unreadable sheet does. Approval is
     recorded exactly as the Compare & Fix default: approved only when the sheet
     carried evidence, otherwise "not approved" — sign it off later on the record.
     Processes up to BULK_ACCEPT_BATCH per call and reports `remaining`; the UI
@@ -713,7 +692,7 @@ async def bulk_accept(body: BulkAcceptIn, db: AsyncSession = Depends(get_db)):
         q = q.where(PipelineFile.month == body.month)
     if body.year:
         q = q.where(PipelineFile.year == body.year)
-    ready, held = _bulk_split((await db.execute(q)).all(), body.no_leaves)
+    ready, held = _bulk_split((await db.execute(q)).all())
 
     by_project: dict[str, int] = {}
     for _t, emp in ready:
@@ -738,7 +717,8 @@ async def bulk_accept(body: BulkAcceptIn, db: AsyncSession = Depends(get_db)):
                 pipeline_id=pid, employee_pk=staged["employee_pk"],
                 month=int(staged["month"]), year=int(staged["year"]),
                 buckets=_json.dumps(buckets),
-                note=("Bulk accepted" + (f" ({_project_group(project)})" if project else "") + "."),
+                note=("Bulk accepted" + (f" ({_project_group(project)})" if project else "") + "."
+                      + (" Accepted with open flags: " + "; ".join(_overridden(meta))[:600] if _overridden(meta) else "")),
                 approval_status="approved" if approved else "not_approved",
                 approval_detail=(approval.get("detail") or "") if approved else None,
                 files=[], db=db,

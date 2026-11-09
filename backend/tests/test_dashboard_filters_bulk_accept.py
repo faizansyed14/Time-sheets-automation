@@ -67,7 +67,7 @@ def _staged(pk, name, blockers=()):
     }
 
 
-async def test_bulk_accept_files_only_clean_pgc_and_mod_items(client, admin_token):
+async def test_bulk_accept_files_pgc_and_mod_items_even_with_flags(client, admin_token):
     h = auth_headers(admin_token)
     # The matcher's real project names: three PGC projects, and MOD = Ministry of Defence.
     pgc = await _emp(client, h, "BA-1", "Bulk Pgc Person", "PGC- TECHNICAL SUPPORT", "Mgr")
@@ -93,13 +93,12 @@ async def test_bulk_accept_files_only_clean_pgc_and_mod_items(client, admin_toke
                 ids[key] = t.id
             await db.commit()
 
-        # Dry run: PGC (approval-only blocker is fine) + MOD are ready; the flagged one is held.
+        # Dry run: PGC + MOD are all ready - even the one with an "incomplete coverage" flag.
         dry = (await client.post("/api/v1/pipeline/bulk-accept", headers=h,
                                  json={"dry_run": True, "month": MONTH, "year": YEAR})).json()
-        assert dry["ready"] == 2 and dry["held_count"] == 1
-        assert dry["by_project"] == {"PGC": 1, "MOD": 1}
+        assert dry["ready"] == 3 and dry["held_count"] == 0
+        assert dry["by_project"] == {"PGC": 2, "MOD": 1}
         assert dry["accepted"] == 0
-        assert "incomplete coverage" in dry["held"][0]["reasons"][0]
 
         # A project outside the list is refused.
         bad = await client.post("/api/v1/pipeline/bulk-accept", headers=h, json={"project": "ACME"})
@@ -112,22 +111,21 @@ async def test_bulk_accept_files_only_clean_pgc_and_mod_items(client, admin_toke
 
         both = (await client.post("/api/v1/pipeline/bulk-accept", headers=h,
                                   json={"month": MONTH, "year": YEAR})).json()
-        assert both["accepted"] == 1 and both["failed"] == []
+        assert both["accepted"] == 2 and both["failed"] == []
 
         async with SessionLocal() as db:
             status = {k: (await db.get(PipelineFile, v)).status for k, v in ids.items()}
             recs = (await db.execute(select(TimesheetRecord).where(
                 TimesheetRecord.matched_employee_pk.in_([pgc, mod, held, other]),
                 TimesheetRecord.year == YEAR, TimesheetRecord.month == MONTH))).scalars().all()
-        assert status["pgc"] == status["mod"] == PipelineStatus.SUCCESS
-        assert status["held"] == status["other"] == PipelineStatus.NEEDS_REVIEW
-        assert {r.matched_employee_pk for r in recs} == {pgc, mod}
+        assert status["pgc"] == status["mod"] == status["held"] == PipelineStatus.SUCCESS
+        assert status["other"] == PipelineStatus.NEEDS_REVIEW          # not a PGC / MOD employee
+        assert {r.matched_employee_pk for r in recs} == {pgc, mod, held}
         assert all(r.annual_leave_dates == ["2034-05-04"] for r in recs)
 
-        # Nothing left to do now except the held one.
         again = (await client.post("/api/v1/pipeline/bulk-accept", headers=h,
                                    json={"dry_run": True, "month": MONTH, "year": YEAR})).json()
-        assert again["ready"] == 0 and again["held_count"] == 1
+        assert again["ready"] == 0 and again["held_count"] == 0
     finally:
         async with SessionLocal() as db:
             await db.execute(delete(TimesheetRecord).where(
@@ -150,30 +148,33 @@ async def test_viewer_cannot_bulk_accept(client, admin_token):
     assert res.status_code == 403
 
 
-async def test_bulk_accept_after_upload_keeps_leave_rows_and_ignores_approval_and_totals(client, admin_token):
-    """Roster upload -> Bulk accept: any project, but rows with leave days (or
-    other flags) stay; missing approval and 'no totals' never hold a row back."""
+async def test_bulk_accept_after_upload_files_leave_rows_and_flagged_rows(client, admin_token):
+    """Roster upload -> Bulk accept: every matched row with data is filed - any leave type, any
+    reader flag. Only a row that cannot be filed (unmatched / nothing read) stays."""
     h = auth_headers(admin_token)
-    no_totals = ("validation flags: this roster prints no Leave/Billing-day totals to check the day grid "
-                 "against \u2014 nothing here has been independently verified; review the day-by-day cells "
-                 "directly before accepting")
-    approval = "no manager approval evidence found \u2014 none"
+    approval = "no manager approval evidence found - none"
     clean = await _emp(client, h, "RU-1", "Roster Clean", None, "Mgr")
     leave = await _emp(client, h, "RU-2", "Roster Leave", "ACME", "Mgr")
     flagged = await _emp(client, h, "RU-3", "Roster Flagged", "ACME", "Mgr")
-    sick = await _emp(client, h, "RU-4", "Roster Sick", "ACME", "Mgr")
-    pks = [clean, leave, flagged, sick]
+    empty = await _emp(client, h, "RU-4", "Roster Empty", "ACME", "Mgr")
+    pks = [clean, leave, flagged, empty]
     ids: dict[str, str] = {}
+    disagree = "a second independent read disagreed on day(s) 20"
     try:
         async with SessionLocal() as db:
-            for key, pk, name, blockers, buckets in (
-                ("clean", clean, "Roster Clean", [approval, no_totals], {"annual": [], "sick": []}),
-                ("leave", leave, "Roster Leave", [approval, no_totals], {"absent": ["2034-05-04"]}),
-                ("sick", sick, "Roster Sick", [approval, no_totals], {"sick": ["2034-05-05"], "annual": ["2034-05-06"]}),
-                ("flagged", flagged, "Roster Flagged", [approval, "1 day(s) flagged uncertain by the model"], {}),
+            for key, pk, name, blockers, buckets, flags in (
+                ("clean", clean, "Roster Clean", [approval], {"annual": ["2034-05-04"], "sick": ["2034-05-05"]}, []),
+                ("leave", leave, "Roster Leave", [approval], {"absent": ["2034-05-04"], "maternity": ["2034-05-05"]}, []),
+                ("flagged", flagged, "Roster Flagged", [approval, "validation flags: " + disagree],
+                 {"annual": ["2034-05-04"]}, [disagree]),
+                ("empty", empty, "Roster Empty", [approval], {}, []),
             ):
                 meta = _staged(pk, name, blockers)
                 meta["staged"]["buckets"] = buckets
+                meta["staged"]["flags"] = flags
+                if key == "empty":
+                    meta["staged"]["working_days"] = []
+                    meta["staged"]["weekend_days"] = []
                 t = PipelineFile(
                     filename=f"{name}.xlsx", source_kind="bulk", source_id="bulk:RU", thread_key="bulk:RU",
                     attachment_id=f"ru:{key}", status=PipelineStatus.NEEDS_REVIEW,
@@ -184,24 +185,22 @@ async def test_bulk_accept_after_upload_keeps_leave_rows_and_ignores_approval_an
             await db.commit()
 
         dry = (await client.post("/api/v1/pipeline/bulk-accept", headers=h, json={
-            "thread_key": "bulk:RU", "no_leaves": True, "dry_run": True})).json()
-        assert dry["ready"] == 2 and dry["held_count"] == 2   # clean + sick/annual; absent and flagged held
-        reasons = " ".join(r for x in dry["held"] for r in x["reasons"])
-        assert "absent" in reasons and "uncertain" in reasons
+            "thread_key": "bulk:RU", "dry_run": True})).json()
+        assert dry["ready"] == 3 and dry["held_count"] == 1
+        assert "nothing was read" in dry["held"][0]["reasons"][0]
 
-        res = (await client.post("/api/v1/pipeline/bulk-accept", headers=h, json={
-            "thread_key": "bulk:RU", "no_leaves": True})).json()
-        assert res["accepted"] == 2 and res["failed"] == []
-        # The response names everyone it filed, with their data.
+        res = (await client.post("/api/v1/pipeline/bulk-accept", headers=h, json={"thread_key": "bulk:RU"})).json()
+        assert res["accepted"] == 3 and res["failed"] == []
         got = {i["employee_name"]: i for i in res["accepted_items"]}
-        assert set(got) == {"Roster Clean", "Roster Sick"}
-        assert got["Roster Sick"]["buckets"] == {"sick": ["2034-05-05"], "annual": ["2034-05-06"]}
-        assert got["Roster Sick"]["month"] == MONTH and got["Roster Sick"]["approved"] is False
+        assert set(got) == {"Roster Clean", "Roster Leave", "Roster Flagged"}
+        assert got["Roster Leave"]["buckets"] == {"absent": ["2034-05-04"], "maternity": ["2034-05-05"]}
 
         async with SessionLocal() as db:
             status = {k: (await db.get(PipelineFile, v)).status for k, v in ids.items()}
-        assert status["clean"] == status["sick"] == PipelineStatus.SUCCESS
-        assert status["leave"] == status["flagged"] == PipelineStatus.NEEDS_REVIEW
+            flagged_row = await db.get(PipelineFile, ids["flagged"])
+        assert status["clean"] == status["leave"] == status["flagged"] == PipelineStatus.SUCCESS
+        assert status["empty"] == PipelineStatus.NEEDS_REVIEW
+        assert "disagreed" in (flagged_row.resolution_note or ""), "the open flag is kept in the filing note"
     finally:
         async with SessionLocal() as db:
             await db.execute(delete(TimesheetRecord).where(TimesheetRecord.matched_employee_pk.in_(pks)))
@@ -210,27 +209,3 @@ async def test_bulk_accept_after_upload_keeps_leave_rows_and_ignores_approval_an
             await db.commit()
         await datacache.bust_pipeline()
         await datacache.bust_employees()
-
-
-def test_flag_tolerance_keeps_ns_and_real_problems_but_not_rotation_notes():
-    from app.api.routes.pipeline import _bulk_split
-
-    class T:  # minimal PipelineFile stand-in
-        def __init__(self, flags):
-            self.id, self.employee_name = "x", "X"
-            self.extraction_meta = {
-                "staged": {"employee_pk": "pk", "flags": flags, "buckets": {}},
-                "auto_accept": {"blockers": ["no manager approval evidence found — n/a",
-                                             "validation flags: " + "; ".join(flags)]}}
-    class E:
-        name, project = "X", "MINISTRY OF DEFENCE"
-
-    no_totals = ("this roster prints no Leave/Billing-day totals to check the day grid against — nothing "
-                 "here has been independently verified; review the day-by-day cells directly before accepting")
-    ok = ["reader note: Read from a rotated scan; verify cells.", no_totals,
-          '3 day(s) marked only as "VC" — the roster does not say which kind']
-    ns = ["12 National Service (NS) day(s) — recorded as 'other' leave; confirm in Review", no_totals]
-    disagree = ["a second independent read disagreed with the first on day(s) 18", no_totals]
-    ready, held = _bulk_split([(T(ok), E()), (T(ns), E()), (T(disagree), E())])
-    assert len(ready) == 1 and len(held) == 2
-    assert "National Service" in held[0]["reasons"][0] and "disagreed" in held[1]["reasons"][0]

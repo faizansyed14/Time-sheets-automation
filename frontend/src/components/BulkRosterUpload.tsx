@@ -152,7 +152,7 @@ export default function BulkRosterUpload({ onStaged }: { onStaged: () => void })
       const failed: string[] = [];
       let held: BulkAcceptHeld[] = [];
       for (;;) {
-        const a = await bulkAcceptPipeline({ thread_key: r.thread_key, no_leaves: true });
+        const a = await bulkAcceptPipeline({ thread_key: r.thread_key });
         accepted += a.accepted;
         items.push(...a.accepted_items);
         held = a.held;
