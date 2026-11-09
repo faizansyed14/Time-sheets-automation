@@ -18,6 +18,9 @@ from app.services.extract_email.thread_extract import (
 )
 
 
+_PNG_MAGIC = bytes([0x89]) + b"PNG" + bytes([13, 10, 26, 10])
+
+
 def _png_bytes(*, big: bool) -> bytes:
     """A real, decodable PNG — the collector actually opens every image with
     PIL (to resize/re-encode it), so a fake byte string with a valid magic
@@ -79,15 +82,75 @@ def test_resolve_source_matches_by_bracketed_key():
     assert resolve_source("nothing-like-this", th.items) is None
 
 
-def test_tiny_images_are_dropped_before_any_ocr_or_model_call():
-    """A signature icon / tracking pixel never reaches the model — filtered by
-    size alone, before OCR is even attempted."""
+def _inline_mail(payload: bytes, *, cid: str = "sig1") -> bytes:
+    """A mail whose HTML body embeds `payload` as a cid image (signature-style)."""
+    m = MimeMessage()
+    m["Subject"] = "TIMESHEET June 2026"
+    m["From"] = "employee@alpha.ae"
+    m["To"] = "timesheet@alpha.ae"
+    m.set_content("See below.")
+    m.add_alternative(f'<html><body><p>hi</p><img src="cid:{cid}"></body></html>', subtype="html")
+    m.get_payload()[1].add_related(payload, maintype="image", subtype="png", cid=f"<{cid}>")
+    return m.as_bytes()
+
+
+def test_tracking_pixel_is_dropped_but_a_small_named_screenshot_is_kept():
+    """Only a sub-1KB image (tracking pixel / bullet) is dropped on size alone.
+    A small NAMED attachment - a weekly-timesheet screenshot is often well under
+    30KB - must reach the model: dropping it silently lost whole weeks."""
     eml = _mail(attachments=[
-        ("logo.png", _png_bytes(big=False), "image", "png"),
+        ("pixel.png", _PNG_MAGIC + b"0" * 100, "image", "png"),
+        ("week1.png", _png_bytes(big=False), "image", "png"),
     ])
     th = collect_thread([("msg 1", eml)])
-    assert not any(it.name == "logo.png" for it in th.items)
-    assert any(d["name"] == "logo.png" for d in th.dropped)
+    assert not any(it.name == "pixel.png" for it in th.items)
+    assert any(d["name"] == "pixel.png" and d["filter"] == "size" for d in th.dropped)
+    assert any(it.name == "week1.png" for it in th.items), "small named screenshot must be kept"
+
+
+def test_small_inline_logo_is_dropped_only_when_ocr_finds_no_text(monkeypatch):
+    """A small EMBEDDED image is a logo/stamp suspect: dropped when OCR ran and
+    found nothing, kept when OCR finds real text (a pasted table screenshot)."""
+    from app.core.config import settings
+    from app.services.extraction import ocr as ocr_mod
+
+    # The 30 KB size rule is covered in test_small_images_and_weak_names; switch it off
+    # here so this test isolates the OCR rule that applies to LARGER embedded pictures.
+    monkeypatch.setattr(settings, "min_image_bytes", 0)
+    eml = _inline_mail(_png_bytes(big=False))
+    monkeypatch.setattr(ocr_mod, "ocr_status", lambda: "ready")
+
+    monkeypatch.setattr(ocr_mod, "ocr_text", lambda *a, **k: "")
+    th = collect_thread([("msg 1", eml)])
+    assert not any(it.mime.startswith("image/") for it in th.items)
+    assert any(d.get("filter") == "ocr" for d in th.dropped)
+
+    monkeypatch.setattr(ocr_mod, "ocr_text", lambda *a, **k: "Mon 1 June 8h  Tue 2 June 8h  Wed 3 June 8h")
+    th = collect_thread([("msg 1", eml)])
+    assert any(it.mime.startswith("image/") for it in th.items), "inline image with text must be kept"
+
+
+def test_undecodable_image_is_reported_not_silently_lost():
+    eml = _mail(attachments=[("broken.png", _PNG_MAGIC + b"x" * 5000, "image", "png")])
+    th = collect_thread([("msg 1", eml)])
+    assert not any(it.name == "broken.png" for it in th.items)
+    assert any("broken.png" in u for u in th.unreadable)
+    assert any(d["name"] == "broken.png" and d["filter"] == "unreadable" for d in th.dropped)
+
+
+def test_deeply_nested_forward_is_reported_not_silently_skipped(monkeypatch):
+    from app.core.config import settings
+
+    inner = _mail(subject="inner", attachments=[("s.pdf", b"%PDF-1.4 x", "application", "pdf")])
+    mid = _mail(subject="mid", attachments=[("inner.eml", inner, "message", "rfc822")])
+    # Attach as a FILE so depth is counted (a MIME-nested part is unwrapped for free).
+    outer = MimeMessage()
+    outer["Subject"] = "outer"
+    outer.set_content("fwd")
+    outer.add_attachment(mid, maintype="application", subtype="octet-stream", filename="mid.eml")
+    monkeypatch.setattr(settings, "max_eml_depth", 1)
+    th = collect_thread([("msg 1", outer.as_bytes())])
+    assert any("mid.eml" in u or "nested" in u for u in th.unreadable), th.unreadable
 
 
 def test_real_sized_image_without_ocr_available_is_kept():
@@ -800,26 +863,33 @@ async def test_pass2_does_not_retry_more_than_once(mock_vision_calls):
 # guards against.
 # --------------------------------------------------------------------------
 
-async def test_one_pass1_batch_failing_does_not_lose_other_batches_results(mock_vision_calls):
+async def test_one_pass1_batch_failing_does_not_lose_other_batches_results(mock_vision_calls, monkeypatch):
+    from app.core.config import settings
     from app.services.extract_email.thread_extract import extract_thread_sheets
 
-    # 6 attachments -> chunk_items_by_count(items, pass1_batch_size=5) splits
-    # into batch 1 (items 1-5) and batch 2 (item 6 + the message body item).
+    # One item per pass-1 call, so a single call failing costs exactly one item.
+    monkeypatch.setattr(settings, "pass1_batch_size", 1)
     eml = _mail(plain="See attached.", attachments=[
         (f"sheet{i}.pdf", f"%PDF-1.4 fake sheet {i}".encode(), "application", "pdf")
         for i in range(1, 7)
     ])
-
+    # items: sheet1..sheet6, then the body -> 7 single-item calls. The fixture
+    # fills a verdict ("other") for any item a scripted reply leaves out.
     mock_vision_calls([
-        RuntimeError("simulated transient failure"),  # batch 1 (sheet1..sheet5) — fails outright
-        {"thread_summary": "", "items": [{                              # batch 2 (sheet6 + body) — succeeds
-            "source": "[A6]", "is_timesheet": True, "kind": "timesheet",
+        RuntimeError("simulated transient failure"),             # sheet1 - fails outright
+        {"thread_summary": "", "items": [{                       # sheet2 - succeeds
+            "source": "[A2]", "is_timesheet": True, "kind": "timesheet",
             "employee_name": "Test Person", "employee_id": "E1",
             "period_hint": "June 2026", "evidence": "1-June-26 present",
             "manager_signature": False, "signature_evidence": "", "notes": "",
         }]},
+        {"thread_summary": "", "items": []},   # sheet3
+        {"thread_summary": "", "items": []},   # sheet4
+        {"thread_summary": "", "items": []},   # sheet5
+        {"thread_summary": "", "items": []},   # sheet6
+        {"thread_summary": "", "items": []},   # body
         {"sheets": [{
-            "source": "[A6]", "employee_name": "Test Person", "employee_id": "E1",
+            "source": "[A2]", "employee_name": "Test Person", "employee_id": "E1",
             "month": 6, "year": 2026, "days_covered": 1, "period_type": "partial",
             "missing_days": [], "working_days": ["2026-06-01"], "weekend_days": [],
             "uncertain_days": [], "annual": [], "remote": [], "sick": [],
@@ -829,13 +899,191 @@ async def test_one_pass1_batch_failing_does_not_lose_other_batches_results(mock_
 
     sheets, approval, conflicts, meta = await extract_thread_sheets([("msg 1", eml)])
 
-    # Batch 2's sheet is still returned — the failure in batch 1 didn't
-    # propagate and wipe out the whole run.
+    # sheet2's result is still returned - the failure on sheet1 didn't wipe the run.
     assert len(sheets) == 1
-    assert sheets[0]["name"] == "sheet6.pdf"
+    assert sheets[0]["name"] == "sheet2.pdf"
     assert meta["errors"], "the failure must be recorded, not silently swallowed"
-    assert any("batch 1" in e for e in meta["errors"])
-    assert any("5 item" in e for e in meta["errors"])  # batch 1's own item count
+    assert any("sheet1.pdf" in e for e in meta["errors"])
+    assert meta["incomplete"] is True
+
+
+async def test_failed_pass1_batch_is_split_and_every_item_still_classified(mock_vision_calls, monkeypatch):
+    """A pass-1 call that fails with several items is split in half and retried,
+    so one bad call no longer costs all of its items."""
+    from app.core.config import settings
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    monkeypatch.setattr(settings, "pass1_batch_size", 4)
+    eml = _mail(plain="See attached.", attachments=[
+        (f"sheet{i}.pdf", f"%PDF-1.4 fake sheet {i}".encode(), "application", "pdf") for i in (1, 2, 3)])
+    # 3 sheets + body = 4 items in one batch.
+    mock_vision_calls([
+        RuntimeError("whole batch failed"),
+        {"thread_summary": "", "items": [_p1_item("[A1]", "Person 1", "E1")]},    # first half (A1, A2)
+        {"thread_summary": "", "items": []},                                       # second half (A3, body)
+        {"sheets": [_p2_sheet("[A1]", "Person 1", "E1")]},
+    ])
+    sheets, _a, _c, meta = await extract_thread_sheets([("msg 1", eml)])
+    assert [s["employee_name"] for s in sheets] == ["Person 1"]
+    assert not meta["errors"], meta["errors"]
+    assert meta["incomplete"] is False
+
+
+async def test_item_missing_from_pass1_reply_is_asked_again_on_its_own(mock_vision_calls, monkeypatch):
+    from app.core.config import settings
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    monkeypatch.setattr(settings, "pass1_batch_size", 10)
+    eml = _mail(plain="See attached.", attachments=[
+        ("a.pdf", b"%PDF-1.4 fake a", "application", "pdf"),
+        ("b.pdf", b"%PDF-1.4 fake b", "application", "pdf")])
+    mock_vision_calls([
+        # The reply covers A1 and the body but silently forgets A2 (b.pdf)...
+        {"thread_summary": "", "items": [_p1_item("[A1]", "Person 1", "E1"),
+                                         {"source": "[A3]", "kind": "other"}]},
+        # ...so it is asked about on its own and turns out to be a timesheet.
+        {"thread_summary": "", "items": [_p1_item("[A2]", "Person 2", "E2")]},
+        {"sheets": [_p2_sheet("[A1]", "Person 1", "E1"), _p2_sheet("[A2]", "Person 2", "E2")]},
+    ])
+    sheets, _a, _c, meta = await extract_thread_sheets([("msg 1", eml)])
+    assert sorted(s["employee_name"] for s in sheets) == ["Person 1", "Person 2"]
+    assert not meta["errors"], meta["errors"]
+
+
+async def test_pass2_item_dropped_from_reply_is_recovered_individually(mock_vision_calls, monkeypatch):
+    from app.core.config import settings
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    monkeypatch.setattr(settings, "pass1_batch_size", 10)
+    names = ["Person 1", "Person 2", "Person 3"]
+    eml = _mail(plain="See attached.", attachments=[
+        (f"sheet{i}.pdf", f"%PDF-1.4 fake sheet {i}".encode(), "application", "pdf") for i in (1, 2, 3)])
+    mock_vision_calls([
+        {"thread_summary": "", "items": [_p1_item(f"[A{i}]", n, f"E{i}") for i, n in enumerate(names, 1)]},
+        # The model transcribes two of the three and silently skips A2.
+        {"sheets": [_p2_sheet("[A1]", "Person 1", "E1"), _p2_sheet("[A3]", "Person 3", "E3")]},
+        {"sheets": [_p2_sheet("[A2]", "Person 2", "E2")]},      # the re-read of A2 alone
+    ])
+    sheets, _a, _c, meta = await extract_thread_sheets([("msg 1", eml)])
+    assert sorted(s["employee_name"] for s in sheets) == names
+    assert not meta["errors"], meta["errors"]
+
+
+async def test_pass2_item_that_never_comes_back_makes_the_run_incomplete(mock_vision_calls, monkeypatch):
+    from app.core.config import settings
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    monkeypatch.setattr(settings, "pass1_batch_size", 10)
+    eml = _mail(plain="See attached.", attachments=[
+        ("sheet1.pdf", b"%PDF-1.4 fake sheet 1", "application", "pdf"),
+        ("sheet2.pdf", b"%PDF-1.4 fake sheet 2", "application", "pdf")])
+    mock_vision_calls([
+        {"thread_summary": "", "items": [_p1_item("[A1]", "Person 1", "E1"),
+                                         _p1_item("[A2]", "Person 2", "E2")]},
+        {"sheets": [_p2_sheet("[A1]", "Person 1", "E1")]},
+        {"sheets": []},                                       # re-read of A2 alone: still nothing
+    ])
+    sheets, _a, _c, meta = await extract_thread_sheets([("msg 1", eml)])
+    assert [s["employee_name"] for s in sheets] == ["Person 1"]
+    assert meta["incomplete"] is True
+    assert any("sheet2.pdf" in e for e in meta["errors"]), meta["errors"]
+
+
+async def test_picture_filed_as_other_gets_a_second_look(monkeypatch):
+    """A screenshot the quick first pass called 'other' is shown again, alone, and
+    a positive verdict from that second look wins."""
+    from app.core.config import settings
+    from app.services.extract_email import thread_prompt, triage_prompt
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+    from app.services.extraction import vision_client
+
+    monkeypatch.setattr(settings, "pass1_batch_size", 10)
+    labels: list[str] = []
+
+    async def fake_chat(system_prompt, blocks, model, api_key, *, label="", **kw):
+        labels.append(label)
+        if label.startswith("pass1-rescue"):
+            return {"thread_summary": "", "items": [_p1_item("[A1]", "Person 1", "E1")]}
+        if label.startswith("pass1"):
+            return {"thread_summary": "", "items": [{"source": "[A1]", "kind": "other"},
+                                                    {"source": "[A2]", "kind": "other"}]}
+        return {"sheets": [_p2_sheet("[A1]", "Person 1", "E1")]}
+
+    monkeypatch.setattr(vision_client, "chat_call", fake_chat)
+    monkeypatch.setattr(triage_prompt, "chat_call", fake_chat)
+    monkeypatch.setattr(thread_prompt, "chat_call", fake_chat)
+
+    eml = _mail(plain="See attached.", attachments=[("week1.png", _png_bytes(big=True), "image", "png")])
+    sheets, _a, _c, meta = await extract_thread_sheets([("msg 1", eml)])
+    assert any(lbl.startswith("pass1-rescue") for lbl in labels)
+    assert [s["employee_name"] for s in sheets] == ["Person 1"]
+
+
+async def _run_with_scripted_kinds(monkeypatch, eml, kinds_by_label_prefix):
+    """Run extract_thread_sheets with a scripted model; returns (labels, sheets, meta)."""
+    from app.core.config import settings
+    from app.services.extract_email import thread_prompt, triage_prompt
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+    from app.services.extraction import vision_client
+
+    monkeypatch.setattr(settings, "pass1_batch_size", 10)
+    labels: list[str] = []
+
+    async def fake_chat(system_prompt, blocks, model, api_key, *, label="", **kw):
+        labels.append(label)
+        for prefix, reply in kinds_by_label_prefix:
+            if label.startswith(prefix):
+                return reply
+        raise AssertionError(f"unexpected model call {label}")
+
+    monkeypatch.setattr(vision_client, "chat_call", fake_chat)
+    monkeypatch.setattr(triage_prompt, "chat_call", fake_chat)
+    monkeypatch.setattr(thread_prompt, "chat_call", fake_chat)
+    sheets, _a, _c, meta = await extract_thread_sheets([("msg 1", eml)])
+    return labels, sheets, meta
+
+
+async def test_leave_request_in_an_email_body_filed_as_other_gets_a_second_look(monkeypatch):
+    """A leave request written only in the message text (no attachment) that the
+    quick first pass called 'other' is re-checked alone, and the positive verdict wins."""
+    eml = _mail(plain="Hi, I will be on sick leave from 3 to 5 June 2026. Thanks, Person 1")
+    labels, sheets, _meta = await _run_with_scripted_kinds(monkeypatch, eml, [
+        ("pass1-rescue", {"thread_summary": "", "items": [{**_p1_item("[A1]", "Person 1", "E1"),
+                                                             "kind": "leave_certificate"}]}),
+        ("pass1", {"thread_summary": "", "items": [{"source": "[A1]", "kind": "other"}]}),
+        ("pass2", {"sheets": [_p2_sheet("[A1]", "Person 1", "E1")]}),
+    ])
+    assert any(lbl.startswith("pass1-rescue") for lbl in labels), labels
+    assert [s["employee_name"] for s in sheets] == ["Person 1"]
+
+
+async def test_ordinary_conversation_and_unrelated_files_are_ignored_cheaply(monkeypatch):
+    """Plain chat with no leave vocabulary is not re-read, nothing is extracted,
+    and nothing is reported as a problem."""
+    eml = _mail(subject="Lunch on Friday", plain="Shall we get lunch on Friday? The new place opened.")
+    labels, sheets, meta = await _run_with_scripted_kinds(monkeypatch, eml, [
+        ("pass1", {"thread_summary": "A lunch invitation.",
+                   "items": [{"source": "[A1]", "kind": "other"}]}),
+    ])
+    assert sheets == []
+    assert not any(lbl.startswith("pass1-rescue") for lbl in labels), labels
+    assert not any(lbl.startswith("pass2") for lbl in labels), labels
+    assert meta["incomplete"] is False and not meta["errors"]
+
+
+async def test_an_invoice_attachment_is_checked_again_but_stays_ignored(monkeypatch):
+    """An unrelated PDF gets one cheap second look (it carries pictures/text), the
+    model confirms 'other', and no sheet is produced."""
+    eml = _mail(plain="Invoice attached.", attachments=[
+        ("invoice.pdf", b"%PDF-1.4 fake invoice", "application", "pdf")])
+    labels, sheets, meta = await _run_with_scripted_kinds(monkeypatch, eml, [
+        ("pass1-rescue", {"thread_summary": "", "items": [{"source": "[A1]", "kind": "other"}]}),
+        ("pass1", {"thread_summary": "An invoice.",
+                   "items": [{"source": "[A1]", "kind": "other"}, {"source": "[A2]", "kind": "other"}]}),
+    ])
+    assert sheets == []
+    assert not any(lbl.startswith("pass2") for lbl in labels)
+    assert meta["incomplete"] is False
 
 
 async def test_one_pass2_batch_failing_does_not_lose_other_batches_results(mock_vision_calls, monkeypatch):
@@ -904,7 +1152,8 @@ async def test_pass2_batch_whose_retry_also_fails_is_recorded_not_raised(mock_vi
 
     assert sheets == []
     assert meta["errors"]
-    assert any("retry failed" in e for e in meta["errors"])
+    assert any("june-timesheet.pdf" in e and "could not be read" in e for e in meta["errors"])
+    assert meta["incomplete"] is True
 
 
 def test_collect_thread_strips_nul_from_attachment_and_nested_message_filenames():
@@ -933,3 +1182,78 @@ def test_collect_thread_strips_nul_from_attachment_and_nested_message_filenames(
     names = [i.name for i in th.items] + [c["name"] for c in th.opened_containers]
     assert "sheetone.pdf" in names and "fwdmail.eml" in names
     assert all("\x00" not in n for n in names)
+
+
+def _p2_sheet(src, name, emp_id):
+    return {"source": src, "employee_name": name, "employee_id": emp_id, "month": 10, "year": 2026,
+            "days_covered": 1, "period_type": "partial", "missing_days": [],
+            "working_days": ["2026-10-01"], "weekend_days": [], "uncertain_days": [],
+            "annual": [], "remote": [], "sick": [], "maternity": [], "unpaid": [], "absent": [],
+            "public_holiday": [], "notes": ""}
+
+
+def _p1_item(src, name, emp_id):
+    return {"source": src, "is_timesheet": True, "kind": "timesheet", "employee_name": name,
+            "employee_id": emp_id, "period_hint": "October 2026", "evidence": "1-Oct-26 present",
+            "manager_signature": False, "signature_evidence": "", "notes": ""}
+
+
+async def test_pass2_calls_are_capped_by_sheet_count_not_only_images(mock_vision_calls, monkeypatch):
+    """14 one-image timesheets in one email used to become a 12-sheet call whose
+    reply overran the output limit and was lost. With a per-call sheet cap they
+    go out in small batches and every sheet is read."""
+    from app.core.config import settings
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    monkeypatch.setattr(settings, "pass2_max_sheets_per_call", 3)
+    monkeypatch.setattr(settings, "pass1_batch_size", 10)   # keep pass 1 to ONE call so the scripted replies line up
+    names = [f"Person {i}" for i in range(1, 8)]
+    eml = _mail(plain="See attached.", attachments=[
+        (f"sheet{i}.pdf", f"%PDF-1.4 fake sheet {i}".encode(), "application", "pdf") for i in range(1, 8)])
+    mock_vision_calls([
+        {"thread_summary": "", "items": [_p1_item(f"[A{i}]", n, f"E{i}") for i, n in enumerate(names, 1)]},
+        {"sheets": [_p2_sheet(f"[A{i}]", names[i - 1], f"E{i}") for i in (1, 2, 3)]},   # batch 1: 3 sheets
+        {"sheets": [_p2_sheet(f"[A{i}]", names[i - 1], f"E{i}") for i in (4, 5, 6)]},   # batch 2: 3 sheets
+        {"sheets": [_p2_sheet("[A7]", names[6], "E7")]},                                  # batch 3: 1 sheet
+    ])
+    sheets, _approval, _conf, meta = await extract_thread_sheets([("msg 1", eml)])
+    assert len(sheets) == 7, meta["errors"]
+    assert not meta["errors"]
+
+
+async def test_a_failed_pass2_batch_is_split_and_retried_not_lost(mock_vision_calls, monkeypatch):
+    from app.core.config import settings
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    monkeypatch.setattr(settings, "pass2_max_sheets_per_call", 4)
+    names = [f"Person {i}" for i in range(1, 5)]
+    eml = _mail(plain="See attached.", attachments=[
+        (f"sheet{i}.pdf", f"%PDF-1.4 fake sheet {i}".encode(), "application", "pdf") for i in range(1, 5)])
+    mock_vision_calls([
+        {"thread_summary": "", "items": [_p1_item(f"[A{i}]", n, f"E{i}") for i, n in enumerate(names, 1)]},
+        RuntimeError("pass2-batch1 failed after 3 attempts: unparseable JSON reply"),     # all 4 in one call: cut off
+        {"sheets": [_p2_sheet(f"[A{i}]", names[i - 1], f"E{i}") for i in (1, 2)]},        # first half
+        {"sheets": [_p2_sheet(f"[A{i}]", names[i - 1], f"E{i}") for i in (3, 4)]},        # second half
+    ])
+    sheets, _approval, _conf, meta = await extract_thread_sheets([("msg 1", eml)])
+    assert sorted(s["employee_name"] for s in sheets) == names
+    assert not meta["errors"], "a batch that recovers by splitting must not be reported as an error"
+
+
+async def test_split_that_still_fails_on_one_sheet_reports_only_that_sheet(mock_vision_calls, monkeypatch):
+    from app.core.config import settings
+    from app.services.extract_email.thread_extract import extract_thread_sheets
+
+    monkeypatch.setattr(settings, "pass2_max_sheets_per_call", 2)
+    names = ["Person 1", "Person 2"]
+    eml = _mail(plain="See attached.", attachments=[
+        (f"sheet{i}.pdf", f"%PDF-1.4 fake sheet {i}".encode(), "application", "pdf") for i in (1, 2)])
+    mock_vision_calls([
+        {"thread_summary": "", "items": [_p1_item(f"[A{i}]", n, f"E{i}") for i, n in enumerate(names, 1)]},
+        RuntimeError("whole batch failed"),
+        {"sheets": [_p2_sheet("[A1]", "Person 1", "E1")]},          # half a: ok
+        RuntimeError("sheet 2 unreadable"),                          # half b: fails
+    ])
+    sheets, _approval, _conf, meta = await extract_thread_sheets([("msg 1", eml)])
+    assert [s["employee_name"] for s in sheets] == ["Person 1"]
+    assert any("sheet2.pdf" in e and "even after splitting" in e for e in meta["errors"])

@@ -10,6 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import AsyncIterator
 
 
 @dataclass
@@ -53,6 +54,19 @@ class EmailProvider(ABC):
         after that time — the incremental-sync fast path: one light request
         instead of re-downloading the whole folder."""
         ...
+
+    async def iter_message_pages(
+        self, since: datetime | None = None, before: datetime | None = None,
+    ) -> AsyncIterator[list[ProviderMessage]]:
+        """Messages newest-first, one page at a time, so a caller can commit and
+        checkpoint progress as it goes instead of holding a whole mailbox in
+        memory and losing everything on one failed request. `before` resumes an
+        interrupted backfill (only messages received strictly before it).
+        Default: one page from list_messages."""
+        msgs = await self.list_messages(None, since=since)
+        if before is not None:
+            msgs = [m for m in msgs if m.received_at < before]
+        yield msgs
 
     @abstractmethod
     async def get_message(self, message_id: str) -> ProviderMessage | None:

@@ -1,9 +1,10 @@
 """Inactive employees are month-wise in the Dashboard and Export: shown for the
-month they were inactivated in (and every month before it), gone from the next.
+the months BEFORE the one they were inactivated in, gone from that month onward.
+Newly added employees count from the month they were added, never earlier.
 Rule lives in services/employee/activity.py; export = Python form, dashboard =
 SQL form — both exercised here, plus the pure helpers.
 """
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from app.models.employee import Employee
 from app.models.timesheet_record import TimesheetRecord, ValidationStatus
@@ -21,11 +22,22 @@ def _shift(year: int, month: int, delta: int) -> tuple[int, int]:
     return idx // 12, idx % 12 + 1
 
 
-async def _create(client, h, employee_id: str, name: str) -> str:
+async def _create(client, h, employee_id: str, name: str, *, long_standing: bool = True) -> str:
+    """long_standing: behave like a row that was on the roster before the join month was
+    tracked (joining_date NULL) - what the older tests below are about."""
     r = await client.post("/api/v1/employee-matcher", headers=h,
                           json={"employee_id": employee_id, "name": name, "location": "DXB"})
     assert r.status_code == 201, r.text
-    return r.json()["id"]
+    pk = r.json()["id"]
+    if long_standing:
+        from app.core import datacache
+        from app.core.database import SessionLocal
+        async with SessionLocal() as db:
+            emp = await db.get(Employee, pk)
+            emp.joining_date = None
+            await db.commit()
+        await datacache.bust_employees()
+    return pk
 
 
 async def _delete_employee(pk: str) -> None:
@@ -84,12 +96,18 @@ def test_in_month_rule():
 
     assert in_month(active, 1, 2020, set())
     assert in_month(left_oct, 9, 2026, set()), "before the inactivation month"
-    assert in_month(left_oct, 10, 2026, set()), "the inactivation month itself"
+    assert not in_month(left_oct, 10, 2026, set()), "the inactivation month itself: already gone"
     assert not in_month(left_oct, 11, 2026, set()), "the month after"
     assert not in_month(left_oct, 1, 2027, set())
     assert in_month(left_oct, 11, 2026, {"b"}), "data that month keeps them visible"
     assert not in_month(legacy, 10, 2026, set()), "unknown month -> hidden unless they have data"
     assert in_month(legacy, 10, 2026, {"c"})
+
+    joined_oct = Employee(id="d", employee_id="D", name="D", active=True, joining_date=date(2026, 10, 12))
+    assert not in_month(joined_oct, 9, 2026, set()), "before they joined"
+    assert in_month(joined_oct, 10, 2026, set()), "the month they joined"
+    assert in_month(joined_oct, 11, 2026, set())
+    assert in_month(joined_oct, 9, 2026, {"d"}), "data that month keeps them visible"
 
 
 # ---------------------------------------------------------------- API behaviour
@@ -108,17 +126,18 @@ async def test_inactivated_employee_shows_through_their_month_then_drops_off(cli
         assert r.json()["active"] is False
         assert r.json()["inactive_ym"] == month_key(*cur)
 
-        for ym, expected in ((prev, True), (cur, True), (nxt, False)):
+        for ym, expected in ((prev, True), (cur, False), (nxt, False)):
             assert await _in_export(client, h, eid, *ym) is expected, f"export {ym}"
             assert await _in_dashboard(client, h, name, *ym) is expected, f"dashboard {ym}"
 
         # The dashboard headline count follows the same month-wise rule.
         assert await _dash_total(client, h, *nxt) == total_next_before - 1
+        assert await _in_dashboard(client, h, name, *prev) is True      # history untouched
 
         # ...and the downloaded XLSX agrees with the preview.
         from io import BytesIO
         from openpyxl import load_workbook
-        for ym, expected in ((cur, True), (nxt, False)):
+        for ym, expected in ((prev, True), (cur, False)):
             x = await client.get("/api/v1/timesheets/export", params={"month": ym[1], "year": ym[0]}, headers=h)
             assert x.status_code == 200, x.text
             ws = load_workbook(BytesIO(x.content), read_only=True).active
@@ -204,5 +223,63 @@ async def test_legacy_inactive_employee_only_shows_where_they_have_data(client, 
         assert await _in_dashboard(client, h, name, *cur) is True
         # ...but only that month.
         assert await _in_export(client, h, eid, *_shift(*cur, +1)) is False
+    finally:
+        await _delete_employee(pk)
+
+
+async def test_headcount_each_month_is_its_own(client, admin_token):
+    """Add someone this month: last month's total and missing list do not change, this
+    month's go up by one. Remove someone: they leave from this month on only."""
+    h = auth_headers(admin_token)
+    cur = _now_ym()
+    prev = _shift(*cur, -1)
+    nxt = _shift(*cur, +1)
+    before = {ym: await _dash_total(client, h, *ym) for ym in (prev, cur, nxt)}
+    leaver = await _create(client, h, "JOIN-M2", "Leaves This Month")      # on the roster already
+    pk = await _create(client, h, "JOIN-M1", "Joined This Month", long_standing=False)
+    try:
+        assert await _dash_total(client, h, *prev) == before[prev] + 1          # leaver only (long-standing)
+        assert await _in_dashboard(client, h, "Joined This Month", *prev) is False
+        assert await _in_dashboard(client, h, "Joined This Month", *cur) is True
+        assert await _in_export(client, h, "JOIN-M1", *prev) is False
+        assert await _in_export(client, h, "JOIN-M1", *cur) is True
+
+        r = await client.patch(f"/api/v1/employee-matcher/{leaver}/status", headers=h, json={"active": False})
+        assert r.status_code == 200, r.text
+        assert await _dash_total(client, h, *prev) == before[prev] + 1          # still counted before
+        assert await _dash_total(client, h, *cur) == before[cur] + 1            # joiner only
+        assert await _dash_total(client, h, *nxt) == before[nxt] + 1
+    finally:
+        await _delete_employee(pk)
+        await _delete_employee(leaver)
+
+
+async def test_dates_can_be_chosen_and_corrected_from_the_form(client, admin_token):
+    """Joining / left dates are editable full dates: back-date the joiner, pick the left
+    date, and an old client that does not send them leaves the stored dates alone."""
+    h = auth_headers(admin_token)
+    pk = await _create(client, h, "FORM-M1", "Form Months Case")
+    body = {"employee_id": "FORM-M1", "name": "Form Months Case", "location": "DXB", "active": True}
+    put = lambda extra: client.put(f"/api/v1/employee-matcher/{pk}", headers=h, json={**body, **extra})
+    try:
+        r = await put({"joining_date": "2026-10-12"})
+        assert r.status_code == 200 and r.json()["joining_date"] == "2026-10-12", r.text
+
+        r = await put({})                                                    # dates not sent
+        assert r.json()["joining_date"] == "2026-10-12", "an old client must not wipe the joining date"
+
+        r = await put({"active": False, "joining_date": "2026-10-12", "left_date": "2026-12-20"})
+        assert r.status_code == 200, r.text
+        assert r.json()["left_date"] == "2026-12-20" and r.json()["inactive_ym"] == 202612
+
+        assert (await put({"active": False, "joining_date": "2026-10-12", "left_date": "2026-10-01"})).status_code == 422
+
+        r = await put({"joining_date": None})
+        assert r.json()["joining_date"] is None, "clearing it means 'every month'"
+
+        c = await client.post("/api/v1/employee-matcher", headers=h,
+                              json={"employee_id": "FORM-M2", "name": "Form Months Two", "joining_date": None})
+        assert c.status_code == 201 and c.json()["joining_date"] is None
+        await _delete_employee(c.json()["id"])
     finally:
         await _delete_employee(pk)

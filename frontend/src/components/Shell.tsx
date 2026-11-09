@@ -288,7 +288,7 @@ export default function Shell({ children }: { children: ReactNode }) {
       <aside
         className={cn(
           "relative hidden shrink-0 flex-col border-r border-slate-200/80 bg-white/70 text-slate-700 backdrop-blur-md transition-[width] duration-200 lg:flex",
-          collapsed ? "w-[68px]" : "w-[248px]"
+          collapsed ? "w-[68px]" : "w-[208px]"
         )}
       >
         <SidebarBody idPrefix="desktop" collapsed={collapsed} {...sidebarProps} />

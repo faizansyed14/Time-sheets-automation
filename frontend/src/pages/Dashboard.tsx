@@ -85,7 +85,14 @@ function StatCard({
 function monthStatus(row: DashboardRow, month: number, year: number) {
   const future = year > CUR_YEAR || (year === CUR_YEAR && month > CUR_MONTH);
   const submitted = row.submitted_months.includes(month);
-  if (submitted) return { label: "Submitted", tone: "success" as const };
+  if (submitted) {
+    // Green only when THIS month's record is verified and approved; otherwise amber.
+    const flagged = row.focus_validation_status === "manual_review";
+    const unapproved = !!row.focus_approval_status && row.focus_approval_status !== "approved";
+    if (flagged) return { label: "Submitted · needs review", tone: "warning" as const };
+    if (unapproved) return { label: "Submitted · not approved", tone: "warning" as const };
+    return { label: "Submitted", tone: "success" as const };
+  }
   if (future) return { label: "Not due", tone: "slate" as const };
   // Focus month only: awaiting_review_this_month is scoped to whatever
   // month/year this dashboard is currently showing (see employees.py).
@@ -96,10 +103,13 @@ function monthStatus(row: DashboardRow, month: number, year: number) {
 
 function MonthStrip({
   submitted,
+  issues,
   year,
   focusMonth,
 }: {
   submitted: number[];
+  /** Submitted months that still need a check (flagged / not approved). */
+  issues: number[];
   year: number;
   focusMonth: number;
 }) {
@@ -107,9 +117,12 @@ function MonthStrip({
     <div className="flex gap-px">
       {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => {
         const done = submitted.includes(m);
+        const hasIssue = done && issues.includes(m);
         const future = year > CUR_YEAR || (year === CUR_YEAR && m > CUR_MONTH);
         const isFocus = m === focusMonth;
-        const state = done ? "submitted" : future ? "not due yet" : "missing";
+        const state = done
+          ? (hasIssue ? "submitted - needs a check (flagged or not approved)" : "submitted - verified and approved")
+          : future ? "not due yet" : "missing";
         return (
           <span
             key={m}
@@ -117,7 +130,7 @@ function MonthStrip({
             className={cn(
               "flex h-4 w-4 items-center justify-center rounded-sm text-[8px] font-bold transition-colors",
               done
-                ? "bg-emerald-500 text-white"
+                ? (hasIssue ? "bg-amber-500 text-white" : "bg-emerald-500 text-white")
                 : future
                   ? "bg-slate-50 text-slate-300"
                   : isFocus
@@ -460,9 +473,10 @@ export default function Dashboard() {
                   const key = rowKey(r);
                   const status = monthStatus(r, month, year);
                   const hasSubmittedMonth = r.submitted_months.includes(month);
+                  // This month's record only - another month's problem must not colour it.
                   const needsReview =
                     r.focus_validation_status === "manual_review" ||
-                    r.needs_review_count > 0;
+                    (!!r.focus_approval_status && r.focus_approval_status !== "approved");
                   const showView = !!r.employee_pk && (hasSubmittedMonth || !!r.focus_record_id);
                   return (
                     <tr key={key} className="group hover:bg-slate-50/80">
@@ -524,6 +538,7 @@ export default function Dashboard() {
                       <td className="px-2 py-1.5">
                         <MonthStrip
                           submitted={r.submitted_months}
+                          issues={r.issue_months ?? []}
                           year={year}
                           focusMonth={month}
                         />

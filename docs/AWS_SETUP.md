@@ -199,7 +199,7 @@ container — they're unused against RDS:
    foot-gun. Remove the `db:` service, the `pg_data` volume, and every
    `depends_on: db` line — or just start the services you need:
    ```bash
-   docker compose -f docker-compose.prod.yml --env-file .env up -d backend worker frontend
+   docker compose -f docker-compose.prod.yml --env-file .env up -d backend worker worker-extract frontend
    ```
 3. **Migrations run automatically**: the backend command is
    `alembic upgrade head && uvicorn ...`, so on boot it migrates RDS using

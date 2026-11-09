@@ -14,7 +14,6 @@ import {
   FileText,
   Mail,
   RefreshCw,
-  RotateCcw,
   ScanLine,
   ShieldQuestion,
   Sparkles,
@@ -28,7 +27,6 @@ import {
   fetchPipeline,
   fetchPipelineStats,
   rematchUnmatchedPipelineFiles,
-  retryPipelineFile,
   MONTHS,
   type PipelineFile,
   type RematchResult,
@@ -298,7 +296,16 @@ function ExtractionSummary({ staged, fee }: { staged: StagedMeta | null; fee: Fe
 
       {(staged?.flags?.length ?? 0) > 0 && (
         <ul className="mt-3 list-inside list-disc space-y-0.5 text-xs text-slate-500">
-          {staged!.flags!.map((f, i) => <li key={i}>{f}</li>)}
+          {staged!.flags!.map((f, i) =>
+            /^EXTRACTION INCOMPLETE/i.test(f) ? (
+              // A run that could not read part of the thread: not a normal
+              // note, so it must not look like one. It is retried automatically.
+              <li key={i} className="font-semibold text-amber-700" title="Part of this email could not be read. It is retried automatically; check the items before accepting.">
+                {f}
+              </li>
+            ) : (
+              <li key={i}>{f}</li>
+            ))}
         </ul>
       )}
     </div>
@@ -565,19 +572,6 @@ export default function PipelinePage() {
     invalidate();
     qc.invalidateQueries({ queryKey: ["files"] });
   };
-
-  const retryMut = useMutation({
-    mutationFn: retryPipelineFile,
-    onSuccess: (t) => {
-      if (t.status === "success")
-        toast("success", "Retry succeeded", `${t.filename} processed cleanly.`);
-      else if (t.status === "needs_review")
-        toast("warning", "Retry finished with flags", t.failure_detail ?? "");
-      else toast("error", "Retry failed again", t.failure_detail ?? "");
-      invalidate();
-    },
-    onError: (e: any) => toast("error", "Retry failed", e?.response?.data?.detail ?? String(e)),
-  });
 
   const deleteMut = useMutation({
     mutationFn: deletePipelineFile,
@@ -960,17 +954,6 @@ export default function PipelinePage() {
                         {f.can_resolve_assign && (
                           <Button size="sm" onClick={() => setAssigning(f)}>
                             <Columns2 className="h-4 w-4" /> Review
-                          </Button>
-                        )}
-                        {f.can_retry && f.status !== "processing" && (
-                          <Button
-                            size="sm"
-                            variant="secondary"
-                            disabled={retryMut.isPending}
-                            onClick={() => retryMut.mutate(f.id)}
-                          >
-                            <RotateCcw className={cn("h-4 w-4", retryMut.isPending && "animate-spin")} />
-                            Retry extraction
                           </Button>
                         )}
                         {f.record_id && (

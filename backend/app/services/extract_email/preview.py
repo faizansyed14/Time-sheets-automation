@@ -54,7 +54,7 @@ async def preview_llm_egress(
         for it in th.items for pi, img in enumerate(it.images, 1)
     ]
 
-    batches = chunk_items_by_count(th.items, settings.pass1_batch_size)
+    batches = chunk_items_by_count(th.items, settings.pass1_batch_size, max_images=settings.max_images_per_call)
     first_batch = batches[0] if batches else []
 
     # Pass 1's prompt carries the whole payload (or the first batch of it on a

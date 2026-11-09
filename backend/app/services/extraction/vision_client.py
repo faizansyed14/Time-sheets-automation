@@ -36,6 +36,13 @@ _TEMPERATURE = 0.0
 _MAX_TOKENS = 8000
 
 
+class TruncatedReply(RuntimeError):
+    """The model hit its output-token limit before finishing the JSON.
+
+    Retrying the identical call can only truncate again, so callers split the
+    work (fewer sheets/items per call) instead of burning attempts."""
+
+
 def vision_provider() -> str:
     return (settings.llm_provider or "openai").strip().lower()
 
@@ -109,6 +116,7 @@ async def chat_call(
     retries: int = 3,
     force_json: bool = True,
     enable_thinking: bool = True,
+    max_tokens: int | None = None,
 ) -> dict:
     """One system+content-blocks call, returning the parsed JSON reply.
 
@@ -118,10 +126,15 @@ async def chat_call(
     `enable_thinking=False` turns off Qwen3-VL's <think> reasoning trace for
     calls that just need a fast, literal transcription (pass 2); pass 1 keeps
     it on since classification benefits from the extra reasoning.
+    `max_tokens` overrides the default 8k output cap (the thread-extraction
+    passes ask for far more so a many-sheet reply is never cut off). A reply
+    cut off by the limit raises TruncatedReply immediately — same call again
+    would truncate again — so the caller can split the batch.
     """
     api_root, _ = openai_urls(settings.openai_base_url)
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     last_err: object = None
+    limit = int(max_tokens) if max_tokens and max_tokens > 0 else _MAX_TOKENS
     for attempt in range(retries):
         messages = []
         if (system_prompt or "").strip():
@@ -129,7 +142,7 @@ async def chat_call(
         messages.append({"role": "user", "content": content_blocks})
         payload: dict = {
             "model": model, "messages": messages,
-            "temperature": _TEMPERATURE, "max_tokens": _MAX_TOKENS,
+            "temperature": _TEMPERATURE, "max_tokens": limit,
         }
         if force_json and attempt == 0:
             payload["response_format"] = {"type": "json_object"}
@@ -144,16 +157,32 @@ async def chat_call(
                 r = await client.post(f"{api_root}/v1/chat/completions", json=payload, headers=headers)
             if r.status_code != 200:
                 last_err = f"{r.status_code}: {r.text[:500]}"
-                await asyncio.sleep(2 + 3 * attempt)
+                if (r.status_code == 400 and limit != _MAX_TOKENS
+                        and "token" in r.text.lower()):
+                    # The model/provider rejects the large output budget —
+                    # drop to the conservative default and ask again.
+                    limit = _MAX_TOKENS
+                    continue
+                retry_after = r.headers.get("retry-after", "")
+                wait = 2 + 3 * attempt
+                if r.status_code == 429 and retry_after.strip().isdigit():
+                    wait = min(60, max(wait, int(retry_after.strip())))
+                await asyncio.sleep(wait)
                 continue
             body = r.json()
-            raw = ((body.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            choice = (body.get("choices") or [{}])[0]
+            raw = (choice.get("message") or {}).get("content") or ""
             data = _parse_json_loose(raw)
+            if data is None and str(choice.get("finish_reason") or "").lower() == "length":
+                raise TruncatedReply(
+                    f"{label or 'vision call'}: reply cut off at {limit} output tokens")
             if data is None:
                 last_err = "unparseable JSON reply"
                 await asyncio.sleep(2 + 3 * attempt)
                 continue
             return data
+        except TruncatedReply:
+            raise
         except Exception as exc:
             last_err = exc
             await asyncio.sleep(2 + 3 * attempt)

@@ -16,7 +16,7 @@ Source of truth: currently **wired** code. Shorter overview:
 
 ## 1. Overview
 
-Four extract entry points share one analysis core (thread two-pass). Vault
+Three extract entry points share one analysis core (thread two-pass). Vault
 filing is a **separate human step** (Compare & Fix Accept). Date checks and
 summaries are plain Python — no second “validation LLM”.
 
@@ -25,7 +25,6 @@ summaries are plain Python — no second “validation LLM”.
 | 1 | Extract Email | Inbox | `POST /inbox/{id}/extract-full` | Yes (`source_kind=email`) | Yes |
 | 2 | Upload | Upload page | `POST /upload` | Yes (`source_kind=upload`) | Yes |
 | 3 | Agentic | Agentic Chat | `POST /agentic-chat/extract` then optional `.../store` | Extract: no; Store: yes | Yes |
-| 4 | Pipeline Retry | Pipeline | `POST /pipeline/{id}/retry` | In-place re-analyse | Yes |
 
 **Shared vault step (no LLM):** Compare & Fix Accept →
 `POST /pipeline/{id}/manual-fix` → `ingest_manual_entry` → File Vault + DB.
@@ -187,10 +186,6 @@ that errors, a thread with zero sheets) do not raise — they are returned in th
 run's `errors`, the run completes, and that run is saved to **Admin → Extraction
 debug** (see [`EXTRACTION_TWO_PASS.md`](EXTRACTION_TWO_PASS.md) §10).
 
-### 4.4 Retry
-
-`POST /pipeline/{id}/retry` — re-read raw copy → refresh staged meta; **no vault write**.
-
 ---
 
 ## 5. Accept → File Vault
@@ -272,7 +267,6 @@ Thread summary: `ThreadSummaryBox` with `defaultOpen` on the conversation view.
 | `POST` | `/inbox/{id}/as-eml/save-to-vault` | File `.eml` (ACO/DCO folder via `employee_pk`) |
 | `POST` | `/upload` | Upload extract → stage |
 | `POST` | `/upload/manual` | Manual → vault |
-| `POST` | `/pipeline/{id}/retry` | Re-analyse raw |
 | `POST` | `/pipeline/{id}/manual-fix` | Accept → vault + record |
 | `POST` | `/inbox/auto-extract/start` · `/stop` | Auto Extract on/off — **admin only** |
 | `GET` | `/inbox/auto-extract/status` | Auto Extract progress (any inbox user) |

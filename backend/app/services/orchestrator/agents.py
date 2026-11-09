@@ -99,7 +99,8 @@ class ThreadAgent(Agent):
         cap_token = debug_capture.set_capture(cap)
         try:
             sheets, approval, conflicts, meta = await extract_thread_sheets(
-                messages, cached_sheets=cached, calendars=calendars)
+                messages, cached_sheets=cached, calendars=calendars,
+                fresh_window=bool(ctx.only_message_ids))
         finally:
             debug_capture.reset_capture(cap_token)
         # Carried into extraction_meta.full_email_extract.snapshot_at (see
@@ -108,8 +109,15 @@ class ThreadAgent(Agent):
         # updated_at for that comparison. None for any caller that never set
         # it, which just means that run falls back to today's behavior.
         meta["snapshot_at"] = ctx.snapshot_at.isoformat() if ctx.snapshot_at else None
+        if ctx.only_message_ids:
+            meta["partial_read"] = True       # other messages were not read: never delete other items
+        if ctx.fetch_problems:
+            # Messages that never downloaded were NOT read: the run is
+            # incomplete (retried), exactly like a model call that failed.
+            meta["errors"] = list(meta.get("errors") or []) + list(ctx.fetch_problems)
+            meta["incomplete"] = True
         errors = meta.get("errors") or []
-        had_a_problem = bool(errors) or not sheets
+        had_a_problem = bool(errors) or not sheets or bool(meta.get("warnings"))
         if not had_a_problem:
             cap.discard_images()    # clean run: its dropped pictures are never written anywhere
         if had_a_problem:
@@ -203,16 +211,14 @@ class ThreadAgent(Agent):
         ctx.conflicts = conflicts
         if meta.get("summary"):
             ctx.notes.append(str(meta["summary"]))
+        for w in meta.get("warnings") or []:
+            ctx.notes.append(str(w))
         skipped = meta.get("skipped") or []
         if skipped:
             names = [s.get("name") for s in skipped if isinstance(s, dict) and s.get("name")]
             if names:
                 ctx.notes.append("Not sent (size/noise filter): " + ", ".join(names[:4]))
-        multi_employee = meta.get("multi_employee_skipped") or []
-        if multi_employee:
-            ctx.notes.append(
-                "Not extracted — looks like a multi-employee roster (upload it on the "
-                "Bulk Upload page instead): " + ", ".join(multi_employee[:4]))
+        # (multi-employee rosters are already in meta["warnings"] above)
         if not sheets:
             ctx.abort("no readable sheets")
             return meta.get("errors", ["nothing readable in this thread"])[0]
@@ -345,7 +351,7 @@ class DecisionAgent(Agent):
             raw_bytes=ctx.raw_bytes, raw_name=ctx.raw_name,
             content_type=ctx.content_type, groups=ctx.groups,
             approval=ctx.approval or {"detected": False, "detail": ""},
-            run_meta=ctx.run_meta)
+            run_meta=ctx.run_meta, keep_existing_raw=not ctx.raw_complete)
         filed = sum(
             1 for t in ctx.staged
             if (t.extraction_meta or {}).get("auto_accept", {}).get("accepted"))

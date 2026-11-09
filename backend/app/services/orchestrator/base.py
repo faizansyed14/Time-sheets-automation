@@ -68,6 +68,15 @@ class AgentContext:
     # path that doesn't set it (e.g. Upload), which is fine — that path
     # never consults this watermark at all.
     snapshot_at: datetime | None = None
+    # Parts of the conversation that could not be DOWNLOADED this run (see
+    # thread_collect.CollectNotes.problems). Retriable, so ThreadAgent folds
+    # them into run_meta["errors"] and marks the run incomplete.
+    fetch_problems: list[str] = field(default_factory=list)
+    # False when the stored copy of the conversation could not be rebuilt in full
+    # on this run - staging then keeps the copy it already has.
+    raw_complete: bool = True
+    # Message ids the reviewer ticked ("extract only these"); empty = the normal run.
+    only_message_ids: list[str] = field(default_factory=list)
 
     def abort(self, reason: str) -> None:
         self.aborted = reason

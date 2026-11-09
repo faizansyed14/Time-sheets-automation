@@ -31,6 +31,25 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_acks_late=True,
+    # Extraction tasks (minutes each, LLM-bound) live on their OWN queue, served by
+    # the dedicated `worker-extract` service. Otherwise a mailbox-wide catch-up
+    # (thousands of threads) sits in front of OTP emails, reminders and inbox sync
+    # in the single default queue and starves them for hours.
+    task_default_queue="celery",
+    task_routes={
+        "inbox.extract_one_thread": {"queue": "extract"},
+        "ingestion.process_upload": {"queue": "extract"},
+        # inbox.auto_extract_scan stays on the default queue: it only lists threads
+        # and dispatches, and it is where a missing extract worker gets reported.
+    },
+    # One task at a time per worker process: a prefetched long extraction would
+    # otherwise sit reserved behind a slow one while other workers idle.
+    worker_prefetch_multiplier=1,
+    # With acks_late a task still running past the broker's visibility timeout
+    # (default 1h) is REDELIVERED to another worker - a duplicate extraction of
+    # a big thread. Cover the longest realistic run (the per-thread lock makes
+    # any remaining duplicate wait instead of double-processing).
+    broker_transport_options={"visibility_timeout": 6 * 3600},
     worker_max_tasks_per_child=200,
     broker_connection_retry_on_startup=True,
     # Periodic maintenance (runs under `celery worker -B` or a dedicated beat).

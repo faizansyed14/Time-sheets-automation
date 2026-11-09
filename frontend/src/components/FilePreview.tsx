@@ -10,6 +10,7 @@ import { b64ToBytes, buildEmailHtmlDocument, downloadFile, isDocx, isEml, isPdf,
 import { api, fetchEmlPreview, fetchEmlPreviewFromBytes, type EmlParsed } from "../api/client";
 import { Spinner } from "./ui";
 import { XlsxPreviewPane } from "./XlsxPreview";
+import DocxPane from "./DocxViewer";
 
 // ---------------------------------------------------------------------------
 // EML viewer — Outlook-style rendering of .eml files
@@ -484,7 +485,7 @@ export function SourcePreview({
   if (isDocx(name, ct)) {
     return (
       <div className="h-full overflow-hidden rounded-lg border border-slate-200 bg-white">
-        <ServerRenderPane
+        <DocxPane
           renderUrl={renderUrl}
           renderUpload={renderUpload}
           sourceUrl={!renderUrl && !renderUpload ? url : null}
@@ -677,6 +678,17 @@ export function FilePreviewModal({
               fileUrl={file.url}
               filename={file.filename}
               dataB64={file.renderUpload?.dataB64}
+            />
+          ) : office && (useServerPages || useOfficeFetch) ? (
+            // Word files: the in-browser viewer; it falls back to the server
+            // page-image renderer itself when it can't read the bytes. The raw
+            // URL (when there is one) is preferred as the source for the bytes.
+            <DocxPane
+              renderUrl={file.renderUrl}
+              renderUpload={file.renderUpload}
+              sourceUrl={file.url || null}
+              filename={file.filename}
+              contentType={mimeFor(file.filename, file.contentType)}
             />
           ) : useServerPages || useOfficeFetch ? (
             <ServerRenderPane

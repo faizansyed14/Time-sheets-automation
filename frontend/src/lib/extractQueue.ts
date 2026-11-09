@@ -11,15 +11,29 @@ import { extractFullEmailStream, type ExtractionEvent, type PipelineFile } from 
 
 export type ExtractTaskStatus = "queued" | "running" | "done" | "error";
 
+/** What the backend returns for one finished Extract Email run. `incomplete`
+ *  means part of the conversation could not be read (a model call failed, a
+ *  message would not download): the thread is retried automatically, and every
+ *  item it staged carries the reason as a flag. */
+export interface ExtractTaskResult {
+  staged: PipelineFile[];
+  groups: number;
+  message: string;
+  incomplete?: boolean;
+  errors?: string[];
+}
+
 export interface ExtractTask {
   id: string;
   msgId: string;
   subject: string;
   forceFull: boolean;
+  /** When set, ONLY these messages of the conversation are read. */
+  messageIds: string[];
   status: ExtractTaskStatus;
   events: ExtractionEvent[];
   error: string | null;
-  result: { staged: PipelineFile[]; groups: number; message: string } | null;
+  result: ExtractTaskResult | null;
   queuedAt: number;
   startedAt: number | null;
   finishedAt: number | null;
@@ -83,7 +97,7 @@ class ExtractQueueStore {
     this.setTasks(this.tasks.filter((t) => t.id !== id));
   };
 
-  enqueue = (msgId: string, subject: string, forceFull = false): string => {
+  enqueue = (msgId: string, subject: string, forceFull = false, messageIds: string[] = []): string => {
     const finishedIds = this.tasks
       .filter((t) => t.status === "done" || t.status === "error")
       .slice(0, -MAX_FINISHED_KEPT)
@@ -95,6 +109,7 @@ class ExtractQueueStore {
       msgId,
       subject: subject || "(no subject)",
       forceFull,
+      messageIds,
       status: "queued",
       events: [],
       error: null,
@@ -121,22 +136,36 @@ class ExtractQueueStore {
           const cur = this.tasks.find((t) => t.id === next.id);
           if (cur) this.patch(next.id, { events: [...cur.events, ev] });
         },
-        next.forceFull
-      )) as { staged: PipelineFile[]; groups: number; message: string };
+        next.forceFull,
+        next.messageIds
+      )) as ExtractTaskResult;
 
       this.patch(next.id, { status: "done", result, finishedAt: Date.now() });
 
       const review = (result?.staged ?? []).filter((f) => f.status === "needs_review");
-      this.toastFn?.(
-        review.length ? "info" : "success",
-        review.length ? "Extract Email — needs review" : "Extract Email complete",
-        `"${next.subject}" · ${result?.groups ?? 0} record(s)${
-          review.length ? ` · ${review.length} to review` : ""
-        }`,
-        review.length
-          ? { label: "Review now", onClick: () => this.navigateFn?.("/pipeline?status=needs_review") }
-          : undefined
-      );
+      const reviewAction = review.length
+        ? { label: "Review now", onClick: () => this.navigateFn?.("/pipeline?status=needs_review") }
+        : undefined;
+      if (result?.incomplete) {
+        // Never report an incomplete read as a clean success.
+        const why = (result.errors ?? []).slice(0, 2).join("; ") || "a part of the thread could not be read";
+        this.toastFn?.(
+          "warning",
+          "Extract Email — incomplete",
+          `"${next.subject}" · ${result.groups ?? 0} record(s) so far. ${why}. It will be retried automatically; ` +
+            `you can also tick the messages and press "Extract selected".`,
+          reviewAction
+        );
+      } else {
+        this.toastFn?.(
+          review.length ? "info" : "success",
+          review.length ? "Extract Email — needs review" : "Extract Email complete",
+          `"${next.subject}" · ${result?.groups ?? 0} record(s)${
+            review.length ? ` · ${review.length} to review` : ""
+          }`,
+          reviewAction
+        );
+      }
 
       this.qc?.invalidateQueries({ queryKey: ["inbox-threads"] });
       this.qc?.invalidateQueries({ queryKey: ["email", next.msgId] });

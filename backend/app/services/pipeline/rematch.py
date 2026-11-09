@@ -11,9 +11,7 @@ even though the file was already sitting in Pipeline.
 
 This reuses the SAME matcher (services/pipeline/matching.py) against the
 name/ID already captured at staging time — no re-extraction, no LLM call —
-so it's safe and cheap to run over the whole backlog at once, unlike
-/pipeline/{id}/retry (which re-runs the full vision extraction per file, and
-isn't even built for bulk-roster items in the first place).
+so it's safe and cheap to run over the whole backlog at once.
 """
 from __future__ import annotations
 

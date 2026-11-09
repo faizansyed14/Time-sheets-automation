@@ -61,17 +61,51 @@ services:
     build: { context: ./backend }
     # -B = embedded beat scheduler (inbox sync, reminder check, system-health
     # check). Keep this a SINGLE replica — beat must not run twice.
-    command: celery -A app.core.celery_app.celery_app worker -B --loglevel=info --concurrency=${CELERY_CONCURRENCY:-3}
+    command: celery -A app.core.celery_app.celery_app worker -B --loglevel=info --concurrency=${CELERY_CONCURRENCY:-3} -Q celery
     env_file: [.env]
     environment:
       REDIS_URL: redis://redis:6379/0
       CELERY_TASK_ALWAYS_EAGER: "false"
       AUTO_CREATE_TABLES: "false"
       DB_NULLPOOL: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.core.celery_app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 5 | grep -q OK"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
     restart: unless-stopped
     depends_on:
       redis: { condition: service_healthy }
       backend: { condition: service_healthy }   # wait for migrations to finish
+    deploy:
+      resources:
+        limits: { cpus: "1.00", memory: 1024M }
+
+  # Dedicated worker for the `extract` queue: Auto Extract threads, the catch-up
+  # scan and background uploads. Kept apart from `worker` (OTP emails, reminders,
+  # inbox sync, beat) so a large extraction backlog can never delay a login code.
+  # NO -B here - beat runs once, in `worker`. Scale with EXTRACT_CONCURRENCY or by
+  # running more replicas of this service (the per-thread lock makes that safe).
+  worker-extract:
+    build: { context: ./backend }
+    command: celery -A app.core.celery_app.celery_app worker -n extract@%h --loglevel=info --concurrency=${EXTRACT_CONCURRENCY:-3} -Q extract
+    env_file: [.env]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CELERY_TASK_ALWAYS_EAGER: "false"
+      AUTO_CREATE_TABLES: "false"
+      DB_NULLPOOL: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.core.celery_app.celery_app inspect ping -d extract@$$HOSTNAME --timeout 5 | grep -q OK"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      redis: { condition: service_healthy }
+      backend: { condition: service_healthy }
     deploy:
       resources:
         limits: { cpus: "1.00", memory: 1024M }

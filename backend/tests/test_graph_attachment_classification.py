@@ -104,16 +104,24 @@ def test_generic_body_image_name_is_junk_even_without_is_inline_flag():
         "image/png", has_doc=True, is_inline=False) == "other"
 
 
-def test_tiny_image_is_junk_but_documents_of_any_size_are_not():
-    """Images under MIN_IMAGE_ATTACHMENT_KB are logos/icons → 'other', even
-    with a real-looking name. The size rule must NEVER touch documents."""
-    tiny = 10 * 1024   # 10 KB
-    big = 200 * 1024   # 200 KB
+def test_only_a_tracking_pixel_is_junk_by_size_and_documents_of_any_size_are_not():
+    """Size alone no longer calls a named screenshot junk - a weekly-timesheet
+    screenshot is often only 10-30KB. Just a tracking-pixel-sized image (<1KB)
+    is ruled out by size; the inline flag / generic names catch signatures.
+    The size rule must NEVER touch documents."""
+    pixel = 600
+    small = 10 * 1024   # 10 KB
+    big = 200 * 1024    # 200 KB
     assert _classify("Screenshot 2026-07-07.png", "image/png",
-                     has_doc=True, size=tiny) == "other"
+                     has_doc=True, size=pixel) == "other"
+    assert _classify("Screenshot 2026-07-07.png", "image/png",
+                     has_doc=True, size=small) == "approval_screenshot"
+    assert _classify("week1.png", "image/png", has_doc=False, size=small) == "timesheet"
     assert _classify("Screenshot 2026-07-07.png", "image/png",
                      has_doc=True, size=big) == "approval_screenshot"
-    # A small PDF/DOCX is still a timesheet — size only applies to images.
-    assert _classify("sheet.pdf", "application/pdf", has_doc=False, size=tiny) == "timesheet"
+    # An inline / generic-named signature graphic is still junk whatever its size.
+    assert _classify("image001.png", "image/png", has_doc=True, size=big) == "other"
+    # A small PDF/DOCX is still a timesheet - size only applies to images.
+    assert _classify("sheet.pdf", "application/pdf", has_doc=False, size=pixel) == "timesheet"
     # size=0 (unknown) must not trigger the rule.
     assert _classify("Screenshot real.png", "image/png", has_doc=True, size=0) == "approval_screenshot"

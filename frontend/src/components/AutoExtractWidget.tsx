@@ -155,6 +155,16 @@ export default function AutoExtractWidget() {
               {status.skipped} already done
             </span>
           )}
+          {status.failed > 0 && (
+            <span
+              className="font-semibold text-rose-600"
+              title={status.last_error
+                ? `${status.failed} thread(s) could not be fully read. Last error: ${status.last_error}`
+                : `${status.failed} thread(s) could not be fully read and will be retried`}
+            >
+              {status.failed} failed
+            </span>
+          )}
           {isRunning && <span className="hidden text-amber-600 md:inline">{remaining} left</span>}
           {isRunning && status.current && (
             <span
@@ -213,6 +223,11 @@ export default function AutoExtractWidget() {
             {status.finished_at && (
               <div className="mt-1 text-[11px] text-slate-400">
                 Last run: {status.succeeded} ok, {status.skipped} skipped, {status.failed} failed
+              </div>
+            )}
+            {status.last_error && (
+              <div className="mt-1.5 rounded border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] leading-4 text-rose-700">
+                {status.last_error}
               </div>
             )}
           </div>

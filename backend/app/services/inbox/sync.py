@@ -101,51 +101,127 @@ async def _has_any_email(db: AsyncSession) -> bool:
     ).scalar_one() > 0
 
 
+async def _pages(provider, since, before):
+    """Pages from the provider; a provider without paging (older/mock/duck-typed)
+    yields its whole list_messages() result as one page."""
+    paged = getattr(provider, "iter_message_pages", None)
+    if paged is None:
+        yield await provider.list_messages(None, since=since)
+        return
+    async for page in paged(since=since, before=before):
+        yield page
+
+
+def _light(row):
+    """What the caller needs from a synced row (ids + subject/time), without the
+    message body - a first-time backfill can be hundreds of thousands of rows."""
+    from types import SimpleNamespace
+
+    if not hasattr(row, "provider_message_id"):
+        return row
+    return SimpleNamespace(
+        provider_message_id=row.provider_message_id,
+        conversation_id=getattr(row, "conversation_id", None),
+        subject=getattr(row, "subject", None), received_at=getattr(row, "received_at", None))
+
+
+SYNC_BACKFILL_KEY = "inbox:sync:backfill"   # {"before": iso, "started_at": epoch} while a first full crawl is unfinished
+SYNC_ERROR_KEY = "inbox:sync:last_error"
+_LOCK_TTL = 120          # refreshed after every page, so a long backfill keeps it
+
+
 async def sync_inbox(db: AsyncSession) -> list[EmailMessage] | None:
     """Throttled, incremental provider sync. Never blocks the caller on a full
     mailbox download:
 
-    - fresh (synced < INBOX_SYNC_MIN_INTERVAL_SECONDS ago) → no-op, serve DB;
+    - fresh (synced < INBOX_SYNC_MIN_INTERVAL_SECONDS ago) -> no-op, serve DB;
     - otherwise ask the provider only for messages received after the LAST
       SUCCESSFUL SYNC (one small request). A full folder crawl happens only
       when there is no sync marker (first boot / cache flushed) OR the table
       is empty despite a marker existing (Postgres was wiped/restored without
-      also clearing the Redis cursor — trust the DB's actual content over a
+      also clearing the Redis cursor - trust the DB's actual content over a
       stale cursor rather than silently syncing "nothing new" forever);
-    - any provider/cache error → serve existing DB rows, never raise.
+    - any provider/cache error -> serve existing DB rows, never raise - but the
+      error is LOGGED and kept in the cache (SYNC_ERROR_KEY), not swallowed.
 
-    Returns the upserted EmailMessage rows (freshly re-selected, so IDs/
-    conversation_id are populated), or None if this call was skipped entirely
-    (still fresh, or another sync already in flight) or hit an error.
+    The pull is CHECKPOINTED page by page (no message-count cap): each page of
+    messages is upserted and committed on its own, and the "last successful
+    sync" cursor only advances once EVERY page has been stored. A failure at
+    page 300 of a first crawl therefore loses one page, not the crawl - the next
+    run resumes below the oldest message already stored (SYNC_BACKFILL_KEY).
+
+    Returns the upserted EmailMessage rows (so IDs/conversation_id are
+    populated; a first-time backfill returns light stand-ins carrying just the
+    ids/subject/time), or None if this call was skipped (still fresh, or
+    another sync already in flight) or hit an error.
     `sync_inbox_task` uses this list to enqueue extraction for EXACTLY these
-    threads — no point re-triggering Auto Extract on a tick that changed
+    threads - no point re-triggering Auto Extract on a tick that changed
     nothing, and no need to rescan the whole mailbox to find what changed
     when the sync itself already knows precisely which rows are new.
     """
+    import logging
+    import uuid
+
+    log = logging.getLogger("inbox.sync")
+    token = uuid.uuid4().hex
     try:
-        if await cache.exists(SYNC_FRESH_KEY) or await cache.exists(SYNC_LOCK_KEY):
+        if await cache.exists(SYNC_FRESH_KEY):
             return None
-        await cache.set(SYNC_LOCK_KEY, True, ttl=60)
+        # Atomic acquire (the old exists()+set() pair let two syncs both pass).
+        if not await cache.acquire_lock(SYNC_LOCK_KEY, _LOCK_TTL, token):
+            return None
     except Exception:
-        return None  # cache layer down → skip sync, DB rows still serve
+        log.exception("inbox sync skipped: cache layer unavailable")
+        return None
     try:
         last = await cache.get(SYNC_LAST_KEY)
         since = (datetime.fromtimestamp(float(last), tz=timezone.utc) - SYNC_OVERLAP) if last else None
         if since is not None and not await _has_any_email(db):
             since = None
         started_at = datetime.now(timezone.utc).timestamp()
+        before = None
+        backfill = since is None
+        if backfill:
+            marker = await cache.get(SYNC_BACKFILL_KEY)
+            if isinstance(marker, dict) and marker.get("before"):
+                # Resume a crawl that was interrupted: keep its ORIGINAL start
+                # time (everything newer than that is the incremental's job).
+                before = datetime.fromisoformat(marker["before"])
+                started_at = float(marker.get("started_at") or started_at)
         provider = get_email_provider()
-        messages = await provider.list_messages(None, since=since)
-        synced = [await sync_message(db, m) for m in messages]
-        await db.commit()
+        synced: list[EmailMessage] = []
+        stored = 0
+        async for page in _pages(provider, since, before):
+            rows = [await sync_message(db, m) for m in page]
+            await db.commit()
+            stored += len(rows)
+            if backfill:
+                synced.extend(_light(r) for r in rows)
+                db.expunge_all()          # don't hold a whole mailbox in the session
+                stamps = [m.received_at for m in page if getattr(m, "received_at", None)]
+                if stamps:
+                    await cache.set(SYNC_BACKFILL_KEY,
+                                    {"before": min(stamps).isoformat(), "started_at": started_at},
+                                    ttl=14 * 24 * 3600)
+            else:
+                synced.extend(rows)
+            await cache.extend_lock(SYNC_LOCK_KEY, token, _LOCK_TTL)
         await cache.set(SYNC_LAST_KEY, started_at)
+        await cache.delete(SYNC_BACKFILL_KEY, SYNC_ERROR_KEY)
         await cache.set(SYNC_FRESH_KEY, True, ttl=settings.inbox_sync_min_interval_seconds)
+        if backfill:
+            log.info("inbox backfill complete: %d message(s) stored", stored)
         return synced
-    except Exception:
-        await db.rollback()
+    except Exception as exc:
+        log.exception("inbox sync failed (progress so far is kept; the cursor did not advance)")
+        try:
+            await db.rollback()
+            await cache.set(SYNC_ERROR_KEY, f"{type(exc).__name__}: {str(exc)[:300]}", ttl=24 * 3600)
+        except Exception:
+            pass
         return None
     finally:
         try:
-            await cache.delete(SYNC_LOCK_KEY)
+            await cache.release_lock(SYNC_LOCK_KEY, token)
         except Exception:
             pass

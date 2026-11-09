@@ -182,6 +182,8 @@ Use any OpenAI-compatible gateway by setting `LLM_PROVIDER` and `OPENAI_BASE_URL
 (`docker compose … up -d`) — `restart` does not re-read it.
 Details: [`docs/EXTRACTION_TWO_PASS.md`](docs/EXTRACTION_TWO_PASS.md),
 [`docs/SYSTEM.md`](docs/SYSTEM.md#ai-models--two-independent-settings).
+Accuracy / reliability guarantees (no silent drops, retries, locks, queues, duplicate
+protection): **[`docs/RELIABILITY.md`](docs/RELIABILITY.md)**.
 
 ### Use your Postgres
 ```

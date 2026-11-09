@@ -30,7 +30,7 @@ from app.schemas.portal import (
     PortalSubmissionFileOut,
     PortalSubmissionPipelineFileRef,
 )
-from app.services.pipeline.ingestion import can_resolve_assign, retry_pipeline_file
+from app.services.pipeline.ingestion import can_resolve_assign
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
@@ -67,7 +67,6 @@ def _out(t: PipelineFile) -> PipelineFileOut:
         extraction_model=t.extraction_model, extraction_method=t.extraction_method,
         used_ocr=bool(t.used_ocr), extraction_meta=t.extraction_meta,
         auto_accepted=bool((t.extraction_meta or {}).get("auto_accept", {}).get("accepted")),
-        can_retry=bool(t.raw_path or (t.source_kind == "email" and t.attachment_id)),
         can_resolve_assign=can_resolve_assign(t),
         resolved_at=t.resolved_at, resolution_note=t.resolution_note,
         created_at=t.created_at, updated_at=t.updated_at,
@@ -421,10 +420,8 @@ async def rematch_unmatched_pipeline(db: AsyncSession = Depends(get_db)):
     that was staged BEFORE that employee existed in the Employee Matcher
     (matching only ever runs once, at staging time; nothing re-checks an
     already-staged item later on its own). Reuses the name/ID already
-    captured — no re-extraction, no LLM call — so unlike /retry (a full
-    vision re-extraction, one file at a time, and not built for bulk-roster
-    items anyway) this is safe and cheap to run over the whole backlog at
-    once. Never overwrites an already-matched or already-decided item, and
+    captured — no re-extraction, no LLM call — so it is safe and cheap to
+    run over the whole backlog at once. Never overwrites an already-matched or already-decided item, and
     never guesses — anything still genuinely unmatched or ambiguous is left
     exactly as it was."""
     from app.services.pipeline.rematch import rematch_unmatched
@@ -432,23 +429,6 @@ async def rematch_unmatched_pipeline(db: AsyncSession = Depends(get_db)):
     result = await rematch_unmatched(db)
     await datacache.bust_pipeline()
     return result
-
-
-@router.post("/{pipeline_id}/retry", response_model=PipelineFileOut)
-async def retry_pipeline(pipeline_id: str, db: AsyncSession = Depends(get_db)):
-    """Re-run the pipeline on the stored copy of the file (e.g. after adding
-    the missing employee to the matcher, or fixing the LLM key)."""
-    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
-    if not t:
-        raise HTTPException(404, "Pipeline file not found")
-    try:
-        _rec, t = await retry_pipeline_file(db, t)
-    except FileNotFoundError as e:
-        raise HTTPException(409, str(e))
-    except ValueError as e:
-        raise HTTPException(422, str(e))
-    await datacache.bust_pipeline()
-    return _out(t)
 
 
 @router.delete("/{pipeline_id}")

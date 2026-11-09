@@ -127,6 +127,47 @@ def _name_score(extracted: str, candidate: str) -> float:
     return score
 
 
+# Common transliteration families of one name: the same person is written any of these
+# ways on different documents, so they must not look like "a different spelling".
+_NAME_FAMILIES = [
+    {"mohammed", "mohamed", "muhammad", "mohammad", "muhammed", "mohamad", "mohd", "muhd", "md"},
+    {"ahmed", "ahmad", "ahmet"},
+    {"abdul", "abdel", "abd", "abdal", "abdell"},
+    {"hussein", "hussain", "husain", "hussin", "hosein"},
+    {"yusuf", "yousef", "youssef", "yousuf", "joseph"},
+    {"omar", "umar"},
+    {"ibrahim", "ebrahim", "ibraheem"},
+    {"ismail", "ismael", "ishmael"},
+    {"mustafa", "mostafa", "moustafa", "mustapha"},
+    {"khalid", "khaled"},
+    {"aisha", "ayesha", "aysha"},
+    {"fatima", "fatema", "fatimah"},
+]
+_FAMILY_OF = {t: min(fam) for fam in _NAME_FAMILIES for t in fam}
+
+
+def _canon(tokens: list[str]) -> list[str]:
+    return [_FAMILY_OF.get(t, t) for t in tokens]
+
+
+def name_match_strength(extracted: str, candidate: str) -> str:
+    """How a sheet name agrees with an employee's name:
+      'exact'        - the same words (any order, case, punctuation, or a well-known
+                       transliteration of the same name: Mohammed / Muhammad / Mohd);
+      'short-form'   - an abbreviation / dropped middle name / initial of it;
+      'approximate'  - accepted only because the spelling is close - a transliteration
+                       we do not know, or a different person whose name differs by a
+                       letter ("Sara Khan" / "Sana Khan").
+    Used to tell the reviewer when a match deserves a second look."""
+    a, b = _tokens((extracted or "").strip().lower()), _tokens((candidate or "").strip().lower())
+    ca, cb = _canon(a), _canon(b)
+    if sorted(ca) == sorted(cb):
+        return "exact"
+    if _subset_compatible(ca, cb) or _subset_compatible(a, b):
+        return "short-form"
+    return "approximate"
+
+
 class MatchCode:
     ID_AND_NAME = "id_and_name"
     EMAIL_AND_NAME = "email_and_name"  # sender / AI employee + sheet name, no id on PDF
@@ -135,6 +176,8 @@ class MatchCode:
     AMBIGUOUS_ID = "ambiguous_id"
     NO_MATCH = "no_match"              # id or name missing / not found / disagree
     NO_IDENTITY = "no_identity"        # nothing extracted to match on
+    ID_PARTIAL_NAME = "id_partial_name"        # name only partly matches; the printed ID agrees
+    EMAIL_PARTIAL_NAME = "email_partial_name"  # name only partly matches; sent from that person's own address
 
 
 @dataclass
@@ -142,6 +185,10 @@ class MatchResult:
     employee: Employee | None
     note: str
     code: str
+    # True when the match is only a suggestion backed by corroborating evidence (a
+    # name that partly resembles the employee + a matching ID or sender address).
+    # Always shown to the reviewer and never auto-recommended.
+    low_confidence: bool = False
 
 
 def _loc(e: Employee) -> str:
@@ -289,7 +336,7 @@ async def _match_by_id(
     )
 
 
-async def match_employee(
+async def _match_strict(
     db: AsyncSession,
     extracted_id: str | None,
     extracted_name: str | None,
@@ -348,3 +395,111 @@ async def match_employee(
         MatchCode.NO_MATCH,
     )
 
+
+# --------------------------------------------------------------------------- #
+# Last resort: a name that only PARTLY matches, backed by independent evidence
+# --------------------------------------------------------------------------- #
+_HONORIFICS = {"mr", "mrs", "ms", "miss", "dr", "eng", "sir", "madam"}
+
+
+def _partial_name_overlap(a: str, b: str) -> bool:
+    """Do two names share enough words to be plausibly the same person even though
+    the strict matcher refused them? At least min(2, words in the shorter name) words
+    must correspond (same word, transliteration, abbreviation, or a near-identical
+    spelling - an OCR slip). One shared common first name is never enough."""
+    ta = [t for t in _canon(_tokens(a)) if len(t) >= 2 and t not in _HONORIFICS]
+    tb = [t for t in _canon(_tokens(b)) if len(t) >= 2 and t not in _HONORIFICS]
+    if not ta or not tb:
+        return False
+    small, big = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    used = [False] * len(big)
+    hits = 0
+    for x in small:
+        for j, y in enumerate(big):
+            if used[j]:
+                continue
+            if _token_match(x, y) or (len(x) >= 4 and len(y) >= 4 and fuzz.ratio(x, y) >= 80):
+                used[j] = True
+                hits += 1
+                break
+    return hits >= min(2, len(small))
+
+
+async def _corroborate(
+    db: AsyncSession, id_norm: str, extracted_name: str, *,
+    sender_email: str | None, body_text: str | None,
+) -> MatchResult | None:
+    """The strict matcher found nobody. Before leaving the sheet unassigned, look for
+    independent evidence behind a PARTLY matching name:
+      * the ID printed on the sheet equals exactly one active employee's ID, or
+      * the email was sent from an active employee's own address;
+    and the sheet name must share enough words with that employee (see
+    _partial_name_overlap). If the two kinds of evidence point at different
+    people, nothing is guessed. The result is always marked low-confidence."""
+    from sqlalchemy import func
+
+    from app.services.inbox.employee_match import match_sender
+
+    by_id: Employee | None = None
+    if id_norm:
+        rows = (await db.execute(select(Employee).where(
+            func.upper(Employee.employee_id) == id_norm.upper(),
+            Employee.active.is_(True)))).scalars().all()
+        fits = [e for e in rows if _partial_name_overlap(extracted_name, e.name)]
+        if len(fits) == 1:
+            by_id = fits[0]
+
+    by_mail: Employee | None = None
+    sm = await match_sender(db, sender_email=sender_email, body_text=body_text) if sender_email else None
+    if sm and sm.get("is_sender"):
+        emp = (await db.execute(select(Employee).where(Employee.id == sm["employee_pk"]))).scalar_one_or_none()
+        if emp is not None and _partial_name_overlap(extracted_name, emp.name):
+            by_mail = emp
+
+    if by_id and by_mail and by_id.id != by_mail.id:
+        return None                              # the evidence disagrees - guess nothing
+    emp = by_id or by_mail
+    if emp is None:
+        return None
+    if by_id and by_mail:
+        why, code = (f"the sheet ID {id_norm} and the sender's own address both point to them",
+                     MatchCode.ID_PARTIAL_NAME)
+    elif by_id:
+        why, code = f"the sheet ID {id_norm} is theirs", MatchCode.ID_PARTIAL_NAME
+    else:
+        why, code = "the email was sent from their own address", MatchCode.EMAIL_PARTIAL_NAME
+    return MatchResult(
+        emp,
+        f'Low confidence: the sheet name "{extracted_name}" only partly matches "{emp.name}" '
+        f"({emp.employee_id}{_loc(emp)}), but {why}. Verify this is the right person.",
+        code, low_confidence=True)
+
+
+async def match_employee(
+    db: AsyncSession,
+    extracted_id: str | None,
+    extracted_name: str | None,
+    *,
+    email_hint: Employee | None = None,
+    all_employees: list[Employee] | None = None,
+    sender_email: str | None = None,
+    body_text: str | None = None,
+    corroborate: bool = False,
+) -> MatchResult:
+    """Strict match first (name -> ID + name; see _match_strict). Only when that finds
+    nobody and the caller opted in (`corroborate=True` - Extract Email does), a name that
+    PARTLY matches an employee is accepted if the printed ID or the sender's own address
+    backs it up - as a low-confidence, always-flagged suggestion rather than leaving the
+    sheet unassigned. Every other caller (bulk roster, rematch) behaves exactly as before."""
+    res = await _match_strict(db, extracted_id, extracted_name,
+                              email_hint=email_hint, all_employees=all_employees)
+    if res.employee is not None or res.code == MatchCode.NO_IDENTITY:
+        return res
+    name = (extracted_name or "").strip()
+    if not name or _is_placeholder_name(name.lower()):
+        return res
+    if not corroborate or not ((extracted_id or "").strip() or sender_email):
+        return res
+    better = await _corroborate(db, (extracted_id or "").strip(), name,
+                                sender_email=sender_email, body_text=body_text)
+    return better or res

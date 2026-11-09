@@ -1097,6 +1097,8 @@ function ThreadMessageCard({
   onToggle,
   setPreview,
   threadExtractedAt,
+  checked = false,
+  onCheck,
 }: {
   msg: EmailDetail;
   open: boolean;
@@ -1104,6 +1106,9 @@ function ThreadMessageCard({
   setPreview: (f: PreviewFile) => void;
   /** When this conversation was last extracted — null if it never was. */
   threadExtractedAt?: string | null;
+  /** Tick box: pick this message for "Extract selected". */
+  checked?: boolean;
+  onCheck?: () => void;
 }) {
   const inlineIds = msg.inline_attachment_ids ?? [];
   const to = msg.to_recipients ?? [];
@@ -1112,11 +1117,28 @@ function ThreadMessageCard({
   const extractState = messageExtractState(msg.received_at, threadExtractedAt);
 
   return (
-    <div className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+    <div className={cn(
+      "overflow-hidden rounded-lg border bg-white shadow-sm",
+      checked ? "border-brand-300 ring-1 ring-brand-200" : "border-slate-200")}>
+      <div className="flex items-stretch">
+      {onCheck && (
+        <label
+          className="flex w-9 shrink-0 cursor-pointer items-start justify-center pt-4 hover:bg-slate-50/80"
+          title="Tick to extract this message"
+        >
+          <input
+            type="checkbox"
+            checked={checked}
+            onChange={onCheck}
+            aria-label="Select this message for extraction"
+            className="h-4 w-4 cursor-pointer rounded border-slate-300 accent-brand-600"
+          />
+        </label>
+      )}
       <button
         type="button"
         onClick={onToggle}
-        className="flex w-full gap-3 px-3 py-3 text-left transition-colors hover:bg-slate-50/80"
+        className="flex min-w-0 flex-1 gap-3 px-3 py-3 text-left transition-colors hover:bg-slate-50/80"
       >
         <div className="relative shrink-0">
           <span
@@ -1179,6 +1201,7 @@ function ThreadMessageCard({
           )}
         </span>
       </button>
+      </div>
 
       {open && (
         <div className="border-t border-slate-100">
@@ -1265,6 +1288,9 @@ export default function InboxPage() {
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
+  // Messages of the open conversation ticked for "Extract selected".
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  useEffect(() => { setPicked(new Set()); }, [selected]);
   const [preview, setPreview] = useState<PreviewFile | null>(null);
   // Extract Email runs through the global queue (lib/extractQueue) so it
   // keeps going — and stays visible in the top nav bar — across page
@@ -1402,10 +1428,13 @@ export default function InboxPage() {
   // Extract Email — whole .eml through the ONE extraction pipeline, queued
   // globally (see lib/extractQueue) so several threads can be triggered back
   // to back without racing. Incremental by default (only new + a couple of
-  // context messages re-read); `forceFull` re-reads the whole thread.
-  const runExtract = (id: string, subject: string | null | undefined, forceFull = false) => {
+  // context messages re-read); `forceFull` re-reads the whole thread;
+  // `messageIds` reads only the messages the reviewer ticked.
+  const runExtract = (
+    id: string, subject: string | null | undefined, forceFull = false, messageIds: string[] = [],
+  ) => {
     if (isBusy(id) || autoExtractRunning) return;
-    const taskId = enqueue(id, subject ?? "(no subject)", forceFull);
+    const taskId = enqueue(id, subject ?? "(no subject)", forceFull, messageIds);
     setFocusTaskId(taskId);
   };
 
@@ -1432,7 +1461,10 @@ export default function InboxPage() {
         "grid min-h-0 flex-1 gap-3",
         fullscreen
           ? "grid-cols-1"
-          : "grid-cols-1 md:grid-cols-[minmax(0,220px)_1fr] xl:grid-cols-[minmax(0,240px)_1fr]",
+          // The list keeps a firm width; the detail pane is minmax(0,1fr) so a wide
+          // email (big image, wide table) scrolls inside its pane instead of
+          // squeezing the list down to a few pixels.
+          : "grid-cols-1 md:grid-cols-[minmax(200px,240px)_minmax(0,1fr)] xl:grid-cols-[minmax(240px,280px)_minmax(0,1fr)]",
       )}>
         {/* ── Left: email list (hidden in fullscreen) ───────────── */}
         <Card className={cn(
@@ -1446,7 +1478,16 @@ export default function InboxPage() {
               <input
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                placeholder="Search…"
+                placeholder="Search mail…"
+                title={[
+                  "Type anything: a name, subject, words from the message, an attachment name.",
+                  "Every word must match somewhere, in any order.",
+                  "",
+                  "from:sara   to:hr   cc:bob   subject:timesheet   body:june",
+                  "attachment:sheet.pdf   hasattachment:true",
+                  "received:2026-06   received:2026-06-01..2026-06-30   before:2026-07-01   after:2026-06-01",
+                  "\"exact phrase\"   word OR word   -word  or  NOT word",
+                ].join("\n")}
                 className="w-full rounded-md border border-slate-200 bg-slate-50 py-1 pl-7 pr-2 text-[11px] placeholder:text-slate-400 focus:border-brand-400 focus:bg-white focus:outline-none"
               />
             </div>
@@ -1529,7 +1570,7 @@ export default function InboxPage() {
 
         {/* ── Right: email detail ───────────────────────────────── */}
         <Card className={cn(
-          "flex min-h-0 flex-col",
+          "flex min-h-0 min-w-0 flex-col",
           !selected && !fullscreen && "hidden md:flex",
         )}>
           {!selected ? (
@@ -1616,9 +1657,8 @@ export default function InboxPage() {
                             // there was no way to re-extract it short of a new
                             // reply arriving. The primary button still hides in
                             // that case (nothing new to read incrementally), but
-                            // "Re-read entire thread" below must always stay
-                            // available once a thread has been extracted at least
-                            // once, so a stale/wrong past read can always be redone.
+                            // "Select all" -> "Extract all" below is always
+                            // available, so a stale/wrong past read can be redone.
                             const showPrimary = !at || isNewer;
                             const busy = isBusy(detail.provider_message_id);
                             const myTask = taskFor(detail.provider_message_id);
@@ -1649,19 +1689,49 @@ export default function InboxPage() {
                                       : isNewer ? "Re-extract (new reply)" : "Extract Email"}
                                 </Button>
                                 )}
-                                {at && (
-                                  <Button
-                                    size="sm"
-                                    variant="ghost"
-                                    disabled={busy || loadingDetail || autoExtractRunning}
-                                    onClick={() => runExtract(detail.provider_message_id, detail.subject, true)}
-                                    title={autoExtractRunning
-                                      ? "Auto Extract is running in the background right now — wait for it to finish (or Stop it) before extracting by hand."
-                                      : "Ignore the incremental cache and re-read the ENTIRE thread from scratch — use this if a past read looks stale or wrong."}
-                                  >
-                                    Re-read entire thread
-                                  </Button>
-                                )}
+                                {threadMessages.length > 0 && (() => {
+                                  const allPicked = threadMessages.every((m) => picked.has(m.provider_message_id));
+                                  const off = busy || loadingDetail || autoExtractRunning;
+                                  return (
+                                    <>
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        disabled={off}
+                                        onClick={() => setPicked(allPicked
+                                          ? new Set()
+                                          : new Set(threadMessages.map((m) => m.provider_message_id)))}
+                                        title="Tick every message of this conversation. Extracting all of them re-reads the whole thread from scratch (use it when a past read looks stale or wrong)."
+                                      >
+                                        {allPicked ? "Clear selection" : "Select all"}
+                                      </Button>
+                                      {picked.size > 0 && (
+                                        <Button
+                                          size="sm"
+                                          variant="secondary"
+                                          disabled={off}
+                                          onClick={() => {
+                                            const ids = threadMessages
+                                              .map((m) => m.provider_message_id)
+                                              .filter((id) => picked.has(id));
+                                            // Every message ticked = a full re-read of the thread.
+                                            if (allPicked) runExtract(detail.provider_message_id, detail.subject, true);
+                                            else runExtract(detail.provider_message_id, detail.subject, false, ids);
+                                            setPicked(new Set());
+                                          }}
+                                          title={autoExtractRunning
+                                            ? "Auto Extract is running in the background right now — wait for it to finish (or Stop it) before extracting by hand."
+                                            : allPicked
+                                              ? "Re-read the ENTIRE thread from scratch."
+                                              : "Read only the ticked messages. Everything already extracted from the other messages is kept, and the stored conversation stays complete."}
+                                        >
+                                          <Wand2 className="h-3 w-3" />
+                                          {allPicked ? "Extract all (re-read)" : `Extract selected (${picked.size})`}
+                                        </Button>
+                                      )}
+                                    </>
+                                  );
+                                })()}
                               </>
                             );
                           })()}
@@ -1748,6 +1818,13 @@ export default function InboxPage() {
                       onToggle={() => toggleThreadMessage(m.provider_message_id)}
                       setPreview={setPreview}
                       threadExtractedAt={thread?.extracted_at}
+                      checked={picked.has(m.provider_message_id)}
+                      onCheck={() => setPicked((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(m.provider_message_id)) next.delete(m.provider_message_id);
+                        else next.add(m.provider_message_id);
+                        return next;
+                      })}
                     />
                   ))}
                 </div>

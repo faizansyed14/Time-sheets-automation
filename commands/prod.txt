@@ -21,11 +21,11 @@ docker compose -f docker-compose.prod.yml down --volumes       # stop + drop the
 
 # ---- logs ----
 docker compose -f docker-compose.prod.yml logs -f
-docker compose -f docker-compose.prod.yml logs -f backend worker
+docker compose -f docker-compose.prod.yml logs -f backend worker worker-extract
 
 # ---- status / scale the worker ----
 docker compose -f docker-compose.prod.yml ps
-docker compose -f docker-compose.prod.yml up -d --scale worker=3
+docker compose -f docker-compose.prod.yml up -d --scale worker-extract=3
 
 # ---- deploy a new version (backend and/or frontend code changed) ----
 # scripts/prod/start.sh is just `up --build -d`: it does NOT git pull and does
@@ -44,7 +44,7 @@ docker compose -f docker-compose.prod.yml up -d
 # ---- changing .env (model names, secrets, limits) ----
 # `restart` does NOT re-read .env — compose reads env_file only when a container
 # is CREATED. Recreate instead:
-docker compose -f docker-compose.prod.yml --env-file .env up -d backend worker
+docker compose -f docker-compose.prod.yml --env-file .env up -d backend worker worker-extract
 docker compose -f docker-compose.prod.yml restart nginx   # backend got a new IP
 # e.g. OPENAI_VISION_MODEL (all vision extraction, incl. bulk roster) and
 # AGENT_CHAT_MODEL (Ask-AI chat) are independent settings — see docs/SYSTEM.md.

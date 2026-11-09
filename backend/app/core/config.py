@@ -118,7 +118,7 @@ class Settings(BaseSettings):
     # Image attachments smaller than this are signature logos/icons in
     # practice: hidden from attachment lists/counts and never sent to the
     # vision model. Applies ONLY to images — documents of any size still flow.
-    min_image_attachment_kb: int = 70
+    min_image_attachment_kb: int = 30
 
     # Which file store to use: "local" | "s3" | "onedrive".
     # Switch to AWS S3 by setting STORAGE_PROVIDER=s3 + the S3_* values below.
@@ -160,31 +160,70 @@ class Settings(BaseSettings):
     # Pass 2 (extract) detail — keep at "low" (cost); Pass 1 (classify) has
     # its own, separate setting below since judging "what is this" doesn't
     # need full resolution either.
-    vision_image_detail: str = "low"   # low | high
+    vision_image_detail: str = "high"  # low | high — accuracy first: digits in dense grids need the full-resolution read
 
     # ----- Two-pass extraction (see services/extract_email/{triage,thread}_prompt.py) -----
     # Pass 1 judges "what is this / is it approved", not exact digits — low
     # detail is enough and far cheaper.
-    pass1_image_detail: str = "low"
+    pass1_image_detail: str = "low"    # pass 1 only classifies; pass 2 reads the digits at vision_image_detail (high). The second look and the copy comparison always use pass1_rescue_detail (high).
     # Items per pass-1 call on a long thread. Every batch still sees every
     # message body (for approval context); only the attachment slice differs.
     pass1_batch_size: int = 5
-    # A thread longer than this only sends its newest N messages to the model
-    # (see extract_email/thread_collect.py) — keeps one run's payload bounded.
-    # 15 is enough for a normal back-and-forth; a manager's reminder that gets
-    # 20-30+ independent replies (one employee per reply, not a conversation
-    # building on itself) needs a higher ceiling or those older replies are
-    # silently never read. Raising this makes an oversized thread's own run
-    # slower (more sequential batches), not more likely to fail.
-    max_thread_messages: int = 40
+    # Cap on how many messages of ONE conversation are read in a single run.
+    # 0 = no cap (default): every message is fetched and read — a reply that is
+    # never read is an approval or timesheet that is never seen. Positive N keeps
+    # only the newest N (with a visible note). Incremental runs already limit
+    # themselves to "new messages + 2 for context", so this rarely matters.
+    max_thread_messages: int = 0
+    # Context-window protection for the shared "MESSAGE BODIES" block sent with
+    # every pass-1 call (and the pass-2 body context): total characters across
+    # all message bodies. Under budget nothing is trimmed. Over budget, each
+    # body keeps its HEAD (the new text of a reply — quoted history sits below)
+    # down to a floor, so short approvals survive and only long quoted trails
+    # shrink. ~240k chars is roughly 60k tokens.
+    bodies_char_budget: int = 240_000
+    # Output budget for the extraction passes. A pass-2 reply lists every date
+    # of every sheet in the call; the old 8k default cut multi-sheet replies off
+    # mid-JSON. Falls back to the client default if the provider rejects it.
+    extract_max_output_tokens: int = 32_000
+    # Second look at every picture/page pass 1 filed as "other": a low-detail
+    # (512px) glance can mistake a dense screenshot of a timesheet for a
+    # banner. The re-check runs at pass1_rescue_detail; a different verdict wins.
+    pass1_rescue_other: bool = True
+    # Copies of one timesheet (signed + unsigned, ADR form + company form): when a
+    # comparison of the page images shows identical day-by-day entries, only ONE
+    # copy (the one carrying the signature) is transcribed; every copy is stored.
+    dedupe_alternate_copies: bool = True
+    pass1_rescue_detail: str = "high"
+    # Context protection for SUPPLEMENTARY text only (the text layer of a PDF, the
+    # cell text of a workbook) that travels next to page images, where the images
+    # remain the primary evidence. A text-only item (an email body, a CSV) is
+    # always sent whole.
+    supplementary_text_chars: int = 60_000
+    # A "no timesheet found" mark made BEFORE this moment was reached under the old
+    # extraction rules (small screenshots dropped as logos, pages/messages capped,
+    # a failed model call recorded as "nothing here"). Auto Extract treats such
+    # marks as stale and looks at those threads again. Bump it whenever the
+    # extraction rules change in a way that could find something new.
+    extract_rules_revision_at: str = "2026-11-03T00:00:00+00:00"
+    # Forward-of-a-forward nesting depth for .eml/.msg attached as a FILE. A
+    # loop guard only; real chains are far shallower. A part beyond it is
+    # recorded as unreadable, never silently skipped.
+    max_eml_depth: int = 12
     # Images per pass-2 call — a thread confirming many/long sheets is split
     # across calls rather than exceeding one request.
     max_images_per_call: int = 12
-    pdf_max_pages: int = 12
+    # Max SHEETS per pass-2 call, on top of the image cap above: each sheet's
+    # reply lists every date, so too many in one call overruns the output limit
+    # and the whole batch is lost. 0 = no cap (image count only).
+    pass2_max_sheets_per_call: int = 3
+    # Pages rendered per PDF/office document for extraction. 0 = no cap (default):
+    # every page is read. Set a positive number only to bound a pathological file.
+    pdf_max_pages: int = 0
     img_max_dim: int = 1600            # px, longest side, for images sent to the model
     # Images smaller than this are logos/icons/signature stamps — dropped
     # before either pass ever sees them, no API call spent.
-    min_image_bytes: int = 60 * 1024
+    min_image_bytes: int = 30 * 1024
     # A standalone picture attachment that survives the size filter still gets
     # OCR'd (see extraction/ocr.py) as a free local check: fewer than this many
     # characters and it's almost certainly a banner/graphic, not a document.

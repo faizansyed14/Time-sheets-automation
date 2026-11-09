@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import datacache
 from app.core.database import get_db
 from app.models.employee import Employee
-from app.services.employee.activity import set_active
+from app.services.employee.activity import set_active, left_date_of, set_left_date, stamp_joined, ym_of
 from app.schemas import (
     EmployeeIn,
     EmployeeOut,
@@ -36,6 +36,8 @@ def _out(e: Employee) -> EmployeeOut:
         personal_email=e.personal_email,
         active=e.active,
         inactive_ym=e.inactive_ym,
+        joining_date=e.joining_date,
+        left_date=left_date_of(e),
     )
 
 
@@ -74,6 +76,14 @@ def _apply_derived_emails(e: Employee) -> None:
         e.employee_email_id = e.work_email or e.personal_email
 
 
+def _check_dates(joined, left, active: bool) -> None:
+    for d, label in ((joined, "Joining date"), (left, "Left date")):
+        if d is not None and not (2000 <= d.year <= 2100):
+            raise HTTPException(422, f"{label} must be a real date.")
+    if not active and joined is not None and left is not None and left < joined:
+        raise HTTPException(422, "The left date cannot be before the joining date.")
+
+
 @router.post("", response_model=EmployeeOut, status_code=201)
 async def create_employee(body: EmployeeIn, db: AsyncSession = Depends(get_db)):
     # The same employee_id may exist for DIFFERENT people (AUH vs DXB teams),
@@ -81,9 +91,18 @@ async def create_employee(body: EmployeeIn, db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(select(Employee).where(Employee.employee_id == body.employee_id))).scalars().all()
     if any(_same_identity(r.name, body.name) for r in rows):
         raise HTTPException(409, f"Employee {body.employee_id} / {body.name} already exists.")
-    e = Employee(**body.model_dump())
+    sent = body.model_fields_set
+    data = body.model_dump(exclude={"joining_date", "left_date"})
+    e = Employee(**data)
+    if "joining_date" in sent:
+        e.joining_date = body.joining_date          # chosen in the form (None = every month)
+    elif (await db.execute(select(Employee.id).limit(1))).first() is not None:
+        stamp_joined(e)        # added to a running roster: earlier months keep their headcount
     if not e.active:
         set_active(e, False)   # created already inactive -> stamp the month
+        if body.left_date is not None:
+            set_left_date(e, body.left_date)
+    _check_dates(e.joining_date, left_date_of(e), e.active)
     _apply_derived_emails(e)
     db.add(e)
     await db.commit()
@@ -100,12 +119,18 @@ async def update_employee(pk: str, body: EmployeeIn, db: AsyncSession = Depends(
     others = (await db.execute(select(Employee).where(Employee.employee_id == body.employee_id))).scalars().all()
     if any(o.id != pk and _same_identity(o.name, body.name) for o in others):
         raise HTTPException(409, f"Employee {body.employee_id} / {body.name} already used by another row.")
-    data = body.model_dump()
+    data = body.model_dump(exclude={"joining_date", "left_date"})
     new_active = data.pop("active")
     for k, v in data.items():
         setattr(e, k, v)
     if new_active != e.active:
         set_active(e, new_active)   # only a real change touches the inactivation month
+    sent = body.model_fields_set
+    if "joining_date" in sent:
+        e.joining_date = body.joining_date
+    if "left_date" in sent and body.left_date is not None and not e.active:
+        set_left_date(e, body.left_date)        # the reviewer chose the date in the form
+    _check_dates(e.joining_date, left_date_of(e), e.active)
     _apply_derived_emails(e)
     await db.commit()
     await db.refresh(e)

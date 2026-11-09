@@ -33,7 +33,6 @@ from app.models.pipeline_file import FailureCode, PipelineFile, PipelineStage, P
 from app.models.timesheet_record import ApprovalStatus, TimesheetRecord, ValidationStatus
 from app.services.pipeline import raw_store
 from app.services import storage_provider as sp
-from app.services.email_provider import get_email_provider
 from app.services.extraction.validation import summarize as summarize_record
 from app.services.extraction.validation import validate
 
@@ -115,6 +114,10 @@ def isolate_employee_attachments(t: PipelineFile, raw_bytes: bytes) -> list[tupl
     wanted = [s.get("filename") for s in (meta.get("sheets") or []) if s.get("filename")]
     if not wanted:
         return None
+    # Copies of the same timesheet that were stored with the item but not read
+    # (e.g. the unsigned copy of a signed sheet) belong to this employee too.
+    for alt in meta.get("alternates") or []:
+        wanted += [n for n in (alt.get("stored_only") or []) if n]
 
     from app.services.extraction.file_processor import eml_all_attachments
     try:
@@ -122,8 +125,13 @@ def isolate_employee_attachments(t: PipelineFile, raw_bytes: bytes) -> list[tupl
     except Exception:
         return None
     by_name: dict[str, tuple[bytes, str]] = {}
+    ambiguous: set[str] = set()
     for name, payload, ftype in found:
+        if name in by_name:
+            ambiguous.add(name)      # two different files share a name (e.g. a signed + an unsigned copy)
         by_name.setdefault(name, (payload, ftype))
+    if any(fn in ambiguous for fn in wanted):
+        return None                  # can't tell which one is this item's: file the whole email instead
 
     import mimetypes as _mt
     matched: list[tuple[str, str, bytes]] = []
@@ -239,7 +247,25 @@ async def _find_existing(
 # ---------------------------------------------------------------------------
 # The core unit
 # ---------------------------------------------------------------------------
-async def ingest_manual_entry(
+async def ingest_manual_entry(db: AsyncSession, **kwargs) -> tuple[TimesheetRecord, PipelineFile]:
+    """Create/merge a monthly record (see _ingest_manual_entry for the details).
+
+    Filing is serialised PER EMPLOYEE + MONTH: two Accepts that land together
+    (a double click, two reviewers, a bulk accept racing a single one) would
+    each look up "is there already a record?", both find none, and both create
+    one - two records for the same month. Behind the lock the second Accept sees
+    the first one's record and MERGES into it, exactly as intended."""
+    from app.services.extract_email.thread_lock import keyed_lock
+
+    key = f"record:lock:{kwargs.get('employee_pk')}:{kwargs.get('year')}-{kwargs.get('month')}"
+    async with keyed_lock(
+        key, waiting_message="Another Accept for this employee and month is in progress — waiting…",
+        busy_message="Another Accept for this employee and month is still running — try again.",
+    ):
+        return await _ingest_manual_entry(db, **kwargs)
+
+
+async def _ingest_manual_entry(
     db: AsyncSession, *, employee_pk: str, month: int, year: int,
     buckets: dict[str, list[str]],
     attachments: list[tuple[str, str, bytes]] | None = None,
@@ -420,123 +446,3 @@ def can_resolve_assign(tracker: PipelineFile) -> bool:
     if tracker.raw_path:
         return True
     return bool(tracker.source_kind == "email" and tracker.source_id and tracker.attachment_id)
-
-
-async def _tracker_bytes(tracker: PipelineFile) -> tuple[bytes, str]:
-    """The raw bytes for a tracker: the stored retry copy, else refetched from
-    the email provider when the item is a single provider attachment."""
-    data = read_raw_copy(tracker)
-    filename = tracker.filename or "file"
-    if (data is None and tracker.source_kind == "email" and tracker.source_id
-            and tracker.attachment_id and not str(tracker.attachment_id).startswith("__")):
-        provider = get_email_provider()
-        data, filename, _ct = await provider.get_attachment_bytes(
-            tracker.source_id, tracker.attachment_id)
-    if data is None:
-        raise FileNotFoundError("The original file is no longer available.")
-    return data, filename
-
-
-async def retry_pipeline_file(db: AsyncSession, tracker: PipelineFile) -> tuple[TimesheetRecord | None, PipelineFile]:
-    """Re-run the ANALYSIS for a tracked file and re-stage it for review —
-    retry never files a record directly (everything goes through Compare & Fix).
-
-    NOT valid for a bulk-roster-sourced tracker (source_kind == "bulk") — see
-    the guard immediately below for why."""
-    if tracker.source_kind == "bulk":
-        # A roster-derived tracker's "file" is really one row on a shared,
-        # multi-employee document. analyse_upload() below runs the SAME
-        # single-submission reader as Extract Email/Upload — pointed at a
-        # 22-person roster image, it has no notion of "read just this one
-        # row" and would misread the whole grid as if it belonged to one
-        # person, silently overwriting this employee's correct roster-read
-        # day_codes with garbage. Block it here rather than let that happen
-        # invisibly; re-staging the whole roster (Bulk Upload) is the
-        # correct, already-supported way to refresh this row — it updates
-        # every employee on the same roster (matched by thread_key) with a
-        # fresh roster-aware read, this one included.
-        raise ValueError(
-            "This file is one employee's row on a shared roster upload — Retry can't "
-            "safely re-read just their row (it would run the single-submission reader "
-            "against the whole multi-employee roster image, which reads it wrong). "
-            "Re-upload the SAME roster file via Bulk Upload instead — re-staging "
-            "refreshes every employee's row on it, including this one."
-        )
-    from app.services.agents import full_email_extract as fx
-    from app.services.extract_email import auto_accept
-    from app.services.extract_email.staging import group_flags, sheet_summaries, summarize_group
-
-    data, filename = await _tracker_bytes(tracker)
-    analysis = await fx.analyse_upload(db, filename=filename, data=data)
-    groups = analysis["groups"]
-    tracker.events = (tracker.events or []) + [{
-        "stage": PipelineStage.EXTRACTION,
-        "status": "ok" if groups else "fail",
-        "detail": (f"Retry re-analysed the file: {len(groups)} group(s) found."
-                   if groups else "Retry re-analysed the file: no timesheet or certificate found."),
-        "at": _now_iso(),
-    }]
-    if not groups:
-        tracker.status = PipelineStatus.FAILED
-        tracker.failure_code = FailureCode.EXTRACTION_UNREADABLE
-        tracker.failure_detail = "No timesheet or certificate could be read from this file."
-        await db.commit()
-        await db.refresh(tracker)
-        return None, tracker
-
-    primary = max(groups, key=lambda g: sum(len(v) for v in g["buckets"].values()))
-    month, year = primary["month"], primary["year"]
-    flags = group_flags(primary)
-    summary = summarize_group(primary)
-
-    # The accept/hold verdict must be recomputed here too — the buckets and
-    # employee match above are FRESH from this retry, and leaving the old
-    # decision in extraction_meta would show a reviewer a "why held" reason
-    # (or an "AI recommends") left over from the run before the retry.
-    decision = auto_accept.evaluate(primary, approval=analysis["approval"])
-
-    tracker.employee_id = primary["employee_id"]
-    tracker.employee_name = primary["name"]
-    tracker.month, tracker.year = month, year
-    tracker.status = PipelineStatus.NEEDS_REVIEW
-    tracker.failure_code = FailureCode.PENDING_REVIEW
-    if decision.accepted:
-        tracker.failure_detail = ("Re-extracted. AI recommends accepting — "
-                                   "review the leaves and press Accept to file.")
-    else:
-        hold = ("; ".join(decision.blockers[:3]) if decision.blockers
-                 else "needs a human check")
-        tracker.failure_detail = f"Re-extracted. Held for review: {hold}"
-    tracker.extraction_method = analysis["run_meta"].get("method")
-    tracker.extraction_model = analysis["run_meta"].get("model")
-    prior_fee = (tracker.extraction_meta or {}).get("full_email_extract") or {}
-    tracker.extraction_meta = {
-        **(tracker.extraction_meta or {}),
-        "staged": {
-            "employee_pk": primary["employee_pk"],
-            "matched_name": primary["name"],
-            "matched_employee_id": primary["employee_id"],
-            "month": month, "year": year,
-            "buckets": primary["buckets"],
-            "working_days": primary.get("working_days") or [],
-            "weekend_days": primary.get("weekend_days") or [],
-            "uncertain_days": primary.get("uncertain_days") or [],
-            "unaccounted_days": primary.get("unaccounted_days") or [],
-            "validation_status": "manual_review" if flags else "verified",
-            "flags": flags,
-            "summary": f"{summary} {analysis['approval']['detail']}",
-            "extraction_status": "ok",
-        },
-        "auto_accept": decision.as_meta(),
-        "full_email_extract": {
-            **prior_fee,
-            "method": analysis["run_meta"].get("method"),
-            "model": analysis["run_meta"].get("model"),
-            "match_note": primary.get("note"),
-            "approval": analysis["approval"],
-            "sheets": sheet_summaries(primary["sheets"]),
-        },
-    }
-    await db.commit()
-    await db.refresh(tracker)
-    return None, tracker

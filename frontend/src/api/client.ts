@@ -245,6 +245,8 @@ export interface DashboardRow {
   pending_approval_count: number;
   years: number[];
   submitted_months: number[];
+  /** Submitted months whose record still needs a check (flagged or not approved) - shown amber. */
+  issue_months: number[];
   in_matcher: boolean;
   has_records: boolean;
   focus_record_id: string | null;
@@ -311,7 +313,6 @@ export interface PipelineFile {
   extraction_meta: Record<string, unknown> | null;
   // True when AI recommends accept (all checks passed). Record not filed until Review.
   auto_accepted: boolean;
-  can_retry: boolean;
   can_resolve_assign: boolean;
   resolved_at: string | null;
   resolution_note: string | null;
@@ -513,13 +514,22 @@ export async function streamExtraction(
 }
 
 /** Extract Email with live progress. `forceFull` bypasses incremental
- *  windowing/attachment-cache reuse and re-reads the whole thread fresh —
- *  the "Re-read entire thread" escape hatch for a suspected stale read. */
+ *  windowing/attachment-cache reuse and re-reads the whole thread fresh
+ *  (what "Select all -> Extract selected" sends). `messageIds` reads ONLY
+ *  those messages of the conversation; everything already extracted from the
+ *  others is kept. */
 export const extractFullEmailStream = (
   msgId: string, onEvent: (ev: ExtractionEvent) => void, forceFull = false,
-) => streamExtraction(
-  `/inbox/${encodeURIComponent(msgId)}/extract-full/stream${forceFull ? "?force_full=true" : ""}`,
-  undefined, onEvent);
+  messageIds: string[] = [],
+) => {
+  const qs = new URLSearchParams();
+  if (forceFull) qs.set("force_full", "true");
+  for (const id of messageIds) qs.append("message_ids", id);
+  const q = qs.toString();
+  return streamExtraction(
+    `/inbox/${encodeURIComponent(msgId)}/extract-full/stream${q ? `?${q}` : ""}`,
+    undefined, onEvent);
+};
 
 /** Upload page extraction with live progress. */
 export const uploadTimesheetsStream = (
@@ -783,8 +793,6 @@ export const fetchPipelineStats = (params?: { success_window_days?: number }) =>
     })
     .then((r) => r.data);
 
-export const retryPipelineFile = (id: string) =>
-  api.post<PipelineFile>(`/pipeline/${id}/retry`).then((r) => r.data);
 
 export const deletePipelineFile = (id: string) =>
   api.delete(`/pipeline/${id}`).then((r) => r.data);
@@ -1206,6 +1214,10 @@ export interface Employee {
    *  Oct 2026). Dashboard/Export keep them through that month and drop them from
    *  the next. null while active, or for rows inactivated before this was recorded. */
   inactive_ym?: number | null;
+  /** Joining date (YYYY-MM-DD). Counted from that month on; null = every month. */
+  joining_date?: string | null;
+  /** Left date (YYYY-MM-DD). Not counted from that month on; null while active. */
+  left_date?: string | null;
 }
 export type EmployeeInput = Omit<Employee, "id" | "inactive_ym">;
 

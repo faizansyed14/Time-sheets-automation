@@ -96,7 +96,8 @@ flowchart TD
 ### Batching
 
 - Batches by **item count** (`PASS1_BATCH_SIZE`), not image count.
-- Every batch still receives **all message bodies** (approval context).
+- Every batch still receives **all message bodies** (approval context), trimmed only when the thread's bodies exceed `BODIES_CHAR_BUDGET` (long quoted history shrinks; short replies are kept whole).
+- A failed batch is **split and retried**; an item missing from a reply is **asked again on its own**; a picture filed as `other` gets a **second look** alone at full detail. See [RELIABILITY.md](RELIABILITY.md).
 
 ### Pass 1 output JSON (shape)
 
@@ -222,7 +223,9 @@ Pass 2 does **not** re-send the full multi-page OCR text when images are already
 
 ### Batching
 
-- Batches by **image count** (`MAX_IMAGES_PER_CALL`).
+- Batches by **image count** (`MAX_IMAGES_PER_CALL`) and **sheet count** (`PASS2_MAX_SHEETS_PER_CALL`).
+- Output budget `EXTRACT_MAX_OUTPUT_TOKENS` (a truncated reply splits the batch).
+- After the batches, every confirmed item must have produced a sheet — a missing one is re-read alone; if it still has none the run is **incomplete** and names the file.
 
 ---
 

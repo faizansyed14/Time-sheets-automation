@@ -12,9 +12,9 @@ names. Identity is (employee_id, name); matching disambiguates by name.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, Integer, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -73,5 +73,10 @@ class Employee(Base):
     # SQL. Always set through services/employee/activity.set_active().
     inactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     inactive_ym: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Joining date. The person is counted from the month it falls in; earlier months keep
+    # their old headcount. Stamped (today, UAE) when an employee is ADDED to an existing
+    # roster, editable in the form. NULL = "since always" (the first bulk load and every
+    # row that existed before this column) - never hidden from any month.
+    joining_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

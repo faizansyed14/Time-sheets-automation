@@ -146,7 +146,7 @@ nothing important once you switch to S3 + RDS.**
    `pg_data` volume + the `depends_on: db` lines from your compose file, or
    start only the services you need:
    ```bash
-   docker compose -f docker-compose.prod.yml --env-file .env up -d backend worker frontend
+   docker compose -f docker-compose.prod.yml --env-file .env up -d backend worker worker-extract frontend
    ```
    (Redis is still needed for Celery + caching unless you use ElastiCache.)
 
