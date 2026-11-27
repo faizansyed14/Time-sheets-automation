@@ -87,6 +87,16 @@ celery_app.conf.update(
         # the two gates above, but for an entirely separate feature (see
         # services/system_health/monitor.py's module docstring for why it's
         # kept isolated from reminders/OTP rather than reusing either).
+        "purge-old-debug-runs": {
+            "task": "admin.purge_debug_runs",
+            "schedule": 24 * 3600.0,
+        },
+        **({
+            "auto-extract-daily-sweep": {
+                "task": "inbox.auto_extract_sweep",
+                "schedule": 24 * 3600.0,
+            },
+        } if settings.inbox_auto_sync_enabled else {}),
         **({
             "system-health-check": {
                 "task": "system_health.check",
@@ -103,3 +113,39 @@ def _celery_worker_process_init(**_kwargs) -> None:
     from app.services.tasks import _reset_async_clients
 
     _reset_async_clients()
+
+
+# ---- Monitor page: time every task, and show each worker process as online ----------
+from celery.signals import task_postrun, task_prerun, worker_ready  # noqa: E402
+
+_task_started: dict[str, float] = {}
+
+
+@worker_ready.connect
+def _mon_worker_ready(**_kwargs) -> None:
+    from app.services.monitoring.recorder import get_recorder
+    get_recorder().start()
+
+
+@task_prerun.connect
+def _mon_task_prerun(task_id=None, **_kwargs) -> None:
+    import time as _time
+    from app.services.monitoring.recorder import get_recorder
+    get_recorder().start()
+    if task_id:
+        _task_started[task_id] = _time.perf_counter()
+
+
+@task_postrun.connect
+def _mon_task_postrun(task_id=None, task=None, state=None, **_kwargs) -> None:
+    import time as _time
+    try:
+        t0 = _task_started.pop(task_id, None)
+        if t0 is None or task is None:
+            return
+        from app.services.monitoring.recorder import record
+        record("job", task.name, "celery", (_time.perf_counter() - t0) * 1000,
+               status="ok" if state in ("SUCCESS", None) else ("retry" if state == "RETRY" else "error"),
+               notable=task.name != "inbox.sync")
+    except Exception:
+        pass

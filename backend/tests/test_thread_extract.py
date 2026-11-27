@@ -317,10 +317,10 @@ def test_msg_to_eml_bytes_uses_asEmailMessage_not_export(monkeypatch):
             return real_eml
 
         def export(self, *a, **kw):
-            raise AssertionError("export() must never be called — wrong format, wrong signature")
+            raise AssertionError("export() must never be called, wrong format, wrong signature")
 
         def exportBytes(self, *a, **kw):
-            raise AssertionError("exportBytes() must never be called — wrong format")
+            raise AssertionError("exportBytes() must never be called, wrong format")
 
         def close(self):
             calls.append("close")

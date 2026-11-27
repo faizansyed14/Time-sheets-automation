@@ -115,7 +115,7 @@ export function EmlPreviewPane({
         <div className="shrink-0 space-y-1.5 border-b border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-700">
           <p className="flex gap-2">
             <span className="w-12 shrink-0 font-semibold text-slate-400">From</span>
-            <span className="min-w-0 break-words">{parsed.from_ || "—"}</span>
+            <span className="min-w-0 break-words">{parsed.from_ || "-"}</span>
           </p>
           {parsed.to && (
             <p className="flex gap-2">
@@ -131,7 +131,7 @@ export function EmlPreviewPane({
           </p>
           <p className="flex gap-2">
             <span className="w-12 shrink-0 font-semibold text-slate-400">Date</span>
-            <span>{parsed.date || "—"}</span>
+            <span>{parsed.date || "-"}</span>
           </p>
         </div>
 

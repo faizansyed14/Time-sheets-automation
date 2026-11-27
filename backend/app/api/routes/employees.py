@@ -79,7 +79,11 @@ async def coverage(
     # inactivated in and every month before it, and drops off from the next —
     # unless they have data that month (a filed record or a received sheet).
     # Rule + the matching Python form used by the export: services/employee/activity.py.
-    in_scope = in_month_clause(focus_month, focus_year, submitted_subq, received_subq)
+    # People whose only item this month is a vault file nobody extracted yet: shown as
+    # "in vault, not extracted" (never missing). A database query - see vault_pending.py.
+    from app.services.pipeline.coverage import vault_employee_pks
+    vault_list = sorted(await vault_employee_pks(db, focus_month, focus_year))
+    in_scope = in_month_clause(focus_month, focus_year, submitted_subq, received_subq, vault_list)
 
     # Project / Account Manager filters narrow EVERYTHING below — headline
     # counts and the rows — so "PGC · Missing" means PGC's missing, not the
@@ -114,6 +118,7 @@ async def coverage(
                     in_scope,
                     Employee.id.in_(received_subq),
                     Employee.id.not_in(submitted_subq),
+                    Employee.id.not_in(vault_list),
                 ).subquery()
             ))).scalar_one()
         # Missing = NOT submitted AND NOT received. Checked against BOTH sets
@@ -130,6 +135,15 @@ async def coverage(
                     in_scope,
                     Employee.id.not_in(submitted_subq),
                     Employee.id.not_in(received_subq),
+                    Employee.id.not_in(vault_list),
+                ).subquery()
+            ))).scalar_one()
+        in_vault = (await db.execute(
+            select(func.count()).select_from(
+                select(Employee.id).where(
+                    in_scope,
+                    Employee.id.in_(vault_list),
+                    Employee.id.not_in(submitted_subq),
                 ).subquery()
             ))).scalar_one()
         nrev = (await db.execute(
@@ -152,8 +166,19 @@ async def coverage(
                 in_scope,
                 Employee.id.not_in(submitted_subq),
                 Employee.id.not_in(received_subq),
+                Employee.id.not_in(vault_list),
             ).order_by(Employee.name).limit(50))).scalars().all()
+        # Sheets that ARRIVED for this month but are matched to nobody: they cannot count
+        # as anyone's submission, so the person shows "missing" until it is matched.
+        from app.models.pipeline_file import PipelineStatus as _PS
+        unmatched = (await db.execute(
+            select(func.count()).select_from(PipelineFile).where(
+                PipelineFile.month == focus_month, PipelineFile.year == focus_year,
+                PipelineFile.status.in_((_PS.NEEDS_REVIEW, _PS.FAILED)),
+                staged_pk.is_(None)))).scalar_one()
         return {"total_employees": total, "submitted_this_month": submitted,
+                "unmatched_this_month": unmatched,
+                "in_vault_this_month": in_vault,
                 "received_this_month": received, "awaiting_review_this_month": awaiting,
                 "missing_this_month": missing,
                 "needs_review": nrev, "pending_approval": pend, "missing_sample": list(sample)}
@@ -192,7 +217,8 @@ async def coverage(
             func.lower(func.coalesce(Employee.location, "")).like(like),
         ))
     if only_missing:
-        emp_q = emp_q.where(Employee.id.not_in(submitted_subq), Employee.id.not_in(received_subq))
+        emp_q = emp_q.where(Employee.id.not_in(submitted_subq), Employee.id.not_in(received_subq),
+                            Employee.id.not_in(vault_list))
 
     # Server-side status filter (applies across the WHOLE matcher, not just the
     # loaded page). Scoped to the focus year so it tracks the dashboard KPIs.
@@ -201,9 +227,13 @@ async def coverage(
         if s == "submitted":
             emp_q = emp_q.where(Employee.id.in_(submitted_subq))
         elif s == "missing":
-            emp_q = emp_q.where(Employee.id.not_in(submitted_subq), Employee.id.not_in(received_subq))
+            emp_q = emp_q.where(Employee.id.not_in(submitted_subq), Employee.id.not_in(received_subq),
+                                Employee.id.not_in(vault_list))
+        elif s == "in_vault":
+            emp_q = emp_q.where(Employee.id.in_(vault_list), Employee.id.not_in(submitted_subq))
         elif s == "awaiting_review":
-            emp_q = emp_q.where(Employee.id.in_(received_subq), Employee.id.not_in(submitted_subq))
+            emp_q = emp_q.where(Employee.id.in_(received_subq), Employee.id.not_in(submitted_subq),
+                                Employee.id.not_in(vault_list))
         elif s == "needs_review":
             emp_q = emp_q.where(Employee.id.in_(_pk_subq(
                 TimesheetRecord.year == focus_year,
@@ -250,6 +280,7 @@ async def coverage(
             ).distinct()
         )).scalars().all())
 
+    vault_set = set(vault_list)
     rows: list[DashboardRow] = []
     for e in page_emps:
         items = by_pk.get(e.id, [])
@@ -272,7 +303,8 @@ async def coverage(
             focus_record_id=focus_rec.id if focus_rec else None,
             focus_validation_status=focus_rec.validation_status if focus_rec else None,
             focus_approval_status=focus_rec.approval_status if focus_rec else None,
-            awaiting_review_this_month=bool(e.id in page_received_pks and not focus_rec),
+            awaiting_review_this_month=bool(e.id in page_received_pks and not focus_rec and e.id not in vault_set),
+            in_vault_this_month=bool(e.id in vault_set and not focus_rec),
         ))
 
     # Dropdown choices for the Project / Account Manager filters: every distinct
@@ -290,6 +322,9 @@ async def coverage(
         total_employees=total_employees,
         submitted_this_month=submitted_this_month,
         missing_this_month=missing_this_month,
+        # .get: a cached aggregate from before this field existed has no key for it
+        unmatched_this_month=agg.get("unmatched_this_month", 0),
+        in_vault_this_month=agg.get("in_vault_this_month", 0),
         awaiting_review_this_month=awaiting_review_this_month,
         submitted_pct=submitted_pct, missing_pct=missing_pct, awaiting_review_pct=awaiting_review_pct,
         needs_review=needs_review, pending_approval=pending_approval,

@@ -95,3 +95,29 @@ def record_dropped(**kwargs) -> None:
     cap = _CAPTURE.get()
     if cap is not None:
         cap.record_dropped(**kwargs)
+
+
+async def purge_old_debug_runs(db, days: int | None = None) -> int:
+    """Delete debug runs older than `days` (default DEBUG_RUN_RETENTION_DAYS) and the
+    pictures saved for them. Returns how many runs were removed."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import delete, select
+
+    from app.core.config import settings
+    from app.models.extraction_debug_run import ExtractionDebugRun
+    from app.services.pipeline import raw_store
+
+    days = settings.debug_run_retention_days if days is None else days
+    if not days or days <= 0:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    ids = list((await db.execute(
+        select(ExtractionDebugRun.id).where(ExtractionDebugRun.created_at < cutoff))).scalars())
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        for run_id in chunk:
+            raw_store.delete_prefix(f"debug/{run_id}")
+        await db.execute(delete(ExtractionDebugRun).where(ExtractionDebugRun.id.in_(chunk)))
+        await db.commit()
+    return len(ids)

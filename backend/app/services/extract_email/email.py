@@ -197,7 +197,7 @@ async def _extract_locked(
     if not ctx.groups:
         if ctx.sheets:
             kinds = ", ".join(f"{s['name']} ({s['kind']})" for s in ctx.sheets)
-            message = f"Nothing to stage — no timesheet or certificate found ({kinds})."
+            message = f"Nothing to stage, no timesheet or certificate found ({kinds})."
         else:
             message = "No readable sheets found inside this email."
         # A degraded thread fetch is the most important thing to surface right

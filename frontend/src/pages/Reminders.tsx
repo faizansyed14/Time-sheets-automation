@@ -81,7 +81,7 @@ function SendNowModal({
     mutationFn: (force: boolean) => sendReminderNow(row.employee_pk, m, y, force),
     onSuccess: (log) => {
       if (log.status === "sent") {
-        toast("success", "Reminder sent", `${row.name} — ${MONTHS_LONG[m]} ${y}`);
+        toast("success", "Reminder sent", `${row.name} · ${MONTHS_LONG[m]} ${y}`);
       } else {
         toast("error", "Could not send", log.error ?? "The send failed.");
       }
@@ -97,7 +97,7 @@ function SendNowModal({
   });
 
   return (
-    <Modal open onClose={onClose} title={`Send reminder to ${row.name}`} subtitle={row.email ?? "No email address on file — this will fail."}>
+    <Modal open onClose={onClose} title={`Send reminder to ${row.name}`} subtitle={row.email ?? "No email address on file, this will fail."}>
       <div className="grid grid-cols-2 gap-3">
         <Field label="Month">
           <Select value={m} onChange={(e) => setM(Number(e.target.value))}>
@@ -159,18 +159,18 @@ function RunDetailModal({ runId, onClose }: { runId: string; onClose: () => void
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {run.logs.length === 0 && (
-                  <tr><td colSpan={4} className="px-3 py-6 text-center text-slate-400">No one was missing this month — nothing to send.</td></tr>
+                  <tr><td colSpan={4} className="px-3 py-6 text-center text-slate-400">No one was missing this month, nothing to send.</td></tr>
                 )}
                 {run.logs.map((l) => (
                   <tr key={l.id}>
                     <td className="px-3 py-2 font-medium text-slate-800">{l.employee_name}</td>
-                    <td className="px-3 py-2 text-slate-500">{l.recipient_email ?? "—"}</td>
+                    <td className="px-3 py-2 text-slate-500">{l.recipient_email ?? "-"}</td>
                     <td className="px-3 py-2">
                       <Badge tone={l.status === "sent" ? "success" : l.status === "failed" ? "danger" : "slate"}>
                         {l.status}
                       </Badge>
                     </td>
-                    <td className="px-3 py-2 text-xs text-slate-500">{l.error ?? (l.sent_at ? formatUaeDateTime(l.sent_at) : "—")}</td>
+                    <td className="px-3 py-2 text-xs text-slate-500">{l.error ?? (l.sent_at ? formatUaeDateTime(l.sent_at) : "-")}</td>
                   </tr>
                 ))}
               </tbody>
@@ -266,7 +266,7 @@ export default function RemindersPage() {
   useEffect(() => {
     if (polling?.finished_at && pollingRunId) {
       toast("success", "Run finished",
-        `${polling.sent_count} sent, ${polling.failed_count} failed, ${polling.skipped_count} already sent — ${MONTHS_LONG[polling.month]} ${polling.year}.`);
+        `${polling.sent_count} sent, ${polling.failed_count} failed, ${polling.skipped_count} already sent · ${MONTHS_LONG[polling.month]} ${polling.year}.`);
       setPollingRunId(null);
       invalidateAfterSend();
     }
@@ -337,8 +337,8 @@ export default function RemindersPage() {
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
             <span className="font-semibold">Sending is disabled by the backend</span> (REMINDER_SENDING_ENABLED=false
-            in .env). Nothing on this page can actually email right now — not the scheduled run, not "Send now",
-            not "Run for all now", not "Test email" — regardless of the toggle above. An admin edits .env and
+            in .env). Nothing on this page can actually email right now, not the scheduled run, not "Send now",
+            not "Run for all now", not "Test email", regardless of the toggle above. An admin edits .env and
             restarts the backend to change this.
           </span>
         </div>
@@ -348,7 +348,7 @@ export default function RemindersPage() {
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
             <span className="font-semibold">The automatic scheduler is disabled by the backend</span>
-            (REMINDER_SCHEDULED_CHECK_ENABLED=false in .env) — the 28th/9am UAE run will never fire on this box,
+            (REMINDER_SCHEDULED_CHECK_ENABLED=false in .env), the 28th/9am UAE run will never fire on this box,
             no matter what the "Automatic reminders" toggle above says. Manual sends ("Send now", "Run for all now",
             "Test email") are unaffected and will still send.
           </span>
@@ -434,7 +434,7 @@ export default function RemindersPage() {
                     <p className="font-semibold text-slate-800">{row.name}</p>
                     <p className="text-xs text-slate-400">{row.employee_id}</p>
                   </td>
-                  <td className="px-3 py-2.5 text-slate-600">{row.account_manager ?? "—"}</td>
+                  <td className="px-3 py-2.5 text-slate-600">{row.account_manager ?? "-"}</td>
                   <td className="px-3 py-2.5 text-slate-600">
                     {row.email ? (
                       <>
@@ -444,8 +444,8 @@ export default function RemindersPage() {
                             className="ml-1.5 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-amber-700 ring-1 ring-inset ring-amber-200"
                             title={
                               row.email_source === "legacy"
-                                ? "No work/personal split on file yet — showing the older resolved address."
-                                : `No ${config?.email_preference} email on file — showing ${row.email_source} instead.`
+                                ? "No work/personal split on file yet, showing the older resolved address."
+                                : `No ${config?.email_preference} email on file, showing ${row.email_source} instead.`
                             }
                           >
                             {row.email_source}
@@ -483,7 +483,7 @@ export default function RemindersPage() {
             </div>
             <p className="mb-4 text-xs text-slate-500">
               Sends the exact reminder design (for {MONTHS_LONG[month]} {year}, the month/year selected above) to any
-              address — no employee record, no duplicate-prevention, always sends.
+              address, no employee record, no duplicate-prevention, always sends.
             </p>
             <div className="flex flex-wrap items-end gap-3">
               <Field label="Test email address">
@@ -514,7 +514,7 @@ export default function RemindersPage() {
                 <button key={run.id} onClick={() => setViewRunId(run.id)}
                   className="flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left text-xs hover:bg-slate-50">
                   <span className="font-medium text-slate-700">
-                    {MONTHS_LONG[run.month]} {run.year} · {run.trigger === "scheduled" ? "Automatic" : `Manual (${run.triggered_by ?? "—"})`}
+                    {MONTHS_LONG[run.month]} {run.year} · {run.trigger === "scheduled" ? "Automatic" : `Manual (${run.triggered_by ?? "-"})`}
                   </span>
                   <span className="flex items-center gap-2 text-slate-400">
                     {run.finished_at ? (

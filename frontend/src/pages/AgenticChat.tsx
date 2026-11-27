@@ -209,7 +209,7 @@ export default function AgenticChatPage() {
     } catch {
       patch((t) => ({
         ...t, streaming: false,
-        content: t.content || "Sorry — I couldn't reach the assistant. Please try again.",
+        content: t.content || "Sorry · I couldn't reach the assistant. Please try again.",
         error: "network",
       }));
     } finally {
@@ -262,7 +262,7 @@ export default function AgenticChatPage() {
                   <span className="text-gradient">How can I help you today?</span>
                 </h3>
                 <p className="mx-auto mt-2 max-w-md text-sm text-slate-500">
-                  Ask anything, or attach a file — PDF, DOCX, XLSX, TXT/CSV, or an image.
+                  Ask anything, or attach a file · PDF, DOCX, XLSX, TXT/CSV, or an image.
                 </p>
                 <div className="mt-6 grid gap-2.5 sm:grid-cols-2">
                   {EXAMPLE_PROMPTS.map((s, i) => (

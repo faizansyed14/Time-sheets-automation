@@ -45,7 +45,7 @@ const FIELD_LABELS: Record<string, string> = {
   location: "Location",
 };
 
-const dash = (v: string | null | undefined) => (v && v.trim() ? v : "—");
+const dash = (v: string | null | undefined) => (v && v.trim() ? v : "-");
 
 function StatChip({
   label,
@@ -154,7 +154,7 @@ export default function EmployeeImportPlanModal({
               Review import
             </h3>
             <p className="mt-0.5 truncate text-sm text-slate-500">
-              {fileName} — nothing has been saved yet.
+              {fileName}: nothing has been saved yet.
             </p>
           </div>
           <button
@@ -180,7 +180,7 @@ export default function EmployeeImportPlanModal({
 
           <Section
             title="New employees"
-            detail="Not in the matcher yet — these will be added."
+            detail="Not in the matcher yet, these will be added."
             count={plan.to_add.length}
             defaultOpen
           >
@@ -203,7 +203,7 @@ export default function EmployeeImportPlanModal({
                       <span className="font-semibold text-slate-800">{r.name}</span>
                       {r.possible_rename_of && (
                         <span className="mt-0.5 block text-[11px] text-amber-700">
-                          Same ID + office as {r.possible_rename_of} — possibly a rename. Added as a
+                          Same ID + office as {r.possible_rename_of}, possibly a rename. Added as a
                           separate person; merge by hand if it's the same employee.
                         </span>
                       )}
@@ -214,7 +214,7 @@ export default function EmployeeImportPlanModal({
                         ? [r.aco_number && `ACO-${r.aco_number}`, r.dco_number && `DCO-${r.dco_number}`]
                             .filter(Boolean)
                             .join(" · ")
-                        : "—"}
+                        : "-"}
                     </td>
                     <td className={TD}>{dash(r.location)}</td>
                     <td className={TD}>{dash(r.account_manager)}</td>
@@ -275,7 +275,7 @@ export default function EmployeeImportPlanModal({
 
           <Section
             title="In the matcher but not in this file"
-            detail="Possibly left the company. They are KEPT — an import never deletes anyone. Mark them inactive from the list if they've left."
+            detail="Possibly left the company. They are KEPT, an import never deletes anyone. Mark them inactive from the list if they've left."
             count={plan.missing_from_file.length}
             defaultOpen
           >
@@ -311,7 +311,7 @@ export default function EmployeeImportPlanModal({
 
           <Section
             title="Unchanged"
-            detail="Matched the matcher exactly — nothing to do."
+            detail="Matched the matcher exactly, nothing to do."
             count={plan.unchanged.length}
           >
             <table className="w-full text-xs">
@@ -340,7 +340,7 @@ export default function EmployeeImportPlanModal({
 
           <Section
             title="Skipped rows"
-            detail="Rows this file can't use — they are ignored entirely."
+            detail="Rows this file can't use, they are ignored entirely."
             count={plan.skipped.length}
           >
             <table className="w-full text-xs">
@@ -372,7 +372,7 @@ export default function EmployeeImportPlanModal({
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-5 py-3.5">
           <p className="text-xs text-slate-500">
             {willWrite === 0
-              ? "Nothing to write — this file matches the matcher as it stands."
+              ? "Nothing to write, this file matches the matcher as it stands."
               : `Will add ${plan.to_add.length} and update ${plan.to_update.length} employee(s). Nobody is deleted.`}
           </p>
           <div className="flex gap-2">

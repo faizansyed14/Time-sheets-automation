@@ -77,7 +77,7 @@ export default function AdminCalendars() {
     <div className="animate-fade-up">
       <PageHeader
         title="Month calendars"
-        subtitle="Weekends and public holidays per month — handed to Extract Email as ground truth for that month's sheets, instead of the model having to guess."
+        subtitle="Weekends and public holidays per month, handed to Extract Email as ground truth for that month's sheets, instead of the model having to guess."
         actions={<Button onClick={openCreate}><Plus className="h-4 w-4" /> Add month</Button>}
       />
 
@@ -104,7 +104,7 @@ export default function AdminCalendars() {
                     {MONTHS_LONG[row.month]} {row.year}
                   </td>
                   <td className="px-3 py-2.5 text-slate-600">
-                    {row.weekend_weekdays.length ? row.weekend_weekdays.join(", ") : "—"}
+                    {row.weekend_weekdays.length ? row.weekend_weekdays.join(", ") : "-"}
                   </td>
                   <td className="px-3 py-2.5">
                     {row.public_holidays.length ? (

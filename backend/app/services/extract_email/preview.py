@@ -48,7 +48,7 @@ async def preview_llm_egress(
         for it in th.items
     ]
     images_sent = [
-        {"name": f"[{it.key}] {it.name} — page {pi} of {len(it.images)}",
+        {"name": f"[{it.key}] {it.name}, page {pi} of {len(it.images)}",
          "file_type": "image", "bytes": len(img), "sha256": (it.digest or "")[:16],
          "jpeg_b64": base64.b64encode(img).decode("ascii")}
         for it in th.items for pi, img in enumerate(it.images, 1)
@@ -74,7 +74,7 @@ async def preview_llm_egress(
             "n": 1,
             "title": "Collect the whole conversation",
             "detail": (f"{len(messages)} message(s) fetched from the mail provider as raw "
-                       ".eml, oldest first — not just the message you are looking at. An "
+                       ".eml, oldest first, not just the message you are looking at. An "
                        "approval that arrived in a later reply is only visible if the "
                        "whole thread goes together."),
             "items": [label for label, _ in messages],
@@ -84,36 +84,36 @@ async def preview_llm_egress(
             "title": "Strip personal data from the message text",
             "detail": ("Email addresses, phone numbers and credentials are replaced in "
                        "every body, signatures and quoted history included. Names, "
-                       "employee IDs, dates and hours are deliberately KEPT — the "
+                       "employee IDs, dates and hours are deliberately KEPT, the "
                        "employee matcher needs them."),
             "items": [f"{len(user_bodies)} characters of scrubbed body text"],
         },
         {
             "n": 3,
             "title": "Classify by structure, not a template catalogue",
-            "detail": ("There is no per-client template list any more — pass 1 reasons "
+            "detail": ("There is no per-client template list any more, pass 1 reasons "
                        "from what it sees (repeating day-by-day rows vs a handful of "
                        "leave records vs bare approval wording), the same way a human "
                        "reviewer who has never seen this exact form before would."),
-            "items": ["no format registry — structural classification only"],
+            "items": ["no format registry, structural classification only"],
         },
         {
             "n": 4,
             "title": f"Render {n_items} item(s), {n_images} page image(s)",
             "detail": ("Every attachment AND every message body becomes its own labelled "
                        "[A#] item. PDFs/DOCX/XLSX render to page images (one JPEG per "
-                       "page); a standalone picture attachment is OCR-screened first — "
+                       "page); a standalone picture attachment is OCR-screened first · "
                        "under-threshold text drops it as a logo/icon before any API call "
                        "is spent on it. Text content (native PDF text, xlsx/docx text, "
                        "csv/txt) travels alongside as supplementary grounding."),
             "items": [f"{f['name']} ({f['file_type']}, {f['bytes'] // 1024} KB)"
-                      for f in files_sent] or ["—"],
+                      for f in files_sent] or ["-"],
         },
         {
             "n": 5,
-            "title": f"PASS 1 — {model} classifies every item"
+            "title": f"PASS 1 · {model} classifies every item"
                      + (f" ({len(batches)} call(s), batched by item count)" if len(batches) > 1 else ""),
-            "detail": ("This pass does NOT extract leave — it decides which items are "
+            "detail": ("This pass does NOT extract leave, it decides which items are "
                        "really timesheets, whose each one is, whether a manager approved "
                        "(signature on the sheet, a screenshot, or wording in the thread), "
                        "and writes the one plain-English thread summary."),
@@ -122,11 +122,11 @@ async def preview_llm_egress(
         },
         {
             "n": 6,
-            "title": "PASS 2 — reads only the confirmed sheets, full day-by-day account",
+            "title": "PASS 2, reads only the confirmed sheets, full day-by-day account",
             "detail": ("Only the items pass 1 confirmed as timesheet/leave_certificate are "
                        "sent again, batched by IMAGE COUNT this time. This prompt "
                        "transcribes not just leave but every day of the period: worked, "
-                       "weekend, a leave type, or genuinely uncertain — a complete, "
+                       "weekend, a leave type, or genuinely uncertain, a complete, "
                        "checkable account, not just a scan for leave."),
             "items": ["batched by image count (MAX_IMAGES_PER_CALL)",
                       "returns: sheets[] with working_days/weekend_days/leave buckets/uncertain_days"],
@@ -138,7 +138,7 @@ async def preview_llm_egress(
                        "validation, duplicate checks and the auto-accept decision all run "
                        "on this server. The model never sees your employee list. "
                        "Auto-accept only recommends a group when every day is confidently "
-                       "accounted for — no unaccounted days, no model-flagged uncertainty."),
+                       "accounted for, no unaccounted days, no model-flagged uncertainty."),
             "items": ["match → normalise/validate → duplicate check → auto-accept or review"],
         },
     ]
@@ -182,7 +182,7 @@ async def preview_llm_egress(
         "not_redacted": [
             "Employee names and employee IDs (the matcher needs them)",
             "Dates, hours and leave types",
-            "ATTACHMENT CONTENTS — rendered page images and native text carry "
+            "ATTACHMENT CONTENTS, rendered page images and native text carry "
             "whatever is printed on the sheet, including any name/ID/signature",
         ],
         "policy": (

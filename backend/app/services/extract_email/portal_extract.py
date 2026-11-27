@@ -180,7 +180,7 @@ async def run_portal_extract(db: AsyncSession, submission: PortalSubmission, onl
             group = {
                 "tag": tag_for(f"portal:{submission.id}:{f.kind}", submission.month, submission.year),
                 "employee_pk": matched.id, "name": matched.name, "employee_id": matched.employee_id,
-                "note": ("Portal submission — identity and period confirmed by the "
+                "note": ("Portal submission, identity and period confirmed by the "
                          "employee's own login, not read from the document."),
                 "month": submission.month, "year": submission.year,
                 "sheets": [ns],

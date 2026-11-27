@@ -162,7 +162,7 @@ def msg_to_eml_bytes(payload: bytes) -> bytes | None:
     try:
         import extract_msg
     except ImportError:
-        log.warning("extract-msg is not installed — cannot convert .msg to .eml")
+        log.warning("extract-msg is not installed, cannot convert .msg to .eml")
         return None
     path = None
     try:
@@ -306,6 +306,19 @@ def _thumb_uri(jpeg_bytes: bytes | None, *, max_side: int = 96) -> str | None:
 
 def _item_thumb(it: Item) -> str | None:
     return _thumb_uri(it.images[0]) if it.images else None
+
+
+def _approval_files(triage: list[dict], items: list[Item]) -> list[dict]:
+    out, seen = [], set()
+    for t in triage or []:
+        if t.get("kind") != "approval":
+            continue
+        it = resolve_source(t.get("source"), items)
+        if it is None or _is_email_body(it) or not it.name or it.name in seen:
+            continue
+        seen.add(it.name)
+        out.append({"name": it.name, "employee_name": t.get("employee_name") or ""})
+    return out
 
 
 def _is_email_body(it: Item) -> bool:
@@ -493,7 +506,7 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
         if ext in (".eml", ".msg"):
             if depth + 1 > _max_depth():
                 th.unreadable.append(
-                    f"{name or 'attached email'}: nested {depth + 1} levels deep — not opened.")
+                    f"{name or 'attached email'}: nested {depth + 1} levels deep, not opened.")
                 return
             sub_bytes = msg_to_eml_bytes(payload) if ext == ".msg" else payload
             if not sub_bytes:
@@ -589,7 +602,7 @@ def collect_thread(messages: list[tuple[str, bytes]]) -> Thread:
                 sub = payload[0] if isinstance(payload, list) and payload else payload
                 if sub is not None and depth + 1 > _max_depth():
                     th.unreadable.append(
-                        f"forwarded message nested {depth + 1} levels deep — not opened.")
+                        f"forwarded message nested {depth + 1} levels deep, not opened.")
                 if sub is not None and depth + 1 <= _max_depth():
                     # Outlook lists these as named .eml attachments — record
                     # the outer filename for the Extracted badge.
@@ -670,7 +683,7 @@ def require_vision_configured() -> tuple[str, str]:
     api_key = vision_client.openai_api_key()
     if not api_key or api_key.lower() == "change-me":
         raise RuntimeError(
-            "AI extraction is not configured — set OPENAI_API_KEY (and LLM_PROVIDER) "
+            "AI extraction is not configured, set OPENAI_API_KEY (and LLM_PROVIDER) "
             "in the environment before running Extract Email or Upload.")
     model = vision_client.model_for(vision_client.vision_provider(), "vision")
     return api_key, model
@@ -758,9 +771,9 @@ def _build_summary(triage: list[dict], approval: dict, thread_summary: str, n_ba
     if n_ts + n_cert == 0:
         headline, status = "No timesheet or leave evidence identified.", "other"
     elif approval["detected"]:
-        headline, status = f"{n_ts} timesheet(s), {n_cert} leave record(s) — approval detected.", "approved"
+        headline, status = f"{n_ts} timesheet(s), {n_cert} leave record(s), approval detected.", "approved"
     else:
-        headline, status = (f"{n_ts} timesheet(s), {n_cert} leave record(s) — "
+        headline, status = (f"{n_ts} timesheet(s), {n_cert} leave record(s) · "
                             f"no approval detected yet."), "awaiting_approval"
     # `narrative` is what ThreadSummaryBox shows as the prose body — use the
     # model's thread_summary (2–4 sentences). Call-count stays as a footnote.
@@ -1004,7 +1017,7 @@ async def extract_thread_sheets(
     reused_sheets = window_cached_sheets + external_sheets
     if reused_sheets:
         emit("unpack", "ok",
-             f"{len(reused_sheets)} sheet(s) reused from a previous read — not re-sent to the model.",
+             f"{len(reused_sheets)} sheet(s) reused from a previous read, not re-sent to the model.",
              reused=[{"name": s.get("name"), "employee": s.get("employee_name")} for s in reused_sheets])
     reused_triage = [_synthetic_triage_from_sheet(s) for s in reused_sheets]
 
@@ -1020,7 +1033,7 @@ async def extract_thread_sheets(
             approval = _derive_approval(reused_triage)
             return reused_sheets, approval, [], {
                 **empty_meta, "reused_sheets": len(reused_sheets),
-                "summary": "Nothing new in this thread — showing what was already extracted."}
+                "summary": "Nothing new in this thread, showing what was already extracted."}
         return [], {"detected": False, "detail": "Nothing readable in this thread."}, [], {
             **empty_meta, "errors": ["empty thread"]}
 
@@ -1030,7 +1043,7 @@ async def extract_thread_sheets(
     batches = triage_prompt.chunk_items_by_count(
         th.items, settings.pass1_batch_size, max_images=settings.max_images_per_call)
     emit("pass1", "spin",
-         f"Pass 1 of 2 — {model} is reading the whole conversation "
+         f"Pass 1 of 2 · {model} is reading the whole conversation "
          f"({len(batches)} call(s))…",
          pass_no=1, model=model, message_count=len(messages))
 
@@ -1115,11 +1128,11 @@ async def extract_thread_sheets(
         # UI can show "waiting for a response" instead of a step that looks
         # frozen — and, with more than one batch, exactly which one is in flight.
         emit("pass1", "spin",
-             f"Pass 1 — sending batch {bi} of {len(batches)} ({len(batch)} item(s)) to {model}…",
+             f"Pass 1, sending batch {bi} of {len(batches)} ({len(batch)} item(s)) to {model}…",
              pass_no=1, model=model, batch_index=bi, batch_total=len(batches), batch_phase="sent")
         all_items += await _pass1_resilient(batch, note, f"pass1-batch{bi}", bi)
         emit("pass1", "spin",
-             f"Pass 1 — batch {bi} of {len(batches)} received.",
+             f"Pass 1, batch {bi} of {len(batches)} received.",
              pass_no=1, model=model, batch_index=bi, batch_total=len(batches), batch_phase="received")
 
     # One verdict per item. If the same item is judged twice (a model echoing
@@ -1214,7 +1227,7 @@ async def extract_thread_sheets(
         message_count=len(messages), model=model)
 
     emit("pass1", "ok",
-         f"Pass 1 done — {len(data_items)} timesheet/certificate(s) identified"
+         f"Pass 1 done · {len(data_items)} timesheet/certificate(s) identified"
          + (f", {len(noise)} noise item(s) ignored" if noise else "")
          + (f", {len(multi_employee_labels)} multi-employee roster(s) skipped (use Bulk Upload)"
             if multi_employee_labels else "") + ".",
@@ -1229,7 +1242,7 @@ async def extract_thread_sheets(
     warnings: list[str] = list(th.unreadable)
     if multi_employee_labels:
         warnings.append(
-            "Not extracted — looks like a multi-employee roster (upload it on the Bulk Upload "
+            "Not extracted, looks like a multi-employee roster (upload it on the Bulk Upload "
             "page): " + ", ".join(multi_employee_labels))
 
     # ---- copies of ONE timesheet: read one, keep them all (see alternates.py) ----
@@ -1257,6 +1270,10 @@ async def extract_thread_sheets(
         "_opened_containers": list(th.opened_containers),
         "multi_employee_skipped": multi_employee_labels,
         "alternates": alt.records,
+        # Attached files that are approval evidence (a manager's screenshot / signed form),
+        # so they are filed with each employee's record even when only that employee's
+        # own sheets are filed from a shared email (ingestion.isolate_employee_attachments).
+        "approval_files": _approval_files(triage, th.items),
     }
 
     def _finish_meta() -> None:
@@ -1313,7 +1330,7 @@ async def extract_thread_sheets(
         body_text = "\n".join(b for _m, b in triage_prompt.budgeted_bodies(th))
 
     emit("pass2", "spin",
-         f"Pass 2 of 2 — extracting {len(pairs)} confirmed sheet(s) ({len(batches2)} call(s))…",
+         f"Pass 2 of 2, extracting {len(pairs)} confirmed sheet(s) ({len(batches2)} call(s))…",
          pass_no=2, model=model, sheets=[it.name for it, _ in pairs])
 
     raw_sheets: list = []
@@ -1355,7 +1372,7 @@ async def extract_thread_sheets(
     for bi, batch in enumerate(batches2, 1):
         # Same sent -> received bracket as pass 1.
         emit("pass2", "spin",
-             f"Pass 2 — sending batch {bi} of {len(batches2)} ({len(batch)} sheet(s)) to {model}…",
+             f"Pass 2, sending batch {bi} of {len(batches2)} ({len(batch)} sheet(s)) to {model}…",
              pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="sent")
         # One batch's call ultimately failing must not discard every OTHER
         # batch's already-confirmed sheets. The failure is recorded (marking
@@ -1365,14 +1382,14 @@ async def extract_thread_sheets(
         except Exception as e:
             failed_keys.update(it.key for it, _ in batch)
             names = ", ".join(it.name for it, _ in batch)
-            msg = (f"Pass 2 batch {bi}/{len(batches2)} failed ({str(e)[:160]}) — "
+            msg = (f"Pass 2 batch {bi}/{len(batches2)} failed ({str(e)[:160]}) · "
                    f"not extracted this run: {names}.")
             batch_errors.append(msg)
             emit("pass2", "warn", msg, pass_no=2, model=model,
                  batch_index=bi, batch_total=len(batches2), batch_phase="failed")
             continue
         emit("pass2", "spin",
-             f"Pass 2 — batch {bi} of {len(batches2)} received.",
+             f"Pass 2, batch {bi} of {len(batches2)} received.",
              pass_no=2, model=model, batch_index=bi, batch_total=len(batches2), batch_phase="received")
         raw_sheets += [s for s in (data.get("sheets") or []) if isinstance(s, dict)]
 
@@ -1394,7 +1411,7 @@ async def extract_thread_sheets(
     for pair in [p for p in pairs if p[0].key not in covered and p[0].key not in failed_keys]:
         it = pair[0]
         emit("pass2", "spin",
-             f"Pass 2 returned no sheet for '{it.name}' — reading it again on its own…",
+             f"Pass 2 returned no sheet for '{it.name}', reading it again on its own…",
              pass_no=2, model=model, batch_phase="retry")
         try:
             d2 = await _pass2_adaptive([pair], f"pass2-recover-{it.key}", 0)
@@ -1425,7 +1442,7 @@ async def extract_thread_sheets(
     # UI gets the model JSON + normalised sheets (minus bulky OCR text).
     ui_sheets = [{k: v for k, v in s.items() if k != "text"} for s in sheets]
     emit("pass2", "ok" if not batch_errors else "warn",
-         f"Pass 2 done — {len(sheets)} sheet(s), {total_days} day(s) accounted for"
+         f"Pass 2 done · {len(sheets)} sheet(s), {total_days} day(s) accounted for"
          + (f"; {len(batch_errors)} problem(s) - run incomplete" if batch_errors else "") + ".",
          pass_no=2,
          raw={"sheets": raw_sheets},

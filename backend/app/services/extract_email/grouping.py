@@ -184,7 +184,7 @@ def _multi_sheet_flags(members: list[dict]) -> tuple[list[str], list[str]]:
         overlap.append(
             "Two sheets claim the SAME full month ("
             + ", ".join(s.get("name") or "?" for s in full[:4])
-            + ") — needs a human check.")
+            + "), needs a human check.")
         return overlap, fold
 
     names = ", ".join(s.get("name") or "?" for s in ts[:6])
@@ -463,7 +463,7 @@ async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]
                 emp_info.setdefault(key, {
                     "employee_pk": None, "name": s["employee_name"],
                     "employee_id": s["employee_id"],
-                    "note": f"Not in the matcher — sheet says {s['employee_name'] or '?'} "
+                    "note": f"Not in the matcher, sheet says {s['employee_name'] or '?'} "
                             f"(client ID {s['employee_id'] or 'none'}). Pick the employee in Review."})
         s["_key"] = key
 
@@ -482,7 +482,7 @@ async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]
         else:
             key = "raw:unknown"
             emp_info[key] = {"employee_pk": None, "name": None, "employee_id": None,
-                             "note": "No employee could be read from any sheet or the sender — "
+                             "note": "No employee could be read from any sheet or the sender · "
                                      "pick the employee in Review."}
         for s in data_sheets:
             s["_key"] = key
@@ -495,7 +495,7 @@ async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]
             if not s["_key"]:
                 s["_key"] = only
                 fold_notes.append(
-                    f"{s['name']} carries no readable name/ID — attributed to "
+                    f"{s['name']} carries no readable name/ID, attributed to "
                     f"{emp_info[only]['name'] or 'the matched employee'} because every "
                     "identified sheet in this email belongs to them. Please verify.")
     else:
@@ -504,7 +504,7 @@ async def group_sheets(db: AsyncSession, email: EmailMessage, sheets: list[dict]
             emp_info["raw:unassigned"] = {
                 "employee_pk": None, "name": None, "employee_id": None,
                 "note": "This email carries sheets for several employees and these sheets "
-                        "show no readable name/ID — assign them manually."}
+                        "show no readable name/ID, assign them manually."}
             for s in data_sheets:
                 if not s["_key"]:
                     s["_key"] = "raw:unassigned"

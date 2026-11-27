@@ -109,7 +109,7 @@ async def extract_upload(
                 + ". Upload it again."), **flags}
         kinds = ", ".join(f"{s['name']} ({s['kind']})" for s in ctx.sheets) or "nothing readable"
         return {**build_result([], [], ctx.sheets, approval,
-                               f"Nothing to stage — no timesheet or certificate found ({kinds})."), **flags}
+                               f"Nothing to stage, no timesheet or certificate found ({kinds})."), **flags}
     message = staged_message(ctx.groups, approval)
     if incomplete:
         message = f"{message} INCOMPLETE - " + "; ".join(run_errors[:3]) + "."

@@ -94,7 +94,7 @@ export default function PortalEmployeeHistory() {
                             {s.extraction_state === "running" && "Reading your files…"}
                             {s.extraction_state === "done" &&
                               s.review_state !== "accepted" &&
-                              "Read — awaiting the timesheet team's review"}
+                              "Read, awaiting the timesheet team's review"}
                             {s.extraction_state === "failed" && "Couldn't read one of your files"}
                             {s.extraction_state === "not_started" && "Queued"}
                           </span>

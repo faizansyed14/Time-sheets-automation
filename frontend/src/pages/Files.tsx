@@ -11,6 +11,7 @@ import {
   FileText,
   Download,
   Plus,
+  ScanLine,
   Trash2,
   Pencil,
   ChevronRight,
@@ -26,6 +27,7 @@ import {
   createFileMonth,
   deleteFolder,
   deleteVaultFile,
+  extractVaultFile,
   downloadScopedZipUrl,
   fetchVaultRecordFor,
   fileContentUrl,
@@ -45,11 +47,13 @@ import {
   searchVaultEmployees,
   uploadFilesToMonth,
   type ProjectEmployee,
+  type PipelineFile,
 } from "../api/client";
 import { cn, formatBytes, formatDateTime } from "../lib/utils";
 import { FilePreviewModal, PreviewableFileRow } from "../components/FilePreview";
 import { VaultDownload } from "../components/VaultDownload";
-import { Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton } from "../components/ui";
+import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
+import { Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton, Spinner } from "../components/ui";
 import { useToast } from "../components/toast";
 import type { PreviewFile } from "../lib/filePreview";
 
@@ -385,8 +389,65 @@ export default function FilesPage() {
     onSuccess: (res: any) => {
       toast("success", `Uploaded ${res?.saved?.length ?? 0} file(s)`);
       invalidate();
+      // Offer to read them now. Stored either way: until extracted they show as
+      // "in vault, not extracted" (never missing) with an Extract button in the Activity log.
+      const saved = (res?.saved ?? []) as { name: string; rel_path: string }[];
+      if (saved.length && canDelete) setJustUploaded(saved);
     },
     onError: (e: any) => toast("error", "Upload failed", e?.response?.data?.detail ?? String(e)),
+  });
+
+  const [justUploaded, setJustUploaded] = useState<{ name: string; rel_path: string }[] | null>(null);
+  const [extractingAll, setExtractingAll] = useState(false);
+  // Review happens right here: every extracted employee/month opens in Compare & Fix,
+  // one after another, and stays until Save (closing asks first).
+  const [reviewQueue, setReviewQueue] = useState<PipelineFile[]>([]);
+  const [progress, setProgress] = useState<{ done: number; total: number; name: string } | null>(null);
+  const extractUploaded = async () => {
+    if (!justUploaded) return;
+    const list = justUploaded;
+    setExtractingAll(true);
+    const found: PipelineFile[] = [];
+    const nothing: { name: string; why: string }[] = [];
+    for (let i = 0; i < list.length; i++) {
+      setProgress({ done: i, total: list.length, name: list[i].name });
+      try {
+        const r = await extractVaultFile(list[i].rel_path);
+        found.push(...(r.items ?? []));
+        if (!r.staged) nothing.push({ name: list[i].name, why: r.message });
+      } catch (e: any) {
+        nothing.push({ name: list[i].name, why: e?.response?.data?.detail ?? String(e) });
+      }
+    }
+    setProgress(null);
+    setExtractingAll(false);
+    setJustUploaded(null);
+    invalidate();
+    if (found.length) setReviewQueue(found);
+    if (nothing.length)
+      toast("warning", `${nothing.length} file(s) not extracted`,
+        `${nothing[0].name}: ${nothing[0].why || "no timesheet or leave record was found"}`);
+  };
+  // Save / Discard also close the review: that close must not ask again.
+  const reviewHandled = useRef(false);
+  const closeReview = () => {
+    if (reviewHandled.current) {
+      reviewHandled.current = false;
+      return;
+    }
+    if (confirm("Close without saving? Nothing is lost: it stays waiting for review in the Activity log."))
+      setReviewQueue((q) => q.slice(1));
+  };
+  // A file dropped straight into the vault is never read by itself: Extract sends it
+  // through the normal reader into Review (Activity log), like an upload.
+  const extractMut = useMutation({
+    mutationFn: (relPath: string) => extractVaultFile(relPath),
+    onSuccess: (r) => {
+      if (r.items?.length) setReviewQueue(r.items);
+      else toast("warning", "Nothing extracted", r.message || "No timesheet or leave record was found in this file.");
+      invalidate();
+    },
+    onError: (e: any) => toast("error", "Extraction failed", e?.response?.data?.detail ?? String(e)),
   });
 
   const deleteFileMut = useMutation({
@@ -411,7 +472,7 @@ export default function FilesPage() {
       toast(
         "success",
         vars.asCopy ? "Copied" : "Moved",
-        renamed ? `A file named "${vars.dst.split("/").pop()}" already existed there — saved as "${finalName}".` : undefined
+        renamed ? `A file named "${vars.dst.split("/").pop()}" already existed there, saved as "${finalName}".` : undefined
       );
       setMovingFile(null);
       setMovingFolder(null);
@@ -454,8 +515,12 @@ export default function FilesPage() {
     <div className="animate-fade-up">
       <PageHeader
         title="File vault"
-        subtitle="Everything the pipeline files on disk — Account Manager → Employee → Month."
-        actions={<VaultDownload manager={viewMode === "manager" ? manager : null} />}
+        subtitle="Everything the pipeline files on disk · Account Manager → Employee → Month."
+        actions={
+          <div className="flex items-center gap-2">
+            <VaultDownload manager={viewMode === "manager" ? manager : null} />
+          </div>
+        }
       />
 
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
@@ -776,7 +841,7 @@ export default function FilesPage() {
         <Card className="flex min-h-[420px] flex-col">
           <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
             <h3 className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-slate-500">
-              <FolderOpen className="h-4 w-4" /> {col3Month ? `Files — ${col3Month}` : "Months"}
+              <FolderOpen className="h-4 w-4" /> {col3Month ? `Files · ${col3Month}` : "Months"}
             </h3>
             <div className="flex items-center gap-1">
               {col3Employee && !col3Month && (
@@ -856,6 +921,20 @@ export default function FilesPage() {
                             className="border-transparent px-3 py-2 hover:border-transparent"
                           />
                         </div>
+                        {canDelete && (
+                          <button
+                            type="button"
+                            title="Extract this file (read it and send it to review). Use it for files added straight to the vault."
+                            disabled={extractMut.isPending}
+                            onClick={() => {
+                              if (confirm(`Extract "${f.name}"? It will be read and sent to review. The file stays where it is.`))
+                                extractMut.mutate(f.rel_path);
+                            }}
+                            className="shrink-0 rounded-lg p-2 text-slate-400 transition-colors hover:bg-brand-50 hover:text-brand-600 disabled:opacity-50"
+                          >
+                            <ScanLine className={cn("h-4 w-4", extractMut.isPending && extractMut.variables === f.rel_path && "animate-pulse text-brand-600")} />
+                          </button>
+                        )}
                         <button
                           type="button"
                           title="Move or copy this file to a different employee/month"
@@ -946,6 +1025,58 @@ export default function FilesPage() {
         </div>
       </Modal>
 
+      <Modal
+        open={!!justUploaded}
+        onClose={() => {}}
+        dismissible={false}
+        title="Extract the uploaded files"
+        subtitle="Each file is read and opens for review here. Save files it to the record."
+      >
+        <ul className="mb-4 max-h-48 space-y-1 overflow-y-auto rounded-lg border border-slate-200 bg-slate-50 p-2 text-sm text-slate-700">
+          {(justUploaded ?? []).map((f) => (
+            <li key={f.rel_path} className="truncate" title={f.name}>{f.name}</li>
+          ))}
+        </ul>
+        <div className="flex justify-end gap-2">
+          <Button disabled={extractingAll} onClick={extractUploaded}>
+            {extractingAll ? "Extracting…" : "Extract and review"}
+          </Button>
+        </div>
+      </Modal>
+
+      {/* Reading overlay: shown while the uploaded files are extracted */}
+      {progress && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/40 backdrop-blur-[3px]">
+          <div className="w-full max-w-sm rounded-2xl border border-slate-200/80 bg-white p-6 text-center shadow-pop animate-scale-in">
+            <Spinner className="mx-auto h-6 w-6" />
+            <p className="mt-4 font-display text-base font-semibold text-slate-900">
+              Reading file {progress.done + 1} of {progress.total}
+            </p>
+            <p className="mt-1 truncate text-sm text-slate-500" title={progress.name}>{progress.name}</p>
+            <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-slate-100">
+              <div className="h-full rounded-full bg-brand-600 transition-all"
+                   style={{ width: `${Math.round(((progress.done + 0.5) / progress.total) * 100)}%` }} />
+            </div>
+            <p className="mt-3 text-xs text-slate-400">The review opens here when it is done.</p>
+          </div>
+        </div>
+      )}
+      {/* Review right here; Save files the record (the file is already in the vault). */}
+      <PipelineCompareFixModal
+        file={reviewQueue[0] ?? null}
+        onClose={closeReview}
+        onSaved={() => {
+          reviewHandled.current = true;
+          toast("success", "Saved", "The extracted data is filed to the record.");
+          setReviewQueue((q) => q.slice(1));
+          invalidate();
+        }}
+        onDiscarded={() => {
+          reviewHandled.current = true;
+          setReviewQueue((q) => q.slice(1));
+        }}
+      />
+
       <Modal open={!!renaming} onClose={() => setRenaming(null)} title="Rename folder">
         <Input value={name} onChange={(e) => setName(e.target.value)} autoFocus />
         <div className="mt-4 flex justify-end gap-2">
@@ -979,7 +1110,7 @@ export default function FilesPage() {
         open={!!movingFolder}
         onClose={() => setMovingFolder(null)}
         title={movingFolder ? `Move or copy "${movingFolder.name}"'s folder` : ""}
-        subtitle="Files this employee to a different account manager — every month/file underneath moves with it."
+        subtitle="Files this employee to a different account manager, every month/file underneath moves with it."
         needsEmployee={false}
         needsMonth={false}
         allowCopy

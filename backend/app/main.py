@@ -57,11 +57,19 @@ def _assert_prod_secrets() -> None:
             "Refusing to start in prod with a weak JWT_SECRET. Set a long random "
             "value, e.g. `python -c \"import secrets; print(secrets.token_urlsafe(48))\"`."
         )
+    if not settings.auth_enabled:
+        raise RuntimeError(
+            "Refusing to start in prod with AUTH_ENABLED=false - every request would be "
+            "treated as an administrator without signing in.")
+    if settings.debug_otp_enabled:
+        raise RuntimeError(
+            "Refusing to start in prod with DEBUG_OTP_ENABLED=true - the sign-in code would "
+            "be returned in the login response, so the second step would protect nothing.")
     if settings.default_admin_password == "admin":
         raise RuntimeError(
             "Refusing to start in prod with DEFAULT_ADMIN_PASSWORD still set to "
             "the hardcoded default \"admin\". Set a strong, unique password in "
-            "your prod .env before first boot — this is what the admin account "
+            "your prod .env before first boot, this is what the admin account "
             "gets seeded with."
         )
 
@@ -122,6 +130,30 @@ def _embeddable_preview_path(path: str) -> bool:
 
 
 @app.middleware("http")
+async def monitor_requests(request: Request, call_next):
+    """Time every API request for the Monitor page (health checks excluded)."""
+    import time as _time
+    t0 = _time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        path = request.url.path
+        if not path.endswith("/health"):
+            try:
+                from app.services.monitoring.recorder import record
+                route = request.scope.get("route")
+                role = f"{request.method} {getattr(route, 'path', None) or 'unmatched'}"
+                record("api", role, "-", (_time.perf_counter() - t0) * 1000,
+                       status="ok" if status < 500 else "error",
+                       detail={"http": status} if status >= 500 else None)
+            except Exception:
+                pass
+
+
+@app.middleware("http")
 async def security_headers(request: Request, call_next):
     """Baseline OWASP security headers on every API response."""
     response = await call_next(request)
@@ -139,7 +171,22 @@ async def security_headers(request: Request, call_next):
     if settings.is_prod:
         response.headers.setdefault(
             "Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+    # Files from outside (email attachments, portal uploads, the vault) can be HTML or SVG
+    # carrying a script. Served from this origin, that script would run with the signed-in
+    # user's session. A sandbox CSP lets such a file still be viewed but never run script
+    # or reach this origin. PDFs, images and Office files are not affected.
+    ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if request.url.path.startswith(settings.api_prefix) and ctype in _ACTIVE_CONTENT_TYPES:
+        response.headers["Content-Security-Policy"] = (
+            "sandbox; default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; "
+            "frame-ancestors 'self'")
     return response
+
+
+_ACTIVE_CONTENT_TYPES = {
+    "text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
+    "text/javascript", "application/javascript", "application/x-javascript", "text/xsl",
+}
 
 
 # public
@@ -158,6 +205,8 @@ app.include_router(portal_auth.router, prefix=settings.api_prefix)
 app.include_router(portal_employee.router, prefix=settings.api_prefix)
 # admin (admin role enforced inside the router)
 app.include_router(admin.router, prefix=settings.api_prefix)
+from app.api.routes import monitor as _monitor  # noqa: E402
+app.include_router(_monitor.router, prefix=settings.api_prefix)
 # month calendars — same read/write split as the business routes below, not
 # admin-only (see admin.py's module docstring).
 app.include_router(admin.calendars_router, prefix=settings.api_prefix)

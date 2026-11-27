@@ -141,7 +141,7 @@ def test_legacy_cut_modes_still_available():
     assert "john.smith@acme.com" not in cut_sig
 
     body_thread = (
-        "Latest note only — please see below.\n\n"
+        "Latest note only, please see below.\n\n"
         "From: Other <other@x.com>\n"
         "Sent: yesterday\n"
         "Prior message body\n"

@@ -150,7 +150,7 @@ export default function AdminPortalUsers() {
             />
           </Field>
           {/* NOTE: extra content (the suggestion list, the manager readout)
-              must live OUTSIDE <Field> — Field clones a SINGLE child via
+              must live OUTSIDE <Field> · Field clones a SINGLE child via
               Children.only, so giving it more than one sibling throws at
               render time. */}
           <div>
@@ -189,7 +189,7 @@ export default function AdminPortalUsers() {
             )}
             {selectedEmployee && (
               <p className="mt-1.5 text-xs text-slate-500">
-                Manager: <span className="font-medium text-slate-700">{selectedEmployee.account_manager || "—"}</span>
+                Manager: <span className="font-medium text-slate-700">{selectedEmployee.account_manager || "-"}</span>
               </p>
             )}
           </div>

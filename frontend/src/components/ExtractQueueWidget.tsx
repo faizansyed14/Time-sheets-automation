@@ -37,7 +37,7 @@ export default function ExtractQueueWidget() {
   const isLive = !!current;
 
   const body = isQueuedOnly ? (
-    <span className="text-[11px] font-semibold text-slate-500">Queued — waiting to start…</span>
+    <span className="text-[11px] font-semibold text-slate-500">Queued, waiting to start…</span>
   ) : (
     <ExtractStepRow events={visible.events} overall={overall} />
   );
@@ -47,7 +47,7 @@ export default function ExtractQueueWidget() {
   // 3 (4 sheet(s)) to gpt-4o…") — shown as the hover tooltip and, while live,
   // as a small line under the steps so it's visible without hovering.
   const latestMessage = visible.events[visible.events.length - 1]?.message;
-  const tooltip = latestMessage ? `${visible.subject} — ${latestMessage}` : visible.subject;
+  const tooltip = latestMessage ? `${visible.subject} · ${latestMessage}` : visible.subject;
 
   const trailer = (
     <>

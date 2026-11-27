@@ -427,3 +427,79 @@ async def test_enqueue_new_threads_never_rescans_the_whole_mailbox(monkeypatch):
         await cache.delete("auto_extract:enabled", "auto_extract:run_id")
         if run_id:
             await _cleanup_run(run_id)
+
+
+async def test_mail_stored_by_the_inbox_page_sync_is_still_auto_extracted(monkeypatch):
+    """Regression: the Inbox page's own sync can store new mail before the background
+    sync runs. The background sync then fetches nothing new - the mail must still be
+    queued, because queueing follows what is new in the DATABASE."""
+    from app.services import tasks as tasks_module
+    import app.services.inbox.sync as sync_module
+
+    await auto_extract._set_enabled(True)
+    await cache.delete("auto_extract:run_id", auto_extract._WATERMARK_KEY)
+    dispatched: list[str] = []
+    monkeypatch.setattr(auto_extract, "_dispatch", lambda pmid, subject, run_id: dispatched.append(pmid))
+
+    async def _sync_finds_nothing(db):
+        return []                                   # the page already took the new mail
+    monkeypatch.setattr(sync_module, "sync_inbox", _sync_finds_nothing)
+
+    pmid = "AE-page-synced-1"
+    try:
+        tasks_module.sync_inbox_task()              # first tick sets the watermark
+        dispatched.clear()                          # (ignore any leftover rows from other tests)
+        await _seed([pmid])                         # ...the page sync stores a new message
+        tasks_module.sync_inbox_task()              # next background tick
+        assert dispatched.count(pmid) == 1
+
+        tasks_module.sync_inbox_task()              # and it is queued only once
+        assert dispatched.count(pmid) == 1
+    finally:
+        run_id = await auto_extract._current_run_id()
+        await _unseed([pmid])
+        await cache.delete("auto_extract:enabled", "auto_extract:run_id",
+                           auto_extract._WATERMARK_KEY, f"auto_extract:seen:{pmid}")
+        if run_id:
+            await _cleanup_run(run_id)
+
+
+async def test_auto_extract_off_keeps_the_watermark_current(monkeypatch):
+    """While Auto Extract is off nothing is queued, and turning it on later does not
+    replay everything that arrived meanwhile (Start's catch-up scan handles that)."""
+    await cache.delete("auto_extract:enabled", auto_extract._WATERMARK_KEY)
+    dispatched: list[str] = []
+    monkeypatch.setattr(auto_extract, "_dispatch", lambda pmid, subject, run_id: dispatched.append(pmid))
+    pmid = "AE-off-1"
+    await _seed([pmid])
+    try:
+        async with SessionLocal() as db:
+            assert await auto_extract.enqueue_since_watermark(db) is None
+        assert dispatched == []
+        assert await cache.get(auto_extract._WATERMARK_KEY) is not None
+    finally:
+        await _unseed([pmid])
+        await cache.delete(auto_extract._WATERMARK_KEY)
+
+
+async def test_status_reports_sync_health():
+    from app.services.inbox.sync import SYNC_ERROR_KEY
+    await cache.set(SYNC_ERROR_KEY, "RuntimeError: Graph list error 401", ttl=60)
+    try:
+        st = await auto_extract.get_status()
+        assert st["sync"]["sync_error"].startswith("RuntimeError")
+    finally:
+        await cache.delete(SYNC_ERROR_KEY)
+
+
+async def test_auto_extract_stays_on_until_an_admin_stops_it():
+    """The on switch has no expiry - it must not turn itself off after some days."""
+    from app.core.cache import cache as _c
+    await auto_extract._set_enabled(True)
+    try:
+        r = await _c._client()
+        if r is not None:
+            assert await r.ttl(auto_extract._ENABLED_KEY) == -1     # -1 = no expiry
+        assert await auto_extract.is_enabled()
+    finally:
+        await cache.delete(auto_extract._ENABLED_KEY)

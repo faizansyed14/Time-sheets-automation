@@ -53,12 +53,20 @@ from app.services.extract_email.constants import TAG_PREFIX
 # "should a background sync tick start/extend a run on its own", and
 # outlives any single run's completion.
 _ENABLED_KEY = "auto_extract:enabled"
-_ENABLED_TTL = 30 * 24 * 3600  # 30 days — a deliberate mode, not run bookkeeping
+_ENABLED_TTL = 30 * 24 * 3600  # bookkeeping keys only (watermark); the on/off switch itself never expires
 # Refreshed on every update while running; a safety net so a run's keys never
 # linger forever if every task handling it dies without cleaning up.
 _RUN_TTL = 6 * 3600
 
 _RUN_ID_KEY = "auto_extract:run_id"
+# Insert-time watermark (EmailMessage.created_at, epoch seconds) of the newest message
+# Auto Extract has already queued. Every message INSERTED after it is new mail - no matter
+# whether the background sync or the Inbox page's own sync fetched it.
+_WATERMARK_KEY = "auto_extract:watermark"
+# Re-look this far behind the watermark: a sync transaction that started before the last
+# tick can commit rows stamped slightly earlier than the watermark.
+_WATERMARK_OVERLAP = dt.timedelta(minutes=15)
+_SEEN_TTL = 6 * 3600     # a message is queued by the watermark path once
 
 _IDLE_STATUS: dict = {
     "state": "idle",
@@ -86,7 +94,9 @@ async def is_enabled() -> bool:
 
 async def _set_enabled(value: bool) -> None:
     if value:
-        await cache.set(_ENABLED_KEY, True, ttl=_ENABLED_TTL)
+        # No expiry: Auto Extract stays on until an admin presses Stop. (Keys without an
+        # expiry are also never evicted by Redis's volatile-lru memory policy.)
+        await cache.set(_ENABLED_KEY, True)
     else:
         await cache.delete(_ENABLED_KEY)
 
@@ -101,10 +111,10 @@ async def get_status() -> dict:
     incremented, so it can't drift out of sync with its parts."""
     run_id = await _current_run_id()
     if not run_id:
-        return {**_IDLE_STATUS, "enabled": await is_enabled()}
+        return {**_IDLE_STATUS, "enabled": await is_enabled(), "sync": await _sync_health()}
     state = await cache.get(_rk(run_id, "state"))
     if not state:
-        return {**_IDLE_STATUS, "enabled": await is_enabled()}
+        return {**_IDLE_STATUS, "enabled": await is_enabled(), "sync": await _sync_health()}
     total = int(await cache.get(_rk(run_id, "total")) or 0)
     skipped = int(await cache.get(_rk(run_id, "skipped")) or 0)
     succeeded = int(await cache.get(_rk(run_id, "succeeded")) or 0)
@@ -120,7 +130,13 @@ async def get_status() -> dict:
         "finished_at": await cache.get(_rk(run_id, "finished_at")),
         "last_error": await cache.get(_rk(run_id, "last_error")),
         "enabled": await is_enabled(),
+        "sync": await _sync_health(),
     }
+
+
+async def _sync_health() -> dict:
+    from app.services.inbox.sync import sync_health
+    return await sync_health()
 
 
 async def request_stop() -> dict:
@@ -448,6 +464,59 @@ async def enqueue_new_threads(db: AsyncSession, rows: list[EmailMessage]) -> dic
     if dupes == len(need_real):
         await _finish_if_done(run_id)
     return await get_status()
+
+
+async def enqueue_since_watermark(db: AsyncSession) -> dict | None:
+    """Queue extraction for every message inserted since the last tick.
+
+    Before, only the rows the BACKGROUND sync itself fetched were queued. When someone
+    had the Inbox open, the page's own sync often fetched new mail first; the background
+    sync then found nothing new and that mail was never auto-extracted. This reads the
+    database instead, so it does not matter which sync stored the message."""
+    import types
+
+    now = dt.datetime.now(dt.timezone.utc)
+    if not await is_enabled():
+        # Off: keep the mark current, so turning it on later does not replay the past
+        # (Start's full catch-up scan is what handles the backlog).
+        await cache.set(_WATERMARK_KEY, now.timestamp(), ttl=_ENABLED_TTL)
+        return None
+    # Re-set the switch without an expiry (one written by older code still has its
+    # 30-day expiry; this makes it permanent until an admin presses Stop).
+    await _set_enabled(True)
+    raw = await cache.get(_WATERMARK_KEY)
+    mark = (dt.datetime.fromtimestamp(float(raw), tz=dt.timezone.utc) if raw
+            else now - _WATERMARK_OVERLAP)
+    rows = (await db.execute(
+        select(EmailMessage.provider_message_id, EmailMessage.created_at)
+        .where(EmailMessage.created_at > mark - _WATERMARK_OVERLAP)
+    )).all()
+    newest = max([r.created_at for r in rows if r.created_at] + [mark])
+    fresh = []
+    for pmid, _at in rows:
+        if not await cache.exists(f"auto_extract:seen:{pmid}"):
+            fresh.append(pmid)
+    result = None
+    if fresh:
+        result = await enqueue_new_threads(
+            db, [types.SimpleNamespace(provider_message_id=p) for p in fresh])
+        for pmid in fresh:          # only after queueing succeeded
+            await cache.set(f"auto_extract:seen:{pmid}", True, ttl=_SEEN_TTL)
+    await cache.set(_WATERMARK_KEY, newest.timestamp(), ttl=_ENABLED_TTL)
+    return result
+
+
+async def scheduled_sweep() -> dict | None:
+    """Daily safety net while Auto Extract is on: the same catch-up scan as Start.
+    It re-tries threads whose extraction failed and picks up anything that slipped
+    past the new-mail path. Threads already extracted and unchanged are skipped
+    without any model call."""
+    if not await is_enabled():
+        return None
+    status = await get_status()
+    if status.get("state") in ("running", "stopping"):
+        return status
+    return await start()
 
 
 async def _finish_if_done(run_id: str) -> None:

@@ -72,7 +72,7 @@ async def test_since_trims_to_new_plus_context_messages():
     since = base + dt.timedelta(days=5)
     fetched, notes = await collect_thread_emls(provider, _Anchor(), since=since)
 
-    subjects = [label.split(" — ", 1)[1] if " — " in label else label for label in
+    subjects = [label.split(" · ", 1)[1] if " · " in label else label for label in
                 [lbl for lbl, _ in fetched]]
     # window_start = new_index(m6, idx 5) - context_messages(2) = 3 -> m4..m8
     assert subjects == ["msg 4", "msg 5", "msg 6", "msg 7", "msg 8"]
@@ -143,7 +143,7 @@ async def test_a_thread_longer_than_the_cap_keeps_only_the_newest_n(monkeypatch)
 
     fetched, notes = await collect_thread_emls(provider, _Anchor(), since=None)
 
-    subjects = [lbl.split(" — ", 1)[1] if " — " in lbl else lbl for lbl, _ in fetched]
+    subjects = [lbl.split(" · ", 1)[1] if " · " in lbl else lbl for lbl, _ in fetched]
     assert subjects == ["msg 5", "msg 6", "msg 7"], "must keep the NEWEST 3, not the oldest"
     assert any("only the newest 3" in n for n in notes), notes
 
@@ -313,7 +313,7 @@ async def test_last_extraction_at_prefers_snapshot_at_over_the_later_commit_time
 
         at = await sheet_cache.last_extraction_at(db, thread_key)
         assert at == fetched_at, (
-            "must report the fetch time, not the later commit time — a "
+            "must report the fetch time, not the later commit time, a "
             "reply that arrived in between was never actually read"
         )
 

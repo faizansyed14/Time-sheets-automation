@@ -36,6 +36,7 @@ router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 # Human-readable labels the UI can show next to each failure code.
 FAILURE_LABELS: dict[str, str] = {
     FailureCode.PROTECTED_PDF: "Protected PDF",
+    FailureCode.VAULT_NOT_EXTRACTED: "In vault, not extracted",
     FailureCode.UNSUPPORTED_TYPE: "Unsupported file type",
     FailureCode.EMPTY_FILE: "Empty file",
     FailureCode.LLM_FAILED: "LLM extraction failed",
@@ -78,14 +79,14 @@ async def list_pipeline_files(
     exclude_status: str | None = Query(
         default=None,
         description="Hide one or more statuses from the results, comma-separated "
-                    "(the Activity log hides 'success,resolved' by default — "
+                    "(the Activity log hides 'success,resolved' by default · "
                     "finished work isn't what the page is for)"),
     failure_code: str | None = Query(default=None),
     source_kind: str | None = Query(default=None, description="upload|email|manual|portal"),
     source_id: str | None = Query(default=None, description="Filter by PipelineFile.source_id"),
     thread_key: str | None = Query(
         default=None,
-        description="Filter by PipelineFile.thread_key (conversation) — every "
+        description="Filter by PipelineFile.thread_key (conversation), every "
                      "record staged from this email thread, however many "
                      "employee+month groups it produced"),
     auto_accepted: bool | None = Query(
@@ -94,11 +95,14 @@ async def list_pipeline_files(
     year: int | None = Query(default=None, ge=2000, le=2100, description="Filter by PipelineFile.year"),
     updated_after: datetime | None = Query(
         default=None,
-        description="Only rows whose PipelineFile.updated_at is at/after this instant — "
+        description="Only rows whose PipelineFile.updated_at is at/after this instant · "
                      "backs the Activity page's scoped 'Success (last 30 days)' card, so "
                      "clicking it lists exactly the rows the card counted, not every "
                      "success ever."),
     q: str | None = Query(default=None, description="search filename / employee (whole table)"),
+    unmatched: bool | None = Query(
+        default=None, description="true = open items whose employee is not matched to anyone "
+                                  "in the Employee Matcher (they count for nobody until fixed)"),
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -126,6 +130,11 @@ async def list_pipeline_files(
         base = base.where(PipelineFile.year == year)
     if updated_after:
         base = base.where(PipelineFile.updated_at >= updated_after)
+    if unmatched:
+        from app.services.pipeline.coverage import staged_employee_pk
+        base = base.where(
+            PipelineFile.status.in_((PipelineStatus.NEEDS_REVIEW, PipelineStatus.FAILED)),
+            staged_employee_pk().is_(None))
     if auto_accepted is not None:
         # Filter in SQL, not on the page: successes are mostly human accepts,
         # so client-side filtering would drop auto-accepts past the first page.
@@ -151,12 +160,22 @@ async def list_pipeline_files(
 @router.get("/stats", response_model=PipelineStats)
 async def pipeline_stats(
     success_window_days: int = Query(default=60, ge=1, le=365,
-        description="How far back success_recent counts — the Activity page's "
+        description="How far back success_recent counts, the Activity page's "
                     "'Success' stat card lets the user pick 60/90/120 days."),
     db: AsyncSession = Depends(get_db),
 ):
     async def _compute() -> dict:
-        rows = (await db.execute(select(PipelineFile))).scalars().all()
+        # Only the three columns counted here - never the (large) extraction_meta JSON
+        # of every row, which grows with the whole history.
+        rows = (await db.execute(select(
+            PipelineFile.status, PipelineFile.failure_code, PipelineFile.updated_at))).all()
+        from app.services.pipeline.coverage import staged_employee_pk
+        unmatched = (await db.execute(select(func.count()).select_from(PipelineFile).where(
+            PipelineFile.status.in_((PipelineStatus.NEEDS_REVIEW, PipelineStatus.FAILED)),
+            staged_employee_pk().is_(None)))).scalar_one()
+        ai_flag = PipelineFile.extraction_meta["auto_accept"]["accepted"].as_boolean()
+        ai_recommended = (await db.execute(select(func.count()).select_from(PipelineFile).where(
+            PipelineFile.status == PipelineStatus.NEEDS_REVIEW, ai_flag.is_(True)))).scalar_one()
         by_status: dict[str, int] = {}
         by_failure: dict[str, int] = {}
         # "success" (below) is the all-time total — needed as-is for the
@@ -182,6 +201,8 @@ async def pipeline_stats(
             "needs_review": by_status.get(PipelineStatus.NEEDS_REVIEW, 0),
             "failed": by_status.get(PipelineStatus.FAILED, 0),
             "resolved": by_status.get(PipelineStatus.RESOLVED, 0),
+            "unmatched": unmatched,
+            "ai_recommended": ai_recommended,
             "by_failure_code": by_failure,
             "failure_labels": FAILURE_LABELS,
         }
@@ -265,7 +286,7 @@ async def _portal_submission_admin_rows(db: AsyncSession, subs: list) -> list:
 async def list_portal_submissions(
     manager_decision: str | None = Query(
         default=None,
-        description="pending|not_approved — \"accepted\" isn't tracked here, see review_state instead"),
+        description="pending|not_approved · \"accepted\" isn't tracked here, see review_state instead"),
     month: int | None = Query(default=None, ge=1, le=12),
     year: int | None = Query(default=None, ge=2000),
     db: AsyncSession = Depends(get_db),
@@ -500,7 +521,9 @@ async def pipeline_manual_fix(
 
     # If the reviewer didn't attach a replacement file, carry the original raw
     # file forward as the record attachment so it is stored in the File Vault.
-    if not attachments and t.raw_path:
+    # A file extracted FROM the vault is already in the vault: never file a second copy.
+    from_vault = str(t.source_id or "").startswith("vault:")
+    if not attachments and t.raw_path and not from_vault:
         raw_bytes = read_raw_copy(t)
         if raw_bytes:
             # One email carrying SEVERAL employees' sheets (a manager sending
@@ -791,6 +814,74 @@ async def pipeline_raw_render(
         raise HTTPException(422, "Could not render this file")
     idx = min(page, len(imgs)) - 1
     return _Response(content=imgs[idx], media_type="image/jpeg",
+                     headers={"X-Page-Count": str(len(imgs))})
+
+
+async def _sheet_bytes(pipeline_id: str, name: str, db: AsyncSession,
+                       digest: str | None = None) -> tuple[bytes, str]:
+    """The one attached file (by name) that a review item's data was read from, pulled
+    out of the stored email - however deep inside the thread it sits."""
+    t = (await db.execute(select(PipelineFile).where(PipelineFile.id == pipeline_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "Pipeline file not found")
+    from app.services.pipeline.ingestion import read_raw_copy
+    data = read_raw_copy(t)
+    if not data:
+        raise HTTPException(404, "Raw file copy is no longer available")
+    if (t.filename or "") == name:
+        return data, name
+    from app.services.extraction.file_processor import detect_file_type
+    if detect_file_type(t.filename or "", data) != "eml":
+        return data, t.filename or name      # not an email: the stored file IS the sheet
+    from app.services.extract_email.thread_extract import _content_digest
+    from app.services.extraction.file_processor import _eml_collect_attachments
+    try:
+        found = _eml_collect_attachments(data)
+    except Exception:
+        found = []
+    if digest:                     # exact file, even when several share the name
+        for fname, payload, _ftype in found:
+            if _content_digest(payload) == digest:
+                return payload, fname or name
+    for fname, payload, _ftype in found:
+        if fname == name:
+            return payload, fname
+    raise HTTPException(404, "That sheet is not in the stored email")
+
+
+@router.get("/{pipeline_id}/sheet")
+async def pipeline_sheet(pipeline_id: str, name: str = Query(..., max_length=300),
+                         digest: str | None = Query(default=None, max_length=64),
+                         db: AsyncSession = Depends(get_db)):
+    """Open the exact sheet an item was extracted from (Compare & Fix's first view)."""
+    from fastapi import Response as _Response
+    from app.services.extraction.file_processor import content_type_for, detect_file_type
+    data, fname = await _sheet_bytes(pipeline_id, name, db, digest)
+    media = content_type_for(fname, data)
+    inline = detect_file_type(fname, data) in ("pdf", "image")
+    return _Response(content=data, media_type=media,
+                     headers={"Content-Disposition": content_disposition("inline" if inline else "attachment", fname)})
+
+
+@router.get("/{pipeline_id}/sheet-render")
+async def pipeline_sheet_render(pipeline_id: str, name: str = Query(..., max_length=300),
+                                page: int = Query(default=1, ge=1, le=50),
+                                digest: str | None = Query(default=None, max_length=64),
+                                db: AsyncSession = Depends(get_db)):
+    """That sheet rendered to a page image (Word / Excel / PDF), like raw-render."""
+    from fastapi import Response as _Response
+    from app.services.extraction.file_processor import detect_file_type, to_page_images
+    data, fname = await _sheet_bytes(pipeline_id, name, db, digest)
+    ftype = detect_file_type(fname, data)
+    if ftype not in ("docx", "xlsx", "pdf"):
+        raise HTTPException(400, f"No server render for type '{ftype}'")
+    try:
+        imgs = to_page_images(ftype, data)
+    except Exception:
+        raise HTTPException(422, "Could not render this file")
+    if not imgs:
+        raise HTTPException(422, "Could not render this file")
+    return _Response(content=imgs[min(page, len(imgs)) - 1], media_type="image/jpeg",
                      headers={"X-Page-Count": str(len(imgs))})
 
 

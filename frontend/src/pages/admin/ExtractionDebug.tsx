@@ -81,7 +81,7 @@ export default function AdminExtractionDebug() {
     <div className="animate-fade-up">
       <PageHeader
         title="Extraction debug"
-        subtitle="Only runs that failed or extracted nothing — the full Pass 1 / Pass 2 prompt/response trace for each. A clean, successful run leaves nothing here."
+        subtitle="Only runs that failed or extracted nothing, the full Pass 1 / Pass 2 prompt/response trace for each. A clean, successful run leaves nothing here."
         actions={
           <Button
             variant="secondary"
@@ -98,7 +98,7 @@ export default function AdminExtractionDebug() {
           {isLoading ? (
             <div className="space-y-2 p-4"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
           ) : !runs?.length ? (
-            <EmptyState icon={<Bug className="h-6 w-6" />} title="Nothing to show — good sign"
+            <EmptyState icon={<Bug className="h-6 w-6" />} title="Nothing to show, good sign"
               detail="Only Extract Email runs that failed or extracted zero sheets show up here. No rows means every run so far has gone cleanly." />
           ) : (
             <ul className="divide-y divide-slate-100">

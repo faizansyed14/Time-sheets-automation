@@ -304,7 +304,7 @@ export default function EmployeesPage() {
                         <span className="truncate">{r.employee_id}</span>
                         {sharedIds.has(r.employee_id) && (
                           <span
-                            title="This ID exists in both teams — matching uses ID + name"
+                            title="This ID exists in both teams, matching uses ID + name"
                             className="shrink-0"
                           >
                             <Copy className="h-3 w-3 text-amber-500" />
@@ -318,32 +318,32 @@ export default function EmployeesPage() {
                           <MapPin className="h-2.5 w-2.5" /> {r.location}
                         </Badge>
                       ) : (
-                        <span className="text-[10px] text-slate-300">—</span>
+                        <span className="text-[10px] text-slate-300">-</span>
                       )}
                     </td>
                     <td
                       className="hidden truncate px-2 py-1.5 text-[11px] text-slate-600 lg:table-cell"
                       title={r.account_manager ?? undefined}
                     >
-                      {r.account_manager ?? "—"}
+                      {r.account_manager ?? "-"}
                     </td>
                     <td
                       className="hidden truncate px-2 py-1.5 text-[10px] text-slate-500 xl:table-cell"
                       title={r.project ?? undefined}
                     >
-                      {r.project ?? "—"}
+                      {r.project ?? "-"}
                     </td>
                     <td
                       className="hidden truncate px-2 py-1.5 text-[10px] text-slate-500 xl:table-cell"
                       title={r.work_email ?? undefined}
                     >
-                      {r.work_email ?? "—"}
+                      {r.work_email ?? "-"}
                     </td>
                     <td
                       className="hidden truncate px-2 py-1.5 text-[10px] text-slate-500 xl:table-cell"
                       title={r.personal_email ?? undefined}
                     >
-                      {r.personal_email ?? "—"}
+                      {r.personal_email ?? "-"}
                     </td>
                     <td className="px-2 py-1.5">
                       <span
@@ -351,8 +351,8 @@ export default function EmployeesPage() {
                           r.active
                             ? undefined
                             : r.inactive_ym
-                              ? `Left on ${fullDate(r.left_date) || inactiveSince(r.inactive_ym)} — counted in Dashboard/Export for earlier months, not from that month on. Change it in Edit.`
-                              : "Left (date not recorded) — shown in Dashboard/Export only for months where they have a record or sheet."
+                              ? `Left on ${fullDate(r.left_date) || inactiveSince(r.inactive_ym)}, counted in Dashboard/Export for earlier months, not from that month on. Change it in Edit.`
+                              : "Left (date not recorded), shown in Dashboard/Export only for months where they have a record or sheet."
                         }
                       >
                         <Badge tone={r.active ? "success" : "slate"} className="px-1.5 py-0 text-[10px]">
@@ -404,7 +404,7 @@ export default function EmployeesPage() {
         open={!!modal}
         onClose={() => setModal(null)}
         title={modal?.mode === "edit" ? "Edit employee" : "Add employee"}
-        subtitle="Identity is employee ID + name — the same ID may exist once per team."
+        subtitle="Identity is employee ID + name, the same ID may exist once per team."
       >
         <div className="grid grid-cols-2 gap-3">
           <Field label="Employee ID" name="employee_id">
@@ -427,7 +427,7 @@ export default function EmployeesPage() {
               value={form.location ?? ""}
               onChange={(e) => setForm({ ...form, location: e.target.value || null })}
             >
-              <option value="">—</option>
+              <option value="">-</option>
               <option value="DXB">DXB</option>
               <option value="AUH">AUH</option>
             </Select>

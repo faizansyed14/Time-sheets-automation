@@ -113,8 +113,8 @@ export default function ManualEntryForm({ onResult }: { onResult: (r: UploadResu
     onSuccess: (r) => {
       toast(
         r.status === "success" ? "success" : "warning",
-        r.status === "success" ? "Record created" : "Record created — needs review",
-        `${r.employee_name} — ${MONTHS_LONG[r.month ?? 0]} ${r.year}`
+        r.status === "success" ? "Record created" : "Record created, needs review",
+        `${r.employee_name} · ${MONTHS_LONG[r.month ?? 0]} ${r.year}`
       );
       onResult(r);
       setPicked(null); setQ(""); setDates({}); setFiles([]); setNote("");

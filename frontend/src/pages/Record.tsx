@@ -119,7 +119,7 @@ export default function RecordPage() {
     onSuccess: (r) => {
       toast(
         r.validation_status === "verified" ? "success" : "warning",
-        r.validation_status === "verified" ? "Saved — validation clean" : "Saved — still flagged",
+        r.validation_status === "verified" ? "Saved, validation clean" : "Saved, still flagged",
         r.llm_summary ?? undefined
       );
       setEditing(false);
@@ -158,7 +158,7 @@ export default function RecordPage() {
       <div className="mx-auto max-w-lg animate-fade-up py-16 text-center">
         <p className="text-base font-semibold text-slate-700">This record no longer exists.</p>
         <p className="mt-1 text-sm text-slate-500">
-          It was probably deleted after this link was created — the Activity log will
+          It was probably deleted after this link was created, the Activity log will
           show it as failed with a "record deleted" reason instead of a broken link now.
         </p>
         <Link
@@ -192,7 +192,7 @@ export default function RecordPage() {
       </Link>
 
       <PageHeader
-        title={`${rec.employee_name ?? "Unknown"} — ${MONTHS_LONG[rec.month]} ${rec.year}`}
+        title={`${rec.employee_name ?? "Unknown"} · ${MONTHS_LONG[rec.month]} ${rec.year}`}
         subtitle={`${rec.employee_id ?? "no ID"} · ${rec.account_manager ?? "no manager"} · ${totalDays} leave/holiday day(s) · ${rec.calendar_days ?? "?"} calendar days`}
         actions={
           <>
@@ -463,7 +463,7 @@ export default function RecordPage() {
               <div className="flex shrink-0 items-center gap-2 border-b border-slate-100 bg-slate-50 px-4 py-3">
                 <Columns2 className="h-4 w-4 text-slate-400" />
                 <span className="min-w-0 flex-1 truncate text-sm font-semibold text-slate-700">
-                  Compare — {rec.employee_name} · {MONTHS_LONG[rec.month]} {rec.year}
+                  Compare · {rec.employee_name} · {MONTHS_LONG[rec.month]} {rec.year}
                 </span>
                 <Button size="sm" onClick={() => saveMut.mutate()} disabled={saveMut.isPending}>
                   <Save className="h-3.5 w-3.5" /> Save &amp; re-validate

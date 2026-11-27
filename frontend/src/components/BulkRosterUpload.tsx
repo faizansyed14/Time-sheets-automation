@@ -166,7 +166,7 @@ export default function BulkRosterUpload({ onStaged }: { onStaged: () => void })
         failed.length ? "warning" : "success",
         `${accepted} accepted · ${kept} kept for review`,
         failed.length
-          ? `${failed.length} failed — ${failed[0]}`
+          ? `${failed.length} failed · ${failed[0]}`
           : kept ? "Rows with maternity/unpaid/absent days, notes or flags are waiting in the Activity log." : undefined,
       );
     } catch (e: any) {
@@ -184,11 +184,11 @@ export default function BulkRosterUpload({ onStaged }: { onStaged: () => void })
       <div className="mb-4 flex items-start gap-2 rounded-lg bg-brand-50/70 p-3 text-sm text-brand-900">
         <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-brand-600" />
         <p>
-          For a <strong>single sheet that lists many employees</strong> — one row per person,
+          For a <strong>single sheet that lists many employees</strong>, one row per person,
           one column per day. Every employee gets their own review item, and the whole
           roster is filed into each of their vault folders.
           <span className="block text-brand-800/80">
-            A spreadsheet (.xlsx/.csv) is read cell-by-cell with no AI at all — the most
+            A spreadsheet (.xlsx/.csv) is read cell-by-cell with no AI at all, the most
             accurate option. PDFs and images are read page-by-page instead.
           </span>
         </p>
@@ -215,7 +215,7 @@ export default function BulkRosterUpload({ onStaged }: { onStaged: () => void })
               Drop the roster here, or <span className="text-brand-600">browse</span>
             </p>
             <p className="mt-1 text-xs text-slate-400">
-              XLSX · CSV · PDF · PNG/JPG · DOCX — one sheet at a time
+              XLSX · CSV · PDF · PNG/JPG · DOCX, one sheet at a time
             </p>
           </div>
           <input
@@ -280,7 +280,7 @@ export default function BulkRosterUpload({ onStaged }: { onStaged: () => void })
           </div>
           {!preview && !result && (
             <p className="mt-2 text-xs text-slate-400">
-              Analyse first — you'll see exactly who was found before anything is staged.
+              Analyse first, you'll see exactly who was found before anything is staged.
             </p>
           )}
         </>
@@ -371,7 +371,7 @@ export default function BulkRosterUpload({ onStaged }: { onStaged: () => void })
                           )}
                         </td>
                         <td className="px-2 py-1.5 text-right tabular-nums text-slate-500">
-                          {r.stated_leave_days ?? "—"}
+                          {r.stated_leave_days ?? "-"}
                         </td>
                         <td className={cn(
                           "px-2 py-1.5 text-right tabular-nums font-semibold",

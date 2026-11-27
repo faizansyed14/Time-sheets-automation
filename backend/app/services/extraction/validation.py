@@ -73,11 +73,11 @@ def summarize(cleaned: dict, flags: list[str], month: int, year: int, n_files: i
     parts = [f"{len(cleaned.get(b) or [])} {label}"
              for b, label in _SHORT.items() if cleaned.get(b)]
     total = sum(len(v or []) for v in (cleaned or {}).values())
-    head = f"{_mname(month)} {year} — " + (", ".join(parts) if parts else "no leave recorded")
+    head = f"{_mname(month)} {year} · " + (", ".join(parts) if parts else "no leave recorded")
     head += f" ({total} day{'s' if total != 1 else ''} total"
     head += f", {n_files} files)." if n_files > 1 else ")."
     if not flags:
-        return head + " No issues found — clean and ready for approval."
+        return head + " No issues found, clean and ready for approval."
     n = len(flags)
     shown = " ".join(f.rstrip(".") + "." for f in flags[:6])
     more = f" (+{n - 6} more)" if n > 6 else ""

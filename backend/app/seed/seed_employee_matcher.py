@@ -44,7 +44,7 @@ async def seed_employee_matcher(db: AsyncSession) -> int:
 async def main() -> None:
     async with SessionLocal() as db:
         created = await seed_employee_matcher(db)
-    print(f"Done — {created} demo employee(s) added (existing rows skipped).")
+    print(f"Done · {created} demo employee(s) added (existing rows skipped).")
 
 
 if __name__ == "__main__":

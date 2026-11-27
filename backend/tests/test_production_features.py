@@ -18,7 +18,9 @@ def test_assert_prod_secrets_refuses_the_default_admin_password():
     from app.main import _assert_prod_secrets
 
     orig_env, orig_jwt, orig_pw = settings.environment, settings.jwt_secret, settings.default_admin_password
+    orig_debug_otp = settings.debug_otp_enabled
     try:
+        settings.debug_otp_enabled = False   # tests run with it on; prod refuses that separately
         settings.environment = "prod"
         settings.jwt_secret = "a" * 40  # long enough to clear the JWT check on its own
         settings.default_admin_password = "admin"
@@ -33,6 +35,7 @@ def test_assert_prod_secrets_refuses_the_default_admin_password():
         _assert_prod_secrets()  # must not raise
     finally:
         settings.environment, settings.jwt_secret, settings.default_admin_password = orig_env, orig_jwt, orig_pw
+        settings.debug_otp_enabled = orig_debug_otp
 
 
 def test_assert_prod_secrets_is_a_no_op_outside_prod():

@@ -46,7 +46,7 @@ def test_bundle_keeps_every_message_and_its_attachment():
 
     msgs = [
         ("msg 1", _msg("TIMESHEET June", "My sheet", ("sheet.pdf", b"%PDF-1.4 sheet"))),
-        ("msg 2", _msg("RE: TIMESHEET June", "Approved — D. Shetty")),
+        ("msg 2", _msg("RE: TIMESHEET June", "Approved · D. Shetty")),
     ]
     data, name = build_thread_bundle(msgs, "TIMESHEET June")
     assert name.endswith(".eml")
@@ -112,7 +112,7 @@ def test_wrapped_nested_message_uses_crlf_not_bare_lf():
     # left matching "=\n" is a bare-LF (broken) soft break.
     assert b"=\n" not in data.replace(b"\r\n", b""), (
         "wrapped thread bundle contains a bare-LF quoted-printable soft "
-        "break — Outlook will show a literal '=' instead of joining the "
+        "break · Outlook will show a literal '=' instead of joining the "
         "line (this is the exact cause of the 'Augu=t'/'&nb=p;' corruption "
         "reported against a real downloaded timesheet)")
 
@@ -253,7 +253,7 @@ async def test_reextract_can_correct_a_filed_record_downward():
         await db.refresh(rec2)
 
         assert sorted(rec2.sick_leave_dates) == ["2026-06-19"], (
-            "same thread re-read must REPLACE its contribution, not union it — "
+            "same thread re-read must REPLACE its contribution, not union it · "
             f"got {rec2.sick_leave_dates}")
 
         await _cleanup(db, emp)

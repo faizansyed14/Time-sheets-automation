@@ -47,9 +47,11 @@ import {
   type LlmEgressPart,
   type LlmEgressPreview,
   type ThreadListItem,
+  type PipelineFile,
 } from "../api/client";
 import { cn, formatBytes, formatDateTime, formatOutlookDateTime, emailSnippet, initials, avatarColor } from "../lib/utils";
 import { isBodyJunkImage, isImageAttachment } from "../lib/attachmentFilters";
+import PipelineCompareFixModal from "../components/PipelineCompareFixModal";
 import { FilePreviewModal } from "../components/FilePreview";
 import { ThreadSummaryBox } from "../components/ThreadSummaryBox";
 import { attachmentRenderUrlIfSupported, buildEmailHtmlDocument, downloadFile } from "../lib/filePreview";
@@ -84,7 +86,7 @@ function taskToRun(
     const ahead = tasks.filter((t) => t.status === "queued" && t.queuedAt < task.queuedAt).length;
     const placeholder: ExtractionEvent = {
       stage: "start", status: "spin",
-      message: ahead > 0 ? `Queued — ${ahead} other run(s) ahead of this one…` : "Queued — starting shortly…",
+      message: ahead > 0 ? `Queued · ${ahead} other run(s) ahead of this one…` : "Queued, starting shortly…",
       llm_calls: 0, elapsed_ms: 0, data: {},
     };
     events = [placeholder];
@@ -163,7 +165,7 @@ function ThreadStateBadges({
 function NoSheetsBadge({ at, note }: { at: string | null | undefined; note: string | null | undefined }) {
   if (!at) return null;
   return (
-    <span title={`Extract Email found nothing to stage ${formatDateTime(at)}${note ? ` — ${note}` : ""}`}>
+    <span title={`Extract Email found nothing to stage ${formatDateTime(at)}${note ? ` · ${note}` : ""}`}>
       <Badge tone="slate" className="px-1.5 py-0 text-[9px]">
         <FileX className="h-2.5 w-2.5" /> No sheets
       </Badge>
@@ -227,7 +229,7 @@ function EmailMenu({
             </>
           )}
           <p className="px-3 pb-1 pt-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-            Full email (.eml — includes every attachment)
+            Full email (.eml, includes every attachment)
           </p>
           {emlActions.map((a) => (
             <button key={a.label} type="button" className={item} onClick={act(a.onClick)}>
@@ -277,7 +279,7 @@ function LlmEgressPreviewModal({
       open={open}
       onClose={onClose}
       title="What is sent to OpenAI"
-      subtitle="Built exactly the way a real Extract Email run builds it — this is what leaves, not a description of it."
+      subtitle="Built exactly the way a real Extract Email run builds it, this is what leaves, not a description of it."
       wide
     >
       {loading && (
@@ -347,7 +349,7 @@ function LlmEgressPreviewModal({
           {preview.files_sent.length > 0 && (
             <div>
               <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                Files uploaded — raw bytes, NOT redacted
+                Files uploaded, raw bytes, NOT redacted
               </p>
               <PartList parts={preview.files_sent} tone="border-amber-200 bg-amber-50 text-amber-800" />
             </div>
@@ -442,10 +444,13 @@ function SaveEmlToVaultModal({
   emailId,
   subject,
   onClose,
+  notice,
 }: {
   emailId: string | null;
   subject: string | null;
   onClose: () => void;
+  /** Why this manual picker is shown (e.g. nothing could be extracted). */
+  notice?: string | null;
 }) {
   const { toast } = useToast();
   const [employeeQuery, setEmployeeQuery] = useState("");
@@ -514,8 +519,11 @@ function SaveEmlToVaultModal({
 
   return (
     <Modal open={!!emailId} onClose={onClose} title="Save .eml to File Vault"
-      subtitle={subject ? `“${subject}” — pick where to file the full email.` : undefined}>
+      subtitle={subject ? `“${subject}”, pick where to file the full email.` : undefined}>
       <div className="space-y-3">
+        {notice && (
+          <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">{notice}</p>
+        )}
         <div className="block" ref={pickerRef}>
           <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">Employee</span>
           <div className="relative">
@@ -949,7 +957,7 @@ function MessageExtractedBadge({ state }: { state: MsgExtractState }) {
     <span
       title={extracted
         ? "This message was included in the last Extract Email run."
-        : "Arrived after the last run — re-extract to include it."}
+        : "Arrived after the last run, re-extract to include it."}
       className={cn(
         "mb-1 inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide",
         extracted
@@ -1040,7 +1048,7 @@ function OutlookAttachmentStrip({
                       </span>
                     ) : badge === "new" ? (
                       <span
-                        title="Arrived after the last Extract Email — the next run will read this one."
+                        title="Arrived after the last Extract Email, the next run will read this one."
                         className="shrink-0 rounded-full border border-blue-900 bg-blue-800 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-white"
                       >
                         New
@@ -1347,7 +1355,11 @@ export default function InboxPage() {
     queryFn: ({ pageParam }) => fetchThreads(dq, status, pageParam as number),
     initialPageParam: 0,
     getNextPageParam: (last) => (last.has_more ? last.offset + last.items.length : undefined),
+    // While the mailbox is still being downloaded in the background, refresh the list so
+    // new emails appear as they are stored (the page itself never waits for the download).
+    refetchInterval: autoExtractStatus?.sync?.backfill_in_progress ? 10_000 : false,
   });
+  const mailboxDownloading = !!autoExtractStatus?.sync?.backfill_in_progress;
   const emails: ThreadListItem[] = data?.pages.flatMap((p) => p.items) ?? [];
   const inboxTotal = data?.pages[0]?.total ?? 0;
 
@@ -1439,6 +1451,46 @@ export default function InboxPage() {
   };
 
   const [vaultEmailId, setVaultEmailId] = useState<string | null>(null);
+  const [vaultNotice, setVaultNotice] = useState<string | null>(null);
+
+  // "Save to File Vault" = extract first, review, then file. The email is read with the
+  // live progress overlay; every employee/month found opens in Compare & Fix one after
+  // another, and Save there files the record AND the email into the vault. Only when
+  // nothing can be read does the old manual folder picker appear.
+  const [vaultFlow, setVaultFlow] = useState<{ taskId: string; msgId: string } | null>(null);
+  const [reviewQueue, setReviewQueue] = useState<PipelineFile[]>([]);
+  const reviewHandled = useRef(false);
+  const startVaultFlow = (msgId: string, subject: string | null | undefined) => {
+    if (isBusy(msgId) || autoExtractRunning) {
+      toast("info", "Already being extracted", "Wait for the current run on this email to finish.");
+      return;
+    }
+    const taskId = enqueue(msgId, subject ?? "(no subject)", false, []);
+    setFocusTaskId(taskId);
+    setVaultFlow({ taskId, msgId });
+  };
+  useEffect(() => {
+    if (!vaultFlow) return;
+    const task = tasks.find((t) => t.id === vaultFlow.taskId);
+    if (!task || (task.status !== "done" && task.status !== "error")) return;
+    const staged = (task.result?.staged ?? []).filter((f) => f.status === "needs_review");
+    const filed = (task.result?.staged ?? []).filter((f) => f.status === "success");
+    setVaultFlow(null);
+    if (staged.length) {
+      setFocusTaskId(null);
+      setReviewQueue(staged);
+    } else if (filed.length) {
+      setFocusTaskId(null);
+      toast("success", "Already saved", "This email was already extracted and filed to the vault.");
+    } else {
+      setFocusTaskId(null);
+      setVaultNotice(task.status === "error"
+        ? `Extraction failed (${task.error ?? "unknown error"}). You can still save the email to the vault; it will show as "In vault, not extracted" until it is extracted.`
+        : `No timesheet or leave record could be read from this email. You can still save it to the vault; it will show as "In vault, not extracted".`);
+      setVaultEmailId(vaultFlow.msgId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tasks, vaultFlow]);
 
   const restore = useMutation({
     mutationFn: restoreEmail,
@@ -1500,6 +1552,12 @@ export default function InboxPage() {
               <option value="archived">Archived</option>
             </Select>
           </div>
+          {mailboxDownloading && (
+            <p className="flex items-center gap-1.5 border-b border-brand-100 bg-brand-50 px-2 py-1.5 text-[11px] font-medium text-brand-800">
+              <Spinner className="h-3 w-3" />
+              Downloading your mailbox in the background, {inboxTotal} email{inboxTotal === 1 ? "" : "s"} so far.
+            </p>
+          )}
           {inboxTotal > 0 && (
             <p className="border-b border-slate-100 px-2 py-1 text-[9px] text-slate-400">
               {emails.length}/{inboxTotal}
@@ -1646,7 +1704,7 @@ export default function InboxPage() {
                         <div className="flex flex-wrap justify-end gap-1.5">
                           {/* Extract Email reads the whole conversation, so the
                               badge is thread-level. This message still needs a
-                              run if it arrived AFTER the last one — otherwise a
+                              run if it arrived AFTER the last one, otherwise a
                               reply carrying the approval would never be read. */}
                           {(() => {
                             const at = detail.extract_email_at;
@@ -1672,10 +1730,10 @@ export default function InboxPage() {
                                   disabled={busy || loadingDetail || autoExtractRunning}
                                   onClick={() => runExtract(detail.provider_message_id, detail.subject)}
                                   title={autoExtractRunning
-                                    ? "Auto Extract is running in the background right now — wait for it to finish (or Stop it) before extracting by hand, so the two don't race the same thread."
+                                    ? "Auto Extract is running in the background right now, wait for it to finish (or Stop it) before extracting by hand, so the two don't race the same thread."
                                     : isNewer
-                                      ? "This reply arrived after the last run — reads only the new message(s) + a couple of prior ones for context, reusing everything else already extracted."
-                                      : "Whole conversation to the model in one call — every attachment, approval detected, grouped per employee/month for Compare & Fix"}
+                                      ? "This reply arrived after the last run, reads only the new message(s) + a couple of prior ones for context, reusing everything else already extracted."
+                                      : "Whole conversation to the model in one call, every attachment, approval detected, grouped per employee/month for Compare & Fix"}
                                 >
                                   {busy ? (
                                     <Spinner className="border-white/40 border-t-white h-3 w-3" />
@@ -1720,7 +1778,7 @@ export default function InboxPage() {
                                             setPicked(new Set());
                                           }}
                                           title={autoExtractRunning
-                                            ? "Auto Extract is running in the background right now — wait for it to finish (or Stop it) before extracting by hand."
+                                            ? "Auto Extract is running in the background right now, wait for it to finish (or Stop it) before extracting by hand."
                                             : allPicked
                                               ? "Re-read the ENTIRE thread from scratch."
                                               : "Read only the ticked messages. Everything already extracted from the other messages is kept, and the stored conversation stays complete."}
@@ -1746,7 +1804,7 @@ export default function InboxPage() {
                                   )}`
                                 )
                               }
-                              title="Open the exact pipeline record(s) this conversation was staged into — not just the thread, the genuinely extracted result"
+                              title="Open the exact pipeline record(s) this conversation was staged into, not just the thread, the genuinely extracted result"
                             >
                               <ExternalLink className="h-3 w-3" />
                               View in Pipeline
@@ -1787,9 +1845,9 @@ export default function InboxPage() {
                                 onClick: () => downloadFile(emlUrl(detail.provider_message_id), `${detail.subject || "email"}.eml`),
                               },
                               {
-                                label: "Save .eml to File Vault…",
+                                label: "Extract and save to File Vault…",
                                 icon: FolderInput,
-                                onClick: () => setVaultEmailId(detail.provider_message_id),
+                                onClick: () => startVaultFlow(detail.provider_message_id, detail.subject),
                               },
                             ]}
                           />
@@ -1839,7 +1897,7 @@ export default function InboxPage() {
       {/* Live Extract Email activity — stages, LLM-call count, auto-accept
           outcome, for whichever run this page most recently triggered. Any
           run's held-for-review items land in Compare & Fix automatically
-          (see the effect above) whether or not its panel is still open —
+          (see the effect above) whether or not its panel is still open -
           other queued/background runs keep going regardless. */}
       <ExtractionActivityModal
         run={taskToRun(focusTask, tasks, dismissTask)}
@@ -1849,7 +1907,32 @@ export default function InboxPage() {
       <SaveEmlToVaultModal
         emailId={vaultEmailId}
         subject={detail?.subject ?? null}
-        onClose={() => setVaultEmailId(null)}
+        notice={vaultNotice}
+        onClose={() => { setVaultEmailId(null); setVaultNotice(null); }}
+      />
+      {/* Review each extracted employee/month; Save files the record and the email. */}
+      <PipelineCompareFixModal
+        file={reviewQueue[0] ?? null}
+        onClose={() => {
+          if (reviewHandled.current) {       // Save / Discard close it too: don't ask again
+            reviewHandled.current = false;
+            return;
+          }
+          if (confirm("Close without saving? Nothing is lost: it stays waiting for review in the Activity log."))
+            setReviewQueue((q) => q.slice(1));
+        }}
+        onSaved={() => {
+          reviewHandled.current = true;
+          toast("success", "Saved to File Vault", "The record and the email are filed.");
+          setReviewQueue((q) => q.slice(1));
+          qc.invalidateQueries({ queryKey: ["inbox-threads"] });
+          qc.invalidateQueries({ queryKey: ["pipeline"] });
+          qc.invalidateQueries({ queryKey: ["coverage"] });
+        }}
+        onDiscarded={() => {
+          reviewHandled.current = true;
+          setReviewQueue((q) => q.slice(1));
+        }}
       />
       <LlmEgressPreviewModal
         open={llmPreviewOpen}

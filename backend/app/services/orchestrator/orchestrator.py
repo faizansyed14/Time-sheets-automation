@@ -8,6 +8,7 @@ partial result a human can fix beats no result at all.
 """
 from __future__ import annotations
 
+import logging
 import time
 
 from app.services.extract_email.progress import emit
@@ -31,28 +32,35 @@ class Orchestrator:
         for agent in self.agents:
             info = agent.info
             if ctx.aborted:
-                emit("agent", "skip", f"{info.label} — skipped ({ctx.aborted})",
+                emit("agent", "skip", f"{info.label}, skipped ({ctx.aborted})",
                      agent=info.name, label=info.label)
                 continue
 
             reason = agent.skip_reason(ctx)
             if reason:
-                emit("agent", "skip", f"{info.label} — skipped ({reason})",
+                emit("agent", "skip", f"{info.label}, skipped ({reason})",
                      agent=info.name, label=info.label)
                 continue
 
-            emit("agent", "spin", f"{info.label} — {info.description}",
+            emit("agent", "spin", f"{info.label} · {info.description}",
                  agent=info.name, label=info.label, uses_llm=info.uses_llm)
             started = time.monotonic()
             try:
                 summary = await agent.run(ctx)
                 took = int((time.monotonic() - started) * 1000)
-                emit("agent", "ok", f"{info.label} — {summary}",
+                emit("agent", "ok", f"{info.label} · {summary}",
                      agent=info.name, label=info.label, took_ms=took)
             except Exception as exc:                     # keep going, record it
                 took = int((time.monotonic() - started) * 1000)
                 note = f"{info.label} failed: {str(exc)[:160]}"
                 ctx.notes.append(note)
+                # A crash is NOT "nothing found": mark the run incomplete so the caller
+                # never records the thread as checked-with-no-timesheet (which would
+                # stop every later scan from looking again) and it is retried.
+                logging.getLogger("orchestrator").exception("%s crashed", info.label)
+                ctx.run_meta = ctx.run_meta or {}
+                ctx.run_meta["incomplete"] = True
+                ctx.run_meta.setdefault("errors", []).append(note)
                 emit("agent", "warn", note,
                      agent=info.name, label=info.label, took_ms=took)
         return ctx

@@ -18,6 +18,7 @@ import {
   CalendarClock,
   UserCog,
   Bug,
+  Gauge,
   LogOut,
   ChevronLeft,
   ChevronRight,
@@ -66,6 +67,7 @@ const ADMIN_NAV = [
   // and main.py's router wiring), unlike the "any full-access role" tier
   // calendars/portal-accounts above use.
   { to: "/reminders", label: "Reminders", icon: BellRing },
+  { to: "/admin/monitor", label: "Monitor", icon: Gauge },
   { to: "/admin/settings", label: "AI Settings", icon: Settings },
   { to: "/admin/debug", label: "Extraction debug", icon: Bug },
 ];
@@ -100,7 +102,7 @@ function ActivePill({ id }: { id: string }) {
     <motion.span
       layoutId={id}
       transition={spring.snappy}
-      className="absolute inset-0 rounded-lg bg-brand-600/10 ring-1 ring-inset ring-brand-600/15"
+      className="absolute inset-0 rounded-lg bg-brand-50 shadow-xs ring-1 ring-inset ring-brand-200/70"
     />
   );
 }
@@ -130,7 +132,7 @@ function SidebarBody({ idPrefix, collapsed, attention, visibleNav, visibleToolsN
         cn(
           "group relative flex h-9 items-center rounded-lg text-sm font-medium transition-colors duration-150",
           collapsed ? "justify-center px-0" : "gap-2.5 px-3",
-          isActive ? "font-semibold text-brand-600" : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
+          isActive ? "font-semibold text-brand-800" : "text-slate-600 hover:bg-slate-100/80 hover:text-slate-900"
         )
       }
     >
@@ -138,7 +140,7 @@ function SidebarBody({ idPrefix, collapsed, attention, visibleNav, visibleToolsN
         <>
           {isActive ? <ActivePill id={pill} /> : null}
           <Icon
-            className={cn("relative h-4 w-4 shrink-0", isActive ? "text-brand-600" : "text-slate-400 group-hover:text-slate-700")}
+            className={cn("relative h-4 w-4 shrink-0", isActive ? "text-brand-700" : "text-slate-400 group-hover:text-slate-600")}
             aria-hidden
           />
           {!collapsed && <span className="relative min-w-0 flex-1 truncate">{label}</span>}
@@ -173,7 +175,7 @@ function SidebarBody({ idPrefix, collapsed, attention, visibleNav, visibleToolsN
         </div>
         {!collapsed && (
           <div className="min-w-0">
-            <p className="truncate font-serif text-sm font-bold leading-tight text-slate-900">Timesheets</p>
+            <p className="truncate font-display text-sm font-bold leading-tight tracking-[-0.02em] text-slate-900">Timesheets</p>
             <p className="truncate text-[11px] font-medium text-slate-500">Intelligence Portal</p>
           </div>
         )}
@@ -359,7 +361,7 @@ export default function Shell({ children }: { children: ReactNode }) {
                   </span>
                 )}
               </p>
-              <p className="font-serif text-base font-bold tracking-tight text-slate-900">{title}</p>
+              <p className="font-display text-[15px] font-semibold tracking-[-0.02em] text-slate-900">{title}</p>
             </div>
           )}
           {/* Extract Email progress, full-width 3-step bar, renders nothing

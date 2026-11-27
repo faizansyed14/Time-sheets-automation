@@ -53,7 +53,7 @@ async def seed_test_employees(db: AsyncSession) -> int:
 async def main() -> None:
     async with SessionLocal() as db:
         created = await seed_test_employees(db)
-    print(f"Done — {created} new test employee(s) added (existing ones updated in place).")
+    print(f"Done · {created} new test employee(s) added (existing ones updated in place).")
 
 
 if __name__ == "__main__":

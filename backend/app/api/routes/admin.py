@@ -162,7 +162,7 @@ async def update_user(user_id: str, body: AdminUserUpdate, db: AsyncSession = De
         u.password_hash = hash_password(body.password)
     # Don't strand a user in OTP mode with no delivery address.
     if u.auth_mode == AuthMode.OTP and not u.email:
-        raise HTTPException(400, "This user uses OTP — an email is required.")
+        raise HTTPException(400, "This user uses OTP, an email is required.")
     await db.commit()
     await db.refresh(u)
     return _user_out(u)
@@ -281,7 +281,7 @@ async def config_status(db: AsyncSession = Depends(get_db)):
     provider = (settings.llm_provider or "openai").strip().lower()
     extraction_note = None
     if engine != "vision":
-        extraction_note = f"EXTRACTION_ENGINE={engine} — vision LLM disabled; using mock/deterministic engine."
+        extraction_note = f"EXTRACTION_ENGINE={engine}, vision LLM disabled; using mock/deterministic engine."
 
     return [
         AiStatusItem(

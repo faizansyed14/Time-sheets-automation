@@ -64,7 +64,7 @@ async def get_current_user(
     # even though it hasn't expired yet.
     jti = payload.get("jti")
     if jti and await cache.exists(is_token_revoked_key(jti)):
-        raise HTTPException(401, "Session ended — please sign in again.")
+        raise HTTPException(401, "Session ended, please sign in again.")
     user = (await db.execute(select(User).where(User.id == payload.get("sub")))).scalar_one_or_none()
     if not user or not user.is_active:
         raise HTTPException(401, "User not found or inactive")

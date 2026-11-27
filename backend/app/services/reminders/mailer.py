@@ -55,7 +55,7 @@ def send_reminder_email(to_email: str, subject: str, html_body: str) -> None:
     if not settings.reminder_sending_enabled:
         raise ValueError(
             "Reminder sending is disabled (REMINDER_SENDING_ENABLED=false in "
-            ".env) — no email was actually sent."
+            ".env), no email was actually sent."
         )
     if not to_email or "@" not in to_email:
         raise ValueError(f"Not a usable email address: {to_email!r}")

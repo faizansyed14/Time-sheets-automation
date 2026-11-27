@@ -16,6 +16,7 @@ Prompts are PII-scrubbed (core/pii.py) before every call.
 from __future__ import annotations
 
 import asyncio
+import time
 import base64
 import json
 import re
@@ -106,6 +107,22 @@ def _parse_json_loose(raw: str) -> dict | None:
     return None
 
 
+_usage_rejected = [False]     # set once if the provider refuses the usage field
+
+
+def _mon(label: str, model: str, t0: float, status: str, *, usage: dict | None = None,
+         detail: dict | None = None) -> None:
+    """Record one LLM HTTP call for the Monitor page (never raises)."""
+    try:
+        from app.services.monitoring.recorder import record, role_from_label
+        u = usage or {}
+        record("llm", role_from_label(label), model, (time.perf_counter() - t0) * 1000, status=status,
+               tokens_in=int(u.get("prompt_tokens") or 0), tokens_out=int(u.get("completion_tokens") or 0),
+               cost=float(u.get("cost") or 0.0), detail={"label": label, **(detail or {})})
+    except Exception:
+        pass
+
+
 async def chat_call(
     system_prompt: str,
     content_blocks: list[dict],
@@ -148,6 +165,9 @@ async def chat_call(
             payload["response_format"] = {"type": "json_object"}
         if not enable_thinking:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
+        if "openrouter" in (settings.openai_base_url or "").lower() and not _usage_rejected[0]:
+            payload["usage"] = {"include": True}      # OpenRouter returns the real cost per call
+        _t0 = time.perf_counter()
         # No `provider` preference on purpose: pinning `sort: "price"` sent every
         # call to the cheapest (often slowest) OpenRouter host — a scanned
         # 22x30 roster took ~9 min in one request. Default routing lets
@@ -157,6 +177,12 @@ async def chat_call(
                 r = await client.post(f"{api_root}/v1/chat/completions", json=payload, headers=headers)
             if r.status_code != 200:
                 last_err = f"{r.status_code}: {r.text[:500]}"
+                _mon(label, model, _t0, "error", detail={"http": r.status_code, "error": r.text[:200]})
+                if r.status_code == 400 and "usage" in payload and "usage" in r.text.lower():
+                    # Cost reporting is optional - never let it block an extraction.
+                    payload.pop("usage", None)
+                    _usage_rejected[0] = True
+                    continue
                 if (r.status_code == 400 and limit != _MAX_TOKENS
                         and "token" in r.text.lower()):
                     # The model/provider rejects the large output budget —
@@ -173,17 +199,22 @@ async def chat_call(
             choice = (body.get("choices") or [{}])[0]
             raw = (choice.get("message") or {}).get("content") or ""
             data = _parse_json_loose(raw)
+            usage = body.get("usage") or {}
             if data is None and str(choice.get("finish_reason") or "").lower() == "length":
+                _mon(label, model, _t0, "truncated", usage=usage)
                 raise TruncatedReply(
                     f"{label or 'vision call'}: reply cut off at {limit} output tokens")
             if data is None:
+                _mon(label, model, _t0, "bad_json", usage=usage)
                 last_err = "unparseable JSON reply"
                 await asyncio.sleep(2 + 3 * attempt)
                 continue
+            _mon(label, model, _t0, "ok", usage=usage)
             return data
         except TruncatedReply:
             raise
         except Exception as exc:
+            _mon(label, model, _t0, "error", detail={"error": str(exc)[:200]})
             last_err = exc
             await asyncio.sleep(2 + 3 * attempt)
     raise RuntimeError(f"{label or 'vision call'} failed after {retries} attempts: {last_err}")

@@ -28,8 +28,8 @@ import io
 # this module deliberately doesn't carry) — a clear error beats silently
 # feeding the model garbage decoded-as-text bytes.
 _UNSUPPORTED_LEGACY = {
-    ".doc": "Old .doc format isn't supported here — save it as .docx, or use the Upload page.",
-    ".xls": "Old .xls format isn't supported here — save it as .xlsx, or use the Upload page.",
+    ".doc": "Old .doc format isn't supported here, save it as .docx, or use the Upload page.",
+    ".xls": "Old .xls format isn't supported here, save it as .xlsx, or use the Upload page.",
 }
 
 _IMAGE_MIME = {

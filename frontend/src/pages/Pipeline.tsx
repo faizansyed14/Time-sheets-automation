@@ -1,29 +1,27 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
-  AlertTriangle,
   BadgeCheck,
-  CheckCircle2,
-  ChevronDown,
   ChevronRight,
   Columns2,
   Cpu,
-  ExternalLink,
+  MoreHorizontal,
+  Search,
   FileText,
+  FolderOpen,
   Mail,
   RefreshCw,
   ScanLine,
   ShieldQuestion,
   Sparkles,
-  Trash2,
   UploadCloud,
   UserCheck,
-  XCircle,
 } from "lucide-react";
 import {
   deletePipelineFile,
+  extractVaultFile,
   fetchPipeline,
   fetchPipelineStats,
   rematchUnmatchedPipelineFiles,
@@ -40,60 +38,18 @@ import StoredFilesPreview from "../components/StoredFilesPreview";
 import { ThreadSummaryBox } from "../components/ThreadSummaryBox";
 import { cn, formatBytes, formatDateTime } from "../lib/utils";
 import { leaveBucketDefs } from "../lib/theme";
-import { Button, Card, EmptyState, Select } from "../components/ui";
-import { FailureChip, PipelineStatusBadge, StageTimeline } from "../components/status";
+import { Badge, Button, Card, EmptyState, Select } from "../components/ui";
+import { StageTimeline } from "../components/status";
 import { useToast } from "../components/toast";
 import { useDebounced, useSentinel } from "../lib/useInfinite";
 
 import { ListSkeleton, MoreRowsSkeleton } from "../components/skeletons";
-type Filter = "" | "failed" | "needs_review" | "success" | "processing";
-type OutcomeFilter = "" | "auto_accepted" | "held";
+type Filter = "" | "failed" | "needs_review" | "ai_recommended" | "success" | "processing" | "unmatched";
 
 /** Engineering diagnostics (model, OCR, DPI, stage timeline) are off by
  *  default — a reviewer reading this page wants the extracted result, not the
  *  bookkeeping. Remembered per browser so the choice sticks. */
 const TECH_KEY = "pipeline_show_tech";
-
-function StatCard({
-  label,
-  value,
-  icon,
-  tone,
-  active,
-  onClick,
-  caption,
-}: {
-  label: string;
-  value: number;
-  icon: React.ReactNode;
-  tone: string;
-  active: boolean;
-  onClick: () => void;
-  /** Small qualifier under the label, e.g. "Last 30 days" — for a stat
-   *  that's scoped rather than an all-time total, so the number's window
-   *  is never ambiguous at a glance. */
-  caption?: string;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={cn(
-        "flex items-center gap-3 rounded-xl border bg-white p-4 text-left shadow-card transition-all",
-        active ? "border-brand-500 ring-2 ring-brand-100" : "border-slate-200 hover:border-slate-300"
-      )}
-    >
-      <div className={cn("flex h-10 w-10 shrink-0 items-center justify-center rounded-lg", tone)}>
-        {icon}
-      </div>
-      <div>
-        <p className="text-xl font-bold leading-6 text-slate-900">{value}</p>
-        <p className="text-xs font-medium text-slate-500">
-          {label}{caption && <span className="text-slate-400"> · {caption}</span>}
-        </p>
-      </div>
-    </button>
-  );
-}
 
 /** Per-file cost/provenance badge: which model handled the file, or whether a
  *  no-LLM path read it, plus an OCR chip. Technical — only shown inside the
@@ -326,8 +282,8 @@ function AiVerdict({ auto }: {
         auto.accepted ? "text-emerald-700" : "text-amber-700")}>
         <Sparkles className="h-4 w-4" />
         {auto.accepted
-          ? "AI recommends accepting — review the leaves and accept to file"
-          : "Held for human review — here's why"}
+          ? "AI recommends accepting, review the leaves and accept to file"
+          : "Held for human review, here's why"}
       </p>
       {auto.accepted && (auto.reasons?.length ?? 0) > 0 && (
         <ul className="list-inside list-disc space-y-0.5 text-xs text-emerald-800/90">
@@ -356,7 +312,7 @@ function TechnicalPanel({ file }: { file: PipelineFile }) {
     unsupported: "Unsupported file",
   };
   const fmt = (v: unknown): string => {
-    if (v === null || v === undefined || v === "") return "—";
+    if (v === null || v === undefined || v === "") return "-";
     if (typeof v === "boolean") return v ? "Yes" : "No";
     if (typeof v === "object") return JSON.stringify(v);
     return String(v);
@@ -422,6 +378,9 @@ function TechnicalPanel({ file }: { file: PipelineFile }) {
   );
 }
 
+/** Stored in the File Vault without being extracted (backend: vault_pending.py). */
+const isVaultPending = (f: PipelineFile) => f.failure_code === "vault_not_extracted";
+
 export default function PipelinePage() {
   const qc = useQueryClient();
   const { canWrite } = useAuth();
@@ -457,9 +416,8 @@ export default function PipelinePage() {
   };
 
   const [statusFilter, setStatusFilter] = useState<Filter>(
-    () => (sp.get("status") as Filter) || ""
+    () => (sp.get("unmatched") === "1" ? "unmatched" : (sp.get("status") as Filter) || "")
   );
-  const [outcomeFilter, setOutcomeFilter] = useState<OutcomeFilter>("");
   const [sourceFilter, setSourceFilter] = useState("");
   // "Pipeline" is the existing per-file table (unchanged); "Portal
   // Submissions" is a submission-centric view filterable by the employee's
@@ -467,6 +425,7 @@ export default function PipelinePage() {
   const [tab, setTab] = useState<"pipeline" | "portal">("pipeline");
   const [q, setQ] = useState("");
   const [open, setOpen] = useState<string | null>(null);
+  const [menuFor, setMenuFor] = useState<string | null>(null);
   const [assigning, setAssigning] = useState<PipelineFile | null>(null);
 
   const [showTech, setShowTech] = useState(() => localStorage.getItem(TECH_KEY) === "1");
@@ -509,12 +468,16 @@ export default function PipelinePage() {
     queryKey: ["pipeline", statusFilter, sourceFilter, dq, threadKeyFilter, periodFilter, successSince],
     queryFn: ({ pageParam }) =>
       fetchPipeline({
-        status: statusFilter || undefined,
+        status: statusFilter === "ai_recommended" ? "needs_review"
+          : statusFilter && statusFilter !== "unmatched" ? statusFilter : undefined,
+        unmatched: statusFilter === "unmatched" || undefined,
+        auto_accepted: statusFilter === "ai_recommended" ? true : undefined,
         // Succeeded and resolved files are finished work — they'd bury the
         // rows that actually need someone. Hidden unless their own card is
         // picked. ("Resolved" also covers backfilled backlog threads that
         // were deliberately marked done without ever being extracted.)
-        exclude_status: statusFilter ? undefined : "success,resolved",
+        exclude_status: statusFilter && statusFilter !== "unmatched" && statusFilter !== "ai_recommended"
+          ? undefined : "success,resolved",
         updated_after: successSince,
         source_kind: sourceFilter || undefined,
         thread_key: threadKeyFilter || undefined,
@@ -531,20 +494,7 @@ export default function PipelinePage() {
   const items = data?.pages.flatMap((p) => p.items) ?? [];
   const total = data?.pages[0]?.total ?? 0;
 
-  const outcomeCounts = {
-    // "AI recommends" spans both awaiting-review and already-filed records
-    // (see the chip's own title text) — "Held" is narrower: needs_review
-    // rows the AI did NOT recommend, i.e. genuinely need a human's judgment,
-    // not just their click.
-    auto_accepted: items.filter((f) => f.auto_accepted).length,
-    held: items.filter((f) => f.status === "needs_review" && !f.auto_accepted).length,
-  };
-
-  const visibleItems = items.filter((f) => {
-    if (outcomeFilter === "auto_accepted") return f.auto_accepted;
-    if (outcomeFilter === "held") return f.status === "needs_review" && !f.auto_accepted;
-    return true;
-  });
+  const visibleItems = items;
 
   // Arrived via "View in Pipeline" from a specific email thread — jump
   // straight to the record instead of making them find it in the list.
@@ -573,6 +523,17 @@ export default function PipelinePage() {
     qc.invalidateQueries({ queryKey: ["files"] });
   };
 
+  // A file stored in the File Vault without being read: Extract reads it now.
+  const extractMut = useMutation({
+    mutationFn: (relPath: string) => extractVaultFile(relPath),
+    onSuccess: (r) => {
+      if (r.staged) toast("success", "Extracted", `${r.staged} item(s) are ready to review.`);
+      else toast("warning", "Nothing extracted", r.message || "No timesheet or leave record was found in this file.");
+      invalidate();
+    },
+    onError: (e: any) => toast("error", "Extraction failed", e?.response?.data?.detail ?? String(e)),
+  });
+
   const deleteMut = useMutation({
     mutationFn: deletePipelineFile,
     onSuccess: () => {
@@ -593,7 +554,7 @@ export default function PipelinePage() {
       if (r.rematched_count > 0) {
         toast("success", `${r.rematched_count} employee(s) now matched`,
           r.still_unmatched_count > 0
-            ? `${r.still_unmatched_count} still have nobody to match — add them to the Employee Matcher, or assign manually in Compare & Fix.`
+            ? `${r.still_unmatched_count} still have nobody to match, add them to the Employee Matcher, or assign manually in Compare & Fix.`
             : "Everything that was waiting on this is now resolved.");
       } else if (r.still_unmatched_count > 0) {
         toast("info", "Nothing new to match",
@@ -606,41 +567,77 @@ export default function PipelinePage() {
     onError: (e: any) => toast("error", "Could not re-check matches", e?.response?.data?.detail ?? String(e)),
   });
 
+  // One plain-language line under each row: why it is where it is.
+  const reasonFor = (f: PipelineFile): { text: string; tone: "ok" | "warn" | "bad" | "muted" } => {
+    const meta = (f.extraction_meta ?? {}) as Record<string, any>;
+    const blockers: string[] = meta?.auto_accept?.blockers ?? [];
+    if (isVaultPending(f)) return { text: "In vault, not extracted", tone: "warn" };
+    if (f.status === "failed") return { text: f.failure_label ?? "Could not be processed", tone: "bad" };
+    if (f.status === "processing") return { text: "Being read now", tone: "muted" };
+    if (f.status === "success") return { text: "Filed to the record", tone: "ok" };
+    if (f.status === "resolved") return { text: "Closed", tone: "muted" };
+    if (!meta?.staged?.employee_pk) return { text: "Not matched to an employee", tone: "bad" };
+    if (f.auto_accepted) return { text: "Ready to accept", tone: "ok" };
+    const b = (blockers[0] ?? "").replace(/^validation flags:\s*/i, "");
+    if (/no manager approval/i.test(b)) return { text: "No manager approval found", tone: "warn" };
+    return { text: b ? b.charAt(0).toUpperCase() + b.slice(1) : "Needs a check", tone: "warn" };
+  };
+
+  const statusChip = (f: PipelineFile) => {
+    if (isVaultPending(f)) return <Badge tone="brand">In vault</Badge>;
+    if (f.status === "needs_review")
+      return f.auto_accepted
+        ? <Badge tone="success">Ready</Badge>
+        : <Badge tone="warning">Needs review</Badge>;
+    if (f.status === "failed") return <Badge tone="danger">Failed</Badge>;
+    if (f.status === "success") return <Badge tone="success">Filed</Badge>;
+    if (f.status === "processing") return <Badge tone="brand">Reading</Badge>;
+    return <Badge>Closed</Badge>;
+  };
+
+  const FILTERS: { key: Filter; label: string; count?: number }[] = [
+    { key: "", label: "Open", count: Math.max(0, (stats?.total ?? 0) - (stats?.success ?? 0) - (stats?.resolved ?? 0)) },
+    { key: "needs_review", label: "Needs review", count: stats?.needs_review },
+    { key: "ai_recommended", label: "AI recommended", count: stats?.ai_recommended },
+    { key: "failed", label: "Failed", count: stats?.failed },
+    { key: "unmatched", label: "Not matched", count: stats?.unmatched },
+    { key: "success", label: "Filed", count: stats?.success_recent },
+  ];
+
   return (
     <div className="animate-fade-up">
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-        <div className="flex gap-1 rounded-lg border border-slate-200 bg-white p-1 text-sm w-fit">
-          <button
-            type="button"
-            onClick={() => setTab("pipeline")}
-            className={cn(
-              "rounded-md px-3 py-1.5 font-medium transition-colors",
-              tab === "pipeline" ? "bg-brand-50 text-brand-700" : "text-slate-500 hover:bg-slate-50"
-            )}
-          >
-            Pipeline
-          </button>
-          <button
-            type="button"
-            onClick={() => setTab("portal")}
-            className={cn(
-              "rounded-md px-3 py-1.5 font-medium transition-colors",
-              tab === "portal" ? "bg-brand-50 text-brand-700" : "text-slate-500 hover:bg-slate-50"
-            )}
-          >
-            Portal Submissions
-          </button>
+      {/* View switch + the two page-wide actions */}
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div className="inline-flex rounded-lg bg-slate-200/60 p-0.5 text-sm">
+          {(["pipeline", "portal"] as const).map((t) => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => setTab(t)}
+              className={cn(
+                "rounded-md px-3.5 py-1.5 font-semibold transition-all",
+                tab === t ? "bg-white text-slate-900 shadow-xs" : "text-slate-500 hover:text-slate-800"
+              )}
+            >
+              {t === "pipeline" ? "Activity" : "Portal submissions"}
+            </button>
+          ))}
         </div>
-        <Button
-          variant="secondary"
-          size="sm"
-          disabled={rematchMut.isPending}
-          onClick={() => rematchMut.mutate()}
-          title="Re-check employee identity for items whose match wasn't found at staging time (e.g. the employee was added to the matcher afterward) — no LLM call, safe to run anytime."
-        >
-          <RefreshCw className={cn("h-3.5 w-3.5", rematchMut.isPending && "animate-spin")} />
-          Re-check unmatched employees
-        </Button>
+        {tab === "pipeline" && (
+          <div className="flex flex-wrap items-center gap-2">
+            {canWrite && <BulkAccept period={periodFilter} onDone={invalidate} />}
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={rematchMut.isPending}
+              onClick={() => rematchMut.mutate()}
+              title="Look again for the employee of items that were not matched (for example after adding someone to the Employee Matcher). No AI call."
+            >
+              <RefreshCw className={cn("h-3.5 w-3.5", rematchMut.isPending && "animate-spin")} />
+              Re-check matches
+            </Button>
+          </div>
+        )}
       </div>
 
       {tab === "portal" ? (
@@ -649,345 +646,225 @@ export default function PipelinePage() {
         </Card>
       ) : (
         <>
-      {threadKeyFilter && (
-        <div className="mb-4 flex items-center gap-2 rounded-xl border border-brand-200 bg-brand-50 px-4 py-2.5 text-sm text-brand-800">
-          <Columns2 className="h-4 w-4 shrink-0" />
-          <span className="flex-1">Showing only records from that email thread.</span>
-          <button
-            type="button"
-            onClick={clearThreadKeyFilter}
-            className="font-semibold text-brand-700 hover:text-brand-900"
-          >
-            Show all records
-          </button>
-        </div>
-      )}
+          {(threadKeyFilter || periodFilter) && (
+            <div className="mb-3 flex items-center gap-2 rounded-lg border border-brand-200/70 bg-brand-50 px-3.5 py-2 text-sm text-brand-800">
+              <Columns2 className="h-4 w-4 shrink-0" />
+              <span className="flex-1">
+                {threadKeyFilter
+                  ? "Showing the records from one email thread."
+                  : `Showing ${MONTHS[periodFilter!.month]} ${periodFilter!.year} only.`}
+              </span>
+              <button
+                type="button"
+                onClick={threadKeyFilter ? clearThreadKeyFilter : clearPeriodFilter}
+                className="font-semibold text-brand-700 hover:text-brand-900"
+              >
+                Show all
+              </button>
+            </div>
+          )}
 
-      {periodFilter && (
-        <div className="mb-4 flex items-center gap-2 rounded-xl border border-brand-200 bg-brand-50 px-4 py-2.5 text-sm text-brand-800">
-          <Columns2 className="h-4 w-4 shrink-0" />
-          <span className="flex-1">
-            Showing only {MONTHS[periodFilter.month]} {periodFilter.year} — from the Dashboard's Awaiting review.
-          </span>
-          <button
-            type="button"
-            onClick={clearPeriodFilter}
-            className="font-semibold text-brand-700 hover:text-brand-900"
-          >
-            Show all periods
-          </button>
-        </div>
-      )}
-
-      <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-        {/* Default view. Succeeded AND resolved files are hidden here
-            (finished work), so the count matches the rows actually listed
-            below — their own cards open them on demand. */}
-        <StatCard
-          label="Open files"
-          value={Math.max(0, (stats?.total ?? 0) - (stats?.success ?? 0) - (stats?.resolved ?? 0))}
-          icon={<Activity className="h-5 w-5 text-slate-600" />}
-          tone="bg-slate-100"
-          active={statusFilter === ""}
-          onClick={() => setStatusFilter("")}
-        />
-        <div className="relative">
-          <StatCard
-            label="Success"
-            caption={`Last ${successWindowDays} days`}
-            value={stats?.success_recent ?? 0}
-            icon={<CheckCircle2 className="h-5 w-5 text-emerald-600" />}
-            tone="bg-emerald-50"
-            active={statusFilter === "success"}
-            onClick={() => setStatusFilter(statusFilter === "success" ? "" : "success")}
-          />
-          {/* Sibling to the card's own <button>, not nested inside it — a
-              <select> inside a <button> is invalid HTML and would fight the
-              card's click-to-filter behavior. */}
-          <select
-            value={successWindowDays}
-            onChange={(e) => setSuccessWindowDays(Number(e.target.value))}
-            onClick={(e) => e.stopPropagation()}
-            title="How far back Success counts"
-            className="absolute right-1.5 top-1.5 rounded-md border border-slate-200 bg-white px-1 py-0.5 text-[10px] font-semibold text-slate-500 shadow-xs focus:border-brand-500 focus:outline-none"
-          >
-            <option value={60}>60d</option>
-            <option value={90}>90d</option>
-            <option value={120}>120d</option>
-          </select>
-        </div>
-        <StatCard
-          label="Needs review"
-          value={stats?.needs_review ?? 0}
-          icon={<AlertTriangle className="h-5 w-5 text-amber-600" />}
-          tone="bg-amber-50"
-          active={statusFilter === "needs_review"}
-          onClick={() => setStatusFilter(statusFilter === "needs_review" ? "" : "needs_review")}
-        />
-        <StatCard
-          label="Failed"
-          value={stats?.failed ?? 0}
-          icon={<XCircle className="h-5 w-5 text-rose-600" />}
-          tone="bg-rose-50"
-          active={statusFilter === "failed"}
-          onClick={() => setStatusFilter(statusFilter === "failed" ? "" : "failed")}
-        />
-        <StatCard
-          label="AI recommendations"
-          value={outcomeCounts.auto_accepted}
-          icon={<Sparkles className="h-5 w-5 text-emerald-600" />}
-          tone="bg-emerald-50"
-          active={outcomeFilter === "auto_accepted"}
-          onClick={() => setOutcomeFilter(outcomeFilter === "auto_accepted" ? "" : "auto_accepted")}
-        />
-        <StatCard
-          label="Held"
-          value={outcomeCounts.held}
-          icon={<AlertTriangle className="h-5 w-5 text-amber-600" />}
-          tone="bg-amber-50"
-          active={outcomeFilter === "held"}
-          onClick={() => setOutcomeFilter(outcomeFilter === "held" ? "" : "held")}
-        />
-      </div>
-
-      <Card>
-        {/* Toolbar — search, source, and the "hide the noise" technical-details toggle. */}
-        <div className="flex flex-wrap items-center gap-3 border-b border-slate-100 px-5 py-3.5">
-          <input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="Search file or employee…"
-            className="w-64 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-sm placeholder:text-slate-400 focus:border-brand-400 focus:bg-white focus:outline-none"
-          />
-
-          <Select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)} className="py-1.5 text-xs">
-            <option value="">All sources</option>
-            <option value="email">Email</option>
-            <option value="upload">Upload</option>
-            <option value="portal">Portal</option>
-          </Select>
-
-          {canWrite && <BulkAccept period={periodFilter} onDone={invalidate} />}
-
-          <button
-            type="button"
-            onClick={toggleTech}
-            title="Show model, OCR and pipeline-stage diagnostics inside each expanded row"
-            className={cn(
-              "inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition-colors",
-              showTech
-                ? "border-brand-200 bg-brand-50 text-brand-700"
-                : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
-            )}
-          >
-            <Cpu className="h-3.5 w-3.5" />
-            Technical details
-            <span className={cn(
-              "rounded-full px-1.5 text-[10px] font-bold",
-              showTech ? "bg-brand-600 text-white" : "bg-slate-200 text-slate-500"
-            )}>
-              {showTech ? "ON" : "OFF"}
-            </span>
-          </button>
-
-          <p className="ml-auto text-xs text-slate-400">
-            {visibleItems.length} of {total} file{total !== 1 && "s"}
-            {outcomeFilter ? " (filtered)" : ""}
-          </p>
-        </div>
-
-        {isLoading ? (
-          <ListSkeleton label="Loading activity" columns={["File", "Employee", "Period", "Status", "Updated"]} widths={["w-56", "w-36", "w-20", "w-24", "w-24"]} />
-        ) : visibleItems.length === 0 ? (
-          <EmptyState
-            icon={<Activity className="h-6 w-6" />}
-            title="Nothing here"
-            detail={outcomeFilter
-              ? "No files match this AI outcome filter in the loaded page — try clearing the filter or load more."
-              : "Files appear the moment they enter the pipeline — from an accepted email or an upload."}
-          />
-        ) : (
-          <div className="divide-y divide-slate-100">
-            {visibleItems.map((f) => {
-              const expanded = open === f.id;
-              const meta = (f.extraction_meta ?? {}) as Record<string, unknown>;
-              const staged = (meta["staged"] ?? null) as StagedMeta | null;
-              const fee = (meta["full_email_extract"] ?? null) as FeeMeta | null;
-              const auto = (meta["auto_accept"] ?? null) as
-                | { accepted?: boolean; confidence?: string; reasons?: string[]; blockers?: string[] }
-                | null;
-
-              return (
-                <div key={f.id}>
-                  <button
-                    onClick={() => setOpen(expanded ? null : f.id)}
-                    className="flex w-full items-center gap-3 px-5 py-3 text-left transition-colors hover:bg-slate-50"
+          <Card className="overflow-hidden">
+            {/* Filters: status tabs, then search / source / AI chips */}
+            <div className="border-b border-slate-100 px-4 pt-3">
+              <div className="-mb-px flex gap-1 overflow-x-auto">
+                {FILTERS.map((x) => {
+                  const active = statusFilter === x.key;
+                  return (
+                    <button
+                      key={x.key || "open"}
+                      type="button"
+                      onClick={() => setStatusFilter(x.key)}
+                      className={cn(
+                        "flex shrink-0 items-center gap-2 border-b-2 px-3 pb-2.5 pt-1 text-sm font-semibold transition-colors",
+                        active ? "border-brand-700 text-slate-900" : "border-transparent text-slate-500 hover:text-slate-800"
+                      )}
+                    >
+                      {x.label}
+                      <span className={cn(
+                        "rounded-full px-1.5 text-[11px] tabular-nums",
+                        active ? "bg-brand-700 text-white" : x.key === "unmatched" && (x.count ?? 0) > 0
+                          ? "bg-rose-100 text-rose-700" : "bg-slate-100 text-slate-600"
+                      )}>
+                        {x.count ?? 0}
+                      </span>
+                    </button>
+                  );
+                })}
+                {statusFilter === "success" && (
+                  <select
+                    value={successWindowDays}
+                    onChange={(e) => setSuccessWindowDays(Number(e.target.value))}
+                    title="How far back Filed counts"
+                    className="mb-2 ml-1 self-center rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-slate-600"
                   >
-                    {expanded ? (
-                      <ChevronDown className="h-4 w-4 shrink-0 text-slate-400" />
-                    ) : (
-                      <ChevronRight className="h-4 w-4 shrink-0 text-slate-400" />
-                    )}
-                    {f.source_kind === "email" ? (
-                      <Mail className="h-4 w-4 shrink-0 text-slate-400" />
-                    ) : f.source_kind === "portal" ? (
-                      <span title="Employee portal">
-                        <UserCheck className="h-4 w-4 shrink-0 text-brand-400" />
-                      </span>
-                    ) : (
-                      <UploadCloud className="h-4 w-4 shrink-0 text-slate-400" />
-                    )}
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-semibold text-slate-800">
-                        {f.filename}
-                      </span>
-                      {/* Employee and period are what identify a row; byte size
-                          is bookkeeping and now lives in Technical details. */}
-                      <span className="block truncate text-xs text-slate-400">
-                        {f.employee_name ?? "Unidentified"}
-                        {f.month ? ` · ${MONTHS[f.month]} ${f.year}` : ""} ·{" "}
-                        {formatDateTime(f.created_at)}
-                      </span>
-                    </span>
+                    <option value={60}>last 60 days</option>
+                    <option value={90}>last 90 days</option>
+                    <option value={120}>last 120 days</option>
+                  </select>
+                )}
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 bg-slate-50/60 px-4 py-2.5">
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                <input
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  placeholder="Search employee or file"
+                  className="h-8 w-60 rounded-lg border border-slate-300/80 bg-white pl-8 pr-3 text-sm placeholder:text-slate-400 focus:border-brand-600 focus:outline-none focus:ring-[3px] focus:ring-brand-600/15"
+                />
+              </div>
+              <Select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)} className="h-8 py-0 text-xs">
+                <option value="">All sources</option>
+                <option value="email">Email</option>
+                <option value="upload">Upload</option>
+                <option value="portal">Portal</option>
+              </Select>
+              <p className="ml-auto text-xs tabular-nums text-slate-500">
+                {visibleItems.length} of {total}
+              </p>
+            </div>
 
-                    {/* One outcome badge per row — status, AI verdict and failure
-                        reason used to render as three separate, overlapping
-                        chips saying the same thing. */}
-                    {f.status === "needs_review" ? (
-                      f.auto_accepted ? (
-                        <span
-                          title="AI recommends accepting — review and press Accept to file"
-                          className="hidden shrink-0 items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-emerald-700 sm:inline-flex"
-                        >
-                          <Sparkles className="h-3 w-3" /> AI recommends
-                        </span>
-                      ) : (
-                        <span
-                          title="AI held this for human review — open Review"
-                          className="hidden shrink-0 items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-amber-700 sm:inline-flex"
-                        >
-                          <AlertTriangle className="h-3 w-3" /> Held
-                        </span>
-                      )
-                    ) : f.status === "failed" ? (
-                      <span className="hidden md:block">
-                        <FailureChip code={f.failure_code} label={f.failure_label} />
-                      </span>
-                    ) : (
-                      <PipelineStatusBadge status={f.status} />
-                    )}
-
-                    {f.status === "success" && f.record_id && (
-                      <button
-                        type="button"
-                        title="View the filed record"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          navigate(`/records/${f.record_id}`);
-                        }}
-                        className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
-                      >
-                        <ExternalLink className="h-3.5 w-3.5" />
-                        <span className="hidden sm:inline">View record</span>
-                      </button>
-                    )}
-                    {f.can_resolve_assign && (
-                      <button
-                        type="button"
-                        title={f.status === "success" ? "Review and correct this filing" : "Open Review"}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setAssigning(f);
-                        }}
-                        className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-brand-200 bg-brand-50 px-2 py-1 text-[11px] font-semibold text-brand-700 hover:bg-brand-100"
-                      >
-                        <Columns2 className="h-3.5 w-3.5" />
-                        <span className="hidden sm:inline">Review</span>
-                      </button>
-                    )}
-                    {(f.status === "needs_review" || f.status === "failed") && (
-                      <button
-                        type="button"
-                        title="Delete"
-                        disabled={deleteMut.isPending}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          deleteMut.mutate(f.id);
-                        }}
-                        className="shrink-0 rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                    )}
-                  </button>
-
-                  {expanded && (
-                    /* Expanded detail, ordered by what a reviewer needs first:
-                       the AI's verdict, then the extracted result, then any
-                       problem, and only then (opt-in) the diagnostics. */
-                    <div className="space-y-4 border-t border-slate-100 bg-slate-50/60 px-6 py-5">
-                      <AiVerdict auto={auto} />
-
-                      <ExtractionSummary staged={staged} fee={fee} />
-
-                      {f.failure_detail && f.status === "failed" && (
-                        <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
-                          <p className="font-semibold">{f.failure_label ?? "Issue"}</p>
-                          <p className="mt-0.5 whitespace-pre-wrap leading-5">{f.failure_detail}</p>
-                        </div>
-                      )}
-
-                      {f.resolution_note && (
-                        <div className="rounded-lg border border-brand-200 bg-brand-50 p-3 text-sm text-brand-800">
-                          <p className="font-semibold">Last update</p>
-                          <p className="mt-0.5 leading-5">{f.resolution_note}</p>
-                        </div>
-                      )}
-
-                      {f.record_id && (f.status === "success" || f.status === "needs_review") && (
-                        <StoredFilesPreview recordId={f.record_id} />
-                      )}
-
-                      {showTech && <TechnicalPanel file={f} />}
-
-                      <div className="flex flex-wrap items-center gap-2 pt-1">
-                        {f.can_resolve_assign && (
-                          <Button size="sm" onClick={() => setAssigning(f)}>
-                            <Columns2 className="h-4 w-4" /> Review
-                          </Button>
-                        )}
-                        {f.record_id && (
-                          <Link to={`/records/${f.record_id}`}>
-                            <Button size="sm" variant="secondary">
-                              <ExternalLink className="h-4 w-4" /> View record
-                            </Button>
-                          </Link>
-                        )}
-                        {(f.status === "needs_review" || f.status === "failed") && (
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="ml-auto text-rose-500 hover:bg-rose-50"
-                            disabled={deleteMut.isPending}
-                            onClick={() => deleteMut.mutate(f.id)}
-                          >
-                            <Trash2 className="h-4 w-4" /> Delete
-                          </Button>
-                        )}
-                      </div>
-                    </div>
-                  )}
+            {isLoading ? (
+              <ListSkeleton label="Loading activity" columns={["Employee", "Period", "Status", "Received"]} widths={["w-56", "w-20", "w-24", "w-24"]} />
+            ) : visibleItems.length === 0 ? (
+              <EmptyState
+                icon={<Activity className="h-6 w-6" />}
+                title={statusFilter === "unmatched" ? "Every item is matched to an employee" : "Nothing here"}
+                detail={statusFilter === "unmatched"
+                  ? "Sheets that cannot be matched to someone in the Employee Matcher would appear here."
+                  : "Items appear as soon as a sheet arrives by email, upload or the employee portal."}
+              />
+            ) : (
+              <div>
+                <div className="hidden grid-cols-[minmax(0,1fr)_110px_minmax(0,220px)_120px_150px] gap-4 border-b border-slate-100 px-4 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400 md:grid">
+                  <span>Employee</span><span>Period</span><span>Status</span><span>Received</span><span />
                 </div>
-              );
-            })}
+                <ul className="divide-y divide-slate-100">
+                  {visibleItems.map((f) => {
+                    const expanded = open === f.id;
+                    const meta = (f.extraction_meta ?? {}) as Record<string, unknown>;
+                    const staged = (meta["staged"] ?? null) as StagedMeta | null;
+                    const fee = (meta["full_email_extract"] ?? null) as FeeMeta | null;
+                    const auto = (meta["auto_accept"] ?? null) as
+                      | { accepted?: boolean; confidence?: string; reasons?: string[]; blockers?: string[] }
+                      | null;
+                    const reason = reasonFor(f);
+                    const SourceIcon = f.source_kind === "email" ? Mail : f.source_kind === "portal" ? UserCheck
+                      : f.source_kind === "vault" ? FolderOpen : UploadCloud;
+                    return (
+                      <li key={f.id} className={cn(expanded && "bg-slate-50/50")}>
+                        <div
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => setOpen(expanded ? null : f.id)}
+                          onKeyDown={(e) => { if (e.key === "Enter") setOpen(expanded ? null : f.id); }}
+                          className="grid cursor-pointer grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-1 px-4 py-3 transition-colors hover:bg-slate-50 md:grid-cols-[minmax(0,1fr)_110px_minmax(0,220px)_120px_150px]"
+                        >
+                          <div className="flex min-w-0 items-center gap-3">
+                            <ChevronRight className={cn("h-4 w-4 shrink-0 text-slate-300 transition-transform", expanded && "rotate-90 text-slate-500")} />
+                            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-500" title={f.source_kind}>
+                              <SourceIcon className="h-4 w-4" />
+                            </span>
+                            <span className="min-w-0">
+                              <span className="block truncate text-sm font-semibold text-slate-900">
+                                {f.employee_name ?? "Not identified"}
+                              </span>
+                              <span className="block truncate text-xs text-slate-500" title={f.filename}>{f.filename}</span>
+                            </span>
+                          </div>
+                          <span className="hidden text-sm tabular-nums text-slate-700 md:block">
+                            {f.month ? `${MONTHS[f.month]} ${f.year}` : "-"}
+                          </span>
+                          <span className="hidden min-w-0 md:block">
+                            {statusChip(f)}
+                            <span className={cn(
+                              "mt-1 block truncate text-xs",
+                              reason.tone === "bad" ? "text-rose-700" : reason.tone === "warn" ? "text-amber-700"
+                                : reason.tone === "ok" ? "text-emerald-700" : "text-slate-500"
+                            )} title={reason.text}>
+                              {reason.text}
+                            </span>
+                          </span>
+                          <span className="hidden text-xs tabular-nums text-slate-500 md:block">{formatDateTime(f.created_at)}</span>
+                          <div className="flex items-center justify-end gap-1" onClick={(e) => e.stopPropagation()}>
+                            <span className="md:hidden">{statusChip(f)}</span>
+                            {isVaultPending(f) && canWrite && (
+                              <Button
+                                size="sm"
+                                disabled={extractMut.isPending}
+                                onClick={() => {
+                                  if (confirm(`Extract "${f.filename}"? It is read and the result is sent to review.`))
+                                    extractMut.mutate((f.source_id ?? "").replace(/^vault:/, ""));
+                                }}
+                              >
+                                {extractMut.isPending && extractMut.variables === (f.source_id ?? "").replace(/^vault:/, "") ? "Extracting…" : "Extract"}
+                              </Button>
+                            )}
+                            {f.can_resolve_assign && (
+                              <Button size="sm" variant={f.status === "success" ? "secondary" : "primary"} onClick={() => setAssigning(f)}>
+                                {f.status === "success" ? "Correct" : "Review"}
+                              </Button>
+                            )}
+                            <RowMenu
+                              open={menuFor === f.id}
+                              onToggle={() => setMenuFor(menuFor === f.id ? null : f.id)}
+                              onClose={() => setMenuFor(null)}
+                              items={[
+                                ...(f.record_id ? [{ label: "View record", onClick: () => navigate(`/records/${f.record_id}`) }] : []),
+                                ...((f.status === "needs_review" || f.status === "failed") ? [{
+                                  label: "Delete item",
+                                  danger: true,
+                                  onClick: () => {
+                                    if (confirm(`Delete "${f.filename}" from the activity list? The email itself is not touched.`))
+                                      deleteMut.mutate(f.id);
+                                  },
+                                }] : []),
+                              ]}
+                            />
+                          </div>
+                        </div>
 
-            <div ref={sentinelRef} />
-            {isFetchingNextPage && (
-              <MoreRowsSkeleton />
+                        {expanded && (
+                          <div className="space-y-4 border-t border-slate-100 px-4 py-5 sm:px-14">
+                            <AiVerdict auto={auto} />
+                            <ExtractionSummary staged={staged} fee={fee} />
+                            {f.failure_detail && f.status === "failed" && (
+                              <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
+                                <p className="font-semibold">{f.failure_label ?? "Issue"}</p>
+                                <p className="mt-0.5 whitespace-pre-wrap leading-5">{f.failure_detail}</p>
+                              </div>
+                            )}
+                            {f.resolution_note && (
+                              <div className="rounded-lg border border-slate-200 bg-white p-3 text-sm text-slate-700">
+                                <p className="font-semibold text-slate-900">Last update</p>
+                                <p className="mt-0.5 leading-5">{f.resolution_note}</p>
+                              </div>
+                            )}
+                            {f.record_id && (f.status === "success" || f.status === "needs_review") && (
+                              <StoredFilesPreview recordId={f.record_id} />
+                            )}
+                            <button
+                              type="button"
+                              onClick={toggleTech}
+                              className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500 hover:text-slate-800"
+                            >
+                              <Cpu className="h-3.5 w-3.5" />
+                              {showTech ? "Hide technical details" : "Show technical details"}
+                            </button>
+                            {showTech && <TechnicalPanel file={f} />}
+                          </div>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+                <div ref={sentinelRef} />
+                {isFetchingNextPage && <MoreRowsSkeleton />}
+              </div>
             )}
-          </div>
-        )}
-      </Card>
+          </Card>
         </>
       )}
 
@@ -997,6 +874,46 @@ export default function PipelinePage() {
         onSaved={onAssignSaved}
         onDiscarded={invalidate}
       />
+    </div>
+  );
+}
+
+/** A small "more actions" menu: keeps rare actions out of the row. */
+function RowMenu({ open, onToggle, onClose, items }: {
+  open: boolean; onToggle: () => void; onClose: () => void;
+  items: { label: string; onClick: () => void; danger?: boolean }[];
+}) {
+  if (!items.length) return <span className="w-8" />;
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        aria-label="More actions"
+        onClick={onToggle}
+        className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+      >
+        <MoreHorizontal className="h-4 w-4" />
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-30" onClick={onClose} />
+          <div className="absolute right-0 top-9 z-40 w-44 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-pop animate-scale-in">
+            {items.map((it) => (
+              <button
+                key={it.label}
+                type="button"
+                onClick={() => { onClose(); it.onClick(); }}
+                className={cn(
+                  "block w-full px-3 py-2 text-left text-sm hover:bg-slate-50",
+                  it.danger ? "text-rose-600" : "text-slate-700"
+                )}
+              >
+                {it.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }

@@ -108,7 +108,7 @@ def _check_llm_sync() -> CheckResult:
         except Exception as exc:
             return CheckResult(HealthStatus.DOWN, f"Could not reach OpenRouter to check the key: {exc}")
         if r.status_code == 401:
-            return CheckResult(HealthStatus.DOWN, "OpenRouter rejected the API key (401 — invalid or revoked).")
+            return CheckResult(HealthStatus.DOWN, "OpenRouter rejected the API key (401, invalid or revoked).")
         if r.status_code != 200:
             return CheckResult(HealthStatus.DOWN, f"OpenRouter key check failed (HTTP {r.status_code}).")
         data = (r.json() or {}).get("data") or {}
@@ -139,12 +139,12 @@ def _check_llm_sync() -> CheckResult:
     except Exception as exc:
         return CheckResult(HealthStatus.DOWN, f"Could not reach the LLM provider to check the key: {exc}")
     if r.status_code == 401:
-        return CheckResult(HealthStatus.DOWN, "The LLM provider rejected the API key (401 — invalid or revoked).")
+        return CheckResult(HealthStatus.DOWN, "The LLM provider rejected the API key (401, invalid or revoked).")
     if r.status_code != 200:
         return CheckResult(
             HealthStatus.DOWN,
             f"LLM provider key check failed (HTTP {r.status_code}). Credit/quota exhaustion has no dedicated "
-            "signal for a plain OpenAI-compatible key — check the provider's own dashboard if this persists.",
+            "signal for a plain OpenAI-compatible key, check the provider's own dashboard if this persists.",
         )
     return CheckResult(HealthStatus.OK, "LLM API key is valid.")
 
@@ -187,7 +187,7 @@ def _with_expiry_warning(result: CheckResult) -> CheckResult:
     try:
         expires_on = datetime.strptime(raw, "%Y-%m-%d").date()
     except ValueError:
-        log.warning("graph_client_secret_expires_on=%r is not a YYYY-MM-DD date — ignoring.", raw)
+        log.warning("graph_client_secret_expires_on=%r is not a YYYY-MM-DD date, ignoring.", raw)
         return result
     days_left = (expires_on - datetime.now(timezone.utc).date()).days
     if days_left > settings.system_health_graph_expiry_warn_days:
@@ -200,7 +200,7 @@ def _with_expiry_warning(result: CheckResult) -> CheckResult:
         note = f"its configured expiry ({raw}) is in {days_left} day(s)"
     return CheckResult(
         HealthStatus.DEGRADED,
-        f"{result.detail} Still working, but {note} — rotate the client secret in Azure Portal "
+        f"{result.detail} Still working, but {note}, rotate the client secret in Azure Portal "
         "(App registrations -> Certificates & secrets) before then.",
     )
 

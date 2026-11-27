@@ -69,8 +69,8 @@ async def _heartbeat(key: str, token: str) -> None:
 @asynccontextmanager
 async def keyed_lock(
     key: str, *, max_wait: float = MAX_WAIT,
-    waiting_message: str = "Another run is using this — waiting for it…",
-    busy_message: str = "Still being processed by another run — try again shortly.",
+    waiting_message: str = "Another run is using this, waiting for it…",
+    busy_message: str = "Still being processed by another run, try again shortly.",
 ) -> AsyncIterator[bool]:
     """Hold the named lock (any key). Yields `waited` — True if it was busy on
     the first try."""
@@ -105,9 +105,9 @@ async def thread_lock(thread_key: str, *, max_wait: float = MAX_WAIT) -> AsyncIt
     lock was busy on first try)."""
     async with keyed_lock(
         lock_key(thread_key), max_wait=max_wait,
-        waiting_message=("Another extraction of this conversation is already running — waiting "
+        waiting_message=("Another extraction of this conversation is already running, waiting "
                          "for it instead of starting a duplicate…"),
-        busy_message=("This conversation is still being extracted by another run — "
+        busy_message=("This conversation is still being extracted by another run · "
                       "try again shortly."),
     ) as waited:
         yield waited

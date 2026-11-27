@@ -151,7 +151,7 @@ class ExtractQueueStore {
         const why = (result.errors ?? []).slice(0, 2).join("; ") || "a part of the thread could not be read";
         this.toastFn?.(
           "warning",
-          "Extract Email — incomplete",
+          "Extract Email, incomplete",
           `"${next.subject}" · ${result.groups ?? 0} record(s) so far. ${why}. It will be retried automatically; ` +
             `you can also tick the messages and press "Extract selected".`,
           reviewAction
@@ -159,7 +159,7 @@ class ExtractQueueStore {
       } else {
         this.toastFn?.(
           review.length ? "info" : "success",
-          review.length ? "Extract Email — needs review" : "Extract Email complete",
+          review.length ? "Extract Email, needs review" : "Extract Email complete",
           `"${next.subject}" · ${result?.groups ?? 0} record(s)${
             review.length ? ` · ${review.length} to review` : ""
           }`,

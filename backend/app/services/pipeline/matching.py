@@ -260,7 +260,7 @@ def _name_match_result(
             emp,
             f'Matched by name ("{extracted_name}" → "{emp.name}" · '
             f'{emp.employee_id}{_loc(emp)}). Sheet shows client ID {id_norm} '
-            f'— not used for matching.',
+            f'· not used for matching.',
             MatchCode.NAME_PRIMARY,
         )
     return MatchResult(
@@ -300,7 +300,7 @@ async def _match_by_id(
         return MatchResult(
             None,
             f'Employee ID {id_norm} belongs to "{emp.name}"{_loc(emp)}, but the sheet name '
-            f'"{extracted_name}" does not match it — not matched. Please assign the correct employee.',
+            f'"{extracted_name}" does not match it, not matched. Please assign the correct employee.',
             MatchCode.NO_MATCH,
         )
 
@@ -310,7 +310,7 @@ async def _match_by_id(
         return MatchResult(
             emp,
             f'Matched by employee ID ({id_norm}) + name '
-            f'("{extracted_name}" → "{emp.name}"{_loc(emp)}) — ID is shared across teams.',
+            f'("{extracted_name}" → "{emp.name}"{_loc(emp)}) · ID is shared across teams.',
             MatchCode.ID_AND_NAME,
         )
     if len(agreeing) > 1:
@@ -331,7 +331,7 @@ async def _match_by_id(
     return MatchResult(
         None,
         f'Employee ID {id_norm} is shared by {who}, and the sheet name "{extracted_name}" '
-        "does not clearly identify one of them — not matched. Please assign the correct employee.",
+        "does not clearly identify one of them, not matched. Please assign the correct employee.",
         MatchCode.AMBIGUOUS_ID,
     )
 
@@ -379,7 +379,7 @@ async def _match_strict(
         why = "only a placeholder name" if name_is_placeholder else "no employee name"
         return MatchResult(
             None,
-            f'Employee ID {id_norm} was found but {why} — a readable name is '
+            f'Employee ID {id_norm} was found but {why}, a readable name is '
             "required to match. Please assign the correct employee.",
             MatchCode.NO_MATCH,
         )

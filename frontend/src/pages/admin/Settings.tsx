@@ -113,7 +113,7 @@ export default function AdminSettings() {
     <div className="mx-auto max-w-3xl animate-fade-up">
       <PageHeader
         title="AI Settings"
-        subtitle="OpenAI only. All models, keys and tuning live in .env — edit the file and restart the backend."
+        subtitle="OpenAI only. All models, keys and tuning live in .env, edit the file and restart the backend."
       />
 
       <Card className="mb-5 p-5">
@@ -138,7 +138,7 @@ export default function AdminSettings() {
                 <div className="flex shrink-0 flex-wrap items-center gap-2">
                   <Badge tone="brand">OpenAI</Badge>
                   <code className="rounded bg-slate-100 px-2 py-0.5 font-mono text-[11px] text-slate-700">
-                    {svc.model || "—"}
+                    {svc.model || "-"}
                   </code>
                   {!svc.has_key && (
                     <Badge tone="warning">no API key in .env</Badge>
@@ -192,7 +192,7 @@ export default function AdminSettings() {
           </Button>
         </div>
         <p className="mb-3 text-xs text-slate-500">
-          Checked automatically every few hours — an expired key/credit exhaustion or a broken
+          Checked automatically every few hours, an expired key/credit exhaustion or a broken
           Microsoft Graph credential emails an admin the moment either happens, instead of
           extractions/OTP/reminders silently failing one by one.
         </p>
@@ -202,7 +202,7 @@ export default function AdminSettings() {
           <div className="space-y-2">
             {(health ?? []).map((row) => <HealthRow key={row.component} row={row} />)}
             {!health?.length && (
-              <p className="text-sm text-slate-500">Not checked yet — click "Check now".</p>
+              <p className="text-sm text-slate-500">Not checked yet, click "Check now".</p>
             )}
           </div>
         )}

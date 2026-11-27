@@ -336,7 +336,7 @@ def _reject_if_irm_protected(data: bytes) -> None:
     if any("EncryptedPackage" in s or "DataSpaces" in s for s in streams):
         raise RuntimeError(
             "This file is protected by Microsoft Information Rights Management "
-            "(IRM/Azure RMS) — no script can read it, only Excel itself, "
+            "(IRM/Azure RMS), no script can read it, only Excel itself, "
             "authenticated as a permitted user, can. Open it in Excel, then "
             "File → Save As a plain copy (or export to CSV), and import "
             "that copy instead."
@@ -364,7 +364,7 @@ def _load_sheets(data: bytes) -> list:
         book = xlrd.open_workbook(file_contents=data)
         return [_XlsSheet(book.sheet_by_index(i)) for i in range(book.nsheets)]
 
-    raise RuntimeError("Unrecognized file — expected a .xlsx or .xls workbook.")
+    raise RuntimeError("Unrecognized file, expected a .xlsx or .xls workbook.")
 
 
 def parse_workbook(data: bytes) -> list[dict]:

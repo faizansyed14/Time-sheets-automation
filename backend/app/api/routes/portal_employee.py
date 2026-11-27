@@ -189,7 +189,7 @@ async def precheck(month: int, year: int, user: PortalUser = Depends(require_por
     if existing_record:
         note = (f"{month:02d}/{year} already has a filed record"
                 f"{f' (from {existing_record.source_email_id})' if existing_record.source_email_id else ''}"
-                f" — anything you submit will be added to it, not replace it.")
+                f", anything you submit will be added to it, not replace it.")
     return PortalSubmissionPrecheckOut(
         submission=await _submission_out(db, sub, emp) if sub else None,
         already_filed_elsewhere=bool(existing_record), filed_source_note=note,

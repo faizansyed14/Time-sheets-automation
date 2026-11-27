@@ -78,7 +78,7 @@ async def test_bulk_accept_files_pgc_and_mod_items_even_with_flags(client, admin
     try:
         async with SessionLocal() as db:
             for key, pk, name, blockers in (
-                ("pgc", pgc, "Bulk Pgc Person", ["no manager approval evidence found — none"]),
+                ("pgc", pgc, "Bulk Pgc Person", ["no manager approval evidence found, none"]),
                 ("mod", mod, "Bulk Mod Person", []),
                 ("held", held, "Bulk Held Person", ["incomplete coverage: 20/31 days"]),
                 ("other", other, "Bulk Other Person", []),
