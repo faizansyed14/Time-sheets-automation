@@ -324,7 +324,12 @@ _SELECT = (
 # type though, and is what actually fixes the list-vs-detail count mismatch.
 _EXPAND = "attachments($select=id,name,contentType,size,isInline)"
 # Detail view: no $select → Graph returns all fields including contentId on fileAttachment subtype
-_EXPAND_DETAIL = "attachments"
+# Attachment DETAILS only - never their contents. A bare "attachments" expand made Graph
+# send every file's bytes inline: a 27-message thread was 8.4 MB and 21 s just to list it,
+# against 0.35 MB and 1.3 s like this (measured). contentId is selected on the file
+# subtype, which inline-image rendering needs; file bytes come from get_attachment_bytes.
+_EXPAND_DETAIL = ("attachments($select=id,name,contentType,size,isInline,"
+                  "microsoft.graph.fileAttachment/contentId)")
 
 
 class GraphEmailProvider(EmailProvider):

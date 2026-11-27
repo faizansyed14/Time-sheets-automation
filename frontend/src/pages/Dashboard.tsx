@@ -201,19 +201,21 @@ function ViewRecordButton({
   recordId: string | null;
   needsReview: boolean;
 }) {
+  // The coverage row already carries the month's record id: link straight to it. Only a
+  // row WITHOUT one looks the record up (this used to run once per row, every load).
   const { data, isLoading } = useQuery({
     queryKey: ["employee-records", pk, year],
     queryFn: () => fetchEmployeeRecords(pk, year),
-    enabled: !!pk,
+    enabled: !!pk && !recordId,
   });
-  const rec = resolveFocusRecord(data, { recordId, month, year });
-  if (isLoading && !recordId) {
+  const targetId = recordId ?? resolveFocusRecord(data, { recordId, month, year })?.id ?? null;
+  if (!targetId && isLoading) {
     return <span className="text-xs text-slate-400">…</span>;
   }
-  if (!rec) return null;
+  if (!targetId) return null;
   return (
     <Link
-      to={`/records/${rec.id}`}
+      to={`/records/${targetId}`}
       title="View record"
       className={cn(
         "inline-flex items-center gap-0.5 rounded-md px-1.5 py-1 text-[11px] font-semibold text-white shadow-sm",

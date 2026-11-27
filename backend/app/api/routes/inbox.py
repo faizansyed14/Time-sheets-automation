@@ -41,7 +41,7 @@ _EXTRACT_EMAIL_TAG = "__email_extract__"
 # mirror. Set only by get_thread's own live fetch, never by the background
 # sync (that keeps individual rows current but never asserts a whole
 # conversation — Sent-Items replies included — is fully caught up).
-_THREAD_FRESH_TTL = 60
+_THREAD_FRESH_TTL = 300   # new replies still show: the background sync stores them
 
 
 def _thread_fresh_key(thread_id: str) -> str:
@@ -533,13 +533,14 @@ async def auto_extract_coverage(db: AsyncSession = Depends(get_db)):
     return await auto_extract.coverage(db)
 
 
-async def _build_email_detail(db: AsyncSession, provider, row: EmailMessage) -> EmailDetail:
+async def _build_email_detail(db: AsyncSession, provider, row: EmailMessage,
+                              inline: tuple | None = None) -> EmailDetail:
     """EmailDetail for an ALREADY-SYNCED row — resolves inline cid: images to
     data URIs so the body renders exactly like Outlook. Shared by the single-
     message detail endpoint and the thread view (one call per message)."""
     from app.services.extract_email import sheet_cache
     from app.services.inbox.inline_images import inline_cid_images
-    body_html, inline_ids = await inline_cid_images(
+    body_html, inline_ids = inline if inline is not None else await inline_cid_images(
         provider, row.provider_message_id, row.body_html, row.attachments or [])
 
     base = _to_list_item(
@@ -583,7 +584,17 @@ async def _build_thread_detail(
     db: AsyncSession, provider, anchor_row: EmailMessage, rows: list[EmailMessage],
 ) -> ThreadDetail:
     thread_id = anchor_row.conversation_id or anchor_row.id
-    messages = [await _build_email_detail(db, provider, r) for r in rows]
+    # Inline images of EVERY message at once (Graph I/O only, no DB), then build each
+    # message - not one message's images after another.
+    import asyncio
+    from app.services.inbox.inline_images import inline_cid_images
+    gate = asyncio.Semaphore(8)
+
+    async def _inline(r):
+        async with gate:
+            return await inline_cid_images(provider, r.provider_message_id, r.body_html, r.attachments or [])
+    inlined = await asyncio.gather(*[_inline(r) for r in rows])
+    messages = [await _build_email_detail(db, provider, r, inline=i) for r, i in zip(rows, inlined)]
     # Extraction keys a conversation-less message by its PROVIDER id, while
     # thread_id falls back to the DB row id — look up what extraction actually
     # wrote, or a singleton thread would never show as extracted.
@@ -647,14 +658,26 @@ async def get_thread(
         # the anchor message is the whole "thread".
         rows = [anchor_row]
     else:
+        # The inbox sync stores plain text only; the viewer wants the HTML body. Re-fetch
+        # ONLY messages whose HTML is not stored yet (a thread opened before keeps it), and
+        # fetch those in parallel instead of one Graph round-trip after another.
+        import asyncio
+        have_html = set((await db.execute(select(EmailMessage.provider_message_id).where(
+            EmailMessage.provider_message_id.in_([m.message_id for m in thread_msgs]),
+            EmailMessage.body_html.is_not(None), EmailMessage.body_html != ""))).scalars())
+        gate = asyncio.Semaphore(6)
+
+        async def _full(m):
+            if m.body_html or m.message_id in have_html:
+                return m
+            async with gate:
+                try:
+                    return (await provider.get_message(m.message_id)) or m
+                except Exception:
+                    return m          # the text body still shows; never fail the whole thread
+        thread_msgs = await asyncio.gather(*[_full(m) for m in thread_msgs])
         rows = []
         for m in thread_msgs:
-            # Incremental inbox sync stores plain text only — re-fetch any
-            # thread message that still lacks HTML so signatures/fonts render.
-            if not m.body_html:
-                full = await provider.get_message(m.message_id)
-                if full:
-                    m = full
             rows.append(await sync_message(db, m))
         await db.commit()
         for r in rows:

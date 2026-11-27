@@ -91,6 +91,10 @@ def strip_unresolved_cids(html: str) -> str:
     return _CID_REF_RE.sub("", html)
 
 
+_INLINE_CACHE_TTL = 7 * 24 * 3600      # evictable first under Redis' memory cap
+_INLINE_CACHE_MAX = 1_500_000           # don't keep a huge pasted screenshot in Redis
+
+
 async def inline_cid_images(
     provider,
     message_id: str,
@@ -117,18 +121,32 @@ async def inline_cid_images(
     pairs = [(ref, att) for ref in refs if (att := _find_attachment(ref, attachments))]
 
     async def _fetch(ref: str, att: dict) -> tuple[str, str | None]:
+        # A sent email's inline images never change: remember each one, so opening the
+        # thread again makes no Graph call for it (a long thread has 100+ of them).
+        from app.core.cache import cache
+        key = f"inbox:inline:{message_id}:{att['attachment_id']}"
+        try:
+            hit = await cache.get(key)
+        except Exception:
+            hit = None
+        if hit is not None:
+            return ref, (hit or None)          # "" = known not to be an image
         try:
             data, _fn, ctype = await provider.get_attachment_bytes(
                 message_id, att["attachment_id"])
         except Exception:
-            return ref, None
-        if not data:
-            return ref, None
-        ctype = (ctype or att.get("content_type") or "image/png").split(";")[0]
-        if not ctype.startswith("image/"):
-            return ref, None
-        b64 = base64.b64encode(data).decode()
-        return ref, f"data:{ctype};base64,{b64}"
+            return ref, None                   # not cached: retried next time
+        uri = None
+        if data:
+            ctype = (ctype or att.get("content_type") or "image/png").split(";")[0]
+            if ctype.startswith("image/"):
+                uri = f"data:{ctype};base64,{base64.b64encode(data).decode()}"
+        if uri is None or len(uri) <= _INLINE_CACHE_MAX:
+            try:
+                await cache.set(key, uri or "", ttl=_INLINE_CACHE_TTL)
+            except Exception:
+                pass
+        return ref, uri
 
     results = await asyncio.gather(*(_fetch(ref, att) for ref, att in pairs))
 

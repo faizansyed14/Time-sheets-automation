@@ -359,11 +359,17 @@ export default function PipelineCompareFixModal({
     // A sheet that is not a direct attachment of any message (e.g. inside a forwarded
     // email) is pulled out of the stored copy by name, so it still opens directly.
     const have = new Set(fromThread.map((d) => d.filename));
+    // A name used by more than one attachment ("Timesheet.pdf" from several people) can't
+    // pick the right file by name: such a sheet is opened by its content fingerprint.
+    const nameCount = new Map<string, number>();
+    fromThread.forEach((d) => nameCount.set(d.filename, (nameCount.get(d.filename) ?? 0) + 1));
+    const ambiguous = (name: string) => (nameCount.get(name) ?? 0) > 1;
     // Only an EMAIL holds several attachments to pick the sheet from; for an upload
     // (or a vault file) the staged file IS the sheet, shown by "Staged file".
     const fromStored: Doc[] = !file || file.failure_code !== "pending_review" || file.source_kind !== "email" ? [] :
       (((file.extraction_meta as any)?.full_email_extract?.sheets ?? []) as { filename?: string; digest?: string }[])
-        .filter((s): s is { filename: string; digest?: string } => !!s.filename && !have.has(s.filename))
+        .filter((s): s is { filename: string; digest?: string } =>
+          !!s.filename && (!have.has(s.filename) || (ambiguous(s.filename) && !!s.digest)))
         // one tab per FILE: several sheets can share a name ("Timesheet.pdf"), the
         // content fingerprint tells them apart
         .filter((s, i, all) => all.findIndex((o) => o.filename === s.filename && (o.digest ?? "") === (s.digest ?? "")) === i)
@@ -510,8 +516,22 @@ export default function PipelineCompareFixModal({
     if (!sheet) return;
     autoSelectedDocFor.current = file.id;
 
+    // A row the AI could not tie to a person - no matched employee, no name or ID on the
+    // sheet, or a generic pasted-image name like "image001.png" - is often a misread
+    // signature or screenshot. Open the WHOLE email (Staged file) instead, so the
+    // reviewer sees everything that was sent, not just that one doubtful picture.
+    const staged = (file.extraction_meta as any)?.staged ?? {};
+    const genericImage = /^image\d{0,4}\.(png|jpe?g|gif|bmp)$/i.test((sheet.filename ?? "").trim());
+    const noIdentity = !sheet.employee_name && !sheet.employee_id;
+    if (!staged.employee_pk || genericImage || noIdentity) return;
+
     const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
-    let match = docTabs.find((d) => d.filename === sheet.filename);
+    // Exact file first: the fingerprint tab (always right, even when names repeat), then
+    // a by-name tab only when that name is unique in the email.
+    const sheetDigest = (sheet as { digest?: string }).digest ?? "";
+    const sameName = docTabs.filter((d) => d.filename === sheet.filename);
+    let match = docTabs.find((d) => d.id === `sheet:${sheet.filename}:${sheetDigest}`)
+      ?? (sameName.length === 1 ? sameName[0] : undefined);
     if (!match) {
       const idNeedle = sheet.employee_id ? norm(sheet.employee_id) : "";
       const nameNeedle = sheet.employee_name ? norm(sheet.employee_name) : "";

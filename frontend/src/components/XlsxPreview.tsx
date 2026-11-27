@@ -231,9 +231,7 @@ async function loadLegacyXlsWorkbook(url: string): Promise<SheetModel[]> {
   // Lazy-loaded, same as the ExcelJS path — only paid for when actually
   // needed (a genuine legacy .xls hits this fallback).
   const XLSX: any = await import("xlsx");
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const buf = await res.arrayBuffer();
+  const buf = await fetchWorkbookBytes(url);      // already downloaded: no second request
   const wb = XLSX.read(buf, { type: "array" });
   const models = (wb.SheetNames as string[]).map((name) =>
     buildSheetModelFromSheetJS(XLSX, wb.Sheets[name], name));
@@ -282,19 +280,19 @@ function looksRightsProtected(bytes: Uint8Array): boolean {
 }
 
 async function loadWorkbook(url: string) {
-  // Lazy-loaded — only users who actually open an XLSX preview pay for the
-  // parser. The browser build (package.json "browser" field) is imported by
-  // subpath directly so the choice isn't left to bundler field-resolution.
-  const mod: unknown = await import("exceljs/dist/exceljs.min.js");
-  const Workbook = findWorkbookCtor(mod);
-  if (!Workbook) throw new Error("exceljs browser bundle did not expose Workbook");
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const buf = await res.arrayBuffer();
+  // The file is downloaded ONCE (cached by fetchWorkbookBytes) and its header checked
+  // BEFORE the ExcelJS bundle is loaded: an old binary .xls goes straight to SheetJS
+  // instead of downloading ExcelJS just to watch it fail.
+  const buf = await fetchWorkbookBytes(url);
   const bytes = new Uint8Array(buf);
   if (isOleCompoundFile(bytes)) {
     throw new Error(looksRightsProtected(bytes) ? "RIGHTS_PROTECTED" : "LEGACY_XLS_FORMAT");
   }
+  // Lazy-loaded: only a real .xlsx pays for this parser. The browser build is imported
+  // by subpath so the choice isn't left to bundler field-resolution.
+  const mod: unknown = await import("exceljs/dist/exceljs.min.js");
+  const Workbook = findWorkbookCtor(mod);
+  if (!Workbook) throw new Error("exceljs browser bundle did not expose Workbook");
   const wb = new Workbook();
   await wb.xlsx.load(buf);
   return wb;
