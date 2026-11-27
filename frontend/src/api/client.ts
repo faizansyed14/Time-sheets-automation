@@ -847,7 +847,6 @@ export interface BulkAcceptResult {
 export const bulkAcceptPipeline = (p: {
   project?: string; month?: number; year?: number; dry_run?: boolean;
   /** Limit to one uploaded roster (any project) … */ thread_key?: string;
-  /** … and keep out rows that have leave days. */ no_leaves?: boolean;
 }) =>
   api.post<BulkAcceptResult>("/pipeline/bulk-accept", p, { timeout: 300_000 }).then((r) => r.data);
 

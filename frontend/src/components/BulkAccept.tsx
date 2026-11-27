@@ -96,7 +96,7 @@ export default function BulkAccept({ period, onDone }: { period: Period; onDone:
           type="button"
           onClick={() => open(p)}
           disabled={checking || running}
-          title={`Accept every clean ${p === "PGC" ? "PGC (Technical Support, Multimedia, Programming)" : "MOD (Ministry of Defence)"} item waiting for review (${periodLabel})`}
+          title={`Accept every ${p === "PGC" ? "PGC (Technical Support, Multimedia, Programming)" : "MOD (Ministry of Defence)"} item waiting for review (${periodLabel})`}
           className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50"
         >
           <CheckCheck className="h-3.5 w-3.5" />
@@ -110,15 +110,15 @@ export default function BulkAccept({ period, onDone }: { period: Period; onDone:
         ) : (
           <div className="space-y-4 text-sm text-slate-700">
             <p>
-              <span className="text-lg font-bold text-slate-900">{plan.ready}</span> clean{" "}
+              <span className="text-lg font-bold text-slate-900">{plan.ready}</span>{" "}
               {project} item{plan.ready === 1 ? "" : "s"} will be filed to the vault and records.
               {plan.held_count > 0 && (
-                <> <span className="font-semibold text-amber-700">{plan.held_count}</span> need a human and stay in the queue.</>
+                <> <span className="font-semibold text-amber-700">{plan.held_count}</span> cannot be filed and stay in the queue.</>
               )}
             </p>
             <p className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500">
-              Same as pressing Accept on each one. Items with a flag, an unmatched employee or missing days are never
-              included. Approval is recorded as <b>approved</b> only when the sheet carried evidence, otherwise{" "}
+              Same as pressing Accept on each one. Leave days and reader flags do not stop an item (they are written in its note). Only an
+              unmatched employee or a sheet with nothing read stays in the queue. Approval is recorded as <b>approved</b> only when the sheet carried evidence, otherwise{" "}
               <b>not approved</b> — you can sign it off later on the record.
             </p>
             {plan.held.length > 0 && (
