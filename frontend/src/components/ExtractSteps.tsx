@@ -70,7 +70,7 @@ export function BatchPhaseTag({ phase }: { phase: BatchPhase }) {
     return (
       <span className="flex items-center gap-1 whitespace-nowrap text-rose-600">
         <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-rose-500" />
-        failed — continuing with the rest
+        failed, continuing with the rest
       </span>
     );
   }

@@ -67,7 +67,7 @@ def send_health_alert_email(subject: str, html_body: str) -> None:
     if not to_email or "@" not in to_email:
         raise ValueError(
             "No system_health_alert_email or default_admin_email configured "
-            "— nowhere to send this alert."
+            "· nowhere to send this alert."
         )
     if not _graph_configured():
         log.warning("[DEV HEALTH ALERT] -> %s | %s", to_email, subject)

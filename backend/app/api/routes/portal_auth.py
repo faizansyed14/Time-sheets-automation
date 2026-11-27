@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import secrets
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +24,7 @@ from app.core.cache import cache
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import (
+    hash_password,
     create_portal_access_token,
     decode_token,
     is_token_revoked_key,
@@ -32,6 +35,8 @@ from app.models.employee import Employee
 from app.models.portal_auth import PortalUser
 from app.schemas.portal import PortalLoginIn, PortalTokenResult, PortalUserOut
 from app.services.auth import rate_limit
+
+_DUMMY_HASH = hash_password(secrets.token_urlsafe(24))
 
 router = APIRouter(prefix="/portal/auth", tags=["portal"])
 
@@ -88,8 +93,16 @@ async def login(body: PortalLoginIn, request: Request, db: AsyncSession = Depend
     if not allowed:
         raise HTTPException(429, f"Too many login attempts. Try again in {retry}s.")
 
+    # Wrong passwords for one account from ANY address (correct sign-ins never count).
+    fail_key = f"rl:portal-login-fail:{body.username.lower()}"
+    if int(await cache.get(fail_key) or 0) >= settings.login_fail_max:
+        raise HTTPException(429, "Too many failed sign-in attempts for this account. "
+                                 f"Try again in {settings.login_fail_window_seconds // 60} minutes.")
     user = (await db.execute(select(PortalUser).where(PortalUser.username == body.username))).scalar_one_or_none()
-    if not user or not user.is_active or not verify_password(body.password, user.password_hash):
+    # One password check either way, so response time does not reveal valid usernames.
+    ok = verify_password(body.password, user.password_hash if user else _DUMMY_HASH)
+    if not user or not user.is_active or not ok:
+        await cache.incr(fail_key, ttl=settings.login_fail_window_seconds)
         raise HTTPException(401, "Incorrect username or password")
     user.last_login_at = datetime.now(timezone.utc)
     await db.commit()

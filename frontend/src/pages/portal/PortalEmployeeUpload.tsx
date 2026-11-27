@@ -224,7 +224,7 @@ export default function PortalEmployeeUpload() {
     setSubmitting(true);
     try {
       await portalSubmit(submissionId, approvalAnswer);
-      toast("success", "Submitted", "Your timesheet is being read now — check My submissions for status.");
+      toast("success", "Submitted", "Your timesheet is being read now, check My submissions for status.");
       refreshPrecheck();
       qc.invalidateQueries({ queryKey: ["portal-submissions"] });
     } catch (e: any) {
@@ -307,9 +307,9 @@ export default function PortalEmployeeUpload() {
               <div className="mt-4 flex items-center gap-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
                 <Clock className="h-4 w-4 shrink-0" />
                 <p>
-                  Sent on {submission.submitted_at ? new Date(submission.submitted_at).toLocaleDateString() : ""} —
+                  Sent on {submission.submitted_at ? new Date(submission.submitted_at).toLocaleDateString() : ""} -
                   awaiting review. You can still add or replace files below (e.g. a certificate that arrives
-                  later) — doing so puts it back in front of the timesheet team for a fresh look.
+                  later), doing so puts it back in front of the timesheet team for a fresh look.
                 </p>
               </div>
             )}
@@ -318,7 +318,7 @@ export default function PortalEmployeeUpload() {
               <div className="mt-4 flex items-center gap-2 rounded-lg bg-emerald-50 p-3 text-sm text-emerald-800">
                 <CheckCircle2 className="h-4 w-4 shrink-0" />
                 <p>
-                  This submission has been accepted. You can still add or replace files below — doing so sends it
+                  This submission has been accepted. You can still add or replace files below, doing so sends it
                   back for a fresh look.
                 </p>
               </div>

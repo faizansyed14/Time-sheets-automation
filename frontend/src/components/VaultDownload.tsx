@@ -306,7 +306,7 @@ export function VaultDownload({ manager }: { manager: string | null }) {
             <Download className="mt-0.5 h-5 w-5 text-brand-500" />
             <p>
               Your download has started in the browser. Large archives may take a
-              while — you can watch progress in your browser’s downloads bar.
+              while, you can watch progress in your browser’s downloads bar.
             </p>
           </div>
         ) : (

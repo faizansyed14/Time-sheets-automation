@@ -397,7 +397,7 @@ async def list_inbox(
     any caller that wants the flat view; the Inbox page itself uses
     GET /inbox/threads (one row per Outlook-style conversation)."""
     if offset == 0:
-        await sync_inbox(db)
+        await sync_inbox(db, allow_backfill=False)
 
     base = _apply_inbox_filters(select(EmailMessage), q, status)
     total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
@@ -431,7 +431,7 @@ async def list_threads(
     message is from the employee. The status filter is judged on the newest
     message (what the row shows), so filter and badge always agree."""
     if offset == 0:
-        await sync_inbox(db)
+        await sync_inbox(db, allow_backfill=False)
 
     thread_key = func.coalesce(EmailMessage.conversation_id, EmailMessage.id)
 
@@ -878,6 +878,14 @@ async def save_eml_to_vault(
                 mgr, emp.name, emp.aco_number, emp.dco_number)
 
     rel = sp.save_file(mgr, emp_folder, body.month, body.year, fname, data)
+    # Filed WITHOUT extraction (the fallback when nothing could be read): tracked as
+    # "in vault, not extracted" so the person is never shown as missing and it can be
+    # extracted later (services/pipeline/vault_pending.py).
+    from app.core import datacache
+    from app.services.pipeline import vault_pending
+    await vault_pending.register(db, rel)
+    await datacache.bust_pipeline()
+    await datacache.bust_employees()
     return {"saved": True, "path": rel, "filename": fname, "employee_folder": emp_folder}
 
 
@@ -963,7 +971,7 @@ async def decide(provider_message_id: str, body: DecisionIn, db: AsyncSession = 
     await db.refresh(row)
 
     if row.status == EmailStatus.INGESTED:
-        raise HTTPException(409, "Email already ingested — cannot re-decide.")
+        raise HTTPException(409, "Email already ingested, cannot re-decide.")
     if row.status == EmailStatus.ARCHIVED and not body.accepted:
         raise HTTPException(409, "Email already archived. Use /restore to reopen.")
 
@@ -971,7 +979,7 @@ async def decide(provider_message_id: str, body: DecisionIn, db: AsyncSession = 
         # Instant filing is gone by design: every extraction goes through
         # Compare & Fix review. Use Extract Email (full or selected).
         raise HTTPException(
-            400, "Direct accept was removed — run Extract Email and review the "
+            400, "Direct accept was removed, run Extract Email and review the "
                  "staged items instead.")
 
     row.status = EmailStatus.ARCHIVED

@@ -18,6 +18,7 @@ Uses ImmutableId so message/attachment ids are URL-safe in the API paths.
 from __future__ import annotations
 
 import asyncio
+import time
 import base64
 import html
 import re
@@ -65,7 +66,7 @@ async def _token() -> str:
         res = app.acquire_token_for_client(scopes=_SCOPE)
         if "access_token" not in res:
             raise RuntimeError(
-                f"Graph token error: {res.get('error')} — {res.get('error_description')}"
+                f"Graph token error: {res.get('error')} · {res.get('error_description')}"
             )
         return res["access_token"]
     return await asyncio.to_thread(_acquire)
@@ -83,9 +84,41 @@ _RETRY_STATUS = {429, 500, 502, 503, 504}
 _MAX_ATTEMPTS = 6
 
 
+def _graph_role(url: str, params: dict | None) -> str:
+    if "/attachments/" in url:
+        return "mime" if url.endswith("/$value") else "attachment"
+    if url.endswith("/$value"):
+        return "mime"
+    if params and "conversationId" in str(params.get("$filter", "")):
+        return "thread"
+    if "/messages" in url:
+        return "list"
+    return "other"
+
+
 async def _get(c: httpx.AsyncClient, url: str, *, params: dict | None = None,
                text_body: bool | None = None, headers: dict | None = None,
                ok_404: bool = False) -> httpx.Response:
+    """Timed for the Monitor page; the work is _get_retrying."""
+    t0 = time.perf_counter()
+    status, code = "error", None
+    try:
+        r = await _get_retrying(c, url, params=params, text_body=text_body, headers=headers, ok_404=ok_404)
+        code = r.status_code
+        status = "ok" if r.status_code < 400 or (ok_404 and r.status_code == 404) else "error"
+        return r
+    finally:
+        try:
+            from app.services.monitoring.recorder import record
+            record("graph", _graph_role(url, params), "graph", (time.perf_counter() - t0) * 1000,
+                   status=status, detail={"http": code} if status != "ok" else None)
+        except Exception:
+            pass
+
+
+async def _get_retrying(c: httpx.AsyncClient, url: str, *, params: dict | None = None,
+                        text_body: bool | None = None, headers: dict | None = None,
+                        ok_404: bool = False) -> httpx.Response:
     """GET with the retry Graph asks for: 429 (throttled) and 5xx are retried
     with the server's Retry-After (else exponential backoff, capped), and so are
     transport errors/timeouts. Returns the final response - the caller decides
@@ -325,7 +358,9 @@ class GraphEmailProvider(EmailProvider):
         if before is not None:
             # Resume an interrupted backfill: only what is older than the oldest
             # message already stored.
-            clauses.append("receivedDateTime lt "
+            # `le`, not `lt`: several messages can share the boundary timestamp and a
+            # page can end between them - re-reading the boundary is free (upsert).
+            clauses.append("receivedDateTime le "
                            + before.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
         if clauses:
             params["$filter"] = " and ".join(clauses)

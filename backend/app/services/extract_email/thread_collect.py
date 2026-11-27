@@ -64,11 +64,11 @@ def build_thread_bundle(
         safe = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", label).strip()[:80] or f"message {i}"
         try:
             nested = _email.message_from_bytes(data, policy=_email.policy.default)
-            outer.add_attachment(nested, filename=f"{i:02d} — {safe}.eml")
+            outer.add_attachment(nested, filename=f"{i:02d} · {safe}.eml")
         except Exception:
             outer.add_attachment(
                 data, maintype="message", subtype="rfc822",
-                filename=f"{i:02d} — {safe}.eml")
+                filename=f"{i:02d} · {safe}.eml")
     return outer.as_bytes(), eml_filename(subject)
 
 
@@ -98,7 +98,7 @@ def _label(subject: str | None, received) -> str:
     except Exception:
         when = str(received or "")
     subj = (subject or "(no subject)").strip()
-    return f"{when} — {subj}" if when else subj
+    return f"{when} · {subj}" if when else subj
 
 
 async def collect_thread_emls(
@@ -175,7 +175,7 @@ async def collect_thread_emls(
             if mid or hasattr(msg_like, "provider_message_id"):
                 notes.problem(
                     f"Could not download the message '{(subject or '(no subject)')[:80]}'"
-                    f"{' (' + last_err + ')' if last_err else ''} — it was NOT read this run.")
+                    f"{' (' + last_err + ')' if last_err else ''}, it was NOT read this run.")
             return
         if mid:
             seen_ids.add(mid)
@@ -194,7 +194,7 @@ async def collect_thread_emls(
             # the code below silently fell back to 1-2 messages. Say so.
             notes.problem(
                 f"Could not fetch this conversation's full message history from "
-                f"the mail server ({str(e)[:160]}) — only the currently open "
+                f"the mail server ({str(e)[:160]}), only the currently open "
                 f"message could be read, not the whole thread. Re-run once the "
                 f"mailbox is reachable to pick up earlier attachments.")
 
@@ -223,7 +223,7 @@ async def collect_thread_emls(
                 window_start = max(0, new_index - context_messages)
                 if window_start > 0:
                     notes.append(
-                        f"This thread was already extracted through an earlier message — "
+                        f"This thread was already extracted through an earlier message · "
                         f"{window_start} older message(s) were NOT re-read; anything already "
                         f"extracted from them is carried forward from the last run.")
                     thread_msgs = thread_msgs[window_start:]
@@ -241,7 +241,7 @@ async def collect_thread_emls(
         if max_thread_messages > 0 and len(thread_msgs) > max_thread_messages:
             dropped = len(thread_msgs) - max_thread_messages
             notes.append(
-                f"This conversation has {len(thread_msgs)} messages — only the "
+                f"This conversation has {len(thread_msgs)} messages, only the "
                 f"newest {max_thread_messages} were sent for extraction; "
                 f"{dropped} older message(s) (and any sheets attached only to "
                 f"them) were NOT read.")

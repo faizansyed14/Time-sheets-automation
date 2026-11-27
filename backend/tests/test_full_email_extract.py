@@ -189,7 +189,7 @@ async def test_pasted_grid_body_reaches_the_model_and_stages():
                            period_type="partial", days_covered=2,
                            public_holiday=["2026-06-15"],
                            manager_signature=False,
-                           approval_evidence="Approved. — Sylvia Noronha")
+                           approval_evidence="Approved. · Sylvia Noronha")
         assert sheet["public_holiday"] == ["2026-06-15"]
 
         groups = await fx._group_sheets(db, mail, [sheet])
@@ -223,7 +223,7 @@ async def test_accept_files_the_reviewers_approval_verdict():
         rec, _t = await ingest_manual_entry(
             db, employee_pk=emp.id, month=6, year=2026,
             buckets={"public_holiday": ["2026-06-15"]},
-            approval={"approved": True, "detail": "Approved — Sylvia, 2 Jul 2026"})
+            approval={"approved": True, "detail": "Approved · Sylvia, 2 Jul 2026"})
         assert rec.approval_status == "approved"
         assert rec.approval_detected is True
         assert "Sylvia" in (rec.approval_detail or "")

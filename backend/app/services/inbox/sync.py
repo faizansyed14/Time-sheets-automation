@@ -130,7 +130,7 @@ SYNC_ERROR_KEY = "inbox:sync:last_error"
 _LOCK_TTL = 120          # refreshed after every page, so a long backfill keeps it
 
 
-async def sync_inbox(db: AsyncSession) -> list[EmailMessage] | None:
+async def sync_inbox(db: AsyncSession, *, allow_backfill: bool = True) -> list[EmailMessage] | None:
     """Throttled, incremental provider sync. Never blocks the caller on a full
     mailbox download:
 
@@ -181,6 +181,17 @@ async def sync_inbox(db: AsyncSession) -> list[EmailMessage] | None:
         started_at = datetime.now(timezone.utc).timestamp()
         before = None
         backfill = since is None
+        if backfill and not allow_backfill:
+            # A page request must never download the whole mailbox inline (minutes, with
+            # the page stuck loading). Hand it to the background worker and let the page
+            # show what is already stored.
+            if not settings.celery_task_always_eager:
+                try:
+                    from app.services.tasks import sync_inbox_task
+                    sync_inbox_task.delay()
+                except Exception:
+                    log.exception("could not hand the mailbox download to the worker")
+            return None
         if backfill:
             marker = await cache.get(SYNC_BACKFILL_KEY)
             if isinstance(marker, dict) and marker.get("before"):
@@ -225,3 +236,19 @@ async def sync_inbox(db: AsyncSession) -> list[EmailMessage] | None:
             await cache.release_lock(SYNC_LOCK_KEY, token)
         except Exception:
             pass
+
+
+async def sync_health() -> dict:
+    """When the mailbox was last synced in full, and the last sync error (if the most
+    recent sync failed). Shown next to Auto Extract so a broken sync is never silent."""
+    try:
+        last = await cache.get(SYNC_LAST_KEY)
+        err = await cache.get(SYNC_ERROR_KEY)
+        backfill = await cache.get(SYNC_BACKFILL_KEY)
+    except Exception:
+        return {"last_sync_at": None, "sync_error": "cache unavailable", "backfill_in_progress": False}
+    return {
+        "last_sync_at": (datetime.fromtimestamp(float(last), tz=timezone.utc).isoformat() if last else None),
+        "sync_error": err or None,
+        "backfill_in_progress": bool(backfill),
+    }

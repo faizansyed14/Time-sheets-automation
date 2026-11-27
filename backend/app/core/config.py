@@ -206,6 +206,9 @@ class Settings(BaseSettings):
     # marks as stale and looks at those threads again. Bump it whenever the
     # extraction rules change in a way that could find something new.
     extract_rules_revision_at: str = "2026-11-03T00:00:00+00:00"
+    # Extraction debug runs (Admin -> Extraction debug) are deleted after this many days,
+    # pictures included, so they never pile up. 0 = keep until cleared by hand.
+    debug_run_retention_days: int = 7
     # Forward-of-a-forward nesting depth for .eml/.msg attached as a FILE. A
     # loop guard only; real chains are far shallower. A part beyond it is
     # recorded as unreadable, never silently skipped.
@@ -342,14 +345,21 @@ class Settings(BaseSettings):
     # Rate limiting (sliding-window, per identifier+route)
     login_rate_max: int = 10                      # attempts
     login_rate_window_seconds: int = 300          # per 5 min
+    # WRONG passwords for one username from ANY address. Correct sign-ins never count, so
+    # a real user is not locked out by normal use; guessing from many IPs is stopped.
+    login_fail_max: int = 20
+    login_fail_window_seconds: int = 900
     otp_verify_rate_max: int = 20
     otp_verify_rate_window_seconds: int = 300
     # CAPTCHA issuance throttle: at most N fresh/refreshed captchas per IP per
     # window; the (N+1)th is blocked until the window slides (≈ a 300s lockout).
-    captcha_rate_max: int = 10
+    # Per IP. A whole office shares one public IP, so these must cover many people
+    # signing in at once; they only stop scripted floods (a CAPTCHA answer is useless
+    # without a valid password first).
+    captcha_rate_max: int = 60
     captcha_rate_window_seconds: int = 300
     # CAPTCHA answer-verification throttle (brute-force guard on the answer).
-    captcha_verify_rate_max: int = 20
+    captcha_verify_rate_max: int = 60
     captcha_verify_rate_window_seconds: int = 300
 
     # CAPTCHA

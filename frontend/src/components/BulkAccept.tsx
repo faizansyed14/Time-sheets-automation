@@ -73,7 +73,7 @@ export default function BulkAccept({ period, onDone }: { period: Period; onDone:
       toast(
         failures.length ? "warning" : "success",
         `${total} ${project} record${total === 1 ? "" : "s"} accepted`,
-        failures.length ? `${failures.length} failed — ${failures[0]}` : undefined,
+        failures.length ? `${failures.length} failed · ${failures[0]}` : undefined,
       );
     } catch (e: any) {
       toast("error", `Stopped after ${total} accepted`, e?.response?.data?.detail ?? String(e));
@@ -119,14 +119,14 @@ export default function BulkAccept({ period, onDone }: { period: Period; onDone:
             <p className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500">
               Same as pressing Accept on each one. Leave days and reader flags do not stop an item (they are written in its note). Only an
               unmatched employee or a sheet with nothing read stays in the queue. Approval is recorded as <b>approved</b> only when the sheet carried evidence, otherwise{" "}
-              <b>not approved</b> — you can sign it off later on the record.
+              <b>not approved</b>, you can sign it off later on the record.
             </p>
             {plan.held.length > 0 && (
               <details className="rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-xs">
                 <summary className="cursor-pointer font-semibold text-amber-800">Why {plan.held_count} are held</summary>
                 <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto">
                   {plan.held.map((h) => (
-                    <li key={h.id}><b>{h.employee_name ?? "Unknown"}</b> — {h.reasons.join("; ")}</li>
+                    <li key={h.id}><b>{h.employee_name ?? "Unknown"}</b> · {h.reasons.join("; ")}</li>
                   ))}
                 </ul>
               </details>

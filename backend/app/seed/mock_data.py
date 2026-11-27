@@ -108,7 +108,7 @@ MESSAGES = [
                 "issues": ["Duplicate date 2026-01-13 found in Annual leave."],
             },
         ],
-        "approval": {"slot": "ap", "detected": False, "detail": "Screenshot unclear — approval status not legible"},
+        "approval": {"slot": "ap", "detected": False, "detail": "Screenshot unclear, approval status not legible"},
     },
     {
         "message_id": "MSG-0003",

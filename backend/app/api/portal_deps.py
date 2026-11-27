@@ -37,7 +37,7 @@ async def get_current_portal_user(
         raise HTTPException(401, "Invalid or expired token")
     jti = payload.get("jti")
     if jti and await cache.exists(is_token_revoked_key(jti)):
-        raise HTTPException(401, "Session ended — please sign in again.")
+        raise HTTPException(401, "Session ended, please sign in again.")
     user = (await db.execute(select(PortalUser).where(PortalUser.id == payload.get("sub")))).scalar_one_or_none()
     if not user or not user.is_active:
         raise HTTPException(401, "Account not found or inactive")

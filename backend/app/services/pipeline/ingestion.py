@@ -111,42 +111,75 @@ def isolate_employee_attachments(t: PipelineFile, raw_bytes: bytes) -> list[tupl
     meta = (t.extraction_meta or {}).get("full_email_extract") or {}
     if int(meta.get("group_count") or 1) <= 1:
         return None
-    wanted = [s.get("filename") for s in (meta.get("sheets") or []) if s.get("filename")]
-    if not wanted:
+    own_sheets = [s for s in (meta.get("sheets") or []) if s.get("filename")]
+    if not own_sheets:
         return None
     # Copies of the same timesheet that were stored with the item but not read
     # (e.g. the unsigned copy of a signed sheet) belong to this employee too.
-    for alt in meta.get("alternates") or []:
-        wanted += [n for n in (alt.get("stored_only") or []) if n]
+    alt_names = [n for alt in (meta.get("alternates") or []) for n in (alt.get("stored_only") or []) if n]
+    # Approval evidence that is a FILE (a manager's screenshot or signed form) travels
+    # with the record too - unless it clearly names a different employee. Optional:
+    # a missing approval file never blocks filing this employee's own sheets.
+    optional = [a.get("name") for a in (meta.get("approval_files") or [])
+                if a.get("name") and _approval_is_for(a.get("employee_name") or "", t.employee_name or "")]
 
-    from app.services.extraction.file_processor import eml_all_attachments
+    # ORIGINAL filenames (eml_all_attachments renames repeats to "x_2.pdf", which hid
+    # the fact that two different files were both called "Timesheet.pdf").
+    from app.services.extraction.file_processor import _eml_collect_attachments
     try:
-        found = eml_all_attachments(raw_bytes)
+        found = _eml_collect_attachments(raw_bytes)
     except Exception:
         return None
-    by_name: dict[str, tuple[bytes, str]] = {}
+    from app.services.extract_email.thread_extract import _content_digest
+    by_name: dict[str, bytes] = {}
+    by_digest: dict[str, tuple[str, bytes]] = {}
     ambiguous: set[str] = set()
-    for name, payload, ftype in found:
+    for name, payload, _ftype in found:
         if name in by_name:
-            ambiguous.add(name)      # two different files share a name (e.g. a signed + an unsigned copy)
-        by_name.setdefault(name, (payload, ftype))
-    if any(fn in ambiguous for fn in wanted):
-        return None                  # can't tell which one is this item's: file the whole email instead
+            ambiguous.add(name)      # two different files share a name ("Timesheet.pdf" x 20)
+        by_name.setdefault(name, payload)
+        by_digest.setdefault(_content_digest(payload), (name, payload))
 
     import mimetypes as _mt
     matched: list[tuple[str, str, bytes]] = []
-    seen: set[str] = set()
-    for fn in wanted:
-        if fn in seen:
-            continue
-        hit = by_name.get(fn)
-        if hit is None:
-            return None  # any miss -> don't guess, file the whole thing instead
-        payload, _ftype = hit
-        ct = _mt.guess_type(fn)[0] or "application/octet-stream"
-        matched.append((fn, ct, payload))
-        seen.add(fn)
+    taken: set[str] = set()          # content digests already filed (never the same file twice)
+
+    def _take(name: str, payload: bytes) -> None:
+        d = _content_digest(payload)
+        if d not in taken:
+            taken.add(d)
+            matched.append((name, _mt.guess_type(name)[0] or "application/octet-stream", payload))
+
+    # Each of this employee's sheets, one by one: by its content fingerprint first (exact
+    # even when names repeat), else by a name that is unique in the email. Anything that
+    # cannot be pinned down safely -> None: the caller files the WHOLE email instead, so
+    # nothing is ever dropped.
+    for sh in own_sheets:
+        fn, dg = sh["filename"], sh.get("digest") or ""
+        if dg and dg in by_digest:
+            _take(*by_digest[dg])
+        elif fn in ambiguous or fn not in by_name:
+            return None
+        else:
+            _take(fn, by_name[fn])
+    for fn in alt_names:
+        if fn in ambiguous or fn not in by_name:
+            return None
+        _take(fn, by_name[fn])
+    for fn in optional:
+        if fn in by_name and fn not in ambiguous:
+            _take(fn, by_name[fn])
     return matched or None
+
+
+def _approval_is_for(approval_name: str, employee_name: str) -> bool:
+    """An approval that names nobody covers everyone in the email; one that names
+    someone is filed only with a record whose employee shares a name word with it."""
+    a = {w for w in approval_name.lower().replace(",", " ").split() if len(w) > 2}
+    if not a:
+        return True
+    e = {w for w in employee_name.lower().replace(",", " ").split() if len(w) > 2}
+    return bool(a & e)
 
 
 def relocate_legacy_pipeline_raw() -> None:
@@ -259,8 +292,8 @@ async def ingest_manual_entry(db: AsyncSession, **kwargs) -> tuple[TimesheetReco
 
     key = f"record:lock:{kwargs.get('employee_pk')}:{kwargs.get('year')}-{kwargs.get('month')}"
     async with keyed_lock(
-        key, waiting_message="Another Accept for this employee and month is in progress — waiting…",
-        busy_message="Another Accept for this employee and month is still running — try again.",
+        key, waiting_message="Another Accept for this employee and month is in progress, waiting…",
+        busy_message="Another Accept for this employee and month is still running, try again.",
     ):
         return await _ingest_manual_entry(db, **kwargs)
 
@@ -304,7 +337,7 @@ async def _ingest_manual_entry(
     db.add(tracker)
     await db.flush()
     _event(tracker, PipelineStage.RECEIVED, "ok",
-           f"Manual entry for {employee_name} — {calendar.month_name[month]} {year} "
+           f"Manual entry for {employee_name} · {calendar.month_name[month]} {year} "
            f"({len(attachments)} attachment(s)).")
     tracker.employee_name = employee_name
     tracker.employee_id = matched.employee_id
@@ -394,7 +427,7 @@ async def _ingest_manual_entry(
                                    "Marked NOT approved by the reviewer in Compare & Fix."))
     elif not existing:
         rec.approval_detected = False
-        rec.approval_detail = "Manually entered — pending manager sign-off."
+        rec.approval_detail = "Manually entered, pending manager sign-off."
         rec.approval_status = ApprovalStatus.PENDING
     rec.source_email_id = tracker.source_id
     if folder_rel:
@@ -416,7 +449,7 @@ async def _ingest_manual_entry(
         tracker.status = PipelineStatus.SUCCESS
     _event(tracker, PipelineStage.RECORDED,
            "ok" if tracker.status == PipelineStatus.SUCCESS else "warn",
-           f"Record {'updated' if existing else 'created'} for {employee_name} — "
+           f"Record {'updated' if existing else 'created'} for {employee_name} · "
            f"{calendar.month_name[month]} {year}.")
     await db.commit()
     await db.refresh(rec)

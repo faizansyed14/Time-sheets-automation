@@ -281,6 +281,49 @@ async def record_for(
 
 # ---- reading ----
 
+class VaultExtractIn(BaseModel):
+    rel_path: str
+
+
+@router.post("/extract")
+async def extract_vault_file(body: VaultExtractIn, db: AsyncSession = Depends(get_db),
+                             _user: User = Depends(require_full_access)):
+    """Read a file that is in the vault but was never extracted (e.g. uploaded straight
+    into a month folder) with the same reader as the Upload page. The result goes to
+    Review like any other upload; on Accept the record is created and the file is NOT
+    copied into the vault again (it is already there)."""
+    try:
+        data, name, ctype = sp.get_storage_provider().read_file(body.rel_path)
+    except FileNotFoundError:
+        raise HTTPException(404, "File not found")
+    from app.core import datacache
+    from app.services.agents.full_email_extract import extract_upload
+    res = await extract_upload(db, filename=name, content_type=ctype, data=data,
+                               source_id=f"vault:{body.rel_path}")
+    await datacache.bust_pipeline()
+    await datacache.bust_employees()
+    staged = res.get("staged") or []
+    from app.services.pipeline import vault_pending
+    if staged:
+        await vault_pending.forget(db, body.rel_path)     # the review item takes its place
+        await datacache.bust_pipeline()
+        await datacache.bust_employees()
+    message = res.get("message", "")
+    if not staged and "roster" in message.lower():
+        message = ("This file is a roster listing many employees, so it cannot be read as one "
+                   "person's timesheet. Upload it on the Upload page, Bulk Upload tab, where it "
+                   "is read row by row for every employee on it.")
+    ids = [getattr(t, "id", None) for t in staged if getattr(t, "id", None)]
+    # The full items, so the File Vault can open each one for review right there.
+    items = []
+    if ids:
+        from app.api.routes.pipeline import _out as _pipeline_out
+        from app.models.pipeline_file import PipelineFile
+        rows = (await db.execute(select(PipelineFile).where(PipelineFile.id.in_(ids)))).scalars().all()
+        items = [_pipeline_out(t).model_dump(mode="json") for t in rows]
+    return {"staged": len(staged), "message": message, "pipeline_ids": ids, "items": items}
+
+
 @router.get("/content")
 def file_content(rel_path: str = Query(...)):
     try:
@@ -479,34 +522,42 @@ def create_month(manager: str, employee: str, body: CreateMonth):
 
 
 @router.patch("/folder")
-def rename_folder(body: RenameFolder):
+async def rename_folder(body: RenameFolder, db: AsyncSession = Depends(get_db)):
     try:
         new_rel = sp.get_storage_provider().rename_folder(body.rel_path, body.new_name)
     except FileNotFoundError:
         raise HTTPException(404, "Folder not found")
+    from app.services.pipeline import vault_pending
+    await vault_pending.relocate(db, body.rel_path, new_rel)
     return {"rel_path": new_rel}
 
 
 @router.delete("/folder")
-def delete_folder(rel_path: str = Query(...), user: User = Depends(require_full_access)):
+async def delete_folder(rel_path: str = Query(...), user: User = Depends(require_full_access),
+                        db: AsyncSession = Depends(get_db)):
     """Admin/user only — require_full_access overrides this router's default
     require_write (which would otherwise let vault_matcher delete too) down
     to the same roles as the rest of the app's destructive actions.
     vault_matcher keeps every other File Vault action (browse/upload/move/
     rename) via the router-level dependency; this is the one exception."""
     sp.get_storage_provider().delete_folder(rel_path)
+    from app.services.pipeline import vault_pending
+    await vault_pending.forget(db, rel_path, prefix=True)
     return {"deleted": rel_path}
 
 
 @router.delete("/file")
-def delete_file(rel_path: str = Query(...), user: User = Depends(require_full_access)):
-    """Admin/user only — see delete_folder's docstring for why."""
+async def delete_file(rel_path: str = Query(...), user: User = Depends(require_full_access),
+                      db: AsyncSession = Depends(get_db)):
+    """Admin/user only - see delete_folder's docstring for why."""
     sp.get_storage_provider().delete_file(rel_path)
+    from app.services.pipeline import vault_pending
+    await vault_pending.forget(db, rel_path)
     return {"deleted": rel_path}
 
 
 @router.post("/move-path")
-def move_path(body: MovePath):
+async def move_path(body: MovePath, db: AsyncSession = Depends(get_db)):
     """Move (or, when body.as_copy, copy) a sheet — or a whole employee/month
     folder — from one vault location to another. dst_rel_path is the FULL
     destination path (including the filename, for a file); the frontend
@@ -527,6 +578,8 @@ def move_path(body: MovePath):
         raise HTTPException(409, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
+    from app.services.pipeline import vault_pending
+    await vault_pending.relocate(db, body.src_rel_path, new_rel, copy=body.as_copy)
     return {"rel_path": new_rel}
 
 
@@ -535,6 +588,7 @@ def move_path(body: MovePath):
 @router.post("/managers/{manager}/employees/{employee}/months/{month}/files", status_code=201)
 async def upload_files_to_month(
     manager: str, employee: str, month: str, files: list[UploadFile] = File(...),
+    db: AsyncSession = Depends(get_db),
 ):
     """Add one or more files directly into a specific employee/month vault folder.
 
@@ -555,4 +609,12 @@ async def upload_files_to_month(
                       "content_type": uf.content_type or "application/octet-stream"})
     if not saved:
         raise HTTPException(400, "All uploaded files were empty.")
+    # Each file is recorded as "in vault, not extracted" until it is extracted, so the
+    # person never shows as missing and the file is never forgotten (vault_pending.py).
+    from app.core import datacache
+    from app.services.pipeline import vault_pending
+    for f in saved:
+        await vault_pending.register(db, f["rel_path"])
+    await datacache.bust_pipeline()
+    await datacache.bust_employees()
     return {"saved": saved}

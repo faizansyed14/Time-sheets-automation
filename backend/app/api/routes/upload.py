@@ -27,7 +27,7 @@ from app.services.pipeline.ingestion import ingest_manual_entry
 # before any file in the batch is sent for extraction.
 _ROSTER_REJECT_MSG = (
     '"{name}" looks like a multi-employee roster (many people on one sheet) '
-    "— upload it on the Bulk Roster Upload page instead, not here."
+    "· upload it on the Bulk Roster Upload page instead, not here."
 )
 
 
@@ -112,7 +112,7 @@ async def upload_timesheets(
     await datacache.bust_pipeline()
     if not staged:
         raise HTTPException(
-            422, "Nothing to review — no timesheet or certificate was found in "
+            422, "Nothing to review, no timesheet or certificate was found in "
                  "the uploaded file(s).")
     return [_pipeline_out(t) for t in staged]
 

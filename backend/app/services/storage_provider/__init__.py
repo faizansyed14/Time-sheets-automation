@@ -121,10 +121,10 @@ def _dedupe_filename(manager: str, employee: str, month_lbl: str, filename: str)
     stem, dot, ext = filename.rpartition(".")
     stem, ext = (stem, f".{ext}") if dot else (filename, "")
     tag = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    candidate = f"{stem} — {tag}{ext}"
+    candidate = f"{stem} · {tag}{ext}"
     n = 2
     while candidate in existing:
-        candidate = f"{stem} — {tag} ({n}){ext}"
+        candidate = f"{stem} · {tag} ({n}){ext}"
         n += 1
     return candidate
 

@@ -198,7 +198,7 @@ def mock_vision_calls(monkeypatch):
                                   *, label="", retries=3, force_json=True, enable_thinking=True,
                                   max_tokens=None):
             if not queue:
-                raise AssertionError(f"mock_vision_calls exhausted — unexpected extra call ({label})")
+                raise AssertionError(f"mock_vision_calls exhausted, unexpected extra call ({label})")
             import re as _re
 
             def _manifest_keys() -> list[str]:

@@ -25,6 +25,9 @@ def sheet_summaries(sheets: list[dict]) -> list[dict]:
     retry (ingestion.py) and the original stage (below) can never drift apart."""
     return [{
         "filename": s["name"], "kind": s["kind"],
+        # Content fingerprint of the file the sheet was read from: lets Accept file exactly
+        # this file even when several people's attachments share a name ("Timesheet.pdf").
+        "digest": s.get("digest") or "",
         "employee_name": s["employee_name"], "employee_id": s["employee_id"],
         "month": s["month"], "year": s["year"],
         "manager_signature": s.get("manager_signature", False),
@@ -51,11 +54,11 @@ def summarize_group(g: dict) -> str:
     always available (no LLM needed)."""
     month, year = g.get("month"), g.get("year")
     if not (month and year):
-        return "Could not read a month/year — pick the period in Compare & Fix."
+        return "Could not read a month/year, pick the period in Compare & Fix."
     buckets = g.get("buckets") or {}
     parts = [f"{len(buckets.get(b) or [])} {label}" for b, label in _LEAVE_LABEL.items() if buckets.get(b)]
     leave_total = sum(len(v or []) for v in buckets.values())
-    head = f"{calendar.month_name[month]} {year} — " + (", ".join(parts) if parts else "no leave recorded")
+    head = f"{calendar.month_name[month]} {year} · " + (", ".join(parts) if parts else "no leave recorded")
     n_sheets = len(g.get("sheets") or [])
     head += f" ({leave_total} leave day{'s' if leave_total != 1 else ''}"
     head += f", {n_sheets} files)." if n_sheets > 1 else ")."
@@ -64,14 +67,14 @@ def summarize_group(g: dict) -> str:
         head += f" {working} worked, {weekend} weekend."
     n_flags = len(g.get("issues") or []) + len(g.get("uncertain_days") or []) + len(g.get("unaccounted_days") or [])
     if not n_flags:
-        return head + " No issues found — clean and ready for approval."
+        return head + " No issues found, clean and ready for approval."
     return head + f" {n_flags} issue{'s' if n_flags != 1 else ''} need review."
 
 
 def group_flags(g: dict) -> list[str]:
     flags = list(dict.fromkeys(g.get("overlap_flags", []) + g.get("fold_notes", []) + g.get("issues", [])))
     if not (g.get("month") and g.get("year")):
-        flags.append("No usable month/year on these sheets — pick the period.")
+        flags.append("No usable month/year on these sheets, pick the period.")
     for s in g.get("sheets") or []:
         miss = [d for d in (s.get("missing_days") or [])
                 if d in (g.get("missing_days") or [])]    # not covered by another sheet
@@ -237,7 +240,7 @@ async def stage_groups(
         decision = auto_accept.evaluate(g, extra_flags=run_flags, approval=g_approval)
 
         display = raw_name if len(groups) == 1 else \
-            f"{g['name'] or 'Unassigned sheets'} — {raw_name}"
+            f"{g['name'] or 'Unassigned sheets'} · {raw_name}"
         tag = g["tag"]
         used.add(tag)
         t = by_tag.get(tag)
@@ -354,20 +357,20 @@ async def stage_groups(
 
         if decision.accepted:
             emit("autoaccept", "ok",
-                 f"{g['name'] or 'Record'} — AI recommends accept.",
+                 f"{g['name'] or 'Record'} · AI recommends accept.",
                  employee=g["name"], reasons=decision.reasons)
             t.failure_detail = (
-                "AI recommends accepting — review the leaves and press Accept to file."
+                "AI recommends accepting, review the leaves and press Accept to file."
                 + (f" ({g['name']})" if g["name"] and len(groups) > 1 else "")
             )
         else:
             emit("autoaccept", "warn",
-                 f"{g['name'] or 'Record'} — held for review: "
+                 f"{g['name'] or 'Record'}, held for review: "
                  + ("; ".join(decision.blockers[:2]) if decision.blockers else "needs a human check"),
                  employee=g["name"], blockers=decision.blockers)
             hold = (" AI held for review: " + "; ".join(decision.blockers[:3])
                     if decision.blockers else "")
-            t.failure_detail = ("Extracted from the full email — review the leaves and accept to file."
+            t.failure_detail = ("Extracted from the full email, review the leaves and accept to file."
                                 + (f" ({g['name']})" if g["name"] and len(groups) > 1 else "")
                                 + hold)
 

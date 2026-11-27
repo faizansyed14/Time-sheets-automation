@@ -76,3 +76,11 @@ async def received_employee_dates(db: AsyncSession, month: int, year: int) -> di
         )
     ).all()
     return {row[0]: row[1] for row in rows}
+
+
+async def vault_employee_pks(db: AsyncSession, month: int, year: int) -> set[str]:
+    """Employees whose only item this month is a file stored in the vault without being
+    extracted (services/pipeline/vault_pending.py). Read from the database - the vault
+    itself is never listed on a page load."""
+    from app.services.pipeline.vault_pending import pending_employee_pks
+    return await pending_employee_pks(db, month, year)

@@ -213,7 +213,7 @@ export interface TimesheetRecord {
   source_file_count: number;
 }
 
-export type ExportStatus = "Received & Stored" | "Received & Not Stored" | "Not Received";
+export type ExportStatus = "Received & Stored" | "Received & Not Stored" | "In Vault, Not Extracted" | "Not Received";
 
 export interface TimesheetExportRow extends Omit<TimesheetRecord, "validation_status" | "approval_status"> {
   validation_status: TimesheetRecord["validation_status"] | "";
@@ -253,6 +253,8 @@ export interface DashboardRow {
   focus_validation_status: "verified" | "manual_review" | null;
   focus_approval_status: "pending" | "approved" | "not_approved" | null;
   awaiting_review_this_month: boolean;
+  /** Files are in the vault for this month but nothing was extracted from them. */
+  in_vault_this_month?: boolean;
 }
 
 export interface DashboardSummary {
@@ -262,6 +264,10 @@ export interface DashboardSummary {
   submitted_this_month: number;
   missing_this_month: number;
   awaiting_review_this_month: number;
+  /** Sheets received for this month that match no employee (count for nobody until matched). */
+  unmatched_this_month?: number;
+  /** Employees with files in the vault for this month but no extracted record. */
+  in_vault_this_month?: number;
   submitted_pct: number;
   missing_pct: number;
   awaiting_review_pct: number;
@@ -293,7 +299,7 @@ export interface PipelineFile {
   filename: string;
   content_type: string | null;
   size_bytes: number | null;
-  source_kind: "upload" | "email" | "manual" | "portal";
+  source_kind: "upload" | "email" | "manual" | "portal" | "vault" | "bulk";
   source_id: string | null;
   attachment_id: string | null;
   status: PipelineStatus;
@@ -328,6 +334,10 @@ export interface PipelineStats {
   needs_review: number;
   failed: number;
   resolved: number;
+  /** Open items matched to no employee. */
+  unmatched?: number;
+  /** Needs-review items the AI recommends accepting. */
+  ai_recommended?: number;
   by_failure_code: Record<string, number>;
   failure_labels: Record<string, string>;
 }
@@ -653,6 +663,7 @@ export type CoverageStatus =
   | "submitted"
   | "missing"
   | "awaiting_review"
+  | "in_vault"
   | "needs_review"
   | "approved"
   | "not_approved"
@@ -755,6 +766,7 @@ export const fetchPipeline = (params?: {
   thread_key?: string;
   /** true = AI recommends accept (staged, not filed yet). */
   auto_accepted?: boolean;
+  unmatched?: boolean;
   /** Filter by PipelineFile.month/.year — e.g. the Dashboard's "View in
    *  Pipeline" deep link for a specific awaiting-review period. */
   month?: number;
@@ -776,6 +788,7 @@ export const fetchPipeline = (params?: {
         source_id: params?.source_id || undefined,
         thread_key: params?.thread_key || undefined,
         auto_accepted: params?.auto_accepted ?? undefined,
+        unmatched: params?.unmatched || undefined,
         month: params?.month || undefined,
         year: params?.year || undefined,
         updated_after: params?.updated_after || undefined,
@@ -958,6 +971,11 @@ export const scopedZipUrl = (scope: ZipScope) =>
   withAuthParam(`/api/v1/files/download-zip${zipScopeQuery(scope)}`);
 
 // Delete a single file from the vault.
+/** Read a vault file that was never extracted; the result goes to Review like an upload. */
+export const extractVaultFile = (relPath: string) =>
+  api.post<{ staged: number; message: string; pipeline_ids: string[]; items: PipelineFile[] }>(
+    "/files/extract", { rel_path: relPath }, { timeout: 600_000 }).then((r) => r.data);
+
 export const deleteVaultFile = (relPath: string) =>
   api.delete("/files/file", { params: { rel_path: relPath } }).then((r) => r.data);
 
@@ -1116,6 +1134,11 @@ export function fetchEmlPreviewFromBytes(
 /** Authenticated URL for the stored raw pipeline file (for inline preview). */
 export const pipelineRawUrl = (id: string): string =>
   withAuthParam(`/api/v1/pipeline/${id}/raw-preview`);
+/** The exact attached sheet an item was read from, pulled out of the stored email. */
+export const pipelineSheetUrl = (id: string, name: string, digest?: string): string =>
+  withAuthParam(`/api/v1/pipeline/${id}/sheet?name=${encodeURIComponent(name)}${digest ? `&digest=${digest}` : ""}`);
+export const pipelineSheetRenderUrl = (id: string, name: string, digest?: string): string =>
+  withAuthParam(`/api/v1/pipeline/${id}/sheet-render?name=${encodeURIComponent(name)}${digest ? `&digest=${digest}` : ""}`);
 
 /**
  * Resolve a failed/needs-review pipeline file via manual leave entry.
@@ -1683,6 +1706,8 @@ export interface AutoExtractStatus {
    * true, a new background sync tick that finds mail re-triggers a run on
    * its own, with nobody needing to click Auto Extract again. */
   enabled: boolean;
+  /** Mailbox sync health: a failing sync is shown, never silent. */
+  sync?: { last_sync_at: string | null; sync_error: string | null; backfill_in_progress: boolean };
 }
 export interface AutoExtractCoverage {
   extracted_threads: number;
@@ -1911,3 +1936,37 @@ export interface PortalRosterMemberAdmin {
 export const fetchPortalRosterAdmin = (month: number, year: number) =>
   api.get<PortalRosterMemberAdmin[]>("/pipeline/portal-roster", { params: { month, year } }).then((r) => r.data);
 
+
+// ---------------------------------------------------------------------------
+// Admin Monitor (backend/app/api/routes/monitor.py)
+// ---------------------------------------------------------------------------
+export interface MonitorRow {
+  kind: string; role: string; model: string; calls: number; errors: number;
+  avg_ms: number | null; p50_ms: number | null; p95_ms: number | null;
+  tokens_in: number; tokens_out: number; cost_usd: number;
+}
+export interface MonitorEvent {
+  ts: number; kind: string; role: string; model: string; ms: number; status: string;
+  tokens_in: number; tokens_out: number; cost: number; detail: Record<string, unknown>; proc: string;
+}
+export interface MonitorProcess {
+  id: string; kind: string; host: string; pid: number; uptime_s: number; age_s: number; online: boolean;
+}
+export interface MonitorSnapshot {
+  window_minutes: number;
+  llm: { totals: MonitorRow; by_step: MonitorRow[]; series: { t: number; calls: number; errors: number; p95_ms: number | null; cost_usd: number }[] };
+  graph: { totals: MonitorRow; by_call: MonitorRow[] };
+  jobs: { totals: MonitorRow; by_task: MonitorRow[] };
+  api: { totals: MonitorRow; slowest: MonitorRow[]; errors: MonitorRow[] };
+  processes: MonitorProcess[];
+  recent_llm: MonitorEvent[];
+  failures: MonitorEvent[];
+  queues: { available: boolean; celery?: number; extract?: number; in_progress?: number };
+  redis: { available: boolean; used_mb?: number; max_mb?: number | null; policy?: string; evicted_keys?: number; uptime_h?: number };
+  disk: { total_gb?: number; free_gb?: number; used_pct?: number };
+  sync: { last_sync_at: string | null; sync_error: string | null; backfill_in_progress: boolean };
+  auto_extract: { state: string; enabled: boolean; total: number; processed: number; succeeded: number; failed: number; skipped: number; last_error: string | null };
+  alerts: { level: "critical" | "serious" | "warning"; text: string }[];
+}
+export const fetchMonitor = (minutes: number) =>
+  api.get<MonitorSnapshot>("/admin/monitor", { params: { minutes } }).then((r) => r.data);

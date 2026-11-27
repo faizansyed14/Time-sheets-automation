@@ -43,12 +43,14 @@ function StatCard({
   label,
   value,
   pct,
+  caption,
   icon,
   accent = "brand",
 }: {
   label: string;
   value: number | string;
   pct?: number;
+  caption?: string;
   icon: React.ReactNode;
   accent?: "brand" | "success" | "danger" | "slate";
 }) {
@@ -77,6 +79,7 @@ function StatCard({
           )}
         </p>
         <p className="mt-1 text-xs font-medium text-slate-500">{label}</p>
+        {caption && <p className="mt-0.5 text-[11px] font-semibold text-brand-700">{caption}</p>}
       </div>
     </div>
   );
@@ -97,6 +100,7 @@ function monthStatus(row: DashboardRow, month: number, year: number) {
   // Focus month only: awaiting_review_this_month is scoped to whatever
   // month/year this dashboard is currently showing (see employees.py).
   if (row.awaiting_review_this_month) return { label: "Awaiting review", tone: "warning" as const };
+  if (row.in_vault_this_month) return { label: "In vault, not extracted", tone: "brand" as const };
   if (row.in_matcher) return { label: "Missing", tone: "danger" as const };
   return { label: "Unmatched", tone: "warning" as const };
 }
@@ -167,7 +171,7 @@ function ReviewStatCard({
     <button
       type="button"
       onClick={onClick}
-      title="Sent a sheet for this month that isn't filed into a record yet — filters the table below to show exactly these employees."
+      title="Sent a sheet for this month that isn't filed into a record yet, filters the table below to show exactly these employees."
       className="group flex items-center gap-3 rounded-xl border border-amber-200/80 bg-amber-50/30 p-4 text-left shadow-card transition hover:border-amber-300 hover:bg-amber-50/50"
     >
       <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white/80 ring-1 ring-black/[0.04]">
@@ -285,6 +289,7 @@ export default function Dashboard() {
     { id: "submitted", label: "Submitted" },
     { id: "awaiting_review", label: "Awaiting review" },
     { id: "missing", label: "Missing" },
+    ...((cov?.in_vault_this_month ?? 0) > 0 ? [{ id: "in_vault" as QuickFilter, label: "In vault, not extracted" }] : []),
     { id: "needs_review", label: "Needs review" },
   ];
 
@@ -298,21 +303,23 @@ export default function Dashboard() {
       >
           <StatCard
             label="Employees in matcher"
-            value={cov?.total_employees ?? "—"}
+            value={cov?.total_employees ?? "-"}
             icon={<Users className="h-5 w-5" />}
             accent="brand"
           />
           <StatCard
             label={`Submitted · ${MONTHS[month]}`}
-            value={cov?.submitted_this_month ?? "—"}
+            value={cov?.submitted_this_month ?? "-"}
             pct={cov?.submitted_pct}
             icon={<CalendarCheck className="h-5 w-5" />}
             accent="success"
           />
           <StatCard
             label={focusFuture ? `Missing · ${MONTHS[month]} (not due)` : `Missing · ${MONTHS[month]}`}
-            value={focusFuture ? "—" : cov?.missing_this_month ?? "—"}
+            value={focusFuture ? "-" : cov?.missing_this_month ?? "-"}
             pct={focusFuture ? undefined : cov?.missing_pct}
+            caption={!focusFuture && (cov?.in_vault_this_month ?? 0) > 0
+              ? `+ ${cov?.in_vault_this_month} in vault, not extracted` : undefined}
             icon={<CalendarX className="h-5 w-5" />}
             accent="danger"
           />
@@ -502,7 +509,7 @@ export default function Dashboard() {
                         </div>
                       </td>
                       <td className="hidden truncate px-2 py-1.5 font-mono text-[10px] text-slate-500 sm:table-cell">
-                        {r.employee_id ?? "—"}
+                        {r.employee_id ?? "-"}
                       </td>
                       <td className="hidden px-2 py-1.5 md:table-cell">
                         {r.location ? (
@@ -510,14 +517,14 @@ export default function Dashboard() {
                             {r.location}
                           </Badge>
                         ) : (
-                          <span className="text-slate-300">—</span>
+                          <span className="text-slate-300">-</span>
                         )}
                       </td>
                       <td
                         className="hidden truncate px-2 py-1.5 text-[11px] text-slate-600 lg:table-cell"
                         title={r.account_manager ?? undefined}
                       >
-                        {r.account_manager ?? "—"}
+                        {r.account_manager ?? "-"}
                       </td>
                       <td className="px-2 py-1.5">
                         <div className="flex flex-wrap items-center gap-1">
@@ -553,7 +560,7 @@ export default function Dashboard() {
                             needsReview={needsReview}
                           />
                         ) : (
-                          <span className="text-slate-300">—</span>
+                          <span className="text-slate-300">-</span>
                         )}
                       </td>
                     </tr>

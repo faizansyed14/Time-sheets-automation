@@ -26,7 +26,7 @@ def render_alert_html(*, component: str, status: str, detail: str) -> str:
     headline = f"{label} is working again" if is_recovery else f"{label} needs attention"
     body_text = escape(detail)
     next_step = (
-        "No action needed — this is confirmation the fix worked."
+        "No action needed, this is confirmation the fix worked."
         if is_recovery else
         "Check AI Settings (LLM) or the Graph app registration in Azure (client secret expiry) "
         "as appropriate, then use \"Check now\" on the System Health card to confirm it's resolved."
@@ -42,7 +42,7 @@ def render_alert_html(*, component: str, status: str, detail: str) -> str:
                  style="width:560px;max-width:100%;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(15,23,42,0.08);">
             <tr>
               <td style="background:{accent};padding:18px 28px;">
-                <span style="color:#ffffff;font-size:14px;font-weight:700;letter-spacing:0.02em;">TIMESHEET PORTAL — SYSTEM HEALTH</span>
+                <span style="color:#ffffff;font-size:14px;font-weight:700;letter-spacing:0.02em;">TIMESHEET PORTAL · SYSTEM HEALTH</span>
               </td>
             </tr>
             <tr>
@@ -63,7 +63,7 @@ def render_alert_html(*, component: str, status: str, detail: str) -> str:
                 </p>
                 <hr style="border:none;border-top:1px solid {_BORDER};margin:24px 0 16px 0;" />
                 <p style="margin:0;color:{_SLATE};font-size:12px;line-height:1.6;">
-                  Automated system health check — please do not reply to this email.
+                  Automated system health check, please do not reply to this email.
                 </p>
               </td>
             </tr>

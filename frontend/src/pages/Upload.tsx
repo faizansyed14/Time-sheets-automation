@@ -24,6 +24,28 @@ import { FailureChip } from "../components/status";
 import { useToast } from "../components/toast";
 import { useUploadSession } from "../lib/uploadSession";
 
+const SUPPORTED_UPLOAD = /\.(pdf|docx?|xlsx?|csv|txt|png|jpe?g|eml|msg)$/i;
+const MAX_REQUEST_MB = 90;                      // under nginx's 100 MB request cap
+const MAX_REQUEST_BYTES = MAX_REQUEST_MB * 1024 * 1024;
+
+/** Split files into requests that each stay under the server's size cap. */
+function uploadBatches(files: File[]): File[][] {
+  const out: File[][] = [];
+  let cur: File[] = [];
+  let size = 0;
+  for (const f of files) {
+    if (cur.length && size + f.size > MAX_REQUEST_BYTES) {
+      out.push(cur);
+      cur = [];
+      size = 0;
+    }
+    cur.push(f);
+    size += f.size;
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
+
 export default function UploadPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
@@ -57,12 +79,21 @@ export default function UploadPage() {
   };
 
   const addFiles = useCallback((list: FileList | File[]) => {
-    const files = Array.from(list).filter((f) =>
-      /\.(pdf|docx|xlsx|png|jpe?g|eml)$/i.test(f.name)
-    );
+    // Same types the file picker offers and the reader handles - nothing dropped silently.
+    const all = Array.from(list);
+    const files = all.filter((f) => SUPPORTED_UPLOAD.test(f.name));
+    const skipped = all.filter((f) => !SUPPORTED_UPLOAD.test(f.name));
+    if (skipped.length) {
+      toast("warning", `${skipped.length} file(s) not added`,
+        `Not a timesheet file type: ${skipped.slice(0, 3).map((f) => f.name).join(", ")}${skipped.length > 3 ? "…" : ""}`);
+    }
+    const tooBig = files.filter((f) => f.size > MAX_REQUEST_BYTES);
+    if (tooBig.length) {
+      toast("error", "File too large", `${tooBig[0].name} is over ${MAX_REQUEST_MB} MB and cannot be uploaded.`);
+    }
     setQueue((q) => {
       const names = new Set(q.map((f) => f.name));
-      return [...q, ...files.filter((f) => !names.has(f.name))];
+      return [...q, ...files.filter((f) => !names.has(f.name) && f.size <= MAX_REQUEST_BYTES)];
     });
   }, []);
 
@@ -77,9 +108,16 @@ export default function UploadPage() {
     setBusy(true);
     const files = [...queue];
     try {
-      const res = await extractRun.start((onEvent) =>
-        uploadTimesheetsStream(files, onEvent),
-      ) as { staged?: PipelineFile[] };
+      // The server accepts up to 100 MB per request: send a big selection in batches
+      // instead of failing the whole upload.
+      const res = await extractRun.start(async (onEvent) => {
+        const staged: PipelineFile[] = [];
+        for (const batch of uploadBatches(files)) {
+          const r = (await uploadTimesheetsStream(batch, onEvent)) as { staged?: PipelineFile[] };
+          staged.push(...(r?.staged ?? []));
+        }
+        return { staged };
+      }) as { staged?: PipelineFile[] };
       setQueue([]);
       const staged = res?.staged ?? [];
       if (!staged.length) {
@@ -107,7 +145,7 @@ export default function UploadPage() {
     <div className="mx-auto max-w-4xl animate-fade-up">
       <PageHeader
         title="Upload timesheets"
-        subtitle="Same pipeline as Extract Email — every sheet is extracted, you review in Compare & Fix, then Accept files the record."
+        subtitle="Same pipeline as Extract Email, every sheet is extracted, you review in Compare & Fix, then Accept files the record."
       />
 
       <div className="mb-5 inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
@@ -163,7 +201,7 @@ export default function UploadPage() {
               Drop timesheets here, or <span className="text-brand-600">browse</span>
             </p>
             <p className="mt-1 text-xs text-slate-400">
-              PDF · DOCX · XLSX · PNG/JPG · EML — multiple files per month welcome (weekly / 15-day sheets)
+              PDF · DOCX · XLSX · PNG/JPG · EML, multiple files per month welcome (weekly / 15-day sheets)
             </p>
           </div>
           <input
@@ -237,7 +275,7 @@ export default function UploadPage() {
                     {r.employee_name && (
                       <span className="font-medium text-slate-600">
                         {r.employee_name}
-                        {r.month ? ` — ${MONTHS_LONG[r.month]} ${r.year}` : ""} ·{" "}
+                        {r.month ? ` · ${MONTHS_LONG[r.month]} ${r.year}` : ""} ·{" "}
                       </span>
                     )}
                     {r.failure_detail ?? r.llm_summary ?? ""}

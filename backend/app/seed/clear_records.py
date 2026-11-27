@@ -11,7 +11,7 @@ from app.seed._clear_util import delete_all, employee_count, report
 async def main() -> None:
     counts = await delete_all(TimesheetRecord, "timesheet_records")
     report(counts, f"  employees: {await employee_count()} row(s) kept (not cleared)")
-    print("Done — timesheet records cleared. Reload Review.")
+    print("Done, timesheet records cleared. Reload Review.")
 
 
 if __name__ == "__main__":

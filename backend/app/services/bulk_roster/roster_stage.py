@@ -63,7 +63,7 @@ def _row_approval(doc: RosterDoc, row: RosterRow) -> tuple[bool, str]:
             + " Applies to every row on this roster; confirm in Review if in doubt.")
     if confirm:
         return False, (f"This row's confirmation column reads \"{confirm}\", which does not "
-                       f"itself state manager approval — confirm in Review.")
+                       f"itself state manager approval, confirm in Review.")
     return False, "The roster carries no manager-approval evidence for this row."
 
 
@@ -117,7 +117,7 @@ async def build_groups(db: AsyncSession, doc: RosterDoc) -> tuple[list[dict], li
             employee_pk, matched_name, matched_id = None, row.name, row.employee_id
             unmatched.append(row.name)
             note = (f"From a shared roster of {doc.headcount} employees (row {row.sr_no}). "
-                    f"Not in the matcher — roster says {row.name}"
+                    f"Not in the matcher, roster says {row.name}"
                     + (f", {row.title}" if row.title else "")
                     + ". Pick the employee in Review.")
 
@@ -127,7 +127,7 @@ async def build_groups(db: AsyncSession, doc: RosterDoc) -> tuple[list[dict], li
         leave_total = sum(len(fields.get(b, [])) for b in BUCKETS)
 
         sheet = {
-            "name": f"{row.name} — row {row.sr_no}",
+            "name": f"{row.name}, row {row.sr_no}",
             "kind": "timesheet",
             "employee_name": row.name, "employee_id": row.employee_id,
             "month": month, "year": year,

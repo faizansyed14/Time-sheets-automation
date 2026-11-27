@@ -222,7 +222,7 @@ def _reject_if_irm_protected(data: bytes) -> None:
     if any("EncryptedPackage" in s or "DataSpaces" in s for s in streams):
         raise RuntimeError(
             "This file is protected by Microsoft Information Rights Management "
-            "(IRM/Azure RMS) — no script can read it, only Excel itself, "
+            "(IRM/Azure RMS), no script can read it, only Excel itself, "
             "authenticated as a permitted user, can. Open it in Excel, then "
             "File → Save As a plain copy (or export to CSV), and import that "
             "copy instead."
@@ -435,16 +435,16 @@ def _parse_long_format(grid: list[list], header_row: int, cols: dict[str, int]) 
 
         dp = rec["date_parts"]
         if dp is None:
-            rr.issues.append(f"a row for {rec['name']} had no readable AttendanceDate — skipped")
+            rr.issues.append(f"a row for {rec['name']} had no readable AttendanceDate, skipped")
             continue
         day, mth, yr = dp
         if month and (mth, yr) != (month, year):
             rr.issues.append(
                 f"a row dated {yr:04d}-{mth:02d}-{day:02d} doesn't belong to "
-                f"{_calendar.month_name[month]} {year} — skipped")
+                f"{_calendar.month_name[month]} {year}, skipped")
             continue
         if day in rr.day_codes:
-            rr.issues.append(f"day {day} appears more than once for {rec['name']} — kept the first")
+            rr.issues.append(f"day {day} appears more than once for {rec['name']}, kept the first")
             continue
 
         code, flag = translate_attendance_type(rec["attendance_type"])
@@ -550,13 +550,13 @@ def _parse_hhrc_format(grid: list[list], header_row: int, cols: dict[str, int]) 
 
         dp = rec["date_parts"]
         if dp is None:
-            rr.issues.append(f"a row for {rec['name']} had no readable date — skipped")
+            rr.issues.append(f"a row for {rec['name']} had no readable date, skipped")
             continue
         day, mth, yr = dp
         if month and (mth, yr) != (month, year):
             rr.issues.append(
                 f"a row dated {yr:04d}-{mth:02d}-{day:02d} doesn't belong to "
-                f"{_calendar.month_name[month]} {year} — skipped")
+                f"{_calendar.month_name[month]} {year}, skipped")
             continue
         day_entries[key].setdefault(day, []).append((rec["type"], rec["subtype"]))
 
@@ -727,7 +727,7 @@ def parse_roster_cells(filename: str, data: bytes) -> RosterDoc:
     hit = _find_day_header(grid)
     if not hit:
         raise ValueError(
-            "No 1–31 day columns were found — this doesn't look like a multi-employee "
+            "No 1–31 day columns were found, this doesn't look like a multi-employee "
             "roster grid.")
     day_row, day_cols = hit
     first_day_col = min(day_cols.values())
@@ -774,7 +774,7 @@ def parse_roster_cells(filename: str, data: bytes) -> RosterDoc:
             day_codes={d: _text(row[c]) for d, c in day_cols.items() if c < len(row)},
         )
         if rr.key in seen_keys:
-            doc.issues.append(f"row {rr.sr_no} ({person}) appears more than once — kept once")
+            doc.issues.append(f"row {rr.sr_no} ({person}) appears more than once, kept once")
             continue
         seen_keys.add(rr.key)
         doc.rows.append(rr)

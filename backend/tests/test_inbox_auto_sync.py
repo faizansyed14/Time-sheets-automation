@@ -129,54 +129,73 @@ async def test_sync_inbox_returns_synced_rows_or_none_when_skipped(monkeypatch):
         await cache.delete(sync_module.SYNC_LAST_KEY, sync_module.SYNC_FRESH_KEY, sync_module.SYNC_LOCK_KEY)
 
 
-async def test_sync_inbox_task_enqueues_new_threads_when_enabled_and_mail_arrived(monkeypatch):
-    """The background sync tick is deliberately the ONLY place Auto
-    Extract's watch mode reacts to new mail (see sync_inbox_task's
-    docstring) -- must hand the synced rows to enqueue_new_threads exactly
-    when this tick both found new mail AND the mode is on (enqueue_new_
-    threads itself checks `enabled`, but sync_inbox_task shouldn't even call
-    it on an empty/skipped tick), and must stay quiet otherwise. Note: since
-    Auto Extract's redesign, this NEVER does a full-mailbox rescan — it only
-    ever sees the specific rows this tick's sync fetched."""
+async def test_sync_inbox_task_enqueues_new_mail_only_when_enabled(monkeypatch):
+    """The background tick queues every message INSERTED since its last tick (whichever
+    sync stored it), only while Auto Extract is on, and each message only once."""
+    from app.models.email_message import EmailMessage
     from app.services.extract_email import auto_extract
+    from sqlalchemy import delete
 
     calls: list[list] = []
 
     async def _fake_enqueue(db, rows):
-        calls.append(rows)
+        calls.append([r.provider_message_id for r in rows])
         return {}
-
-    async def _found_mail(db):
-        return [object(), object(), object()]
 
     async def _quiet(db):
         return []
 
-    async def _tick_skipped(db):
-        return None
-
     monkeypatch.setattr(auto_extract, "enqueue_new_threads", _fake_enqueue)
-    await cache.delete(auto_extract._ENABLED_KEY)
+    monkeypatch.setattr(sync_module, "sync_inbox", _quiet)
+    await cache.delete(auto_extract._ENABLED_KEY, auto_extract._WATERMARK_KEY)
+    pmids = ["SYNC-T-1", "SYNC-T-2"]
+
+    async def _store(pmid):
+        async with SessionLocal() as db:
+            db.add(EmailMessage(provider_message_id=pmid, sender_name="S", sender_email="s@x.y",
+                                subject=pmid, body_text="", attachments=[],
+                                to_recipients=[], cc_recipients=[]))
+            await db.commit()
 
     try:
-        # Mode off, mail arrived -> must not enqueue.
-        monkeypatch.setattr(sync_module, "sync_inbox", _found_mail)
+        # Mode off, mail arrived -> nothing queued.
+        await _store(pmids[0])
         tasks_module.sync_inbox_task()
-        assert len(calls) == 0
+        assert calls == []
 
-        # Mode on, mail arrived -> enqueues exactly those rows.
+        # Mode on, new mail -> queued.
         await cache.set(auto_extract._ENABLED_KEY, True)
+        await _store(pmids[1])
         tasks_module.sync_inbox_task()
-        assert len(calls) == 1 and len(calls[0]) == 3
+        assert any(pmids[1] in c for c in calls)
+        queued = sum(c.count(pmids[1]) for c in calls)
 
-        # Mode on, quiet tick (no messages) -> does not enqueue again.
-        monkeypatch.setattr(sync_module, "sync_inbox", _quiet)
+        # Quiet tick -> the same message is not queued again.
         tasks_module.sync_inbox_task()
-        assert len(calls) == 1
-
-        # Mode on, tick skipped entirely (None) -> does not enqueue.
-        monkeypatch.setattr(sync_module, "sync_inbox", _tick_skipped)
-        tasks_module.sync_inbox_task()
-        assert len(calls) == 1
+        assert sum(c.count(pmids[1]) for c in calls) == queued == 1
     finally:
-        await cache.delete(auto_extract._ENABLED_KEY)
+        async with SessionLocal() as db:
+            await db.execute(delete(EmailMessage).where(EmailMessage.provider_message_id.in_(pmids)))
+            await db.commit()
+        await cache.delete(auto_extract._ENABLED_KEY, auto_extract._WATERMARK_KEY,
+                           *[f"auto_extract:seen:{p}" for p in pmids])
+
+
+async def test_a_page_request_never_downloads_the_whole_mailbox(monkeypatch):
+    """With no sync position (first run / Redis cleared) the full download is left to the
+    background worker; the Inbox request returns at once instead of waiting minutes."""
+    from app.core.cache import cache as _cache
+
+    called = []
+
+    class _Provider:
+        async def list_messages(self, query=None, since=None):
+            called.append(since)
+            return []
+
+    monkeypatch.setattr(sync_module, "get_email_provider", lambda: _Provider())
+    await _cache.delete(sync_module.SYNC_LAST_KEY, sync_module.SYNC_FRESH_KEY,
+                        sync_module.SYNC_BACKFILL_KEY, sync_module.SYNC_LOCK_KEY)
+    async with SessionLocal() as db:
+        assert await sync_module.sync_inbox(db, allow_backfill=False) is None
+    assert called == [], "no mailbox download inside a page request"

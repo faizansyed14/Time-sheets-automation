@@ -21,12 +21,20 @@ class ExportStatus:
     filed, or nothing sent at all this month."""
     RECEIVED_STORED = "Received & Stored"
     RECEIVED_NOT_STORED = "Received & Not Stored"
+    # A file is in the employee's vault folder for the month, but nothing was extracted
+    # from it (e.g. uploaded straight into the vault): not "missing", but not read either.
+    IN_VAULT_NOT_EXTRACTED = "In Vault, Not Extracted"
     NOT_RECEIVED = "Not Received"
 
 
-def status_for(has_record: bool, employee_pk: str | None, received_pks: set[str]) -> str:
+def status_for(has_record: bool, employee_pk: str | None, received_pks: set[str],
+               vault_pks: set[str] | None = None) -> str:
     if has_record:
         return ExportStatus.RECEIVED_STORED
+    # vault_pks = people whose ONLY item is an unextracted vault file (checked first:
+    # that item is also counted as "received")
+    if employee_pk and vault_pks and employee_pk in vault_pks:
+        return ExportStatus.IN_VAULT_NOT_EXTRACTED
     if employee_pk and employee_pk in received_pks:
         return ExportStatus.RECEIVED_NOT_STORED
     return ExportStatus.NOT_RECEIVED
@@ -37,10 +45,12 @@ def status_for(has_record: bool, employee_pk: str | None, received_pks: set[str]
 _ROW_FILL: dict[str, str] = {
     ExportStatus.NOT_RECEIVED: "FFC7CE",
     ExportStatus.RECEIVED_NOT_STORED: "FFEB9C",
+    ExportStatus.IN_VAULT_NOT_EXTRACTED: "DDEBF7",
 }
 _ROW_FONT: dict[str, str] = {
     ExportStatus.NOT_RECEIVED: "9C0006",
     ExportStatus.RECEIVED_NOT_STORED: "9C6500",
+    ExportStatus.IN_VAULT_NOT_EXTRACTED: "1F4E78",
 }
 
 # (record attribute for dates, count header, dates header)
@@ -242,6 +252,7 @@ def employees_grid_rows(
     year: int,
     received_pks: set[str] | None = None,
     received_dates: dict[str, datetime] | None = None,
+    vault_pks: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """One export row per matcher employee; empty leave cells when not filed."""
     received_pks = received_pks or set()
@@ -249,7 +260,7 @@ def employees_grid_rows(
     out: list[dict[str, Any]] = []
     for emp in employees:
         rec = records_by_pk.get(emp.id)
-        status = status_for(bool(rec), emp.id, received_pks)
+        status = status_for(bool(rec), emp.id, received_pks, vault_pks)
         received_at = received_dates.get(emp.id)
         if rec:
             out.append(_row_dict(rec, emp, month, year, status, received_at))

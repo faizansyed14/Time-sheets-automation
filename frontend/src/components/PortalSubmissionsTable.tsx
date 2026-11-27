@@ -276,7 +276,7 @@ export default function PortalSubmissionsTable({
                           )}
                         >
                           <ExternalLink className="h-3 w-3" />
-                          Review in Compare &amp; Fix — {pf.kind} · {pf.pipeline_status}
+                          Review in Compare &amp; Fix · {pf.kind} · {pf.pipeline_status}
                         </button>
                       )
                     )}

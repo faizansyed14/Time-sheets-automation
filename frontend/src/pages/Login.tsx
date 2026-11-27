@@ -218,7 +218,7 @@ export default function Login() {
         className="pointer-events-none absolute inset-0"
         style={{
           background:
-            "conic-gradient(from 180deg at 50% 35%, rgba(13,148,136,0.12), rgba(20,184,166,0.06), rgba(67,78,96,0.10), rgba(13,148,136,0.12))",
+            "conic-gradient(from 180deg at 50% 35%, rgba(13,148,136,0.12), rgba(20,184,166,0.06), rgba(51,65,85,0.08), rgba(13,148,136,0.12))",
           maskImage: "radial-gradient(60% 60% at 50% 40%, rgba(0,0,0,1) 0%, rgba(0,0,0,0) 75%)",
         }}
         aria-hidden
@@ -229,7 +229,7 @@ export default function Login() {
         {/* Left tagline — desktop only, flanks the centered card */}
         <div className="hidden w-64 shrink-0 animate-fade-up xl:block">
           <div className="h-0.5 w-10 bg-brand-500" />
-          <p className="mt-5 font-serif text-[1.7rem] italic leading-tight text-slate-800">
+          <p className="mt-5 font-display text-[1.7rem] font-semibold leading-tight tracking-tight text-slate-800">
             "AI-powered <span className="text-brand-600">extraction</span>"
           </p>
           <p className="mt-4 text-[15px] italic leading-relaxed text-slate-500">
@@ -442,7 +442,7 @@ export default function Login() {
         {/* Right tagline — desktop only, mirrors the left */}
         <div className="hidden w-64 shrink-0 animate-fade-up text-right xl:block">
           <div className="ml-auto h-0.5 w-10 bg-brand-500" />
-          <p className="mt-5 font-serif text-[1.7rem] italic leading-tight text-slate-800">
+          <p className="mt-5 font-display text-[1.7rem] font-semibold leading-tight tracking-tight text-slate-800">
             "Secure <span className="text-brand-600">vault filing</span>"
           </p>
           <p className="mt-4 text-[15px] italic leading-relaxed text-slate-500">

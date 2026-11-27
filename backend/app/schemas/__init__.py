@@ -231,6 +231,8 @@ class DashboardRow(BaseModel):
     # True when this employee emailed a sheet for the focus month (the
     # pipeline identified them) but it hasn't been accepted into a record yet.
     awaiting_review_this_month: bool = False
+    # files are in the vault for this month but nothing was extracted from them
+    in_vault_this_month: bool = False
 
 
 class DashboardSummary(BaseModel):
@@ -239,6 +241,10 @@ class DashboardSummary(BaseModel):
     total_employees: int             # employees in the matcher (global)
     submitted_this_month: int        # received AND filed into a record — global
     missing_this_month: int          # sent NOTHING at all for this month — global
+    # sheets received for this month that are matched to no employee (count for nobody)
+    unmatched_this_month: int = 0
+    # employees with files in their vault folder for this month but no extracted record
+    in_vault_this_month: int = 0
     awaiting_review_this_month: int  # sent something, not yet filed — global
     submitted_pct: float = 0.0
     missing_pct: float = 0.0
@@ -382,6 +388,11 @@ class PipelineStats(BaseModel):
     needs_review: int
     failed: int
     resolved: int
+    # Open (needs review / failed) items not matched to any employee: they count for
+    # nobody on the Dashboard or Export until matched.
+    unmatched: int = 0
+    # needs-review items the AI recommends accepting (all checks passed)
+    ai_recommended: int = 0
     by_failure_code: dict[str, int]
     failure_labels: dict[str, str]
 

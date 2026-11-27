@@ -15,6 +15,7 @@ import AdminSettings from "./pages/admin/Settings";
 import AdminUsers from "./pages/admin/Users";
 import AdminCalendars from "./pages/admin/Calendars";
 import AdminExtractionDebug from "./pages/admin/ExtractionDebug";
+import AdminMonitor from "./pages/admin/Monitor";
 import AdminPortalUsers from "./pages/admin/PortalUsers";
 import PortalLogin from "./pages/portal/PortalLogin";
 import PortalEmployeeUpload from "./pages/portal/PortalEmployeeUpload";
@@ -93,7 +94,7 @@ export default function App() {
           <Protected>
             {/* Wrapped ABOVE the inner route switch (not inside UploadPage
                 itself), so it survives navigating away from /upload and
-                back — only the matched route's component unmounts, this
+                back, only the matched route's component unmounts, this
                 stays mounted the whole session. See lib/uploadSession.tsx. */}
             <UploadSessionProvider>
             <Shell>
@@ -113,6 +114,7 @@ export default function App() {
                 <Route path="/admin/calendars" element={<Protected><AdminCalendars /></Protected>} />
                 <Route path="/admin/portal-users" element={<Protected><AdminPortalUsers /></Protected>} />
                 <Route path="/admin/debug" element={<Protected adminOnly><AdminExtractionDebug /></Protected>} />
+                <Route path="/admin/monitor" element={<Protected adminOnly><AdminMonitor /></Protected>} />
               </Routes>
             </Shell>
             </UploadSessionProvider>

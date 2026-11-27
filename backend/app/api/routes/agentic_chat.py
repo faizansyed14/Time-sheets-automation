@@ -131,7 +131,7 @@ async def chat_stream(
         data = await _read_capped(file, MAX_UPLOAD_BYTES)
         if data is None:
             attachment = {"kind": "error", "message": (
-                f"That file is too large — attachments are capped at "
+                f"That file is too large, attachments are capped at "
                 f"{MAX_UPLOAD_BYTES // (1024 * 1024)}MB.")}
         elif data:
             attachment = chat_files.extract_attachment(file.filename or "attachment", file.content_type or "", data)

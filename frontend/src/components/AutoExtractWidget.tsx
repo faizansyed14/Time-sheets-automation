@@ -150,7 +150,7 @@ export default function AutoExtractWidget() {
           {status.skipped > 0 && (
             <span
               className="hidden text-slate-500 md:inline"
-              title="Already extracted, nothing new since — no model call made"
+              title="Already extracted with nothing new since. No model call was made."
             >
               {status.skipped} already done
             </span>
@@ -171,7 +171,7 @@ export default function AutoExtractWidget() {
               className="hidden max-w-[120px] min-w-0 truncate text-slate-400 xl:inline"
               title={status.current.subject}
             >
-              — {status.current.subject}
+              · {status.current.subject}
             </span>
           )}
         </>
@@ -213,7 +213,7 @@ export default function AutoExtractWidget() {
               <span className={enabled ? "font-semibold text-emerald-600" : "font-semibold text-slate-500"}>
                 {enabled ? "on" : "off"}
               </span>
-              {enabled && " — new mail is extracted automatically."}
+              {enabled && ", new mail is extracted automatically."}
             </div>
             {processing && (
               <div className="mt-1.5 truncate text-[11px] text-slate-500" title={processing.subject}>
@@ -228,6 +228,20 @@ export default function AutoExtractWidget() {
             {status.last_error && (
               <div className="mt-1.5 rounded border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] leading-4 text-rose-700">
                 {status.last_error}
+              </div>
+            )}
+            <div className="mt-2 border-t border-slate-100 pt-1.5 text-[11px] text-slate-500">
+              Mailbox last synced:{" "}
+              <span className="text-slate-700">
+                {status.sync?.last_sync_at ? new Date(status.sync.last_sync_at).toLocaleString() : "not yet"}
+              </span>
+              {status.sync?.backfill_in_progress && (
+                <div className="text-amber-700">First full mailbox download still in progress.</div>
+              )}
+            </div>
+            {status.sync?.sync_error && (
+              <div className="mt-1.5 rounded border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] leading-4 text-rose-700">
+                Mail sync is failing: {status.sync.sync_error}
               </div>
             )}
           </div>

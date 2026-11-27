@@ -1,13 +1,13 @@
 /**
  * Single source of truth for UI colors.
- * Palette: brand (teal) · slate (neutral/"ink") · emerald · amber · rose
+ * Palette: brand (deep teal-green) · slate (neutral) · emerald · amber · rose
  */
 
 export type BadgeTone = "slate" | "brand" | "success" | "warning" | "danger";
 
 export const BADGE_TONES: Record<BadgeTone, string> = {
-  slate: "bg-slate-100 text-slate-700 ring-slate-200",
-  brand: "bg-brand-50 text-brand-700 ring-brand-200",
+  slate: "bg-slate-100 text-slate-700 ring-slate-200/80",
+  brand: "bg-brand-50 text-brand-700 ring-brand-200/80",
   success: "bg-emerald-50 text-emerald-700 ring-emerald-200",
   warning: "bg-amber-50 text-amber-800 ring-amber-200",
   danger: "bg-rose-50 text-rose-700 ring-rose-200",

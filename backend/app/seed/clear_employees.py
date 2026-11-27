@@ -20,7 +20,7 @@ from app.seed._clear_util import delete_all, report
 
 async def main() -> None:
     counts = await delete_all(Employee, "all_employee_data")
-    report(counts, "Done — employee matcher list cleared. Reload Employees.")
+    report(counts, "Done, employee matcher list cleared. Reload Employees.")
 
 
 if __name__ == "__main__":

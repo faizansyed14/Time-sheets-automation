@@ -49,7 +49,7 @@ export default function BulkAcceptReport({
                     return (
                       <tr key={a.id} className="align-top">
                         <td className="px-3 py-1.5">
-                          <div className="font-semibold text-slate-800">{a.employee_name ?? "—"}</div>
+                          <div className="font-semibold text-slate-800">{a.employee_name ?? "-"}</div>
                           <div className="text-[10px] text-slate-400">
                             {a.employee_id ?? ""}{a.project ? ` · ${a.project}` : ""}
                           </div>
@@ -86,7 +86,7 @@ export default function BulkAcceptReport({
             </h4>
             <ul className="max-h-48 space-y-1 overflow-y-auto rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-xs">
               {held.map((h) => (
-                <li key={h.id}><b>{h.employee_name ?? "Unknown"}</b> — {h.reasons.join("; ")}</li>
+                <li key={h.id}><b>{h.employee_name ?? "Unknown"}</b> · {h.reasons.join("; ")}</li>
               ))}
             </ul>
           </section>

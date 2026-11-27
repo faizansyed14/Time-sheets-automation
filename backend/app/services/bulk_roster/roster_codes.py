@@ -188,7 +188,7 @@ def translate_attendance_type(raw: str | None) -> tuple[str, str | None]:
     if code is None:
         return text, None
     if suffix and ("waiting" in suffix or "pending" in suffix):
-        return code, f"marked \"{text}\" — not yet approved, confirm before filing"
+        return code, f"marked \"{text}\", not yet approved, confirm before filing"
     return code, None
 
 
@@ -365,7 +365,7 @@ def distribute_days(
             if normalise_code(day_codes[day]):
                 issues.append(
                     f"day {day} is outside {_calendar.month_name[month]} {year} "
-                    f"({dim} days) — ignored")
+                    f"({dim} days), ignored")
             continue
 
         raw = day_codes[day]
@@ -421,7 +421,7 @@ def verify_row_totals(
     if stated_leave is None and stated_billing is None:
         issues.append(
             "this roster prints no Leave/Billing-day totals to check the day grid "
-            "against — nothing here has been independently verified; review the "
+            "against, nothing here has been independently verified; review the "
             "day-by-day cells directly before accepting")
 
     counted = sum(leave_weight(c) for c in day_codes.values())
@@ -429,7 +429,7 @@ def verify_row_totals(
     if stated_leave is not None and abs(counted - float(stated_leave)) > 1e-6:
         issues.append(
             f"leave-day mismatch: the roster states {_num(stated_leave)} leave day(s) "
-            f"but {_num(counted)} were read from the day grid — check this row")
+            f"but {_num(counted)} were read from the day grid, check this row")
 
     # Second, independent check on the SAME row: the document's two totals
     # must themselves add up. When they don't, the sheet is internally
@@ -447,7 +447,7 @@ def verify_row_totals(
                              if normalise_code(c) in AMBIGUOUS_LEAVE_CODES})
         quoted = "/".join(f'"{c}"' for c in codes_seen)
         issues.append(
-            f"{ambiguous} day(s) marked only as {quoted} — the roster doesn't say which "
+            f"{ambiguous} day(s) marked only as {quoted}, the roster doesn't say which "
             f"specific kind of leave this is (or, for an approval-status code like AL/AUL, "
             f"only whether it was approved), so they were recorded as annual; confirm or "
             f"re-bucket in Review")
@@ -455,13 +455,13 @@ def verify_row_totals(
     half = sum(1 for c in day_codes.values() if normalise_code(c) in _HALF_DAY_CODES)
     if half:
         issues.append(
-            f"{half} half-day (HD) cell(s) — a record stores whole days only, so these were "
+            f"{half} half-day (HD) cell(s), a record stores whole days only, so these were "
             f"recorded as 'other' leave; confirm the intended split in Review")
 
     ns_days = sum(1 for c in day_codes.values() if normalise_code(c) == "NS")
     if ns_days:
         issues.append(
-            f"{ns_days} National Service (NS) day(s) — there is no dedicated bucket for this, "
+            f"{ns_days} National Service (NS) day(s), there is no dedicated bucket for this, "
             f"so they were recorded as 'other' leave; confirm in Review")
 
     return issues

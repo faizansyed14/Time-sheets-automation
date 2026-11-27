@@ -221,14 +221,16 @@ class ThreadAgent(Agent):
         # (multi-employee rosters are already in meta["warnings"] above)
         if not sheets:
             ctx.abort("no readable sheets")
-            return meta.get("errors", ["nothing readable in this thread"])[0]
+            # `errors` is usually present but EMPTY on a clean "no sheets" run -
+            # `.get(key, default)[0]` crashed on that.
+            return str((meta.get("errors") or ["nothing readable in this thread"])[0])
 
         kinds: dict[str, int] = {}
         for s in sheets:
             kinds[s["kind"]] = kinds.get(s["kind"], 0) + 1
         breakdown = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
         return (f"read {len(sheets)} sheet(s) from {len(messages)} message(s) "
-                f"in {meta.get('calls', 0)} call(s) — {breakdown}")
+                f"in {meta.get('calls', 0)} call(s) · {breakdown}")
 
 
 # --------------------------------------------------------------------------- #
@@ -251,7 +253,7 @@ class EmployeeAgent(Agent):
         matched = [g for g in ctx.groups if g.get("employee_pk")]
         names = ", ".join(g["name"] for g in ctx.groups if g.get("name"))
         return (f"{len(ctx.groups)} record(s), {len(matched)} matched to HR"
-                + (f" — {names}" if names else ""))
+                + (f" · {names}" if names else ""))
 
 
 # --------------------------------------------------------------------------- #
@@ -277,13 +279,13 @@ class ConversationAgent(Agent):
     async def run(self, ctx: AgentContext) -> str:
         multi = [g for g in ctx.groups if len(g.get("sheets") or []) > 1]
         if not multi:
-            return "one sheet per record — nothing to consolidate"
+            return "one sheet per record, nothing to consolidate"
         details = []
         for g in multi:
             names = ", ".join(s["name"] for s in g["sheets"])
             month = g.get("month")
             period = f"{calendar.month_name[month]} {g.get('year')}" if month else "the period"
-            msg = (f"{g.get('name') or 'Record'} — {period} built from "
+            msg = (f"{g.get('name') or 'Record'} · {period} built from "
                    f"{len(g['sheets'])} sheets ({names}); their leave is unioned.")
             details.append(msg)
             g.setdefault("fold_notes", []).append(msg)
@@ -321,7 +323,7 @@ class DuplicateAgent(Agent):
                 TimesheetRecord.year == year))).scalars().first()
             if existing is not None:
                 msg = (f"{g.get('name') or 'This employee'} already has a filed "
-                       f"{calendar.month_name[month]} {year} record — these sheets will "
+                       f"{calendar.month_name[month]} {year} record, these sheets will "
                        "MERGE into it (existing leave is kept).")
                 found.append(msg)
                 g.setdefault("fold_notes", []).append(msg)

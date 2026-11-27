@@ -73,7 +73,7 @@ async def main() -> None:
     async with SessionLocal() as db:
         ids = await _dirty_email_ids(db)
         if not ids:
-            print("Nothing to reset — inbox already clean.")
+            print("Nothing to reset, inbox already clean.")
             return
 
         trackers = (
@@ -113,7 +113,7 @@ async def main() -> None:
         print(f"  thread summaries to clear: {n_thread_summaries}")
 
         if args.dry_run:
-            print("Dry run — no changes written.")
+            print("Dry run, no changes written.")
             return
 
         for t in trackers:
@@ -145,7 +145,7 @@ async def main() -> None:
         )
         await db.commit()
 
-    print("Done — inbox reset to new. Reload Inbox / Activity log.")
+    print("Done, inbox reset to new. Reload Inbox / Activity log.")
 
 
 if __name__ == "__main__":

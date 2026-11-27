@@ -72,7 +72,7 @@ async def test_capture_records_pass1_and_pass2_calls_and_a_dropped_image(mock_vi
     finally:
         debug_capture.reset_capture(token)
 
-    assert len(sheets) == 1, "sanity check — extraction itself must still succeed while capturing"
+    assert len(sheets) == 1, "sanity check, extraction itself must still succeed while capturing"
 
     assert len(cap.pass1_calls) == 1
     assert cap.pass1_calls[0]["response_json"]["items"][0]["employee_name"] == "Test Person"

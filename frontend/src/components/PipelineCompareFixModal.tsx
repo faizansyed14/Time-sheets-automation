@@ -43,6 +43,8 @@ import {
   pipelineManualFix,
   pipelineRawRenderUrl,
   pipelineRawUrl,
+  pipelineSheetRenderUrl,
+  pipelineSheetUrl,
   MONTHS_LONG,
   type Employee,
   type PipelineFile,
@@ -341,10 +343,8 @@ export default function PipelineCompareFixModal({
     staleTime: 10_000,
   });
   const docTabs = useMemo(() => {
-    if (!thread) return [] as {
-      id: string; filename: string; ct: string; url: string; renderUrl?: string;
-    }[];
-    return thread.messages.flatMap((m) =>
+    type Doc = { id: string; filename: string; ct: string; url: string; renderUrl?: string };
+    const fromThread: Doc[] = !thread ? [] : thread.messages.flatMap((m) =>
       (m.attachments ?? [])
         .filter((a) => !isBodyJunkImage(a, m.inline_attachment_ids))   // skip signature/logo images
         .map((a) => ({
@@ -356,7 +356,26 @@ export default function PipelineCompareFixModal({
             a.filename, a.content_type,
             attachmentRenderUrl(m.provider_message_id, a.attachment_id)),
         })));
-  }, [thread]);
+    // A sheet that is not a direct attachment of any message (e.g. inside a forwarded
+    // email) is pulled out of the stored copy by name, so it still opens directly.
+    const have = new Set(fromThread.map((d) => d.filename));
+    // Only an EMAIL holds several attachments to pick the sheet from; for an upload
+    // (or a vault file) the staged file IS the sheet, shown by "Staged file".
+    const fromStored: Doc[] = !file || file.failure_code !== "pending_review" || file.source_kind !== "email" ? [] :
+      (((file.extraction_meta as any)?.full_email_extract?.sheets ?? []) as { filename?: string; digest?: string }[])
+        .filter((s): s is { filename: string; digest?: string } => !!s.filename && !have.has(s.filename))
+        // one tab per FILE: several sheets can share a name ("Timesheet.pdf"), the
+        // content fingerprint tells them apart
+        .filter((s, i, all) => all.findIndex((o) => o.filename === s.filename && (o.digest ?? "") === (s.digest ?? "")) === i)
+        .map((s) => ({
+          id: `sheet:${s.filename}:${s.digest ?? ""}`,
+          filename: s.filename,
+          ct: "",
+          url: pipelineSheetUrl(file.id, s.filename, s.digest),
+          renderUrl: /\.(docx?|xlsx?|csv)$/i.test(s.filename) ? pipelineSheetRenderUrl(file.id, s.filename, s.digest) : undefined,
+        }));
+    return [...fromStored, ...fromThread];
+  }, [thread, file]);
   const activeDoc = activeTab.kind === "doc" ? docTabs.find((d) => d.id === activeTab.id) ?? null : null;
 
   const isStaged = file?.failure_code === "pending_review";
@@ -619,8 +638,8 @@ export default function PipelineCompareFixModal({
       const ok = result.status === "success";
       toast(
         ok ? "success" : "warning",
-        ok ? "Record saved & filed" : "Saved — needs review",
-        `${result.employee_name ?? selected?.name} — ${MONTHS_LONG[month]} ${year}`
+        ok ? "Record saved & filed" : "Saved, needs review",
+        `${result.employee_name ?? selected?.name} · ${MONTHS_LONG[month]} ${year}`
       );
       onSaved();
       onClose();
@@ -642,7 +661,7 @@ export default function PipelineCompareFixModal({
         <div className="flex shrink-0 items-center gap-2 border-b border-slate-100 bg-slate-50 px-4 py-3">
           <Columns2 className="h-4 w-4 text-slate-400" />
           <span className="min-w-0 flex-1 truncate text-sm font-semibold text-slate-700">
-            Review — {file.filename}
+            Review · {file.filename}
           </span>
           {file.failure_detail && (
             <span className="hidden truncate text-xs text-rose-500 sm:block max-w-sm">
@@ -677,7 +696,7 @@ export default function PipelineCompareFixModal({
                     <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                     <div>
                       <p className="font-semibold">
-                        This thread was only partially read — {fullEmail.errors!.length} part
+                        This thread was only partially read · {fullEmail.errors!.length} part
                         {fullEmail.errors!.length === 1 ? "" : "s"} of it didn't make it into this run.
                       </p>
                       <ul className="mt-1 list-disc space-y-0.5 pl-4">
@@ -706,7 +725,7 @@ export default function PipelineCompareFixModal({
                           <FileText className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
                           <span className="min-w-0">
                             <span className="font-semibold text-slate-800">{s.filename}</span>
-                            {" — "}
+                            {" · "}
                             {s.kind === "leave_certificate" ? "leave certificate" : s.kind}
                             {s.leave_days ? `, ${s.leave_days} leave day(s)` : ""}
                             {s.manager_signature ? " · manager signature ✓" : ""}
@@ -769,7 +788,7 @@ export default function PipelineCompareFixModal({
                   {selected.name} ({selected.employee_id}
                   {selected.location ? ` · ${selected.location}` : ""})
                   {selected.project ? ` · ${selected.project}` : ""}
-                  {selected.account_manager ? ` — ${selected.account_manager}` : ""}
+                  {selected.account_manager ? ` · ${selected.account_manager}` : ""}
                 </p>
               )}
             </label>
@@ -845,7 +864,7 @@ export default function PipelineCompareFixModal({
                 <div className="mb-2 flex items-start gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-xs text-amber-800">
                   <AlertTriangle className="h-3.5 w-3.5 shrink-0 translate-y-0.5" />
                   <span>
-                    AI found only a typed name near an approval field — no signature,
+                    AI found only a typed name near an approval field, no signature,
                     stamp, or status mark. Not auto-marked as approved; verify by hand.
                   </span>
                 </div>
@@ -880,7 +899,7 @@ export default function PipelineCompareFixModal({
                 value={approvalDetail}
                 onChange={(e) => setApprovalDetail(e.target.value)}
                 placeholder={approved
-                  ? 'Evidence, e.g. "Approved — Sylvia Noronha, 2 Jul 2026"'
+                  ? 'Evidence, e.g. "Approved · Sylvia Noronha, 2 Jul 2026"'
                   : "Why not approved (optional)"}
                 className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10"
               />
@@ -930,7 +949,7 @@ export default function PipelineCompareFixModal({
               <input
                 value={note}
                 onChange={(e) => setNote(e.target.value)}
-                placeholder="e.g. 'Confirmed with manager — Danial Gohar May 2026'"
+                placeholder="e.g. 'Confirmed with manager · Danial Gohar May 2026'"
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10"
               />
             </div>
@@ -944,7 +963,7 @@ export default function PipelineCompareFixModal({
                   AI recommends accepting
                 </p>
                 <p className="mt-1 text-slate-700">
-                  Extraction looks clean — compare with the file on the right, then press{" "}
+                  Extraction looks clean, compare with the file on the right, then press{" "}
                   <strong>Accept &amp; file record</strong> to store it. Nothing is saved until you do.
                 </p>
                 {autoAcceptReasons.length > 0 && (
@@ -1112,7 +1131,7 @@ export default function PipelineCompareFixModal({
           rows={4}
           value={sendBackNote}
           onChange={(e) => setSendBackNote(e.target.value)}
-          placeholder="e.g. 'Missing manager signature on page 2 — please re-upload with approval.'"
+          placeholder="e.g. 'Missing manager signature on page 2, please re-upload with approval.'"
           className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10"
         />
         <div className="flex justify-end gap-2">

@@ -19,14 +19,14 @@ export function filterEmployees(employees: Employee[] | undefined, query: string
 }
 
 export function formatBytes(n: number | null | undefined): string {
-  if (n == null) return "—";
+  if (n == null) return "-";
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export function formatDateTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
+  if (!iso) return "-";
   const d = new Date(iso);
   if (isNaN(d.getTime())) return iso;
   return d.toLocaleString(undefined, {
@@ -44,7 +44,7 @@ export function formatDateTime(iso: string | null | undefined): string {
  *  "sent at" timestamp reads as ambiguous/wrong if it silently switched to
  *  whoever happens to be looking at the page. */
 export function formatUaeDateTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
+  if (!iso) return "-";
   const d = new Date(iso);
   if (isNaN(d.getTime())) return iso;
   const formatted = d.toLocaleString("en-GB", {
@@ -60,7 +60,7 @@ export function formatUaeDateTime(iso: string | null | undefined): string {
 
 /** Outlook reading-pane style: "Fri 6/12/2026 10:15 AM". */
 export function formatOutlookDateTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
+  if (!iso) return "-";
   const d = new Date(iso);
   if (isNaN(d.getTime())) return iso;
   const weekday = d.toLocaleDateString(undefined, { weekday: "short" });

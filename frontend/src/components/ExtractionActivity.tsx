@@ -174,7 +174,7 @@ function Thumb({ src, alt }: { src?: string | null; alt: string }) {
   if (!src) {
     return (
       <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded border border-dashed border-slate-200 bg-slate-50 text-[9px] text-slate-400">
-        —
+        -
       </span>
     );
   }
@@ -318,7 +318,7 @@ function TwoPassPanel({ events }: { events: ExtractionEvent[] }) {
                   <div key={i} className="flex w-[4.5rem] flex-col items-center gap-0.5">
                     <Thumb src={k.thumb} alt={k.name || "item"} />
                     <span className="w-full truncate text-center text-[9px] text-slate-500" title={k.name}>
-                      {k.name || k.key || "—"}
+                      {k.name || k.key || "-"}
                     </span>
                   </div>
                 ))}
@@ -338,7 +338,7 @@ function TwoPassPanel({ events }: { events: ExtractionEvent[] }) {
             {ocrDropped.length > 0 && (
               <div className="space-y-1">
                 <p className="text-[10px] font-bold uppercase tracking-wide text-violet-700">
-                  OCR removed (too little text — logo / icon)
+                  OCR removed (too little text, logo / icon)
                 </p>
                 {ocrDropped.map((d, i) => <DroppedRow key={`o-${i}`} d={d} tone="ocr" />)}
               </div>
@@ -358,7 +358,7 @@ function TwoPassPanel({ events }: { events: ExtractionEvent[] }) {
       {/* 1 — Pass 1 triage */}
       <Section
         n={1}
-        title="Pass 1 — classify"
+        title="Pass 1: classify"
         icon={FileSearch}
         running={!!p1Start && !p1Done}
         done={!!p1Done}
@@ -402,7 +402,7 @@ function TwoPassPanel({ events }: { events: ExtractionEvent[] }) {
       >
         {p1Done && confirmed.length === 0 && (
           <p className="text-[11px] text-amber-700">
-            No timesheet / leave certificate confirmed — Pass 2 skipped.
+            No timesheet / leave certificate confirmed · Pass 2 skipped.
           </p>
         )}
         {confirmed.map((it, i) => <ItemRow key={i} it={it} />)}
@@ -416,7 +416,7 @@ function TwoPassPanel({ events }: { events: ExtractionEvent[] }) {
       {/* 3 — Pass 2 JSON */}
       <Section
         n={3}
-        title="Pass 2 — extract JSON"
+        title="Pass 2: extract JSON"
         icon={Braces}
         running={!!p2Start && !p2Done}
         done={!!p2Done}
@@ -516,7 +516,7 @@ export function ExtractionActivityModal({
         </span>
         <span className="min-w-0 flex-1">
           <span className="block text-xs font-bold text-slate-800">
-            {title} {run.running ? "— working…" : run.error ? "— failed" : "— done"}
+            {title} {run.running ? "· working…" : run.error ? "· failed" : "· done"}
           </span>
           <span className="block truncate text-[11px] text-slate-500">
             {run.running && last ? last.message : `${run.llmCalls} AI call(s) · ${(run.elapsedMs / 1000).toFixed(1)}s`}

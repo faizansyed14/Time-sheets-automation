@@ -23,6 +23,7 @@ endpoint only completes for users whose auth_mode actually uses it.
 """
 from __future__ import annotations
 
+import logging
 import secrets
 from datetime import datetime, timezone
 
@@ -34,6 +35,7 @@ from app.api.deps import ONLINE_THRESHOLD, get_current_user
 from app.core.cache import cache
 from app.core.config import settings
 from app.core.security import (
+    hash_password,
     create_access_token,
     create_login_token,
     decode_token,
@@ -59,6 +61,8 @@ from app.services.auth import otp as otp_svc
 from app.services.auth import rate_limit
 from app.services.auth import totp as totp_svc
 from app.services.tasks import send_otp_email_task
+
+log = logging.getLogger("security")
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -120,6 +124,14 @@ def _totp_enrollment_payload(user: User, secret: str) -> dict:
     }
 
 
+_DUMMY_HASH = hash_password(secrets.token_urlsafe(24))
+
+
+def _mask_user(name: str) -> str:
+    name = (name or "")[:64]
+    return (name[:2] + "***") if len(name) > 2 else "***"
+
+
 @router.post("/login", response_model=LoginResult)
 async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_db)):
     ip = _client_ip(request)
@@ -129,9 +141,19 @@ async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_
     if not allowed:
         raise HTTPException(429, f"Too many login attempts. Try again in {retry}s.")
 
+    fail_key = f"rl:login-fail:{body.username.lower()}"
+    if int(await cache.get(fail_key) or 0) >= settings.login_fail_max:
+        raise HTTPException(429, "Too many failed sign-in attempts for this account. "
+                                 f"Try again in {settings.login_fail_window_seconds // 60} minutes.")
+
     user = (await db.execute(
         select(User).where(User.username == body.username))).scalar_one_or_none()
-    if not user or not user.is_active or not verify_password(body.password, user.password_hash):
+    # Always run one password check, so an unknown username takes as long as a wrong
+    # password and the response time does not reveal which usernames exist.
+    ok = verify_password(body.password, user.password_hash if user else _DUMMY_HASH)
+    if not user or not user.is_active or not ok:
+        await cache.incr(fail_key, ttl=settings.login_fail_window_seconds)
+        log.warning("login failed for %s from %s", _mask_user(body.username), ip)
         raise HTTPException(401, "Invalid username or password")
 
     fp = _fp_from(request, body.fingerprint)
@@ -144,7 +166,7 @@ async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_
     if user.auth_mode == AuthMode.CAPTCHA:
         if body.captcha_id and body.captcha_answer:
             if not await captcha_svc.verify(body.captcha_id, body.captcha_answer):
-                raise HTTPException(401, "Incorrect CAPTCHA — try again.")
+                raise HTTPException(401, "Incorrect CAPTCHA, try again.")
             token = await _issue_session(db, user)
             return LoginResult(status="authenticated", access_token=token, user=_user_out(user))
         return LoginResult(
@@ -189,10 +211,10 @@ def _mask_email(email: str | None) -> str:
 def _validate_login_token(token: str, request: Request, fingerprint: str | None) -> dict:
     payload = decode_token(token)
     if not payload or payload.get("typ") != "login":
-        raise HTTPException(401, "Login session expired — start again.")
+        raise HTTPException(401, "Login session expired, start again.")
     if settings.fingerprint_required:
         if payload.get("fp") != _fp_from(request, fingerprint):
-            raise HTTPException(401, "Device fingerprint mismatch — start again.")
+            raise HTTPException(401, "Device fingerprint mismatch, start again.")
     return payload
 
 
@@ -232,7 +254,7 @@ async def verify_totp(body: VerifyTotpIn, request: Request, db: AsyncSession = D
         raise HTTPException(401, "User not found or inactive")
     secret = totp_svc.decrypt_secret(user.totp_secret_enc)
     if not secret or not totp_svc.verify_code(secret, body.code):
-        raise HTTPException(401, "Incorrect authenticator code — try again.")
+        raise HTTPException(401, "Incorrect authenticator code, try again.")
 
     if not user.totp_enrolled:
         user.totp_enrolled = True
@@ -249,7 +271,7 @@ async def resend_otp(body: ResendOtpIn, request: Request, db: AsyncSession = Dep
             raise HTTPException(429, f"Please wait {res.retry_after}s before requesting another code.")
         if res.reason == "resend_limit":
             raise HTTPException(429, "Resend limit reached. Start the login again.")
-        raise HTTPException(401, "Login session expired — start again.")
+        raise HTTPException(401, "Login session expired, start again.")
     user = (await db.execute(select(User).where(User.id == payload["sub"]))).scalar_one_or_none()
     send_otp_email_task.delay(user.email if user else "", res.code or "")
     return LoginResult(status="otp_required", login_token=body.login_token,
@@ -282,7 +304,7 @@ async def verify_captcha(body: VerifyCaptchaIn, request: Request, db: AsyncSessi
     if not allowed:
         raise HTTPException(429, f"Too many CAPTCHA attempts. Try again in {retry}s.")
     if not await captcha_svc.verify(body.captcha_id, body.answer):
-        raise HTTPException(401, "Incorrect CAPTCHA — try a new one.")
+        raise HTTPException(401, "Incorrect CAPTCHA, try a new one.")
     user = (await db.execute(select(User).where(User.id == payload["sub"]))).scalar_one_or_none()
     if not user or not user.is_active:
         raise HTTPException(401, "User not found or inactive")
@@ -322,9 +344,9 @@ async def logout(authorization: str | None = Header(default=None), db: AsyncSess
 
 def _otp_error(reason: str) -> str:
     if reason == "expired":
-        return "Code expired — request a new one."
+        return "Code expired, request a new one."
     if reason == "too_many_attempts":
-        return "Too many incorrect attempts — request a new code."
+        return "Too many incorrect attempts, request a new code."
     if reason.startswith("invalid_code"):
         remaining = reason.split(":", 1)[1] if ":" in reason else "0"
         return f"Incorrect code. {remaining} attempt(s) left."

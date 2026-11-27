@@ -71,7 +71,7 @@ def evaluate(
         else:
             blockers.append(
                 "no manager approval evidence found"
-                + (f" — {approval['detail']}" if approval.get("detail") else "")
+                + (f" · {approval['detail']}" if approval.get("detail") else "")
             )
 
     if group.get("employee_pk"):
@@ -107,7 +107,7 @@ def evaluate(
         for s in sheets)
 
     if is_cert_only:
-        reasons.append("leave-certificate-only group — day-grid coverage not required")
+        reasons.append("leave-certificate-only group, day-grid coverage not required")
     else:
         dc_total = int(group.get("days_covered_total") or 0)
         missing = group.get("missing_days") or []

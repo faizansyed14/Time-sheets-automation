@@ -358,7 +358,7 @@ function LegacyXlsxPane({ url }: { url: string }) {
             console.error("Legacy .xls preview also failed:", e2);
             setErrorCode(code);
             setError(
-              "This older Excel format (.xls) couldn't be read directly either — "
+              "This older Excel format (.xls) couldn't be read directly either · "
               + "please download this file and compare it against what's shown on the other side.");
             return;
           }
@@ -368,7 +368,7 @@ function LegacyXlsxPane({ url }: { url: string }) {
         setErrorCode(code);
         setError(
           code === "RIGHTS_PROTECTED"
-            ? "This spreadsheet is rights-protected (encrypted) — it can't be previewed here. Download it and open in Excel with the right permissions."
+            ? "This spreadsheet is rights-protected (encrypted), it can't be previewed here. Download it and open in Excel with the right permissions."
             : "Could not read this spreadsheet."
         );
       });
@@ -442,7 +442,7 @@ function LegacyXlsxPane({ url }: { url: string }) {
         <input
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search this sheet — e.g. a name or ID…"
+          placeholder="Search this sheet, e.g. a name or ID…"
           className="min-w-0 flex-1 bg-transparent text-xs text-slate-700 placeholder:text-slate-400 focus:outline-none"
         />
         {term && (
@@ -453,7 +453,7 @@ function LegacyXlsxPane({ url }: { url: string }) {
       </div>
       {usedLegacyParser && (
         <div className="shrink-0 border-b border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-700">
-          Legacy .xls format — showing cell text only (colours/fonts aren't available in this view).{" "}
+          Legacy .xls format, showing cell text only (colours/fonts aren't available in this view).{" "}
           <a href={url} download className="font-semibold underline hover:no-underline">
             Download the original
           </a>{" "}

@@ -223,7 +223,7 @@ async def _census(images: list[bytes], model: str, api_key: str) -> tuple[Roster
         if claimed is not None and claimed > seen_on_page:
             doc.issues.append(
                 f"page {idx}: {claimed} employee row(s) were visible but only {seen_on_page} "
-                f"were listed — the roster may be incomplete, check before accepting")
+                f"were listed, the roster may be incomplete, check before accepting")
 
     doc.rows = [by_key[k] for k in sorted(by_key)]
     return doc, calls
@@ -316,10 +316,10 @@ async def _single_call_roster(images: list[bytes], model: str, api_key: str) -> 
             enable_thinking=False,
         )
     except Exception as e:
-        log.info("single-call roster: falling back — the call itself failed: %s", e)
+        log.info("single-call roster: falling back, the call itself failed: %s", e)
         return None
     if not isinstance(data, dict):
-        log.info("single-call roster: falling back — reply was not valid JSON (got %s)", type(data).__name__)
+        log.info("single-call roster: falling back, reply was not valid JSON (got %s)", type(data).__name__)
         return None
 
     doc = RosterDoc(method="vision-roster-single-call", model=model, llm_calls=1)
@@ -333,7 +333,7 @@ async def _single_call_roster(images: list[bytes], model: str, api_key: str) -> 
         doc.approval_signature_detail = _clean_str(sig.get("detail"))
 
     if not (doc.month and doc.year):
-        log.info("single-call roster: falling back — no month/year read (month=%r, year=%r)",
+        log.info("single-call roster: falling back, no month/year read (month=%r, year=%r)",
                  doc.month, doc.year)
         return None
     dim = doc.calendar_days or days_in_month(doc.month, doc.year)
@@ -370,7 +370,7 @@ async def _single_call_roster(images: list[bytes], model: str, api_key: str) -> 
     doc.rows = [by_key[k] for k in sorted(by_key)]
     if not doc.rows:
         raw_employees = data.get("employees")
-        log.info("single-call roster: falling back — no employee rows in the reply "
+        log.info("single-call roster: falling back, no employee rows in the reply "
                  "(raw \"employees\" value was: %s)",
                  repr(raw_employees)[:800])
         return None
@@ -379,7 +379,7 @@ async def _single_call_roster(images: list[bytes], model: str, api_key: str) -> 
     # already dropped someone — don't trust it, fall back instead.
     claimed = _as_int(data.get("rows_visible"))
     if claimed is not None and claimed > len(doc.rows):
-        log.info("single-call roster: falling back — model reported seeing %d rows but only listed %d",
+        log.info("single-call roster: falling back, model reported seeing %d rows but only listed %d",
                  claimed, len(doc.rows))
         return None
     # Every row needs a COMPLETE grid — a single-call reply that ran out of
@@ -387,12 +387,12 @@ async def _single_call_roster(images: list[bytes], model: str, api_key: str) -> 
     # reconciliation/retry step of its own to recover a partial row.
     incomplete = [(r.sr_no, r.name, len(r.day_codes)) for r in doc.rows if len(r.day_codes) < dim]
     if incomplete:
-        log.info("single-call roster: falling back — %d row(s) had an incomplete day grid "
+        log.info("single-call roster: falling back · %d row(s) had an incomplete day grid "
                  "(expected %d days): %s", len(incomplete), dim, incomplete[:5])
         return None
 
     doc.calendar_days = dim
-    log.info("single-call roster: succeeded — %d employee(s), %d days, 1 call", len(doc.rows), dim)
+    log.info("single-call roster: succeeded · %d employee(s), %d days, 1 call", len(doc.rows), dim)
     return doc
 
 
@@ -508,7 +508,7 @@ async def _read_attendance_page(
     issue = None
     if claimed is not None and claimed > len(rows):
         issue = (f"{page_label}: {claimed} row(s) were visible but only {len(rows)} "
-                 f"were listed — this page may be incomplete, check before accepting")
+                 f"were listed, this page may be incomplete, check before accepting")
     return rows, issue
 
 
@@ -605,13 +605,13 @@ async def _vision_attendance_report(filename: str, data: bytes, api_key: str) ->
         try:
             y, m, d = (int(x) for x in date.split("-"))
         except ValueError:
-            per_employee_issues[emp_key].append(f"a row had an unreadable date {date!r} — skipped")
+            per_employee_issues[emp_key].append(f"a row had an unreadable date {date!r}, skipped")
             continue
         month_year_counts[(m, y)] = month_year_counts.get((m, y), 0) + 1
 
         if r1 is None or r2 is None:
             per_employee_issues[emp_key].append(
-                f"{date}: only read on one of the two independent passes — "
+                f"{date}: only read on one of the two independent passes · "
                 f"cannot corroborate, review this day")
             per_employee_days[emp_key][d] = ""
             continue
@@ -622,7 +622,7 @@ async def _vision_attendance_report(filename: str, data: bytes, api_key: str) ->
             r2.get("in_time"), r2.get("out_time"), r2.get("half1"), r2.get("half2"), r2.get("reason"))
         if normalise_code(code1) != normalise_code(code2):
             per_employee_issues[emp_key].append(
-                f"{date}: the two independent reads disagreed ({code1!r} vs {code2!r}) — "
+                f"{date}: the two independent reads disagreed ({code1!r} vs {code2!r}) · "
                 f"check this day against the original file")
             per_employee_days[emp_key][d] = ""
         else:
@@ -644,7 +644,7 @@ async def _vision_attendance_report(filename: str, data: bytes, api_key: str) ->
 
     if not doc.rows:
         raise ValueError(
-            "No employee rows could be read from this attendance report — if it is a "
+            "No employee rows could be read from this attendance report, if it is a "
             "single employee's timesheet, use the normal Upload tab instead.")
     if len(doc.rows) > MAX_EMPLOYEES:
         raise ValueError(
@@ -655,7 +655,7 @@ async def _vision_attendance_report(filename: str, data: bytes, api_key: str) ->
             "The month and year of this report could not be determined from its dates.")
 
     doc.calendar_days = days_in_month(doc.month, doc.year)
-    log.info("attendance-report reader finished — %d employee(s), %d total AI call(s)",
+    log.info("attendance-report reader finished · %d employee(s), %d total AI call(s)",
              len(doc.rows), calls)
     return doc
 
@@ -689,7 +689,7 @@ async def _vision_roster(filename: str, data: bytes) -> RosterDoc:
         calls += more_calls
     if not doc.rows:
         raise ValueError(
-            "No employee rows could be read from this document — if it is a single "
+            "No employee rows could be read from this document, if it is a single "
             "employee's timesheet, use the normal Upload tab instead.")
     if len(doc.rows) > MAX_EMPLOYEES:
         raise ValueError(
@@ -698,7 +698,7 @@ async def _vision_roster(filename: str, data: bytes) -> RosterDoc:
 
     if not (doc.month and doc.year):
         raise ValueError(
-            "The month and year of this roster could not be read — re-upload with the "
+            "The month and year of this roster could not be read, re-upload with the "
             "period selected, or use a clearer copy.")
     dim = doc.calendar_days or days_in_month(doc.month, doc.year)
     month_label = f"{doc.month:02d}/{doc.year}"
@@ -745,7 +745,7 @@ async def _vision_roster(filename: str, data: bytes) -> RosterDoc:
     still_missing = [r for r in doc.rows if not r.day_codes]
     for r in still_missing:
         r.issues.append(
-            "no day grid could be read for this row — enter the days manually in Review")
+            "no day grid could be read for this row, enter the days manually in Review")
     if still_missing:
         doc.issues.append(
             f"{len(still_missing)} of {len(doc.rows)} employee(s) had no readable day grid: "
@@ -763,7 +763,7 @@ async def _vision_roster(filename: str, data: bytes) -> RosterDoc:
     # full grid pass.
     if doc.rows and all(r.stated_leave_days is None and r.stated_billing_days is None
                         for r in doc.rows):
-        log.info("no printed Leave/Billing totals on this roster — running a corroborating "
+        log.info("no printed Leave/Billing totals on this roster, running a corroborating "
                  "second read (%d more call(s))", len(batches))
         second_results = await asyncio.gather(*(
             _read_grid_batch(images, b, dim, month_label, model, api_key, sem,
@@ -782,7 +782,7 @@ async def _vision_roster(filename: str, data: bytes) -> RosterDoc:
             second = second_merged.get(row.sr_no)
             if not isinstance(second, dict) or not isinstance(second.get("days"), dict):
                 row.issues.append(
-                    "a corroborating second read could not be completed for this row — "
+                    "a corroborating second read could not be completed for this row · "
                     "this format prints no totals to verify against either way, so review "
                     "the day-by-day cells directly")
                 continue
@@ -800,12 +800,12 @@ async def _vision_roster(filename: str, data: bytes) -> RosterDoc:
                 row.issues.append(
                     f"a second independent read disagreed with the first on day(s) {shown}"
                     + (" …" if len(disagreements) > 8 else "")
-                    + " — this format has no printed total to check against, so both reads "
+                    + ", this format has no printed total to check against, so both reads "
                       "were compared directly; check these dates against the original file")
 
     doc.calendar_days = dim
     doc.llm_calls = calls
-    log.info("census+grid reader finished — %d employee(s), %d total AI call(s)",
+    log.info("census+grid reader finished · %d employee(s), %d total AI call(s)",
              len(doc.rows), calls)
     return doc
 
@@ -865,7 +865,7 @@ async def extract_roster(
         doc.month, doc.year = doc.month or m, doc.year or y
     if not (doc.month and doc.year):
         raise ValueError(
-            "The month and year of this roster could not be determined — pick the period "
+            "The month and year of this roster could not be determined, pick the period "
             "on the upload form and try again.")
 
     if not doc.rows:

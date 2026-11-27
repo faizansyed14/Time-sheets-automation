@@ -17,7 +17,7 @@ from app.models.timesheet_record import ApprovalStatus, TimesheetRecord
 from app.schemas import ApprovalIn, TimesheetExportOut, TimesheetOut, TimesheetUpdate
 from app.services.employee.activity import in_month
 from app.services.export.timesheet_export import _fmt_dt, build_timesheet_xlsx, employees_grid_rows, status_for
-from app.services.pipeline.coverage import received_employee_dates, received_employee_pks
+from app.services.pipeline.coverage import received_employee_dates, received_employee_pks, vault_employee_pks
 
 router = APIRouter(prefix="/timesheets", tags=["timesheets"])
 
@@ -87,7 +87,7 @@ def to_export_out(
 
 def empty_export_out(
     emp: Employee, month: int, year: int, received_pks: set[str] | None = None,
-    received_at: datetime | None = None,
+    received_at: datetime | None = None, vault_pks: set[str] | None = None,
 ) -> TimesheetExportOut:
     return TimesheetExportOut(
         id=emp.id,
@@ -135,7 +135,7 @@ def empty_export_out(
         work_email=emp.work_email,
         contact_no=emp.contact_no,
         has_record=False,
-        status=status_for(False, emp.id, received_pks or set()),
+        status=status_for(False, emp.id, received_pks or set(), vault_pks),
         received_at=_fmt_dt(received_at) or None,
         stored_at=None,
     )
@@ -143,7 +143,7 @@ def empty_export_out(
 
 async def _export_grid(
     db: AsyncSession, month: int, year: int,
-) -> tuple[list[Employee], dict[str, TimesheetRecord], set[str], dict[str, Any]]:
+) -> tuple[list[Employee], dict[str, TimesheetRecord], set[str], dict[str, Any], set[str]]:
     """The matcher employees IN SCOPE for that month + any filed record for it
     keyed by employee PK, the set of employee PKs the pipeline received a sheet
     for (whether or not it's been filed yet) — same source as the dashboard's
@@ -168,9 +168,11 @@ async def _export_grid(
     records_by_pk = {r.matched_employee_pk: r for r in period_records if r.matched_employee_pk}
     received_pks = await received_employee_pks(db, month, year)
     received_dates = await received_employee_dates(db, month, year)
-    data_pks = set(records_by_pk) | received_pks
+    # Files in the vault with no extracted record are "In Vault, Not Extracted", not missing.
+    vault_pks = await vault_employee_pks(db, month, year)
+    data_pks = set(records_by_pk) | received_pks | vault_pks
     employees = [e for e in all_employees if in_month(e, month, year, data_pks)]
-    return employees, records_by_pk, received_pks, received_dates
+    return employees, records_by_pk, received_pks, received_dates, vault_pks
 
 
 @router.get("/export")
@@ -182,8 +184,8 @@ async def export_period(
     """Download the matcher employees in scope for one month as XLSX (empty cells
     if not filed). Inactive employees appear up to and including the month they
     were inactivated in."""
-    employees, records_by_pk, received_pks, received_dates = await _export_grid(db, month, year)
-    rows = employees_grid_rows(employees, records_by_pk, month, year, received_pks, received_dates)
+    employees, records_by_pk, received_pks, received_dates, vault_pks = await _export_grid(db, month, year)
+    rows = employees_grid_rows(employees, records_by_pk, month, year, received_pks, received_dates, vault_pks)
     data = build_timesheet_xlsx(rows, month, year)
     fname = f"timesheets_{year}-{month:02d}.xlsx"
     return Response(
@@ -200,7 +202,7 @@ async def list_by_period(
     db: AsyncSession = Depends(get_db),
 ):
     """The matcher employees in scope for one month — filed rows filled, others empty."""
-    employees, records_by_pk, received_pks, received_dates = await _export_grid(db, month, year)
+    employees, records_by_pk, received_pks, received_dates, vault_pks = await _export_grid(db, month, year)
     out: list[TimesheetExportOut] = []
     for emp in employees:
         rec = records_by_pk.get(emp.id)
@@ -208,7 +210,7 @@ async def list_by_period(
         if rec:
             out.append(to_export_out(rec, emp, received_at))
         else:
-            out.append(empty_export_out(emp, month, year, received_pks, received_at))
+            out.append(empty_export_out(emp, month, year, received_pks, received_at, vault_pks))
     return out
 
 
@@ -333,7 +335,7 @@ async def update_record(record_id: str, body: TimesheetUpdate, db: AsyncSession 
     }]
     from app.services.extraction.validation import summarize as _summarize
     r.validation_status = ValidationStatus.MANUAL_REVIEW if flags else ValidationStatus.VERIFIED
-    r.llm_summary = "Edited — " + _summarize(cleaned, flags, r.month, r.year)
+    r.llm_summary = "Edited · " + _summarize(cleaned, flags, r.month, r.year)
     await db.commit()
     await db.refresh(r)
     await datacache.bust_coverage()
@@ -379,7 +381,7 @@ async def delete_record(record_id: str, db: AsyncSession = Depends(get_db)):
         t.failure_detail = "The timesheet record this file filed was deleted."
         t.events = (t.events or []) + [{
             "stage": "recorded", "status": "warn",
-            "detail": "Record deleted — no longer filed.",
+            "detail": "Record deleted, no longer filed.",
             "at": datetime.now(timezone.utc).isoformat(),
         }]
 

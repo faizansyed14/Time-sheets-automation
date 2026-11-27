@@ -62,7 +62,7 @@ def render_reminder_html(*, employee_name: str, month_label: str) -> str:
                 </table>
                 <hr style="border:none;border-top:1px solid {_BORDER};margin:28px 0 16px 0;" />
                 <p style="margin:0;color:{_SLATE};font-size:12px;line-height:1.6;">
-                  This is an automated reminder — please do not reply to this email.
+                  This is an automated reminder, please do not reply to this email.
                 </p>
               </td>
             </tr>

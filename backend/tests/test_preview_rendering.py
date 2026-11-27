@@ -89,7 +89,7 @@ def _forwarded_email() -> bytes:
     inner["Subject"] = "Re: Approved June 2026 Timesheet"
     inner["From"] = "manager@alpha.ae"
     inner["To"] = "employee@alpha.ae"
-    inner.set_content("Approved — see attached.")
+    inner.set_content("Approved, see attached.")
     inner.add_attachment(b"%PDF-1.4 inner sheet", maintype="application",
                          subtype="pdf", filename="inner_sheet.pdf")
 

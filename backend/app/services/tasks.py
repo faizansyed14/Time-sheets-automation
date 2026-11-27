@@ -180,11 +180,19 @@ def sync_inbox_task():
 
     async def _run():
         async with SessionLocal() as db:
-            synced = await sync_inbox(db)
-            if synced and await auto_extract.is_enabled():
-                await auto_extract.enqueue_new_threads(db, synced)
+            await sync_inbox(db)
+            # Queue by what is NEW IN THE DATABASE, not by what this particular sync
+            # fetched - the Inbox page's own sync may have stored it first.
+            await auto_extract.enqueue_since_watermark(db)
 
     return _run_coro(_run)
+
+
+@celery_app.task(name="inbox.auto_extract_sweep")
+def auto_extract_sweep_task():
+    """Daily catch-up while Auto Extract is on (see auto_extract.scheduled_sweep)."""
+    from app.services.extract_email import auto_extract
+    return _run_coro(auto_extract.scheduled_sweep)
 
 
 @celery_app.task(name="ingestion.process_upload")
@@ -299,3 +307,17 @@ def run_portal_extraction_task(self, submission_id: str, only_kind: str | None =
         return _run_coro(_run)
     except Exception as exc:  # pragma: no cover - network/model dependent
         raise self.retry(exc=exc)
+
+
+@celery_app.task(name="admin.purge_debug_runs")
+def purge_debug_runs_task():
+    """Daily: delete extraction debug runs older than DEBUG_RUN_RETENTION_DAYS, with their
+    saved pictures (S3 or local)."""
+    from app.core.database import SessionLocal
+    from app.services.extract_email.debug_capture import purge_old_debug_runs
+
+    async def _run():
+        async with SessionLocal() as db:
+            return await purge_old_debug_runs(db)
+
+    return _run_coro(_run)

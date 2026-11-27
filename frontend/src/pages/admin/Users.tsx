@@ -108,7 +108,7 @@ function SystemNoticeCard() {
         <h3 className="text-sm font-bold text-slate-800">System notice</h3>
       </div>
       <p className="mb-3 text-xs text-slate-500">
-        One sentence shown as a popup to every signed-in user, including viewers — e.g. "System under maintenance tonight 10pm–11pm."
+        One sentence shown as a popup to every signed-in user, including viewers, e.g. "System under maintenance tonight 10pm–11pm."
         They get a single OK button; once someone clicks it the popup doesn't come back for them. Changing the message or
         switching it back on shows it to everyone again.
       </p>
@@ -235,7 +235,7 @@ export default function AdminUsers() {
     <div className="animate-fade-up">
       <PageHeader
         title="Users & access"
-        subtitle="Create users and choose their sign-in challenge: CAPTCHA, Authenticator (TOTP) or OTP (email) — exactly one, after username + password."
+        subtitle="Create users and choose their sign-in challenge: CAPTCHA, Authenticator (TOTP) or OTP (email), exactly one, after username + password."
         actions={<Button onClick={openCreate}><UserPlus className="h-4 w-4" /> Add user</Button>}
       />
 
@@ -272,7 +272,7 @@ export default function AdminUsers() {
                   </td>
                   <td className="px-3 py-2.5"><RoleBadge role={u.role} /></td>
                   <td className="px-3 py-2.5 text-slate-600">
-                    <span className="flex items-center gap-1 text-xs"><Mail className="h-3 w-3 text-slate-400" />{u.email ?? "—"}</span>
+                    <span className="flex items-center gap-1 text-xs"><Mail className="h-3 w-3 text-slate-400" />{u.email ?? "-"}</span>
                   </td>
                   <td className="px-3 py-2.5">
                     <span className="text-xs font-medium text-slate-600">{authModeLabel(u.auth_mode)}</span>
@@ -336,10 +336,10 @@ export default function AdminUsers() {
           </Field>
           <Field label="Role">
             <Select className="w-full" value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as AuthRole })}>
-              <option value="admin">admin — full access</option>
-              <option value="user">user — read &amp; write</option>
-              <option value="viewer">viewer — read-only</option>
-              <option value="vault_matcher">vault &amp; matcher — Employee Matcher + File Vault only</option>
+              <option value="admin">admin, full access</option>
+              <option value="user">user, read &amp; write</option>
+              <option value="viewer">viewer, read-only</option>
+              <option value="vault_matcher">vault &amp; matcher · Employee Matcher + File Vault only</option>
             </Select>
           </Field>
           <Field label="2-factor mode">
@@ -375,8 +375,8 @@ export default function AdminUsers() {
       <Modal
         open={!!totpSetup}
         onClose={() => setTotpSetup(null)}
-        title={totpSetup ? `Authenticator setup — ${totpSetup.user.username}` : "Authenticator setup"}
-        subtitle="Scan the QR code in Microsoft Authenticator or Google Authenticator. Shown once — save it securely."
+        title={totpSetup ? `Authenticator setup · ${totpSetup.user.username}` : "Authenticator setup"}
+        subtitle="Scan the QR code in Microsoft Authenticator or Google Authenticator. Shown once, save it securely."
       >
         {totpSetup && (
           <div className="space-y-3 text-center">
